@@ -18,9 +18,11 @@ on:
   pull_request:
 
 # Cancel superseded runs on the same ref so a PR's latest push is the gate.
+# Only for PRs: `main` pushes run to completion so every commit on `main` keeps a
+# real green-CI record (the canonical "is main green" signal downstream relies on).
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -29,16 +31,19 @@ jobs:
   bun:
     name: Bun check (Ubuntu)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # Repo pins Bun 1.4.0 (`.bun-version` + `packageManager`, enforced by
-      # `check:pins`). 1.4.0 has no *stable* GitHub release yet, so resolving it
-      # from `.bun-version` 404s; the `canary` channel is the only public source
-      # of the 1.4.0 line (`bun --version` -> 1.4.0-canary.1), and it is the sole
-      # Bun that reads this repo's `lockfileVersion: 2` lockfile. Dependency
-      # pinning is still hard-guaranteed by `--frozen-lockfile` (INV-PIN); flip
+      # Repo pins Bun 1.4.0 (`.bun-version` + `packageManager`). 1.4.0 has no
+      # *stable* GitHub release yet, so resolving it from `.bun-version` 404s; the
+      # `canary` channel is the only public source of the 1.4.0 line
+      # (`bun --version` -> 1.4.0-canary.1), and it is the sole Bun that reads this
+      # repo's `lockfileVersion: 2` lockfile. `check:pins` (run inside `bun run
+      # check` below) asserts the RUNNING Bun is on the pinned 1.4.0 line, so any
+      # canary drift OFF that line fails the gate loudly rather than silently —
+      # and `--frozen-lockfile` hard-guarantees dependency pinning (INV-PIN). Flip
       # this to `bun-version-file: .bun-version` once Bun 1.4.0 ships stable.
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -57,6 +62,7 @@ jobs:
   swift:
     name: Swift check (macOS)
     runs-on: macos-26
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
