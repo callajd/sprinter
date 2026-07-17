@@ -1,0 +1,76 @@
+# CI — runs BOTH side gates verbatim (FE1.3, policy.md §CI/CD).
+#
+# Bun side  (Ubuntu): `bun run check`  — check:pins → oxfmt → oxlint (type-aware)
+#                                         → tsc → vitest run --coverage.
+# Swift side (macOS):  `make check`     — swift format lint → SwiftLint --strict
+#                                         → swift build (warnings-as-errors)
+#                                         → swift test → coverage-gate.py.
+#
+# Both gates carry their own coverage thresholds (INV-COV); CI invokes the repo
+# `check` commands unchanged (INV-GATE) and never anything weaker. Every
+# third-party action is pinned to a commit SHA (INV-PIN); a comment records the
+# human-readable tag the SHA resolves to.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref so a PR's latest push is the gate.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  bun:
+    name: Bun check (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Bun pinned to .bun-version (1.4.0) — INV-PIN.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # The bun-side gate, verbatim (INV-GATE): check:pins → oxfmt --check →
+      # oxlint --deny-warnings (type-aware, via oxlint-tsgolint) → tsc --noEmit →
+      # vitest run --coverage. Coverage thresholds enforced inside (INV-COV).
+      - name: Run check
+        run: bun run check
+
+  swift:
+    name: Swift check (macOS)
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Repo toolchain targets Swift 6.3 / Xcode 26.x. Pin the Xcode that ships
+      # on the hosted macos-26 image (INV-PIN); the exact Swift version is echoed
+      # below so the run records what the gate built against.
+      - name: Select Xcode 26.5
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: "26.5"
+
+      - name: Toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      # The Swift-side gate, verbatim (INV-GATE): swift format lint → SwiftLint
+      # --strict (pinned SPM plugin) → swift build (warnings-as-errors) →
+      # swift test → coverage-gate.py (python3, preinstalled). INV-COV inside.
+      - name: Run check
+        working-directory: apple/Sprinter
+        run: make check
