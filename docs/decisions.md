@@ -117,6 +117,16 @@ Extends D5 into a standing invariant: Sprinter depends only on **ports**, and
 The full naming & API conventions derived from this invariant live in
 [`conventions.md`](./conventions.md).
 
+### D15 — Engineering policy: coverage, dual `check` gates, strict tooling, pinning, CI
+Binding repo standards (full text: [`policy.md`](./policy.md)): **≥75% line &
+function** unit-test coverage on all modules; one **`check`** command per side
+(`bun run check` / `make check`) running format + lint + typecheck + tests; **TS 7
+(`tsc`)** typecheck with **`oxlint` + `oxfmt`** at max strictness (type assertions
+banned) on the Bun side, and **SwiftLint `--strict` + swift-format +
+warnings-as-errors** (force-unwrap/cast/try banned) on the Swift side; **all deps
+pinned to exact versions** with committed lockfiles; **GitHub Actions CI**
+enforcing both `check`s on every push to `main` and on PRs.
+
 ---
 
 ## Deferred (see architecture §10)

@@ -64,5 +64,6 @@ and parallelism. At any time many workstreams run across many repos.
 - [`docs/decisions.md`](docs/decisions.md) — the decision log and rationale.
 - [`docs/plan/`](docs/plan/README.md) — the implementation plan: Foundation, Track A, Track B.
 - [`docs/conventions.md`](docs/conventions.md) — naming & API conventions.
+- [`docs/policy.md`](docs/policy.md) — engineering policy (coverage, `check`, lint, pinning, CI).
 
 > Status: architecture reference. No implementation yet.

@@ -9,9 +9,18 @@ order: scaffold first, then schemas + the Pi spike in parallel, then the
 contract, then the stub + Swift bridge in parallel.
 
 ## F0.1 — Repo & toolchain scaffold *(blocks all)*
-- Bun workspace monorepo, strict `tsconfig`, biome, pinned Effect
-  `4.0.0-beta.97`, verification gate (`build` / `typecheck` / `test`) — the gate
-  agents must pass post-cutover.
+
+Implements [`docs/policy.md`](../policy.md) — the `check` gate here *is* the
+verification gate agents must pass post-cutover.
+
+- **Bun side:** workspace monorepo; TS 7 (`tsc`) typecheck; `oxlint` + `oxfmt` at
+  max strictness (type assertions banned); `bun test --coverage` (≥75% line &
+  function); exact-pinned deps + committed lockfile; pinned Effect
+  `4.0.0-beta.97` — all behind **`bun run check`**.
+- **Swift side** (`apple/Sprinter/`): the analogous **`make check`** —
+  swift-format + SwiftLint `--strict` + warnings-as-errors + ≥75% coverage.
+- **CI** (`.github/workflows/`): GitHub Actions running both `check`s on every
+  push to `main` and on PRs.
 - Proposed layout:
   ```
   packages/domain/       # Effect Schema: read model, events, commands, session I/O
@@ -20,6 +29,7 @@ contract, then the stub + Swift bridge in parallel.
   packages/stub-server/  # serves the contract with fake data (unblocks Track B)
   apple/Sprinter/        # Track B — SwiftUI app + Swift RPC client
   fixtures/              # captured real pi --mode rpc transcripts
+  .github/workflows/     # CI: runs both check commands
   ```
 
 ## F0.2 — Domain schemas (`packages/domain`) *(blocks contract)*
