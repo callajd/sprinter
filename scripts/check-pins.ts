@@ -104,6 +104,17 @@ const program = Effect.gen(function* () {
     );
   }
 
+  // The RUNNING toolchain must be on the pinned line, not just the two static
+  // files agreeing (INV-PIN at its source). Accept a prerelease build of the same
+  // core version (e.g. `1.4.0-canary.1`) so CI can install the 1.4.0 line via the
+  // `canary` channel until Bun 1.4.0 ships stable — but reject any other version.
+  const running = Bun.version;
+  if (running !== bunVersion && !running.startsWith(`${bunVersion}-`)) {
+    toolchainErrors.push(
+      `  running Bun ${running} is off the pinned ${bunVersion} line (.bun-version)`,
+    );
+  }
+
   if (dependencyErrors.length > 0 || toolchainErrors.length > 0) {
     const sections: Array<string> = [];
     if (dependencyErrors.length > 0) {
