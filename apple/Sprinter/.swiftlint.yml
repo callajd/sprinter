@@ -1,0 +1,21 @@
+# SwiftLint configuration for the Sprinter Swift client (issue FE1.2).
+#
+# Run under `--strict` from `make check`, so every violation (including
+# warnings) fails the gate. The force-unwrap / cast / try family — the Swift
+# analog of TS type assertions — is banned as an ERROR (INV-NOCAST). Resolve at
+# the source; never suppress with `// swiftlint:disable`.
+
+included:
+  - Sources
+  - Tests
+
+# Opt-in rules that are not enabled by default but are required by policy.
+opt_in_rules:
+  - force_unwrapping
+  - implicitly_unwrapped_optional
+
+# Force family = errors (not warnings).
+force_cast: error
+force_try: error
+force_unwrapping: error
+implicitly_unwrapped_optional: error
