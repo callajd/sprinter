@@ -1,78 +1,155 @@
-# Implementation Plan — Part 1: Foundation
+# Workstream `FDN` — Foundation
 
-The prerequisites shared by both tracks. **This is the entire dependency surface
-for Track A and Track B** — once it exits, the tracks diverge and run in parallel
-depending on nothing but what is delivered here.
+> Spec doc for the **`workstream`** skill. One epic set, one sequencing graph, one
+> invariant set. `/epic` cuts one issue per task, copies its **Done**, and threads
+> each cross-cutting invariant into that acceptance (naming its guard).
+>
+> **Goal:** deliver the entire shared dependency surface for Track A and Track B —
+> scaffold + check gate + CI, domain schemas, the frozen RPC contract, the owned
+> Pi protocol schema, the stub server, and the Swift bridge.
+>
+> **Prerequisites:** none. This workstream unblocks `TRK-A` and `TRK-B`.
+> **Exit / divergence point:** `FE5.3` green — the stub serves contract v1 and a
+> Swift client decodes it.
 
-The goal is to reach the **divergence point** fast, so keep this lean. Internal
-order: scaffold first, then schemas + the Pi spike in parallel, then the
-contract, then the stub + Swift bridge in parallel.
+## Cross-cutting invariants
 
-## F0.1 — Repo & toolchain scaffold *(blocks all)*
+Bind every epic; `/epic` threads each applicable one into each task's **Done**.
+Sourced from [`policy.md`](../policy.md), [`conventions.md`](../conventions.md),
+[`decisions.md`](../decisions.md).
 
-Implements [`docs/policy.md`](../policy.md) — the `check` gate here *is* the
-verification gate agents must pass post-cutover.
+| Id | Invariant | Guard |
+|----|-----------|-------|
+| `INV-GATE` | The side's `check` is green — format + lint + typecheck + tests | `bun run check` / `make check` + CI |
+| `INV-COV` | ≥ 75% line **and** function coverage on the task's modules | coverage threshold inside `check` |
+| `INV-NOCAST` | No `as`/non-null `!`/`any` (TS); no force unwrap/cast/try (Swift) | `oxlint` / `SwiftLint --strict` |
+| `INV-PIN` | All deps exact-pinned; lockfile committed | `check` dep-pin verification + committed lock |
+| `INV-NAMING` | Follows `conventions.md` (ports/adapters, owned vs. foreign, `*Store`/`*Ops`) | cold `pr-review` |
+| `INV-PORT` | No concrete backing/instance depended on directly; external systems + locations sit behind ports | cold `pr-review` |
+| `INV-CONTRACT` | Contract changes are versioned and ripple to stub + Swift mirror; golden-fixture tests pass | `check` (contract tests) + cold `pr-review` |
 
-- **Bun side:** workspace monorepo; TS 7 (`tsc`) typecheck; `oxlint` + `oxfmt` at
-  max strictness (type assertions banned); `bun test --coverage` (≥75% line &
-  function); exact-pinned deps + committed lockfile; pinned Effect
-  `4.0.0-beta.97` — all behind **`bun run check`**.
-- **Swift side** (`apple/Sprinter/`): the analogous **`make check`** —
-  swift-format + SwiftLint `--strict` + warnings-as-errors + ≥75% coverage.
-- **CI** (`.github/workflows/`): GitHub Actions running both `check`s on every
-  push to `main` and on PRs.
-- Proposed layout:
-  ```
-  packages/domain/       # Effect Schema: read model, events, commands, session I/O
-  packages/contract/     # effect/unstable/rpc RpcGroup over domain
-  packages/daemon/       # Track A
-  packages/stub-server/  # serves the contract with fake data (unblocks Track B)
-  apple/Sprinter/        # Track B — SwiftUI app + Swift RPC client
-  fixtures/              # captured real pi --mode rpc transcripts
-  .github/workflows/     # CI: runs both check commands
-  ```
+`INV-GATE`, `INV-COV`, `INV-NOCAST`, `INV-PIN`, `INV-NAMING` apply to **every**
+task. `INV-PORT` / `INV-CONTRACT` are tagged per epic below.
 
-## F0.2 — Domain schemas (`packages/domain`) *(blocks contract)*
-- `Schema` for the read model: Workstream / Epic / Issue / Job / Session and their
-  statuses; IDs; the workstream→epic→Issue→PR mapping shape.
-- The **client-facing `SessionEvent` schema** — rich enough to render a full
-  transcript in the Inspector (messages, tool calls, diffs, thinking, ui-requests).
-  Owned and Swift-stable — **not** Pi's `AgentSessionEvent`.
-- Command payloads and session I/O (`SessionInput`, `UiResponse`).
+## Epics — set & sequencing
 
-## F0.3 — Pi-protocol spike + fixture *(de-risks Track A; feeds the stub)*
-- Run `pi --mode rpc` by hand; capture the NDJSON stream to `fixtures/`.
-- Use it to (a) author/validate the **owned Pi protocol schema** against real
-  output, and (b) author the `SessionEvent` schema (F0.2) as a translation
-  target. Seed the stub's synthetic transcript from this capture so Track B builds
-  against real-shaped data.
+| Epic | Name | Depends on |
+|------|------|-----------|
+| `FE1` | Toolchain, check gate & CI | — |
+| `FE2` | Domain schemas | `FE1` |
+| `FE3` | Pi protocol & fixture | `FE1` |
+| `FE4` | RPC contract v1 | `FE2` |
+| `FE5` | Stub server & Swift bridge | `FE4`, `FE3` |
 
-## F0.4 — RPC contract v1 (`packages/contract`) *(the freeze point; blocks Track B)*
-- The `RpcGroup` over the domain schemas, covering all four models: `snapshot`
-  (query), `events` (streaming subscription), commands
-  (`createWorkstream` / `controlWorkstream` / …), and the session channel
-  (`sessionEvents` stream, `sessionSend`, `interrupt`, `answerUiRequest`).
-- Explicitly **versioned**. "Frozen enough to mirror in Swift and build a stub."
-
-## F0.5 — Stub server (`packages/stub-server`) *(the divergence enabler)*
-- An `RpcServer` Layer serving the contract from **in-memory fixtures** + a
-  synthetic event generator (replays the captured transcript over `sessionEvents`,
-  emits canned board deltas over `events`, accepts and echoes commands).
-- Runnable locally over the same transport the real daemon will use.
-
-## F0.6 — Swift contract bridge *(blocks Track B's client)*
-- Schema→Swift DTO codegen (or a documented hand-mirror) + **golden JSON
-  fixtures** to test the Swift decoders against the contract.
-- A minimal Swift RPC client skeleton that connects to the stub and round-trips
-  one query + one stream.
+```
+FE1 ──► FE2 ──► FE4 ──► FE5
+   └──► FE3 ───────────►┘
+```
 
 ---
 
-## Exit criteria — the divergence point
+## Epic `FE1` — Toolchain, check gate & CI
 
-> The **stub server** serves contract v1, and a **Swift client** decodes its
-> `snapshot` and consumes one live stream.
+Implements [`policy.md`](../policy.md). The `check` gate built here **is** the
+project verification gate.
 
-At this point both tracks have their entire dependency surface. They diverge and
-proceed in parallel — see [Track A](./track-a-daemon.md) and
-[Track B](./track-b-ui.md).
+### FE1.1 — Bun monorepo scaffold
+- **Done:** Bun workspace with `packages/{domain,contract,daemon,stub-server}`;
+  `.bun-version` + `packageManager` pinned; strict `tsconfig`; Effect
+  `4.0.0-beta.97` pinned exact; `save-exact` on; `bun.lock` committed.
+- **Depends on:** —
+
+### FE1.2 — Bun check gate
+- **Done:** `oxlint` (bans `as`/`!`/`any` as errors) + `oxfmt --check` +
+  `tsc --noEmit` + `bun test --coverage` (threshold `line=0.75, function=0.75`)
+  all wired behind **`bun run check`**, exiting non-zero on any violation; tooling
+  pinned exact. (If `oxfmt` is not release-ready, fall back to Biome and record it.)
+- **Depends on:** `FE1.1`
+
+### FE1.3 — Swift app scaffold + `make check`
+- **Done:** `apple/Sprinter/` SwiftPM/Xcode project, Swift 6 mode, strict
+  concurrency = complete, warnings-as-errors; `SwiftLint --strict` (force
+  unwrap/cast/try = error) + `swift-format` + coverage gate (≥75%) behind
+  **`make check`**; deps `.exact()`-pinned, `Package.resolved` committed.
+- **Depends on:** —
+
+### FE1.4 — CI workflows
+- **Done:** GitHub Actions running `bun run check` (Ubuntu) and `make check`
+  (macOS, pinned Xcode) on **push to `main`** and on **PRs**; both must pass; red
+  `check` blocks.
+- **Depends on:** `FE1.2`, `FE1.3`
+
+---
+
+## Epic `FE2` — Domain schemas  ·  tag: `INV-NAMING`
+
+`packages/domain`. Owned Effect `Schema`; plain names for domain types.
+
+### FE2.1 — Read-model schemas
+- **Done:** `Schema` for `Workstream`/`Epic`/`Issue`/`Job`/`Session` + their
+  statuses, IDs, and the workstream→epic→Issue→PR mapping shape; round-trip
+  encode/decode tested.
+- **Depends on:** —
+
+### FE2.2 — `SessionEvent` schema
+- **Done:** owned `SessionEvent` rich enough to render a full transcript (messages,
+  tool calls, diffs, thinking, ui-requests); named plainly (not `AgentSessionEvent`).
+- **Depends on:** —
+
+### FE2.3 — Command & session-I/O schemas
+- **Done:** control-command payloads (`createWorkstream`/`controlWorkstream`/…),
+  `SessionInput`, `UiResponse`; validated.
+- **Depends on:** —
+
+---
+
+## Epic `FE3` — Pi protocol & fixture  ·  tag: `INV-BOUNDARY` (defines the owned type)
+
+### FE3.1 — Capture Pi transcript fixture
+- **Done:** a real `pi --mode rpc` NDJSON transcript captured to `fixtures/`, plus
+  the capture harness/notes to regenerate it.
+- **Depends on:** —
+
+### FE3.2 — Owned Pi protocol schema
+- **Done:** owned Effect `Schema` mirroring the `RpcCommand`/`RpcResponse`/
+  `AgentSessionEvent` subset we use (authored against Pi's `rpc-types.ts`, **not**
+  imported), validated by decoding the `FE3.1` fixture.
+- **Depends on:** `FE3.1`
+
+---
+
+## Epic `FE4` — RPC contract v1  ·  tag: `INV-CONTRACT`
+
+`packages/contract`, on `effect/unstable/rpc`. Explicitly versioned.
+
+### FE4.1 — RpcGroup: query + events + commands
+- **Done:** `snapshot` (query), `events` (streaming subscription), and command
+  RPCs defined over the `FE2` schemas; contract is versioned.
+- **Depends on:** `FE2.1`, `FE2.3`
+
+### FE4.2 — RpcGroup: session channel
+- **Done:** `sessionEvents` (streaming, `SessionEvent`), `sessionSend`,
+  `interrupt`, `answerUiRequest` RPCs; the full contract compiles and is exported.
+- **Depends on:** `FE4.1`, `FE2.2`
+
+---
+
+## Epic `FE5` — Stub server & Swift bridge  ·  tag: `INV-CONTRACT`
+
+The divergence enabler. `FE5.3` is the workstream exit gate.
+
+### FE5.1 — Stub RpcServer
+- **Done:** an `RpcServer` layer serving contract v1 from in-memory fixtures +
+  synthetic events, replaying the `FE3.1` transcript over `sessionEvents`; runnable
+  locally over the real transport.
+- **Depends on:** `FE4.2`, `FE3.1`
+
+### FE5.2 — Swift contract bridge
+- **Done:** Schema→Swift DTO codegen (or documented hand-mirror) + golden JSON
+  fixtures the Swift decoders are tested against.
+- **Depends on:** `FE4.2`
+
+### FE5.3 — Swift client skeleton *(exit gate)*
+- **Done:** a minimal Swift RPC client connects to the stub and round-trips one
+  `snapshot` query and one live stream. **Divergence point reached.**
+- **Depends on:** `FE5.1`, `FE5.2`

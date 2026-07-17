@@ -1,14 +1,22 @@
 # Sprinter — Implementation Plan
 
-Split into **three self-contained parts**:
+Three self-contained parts, **each a spec doc for the `workstream` skill** (an
+epic set + sequencing graph + cross-cutting invariants). Run each with
+`/workstream <file>`; `/epic` cuts one issue per task and threads the invariants
+into acceptance.
 
-1. **[Foundation](./foundation.md)** — prerequisites: repo scaffold, domain
-   schemas, the frozen **RPC contract**, the **stub server**, and the Swift
-   bridge. Unblocks both tracks; this is their entire dependency surface.
-2. **[Track A — Daemon / execution](./track-a-daemon.md)** — the real daemon
-   built behind the contract.
-3. **[Track B — SwiftUI app](./track-b-ui.md)** — the client built against the
-   contract.
+1. **[Foundation](./foundation.md)** — workstream `FDN`: scaffold + check gate +
+   CI, domain schemas, the frozen **RPC contract**, the owned Pi protocol schema,
+   the **stub server**, the Swift bridge. Unblocks both tracks; their entire
+   dependency surface.
+2. **[Track A — Daemon / execution](./track-a-daemon.md)** — workstream `TRK-A`:
+   the real daemon behind the contract.
+3. **[Track B — SwiftUI app](./track-b-ui.md)** — workstream `TRK-B`: the client
+   built against the contract.
+
+**Cross-workstream order:** `FDN` lands first (it is the prerequisite of both);
+then `TRK-A` and `TRK-B` run in parallel. Cutover is the convergence milestone
+below, not an epic of either track.
 
 ## Dependency rule (invariant)
 
