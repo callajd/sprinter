@@ -9,11 +9,9 @@ Agents are Pi. Claude Code is not involved in this project. Cognitive work
 
 ### D2 — Deterministic daemon owns control flow; agents only do cognition
 All orchestration — DAG, topo-order, ready-set, parallelism, fail-forward,
-epic/close-out sweep, worktrees, GitHub, durability — is deterministic daemon
-code. Agents are stateless cognitive workers invoked as typed functions. The
-`workstream`/`epic` orchestration logic is lifted *out* of skills into the daemon;
-only cognitive skills (`implement`, `review`, `resolve-conflict`, …) stay
-agent-side.
+epic/close-out sweep, GitHub, durability — is deterministic daemon code. Agents
+are stateless cognitive workers invoked as typed functions; only the cognitive
+work (`implement`, `review`, `resolve-conflict`, …) is done by agents.
 
 ### D3 — Work graph owned by the app, not the agents
 Workstream/Epic/Issue + dependencies live in the app (`StateStore`), never inside

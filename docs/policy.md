@@ -37,7 +37,6 @@ runs, and the gate agents must pass post-cutover.
   ⚠️ oxlint is primarily syntactic; deep *type-aware* rules are limited — but the
   assertion bans above are syntactic and fully covered.
 - **Format:** **`oxfmt`** (oxc formatter, latest pinned); `oxfmt --check` in CI.
-  ⚠️ verify `oxfmt` is release-ready; **fallback: Biome** (`biome format`) if not.
 - **Tests + coverage:** `bun test --coverage`; threshold in `bunfig.toml`
   (`[test] coverageThreshold = { line = 0.75, function = 0.75 }`).
 - **`bun run check`** = `oxfmt --check` → `oxlint` → `tsc --noEmit` →

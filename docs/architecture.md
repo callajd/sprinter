@@ -55,7 +55,7 @@ Sprinter daemon  ── deterministic, durable, long-lived ───────
    ▼                          ▲                         │
 GitHub (Issues + PRs)      StateStore (work graph)      │ ExecutionRunner
                                                         ▼
-                            pi agents  (`pi --mode rpc`, one worktree each)
+                            pi agents  (`pi --mode rpc`, one per Job)
 ```
 
 Three durability tiers (see §9): **work graph** (StateStore — GitHub holds only
@@ -132,7 +132,7 @@ export class Repository extends Context.Service<Repository, {
 | `Repository` | GitHub.com → GitHub Enterprise, other hosts |
 | `Backend` *(client)* | local daemon → remote/hosted daemon |
 
-Per-session/per-job resources (worktree, child process, subscriber set) are
+Per-session/per-job resources (child process, subscriber set) are
 candidates for `LayerMap.Service`, which builds and tears down layers keyed by
 an id — a natural fit for "one resource bundle per running job."
 
@@ -168,7 +168,7 @@ reimplement them natively in Effect.
 
 ```ts
 // illustrative flow, effect/unstable/process
-// 1. ChildProcess.make("pi", "--mode", "rpc") |> setCwd(worktree) |> setEnv(...)
+// 1. ChildProcess.make("pi", "--mode", "rpc") |> setCwd(cwd) |> setEnv(...)
 // 2. spawn under Scope (ChildProcessSpawner) → auto-kill on scope close
 // 3. stdout: Ndjson decode → Schema.decode(AgentSessionEvent) → translate to SessionEvent
 //            → published to a per-session PubSub (SessionHandle.events subscribes)
@@ -191,8 +191,8 @@ version.
 
 ## 6. Daemon core — scheduling and durability
 
-The deterministic logic lifted out of the (Claude Code) `workstream`/`epic`
-skills becomes ordinary daemon code:
+The deterministic orchestration logic — scheduling, topo-order, fail-forward,
+sweep — lives in the daemon as ordinary code:
 
 - **Scheduler** — reads the work-graph DAG, computes the ready-set (deps
   satisfied), respects parallelism limits, dispatches Jobs, applies fail-forward
