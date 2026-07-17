@@ -1,0 +1,14 @@
+# Bun configuration for the Sprinter Bun/TypeScript side.
+# `save-exact` guarantees installs write exact versions (INV-PIN, decision D7).
+[install]
+exact = true
+
+# Coverage gate enforced inside `bun run check` (policy.md §Coverage, INV-COV).
+# NOTE: Bun's object-form `coverageThreshold` uses the PLURAL keys `lines` /
+# `functions` (and `statements`). The singular keys `line` / `function` are
+# silently ignored, so the ≥75% line-and-function gate (INV-COV) is expressed
+# with the enforcing plural keys — verified to exit non-zero when coverage
+# drops below threshold.
+[test]
+coverage = true
+coverageThreshold = { lines = 0.75, functions = 0.75 }
