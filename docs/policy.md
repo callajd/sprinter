@@ -37,10 +37,14 @@ runs, and the gate agents must pass post-cutover.
   ⚠️ oxlint is primarily syntactic; deep *type-aware* rules are limited — but the
   assertion bans above are syntactic and fully covered.
 - **Format:** **`oxfmt`** (oxc formatter, latest pinned); `oxfmt --check` in CI.
-- **Tests + coverage:** `bun test --coverage`; threshold in `bunfig.toml`
-  (`[test] coverageThreshold = { line = 0.75, function = 0.75 }`).
-- **`bun run check`** = `oxfmt --check` → `oxlint` → `tsc --noEmit` →
-  `bun test --coverage`.
+- **Tests + coverage:** **`@effect/vitest`** over **`vitest`** (run under Bun), with
+  Effect-native tests (`it.effect`). Coverage via **`@vitest/coverage-istanbul`** — Bun
+  does not implement Node's V8 inspector coverage API, so the istanbul
+  (source-instrumenting) provider is required; V8 cannot run here. Thresholds in
+  `vitest.config.ts` with `all: true` + `perFile: true` (line & function ≥ 0.75), so an
+  untested or weak *module* fails the gate, not just the aggregate.
+- **`bun run check`** = `check:pins` (Effect CLI) → `oxfmt --check` → `oxlint` →
+  `tsc --noEmit` → `vitest run --coverage`.
 
 ## SwiftUI / Swift side *(recommended analogs — confirm)*
 

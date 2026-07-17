@@ -1,0 +1,6 @@
+# Bun configuration for the Sprinter Bun/TypeScript side.
+# `save-exact` guarantees installs write exact versions (INV-PIN, decision D7).
+# Tests + coverage are owned by vitest (`@effect/vitest`, istanbul provider) — see
+# `vitest.config.ts` — not `bun test`, so there is no `[test]` block here.
+[install]
+exact = true
