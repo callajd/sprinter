@@ -30,6 +30,8 @@ echo "==> [4/5] swift test --enable-code-coverage"
 swift test --enable-code-coverage
 
 echo "==> [5/5] coverage gate (>= ${COVERAGE_MIN}% line AND function on Sources/)"
+# `--show-codecov-path` only PRINTS the JSON path for the already-built coverage
+# data from stage 4; it does not re-run the suite (the test binary is up to date).
 codecov_path="$(swift test --enable-code-coverage --show-codecov-path)"
 python3 scripts/coverage-gate.py "${codecov_path}" "${COVERAGE_MIN}"
 
