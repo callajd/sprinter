@@ -33,11 +33,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # Bun pinned to .bun-version (1.4.0) — INV-PIN.
+      # Repo pins Bun 1.4.0 (`.bun-version` + `packageManager`, enforced by
+      # `check:pins`). 1.4.0 has no *stable* GitHub release yet, so resolving it
+      # from `.bun-version` 404s; the `canary` channel is the only public source
+      # of the 1.4.0 line (`bun --version` -> 1.4.0-canary.1), and it is the sole
+      # Bun that reads this repo's `lockfileVersion: 2` lockfile. Dependency
+      # pinning is still hard-guaranteed by `--frozen-lockfile` (INV-PIN); flip
+      # this to `bun-version-file: .bun-version` once Bun 1.4.0 ships stable.
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version-file: .bun-version
+          bun-version: canary
 
       - name: Install (frozen lockfile)
         run: bun install --frozen-lockfile
