@@ -1,26 +1,50 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["typescript", "oxc", "unicorn"],
-  "categories": {
-    "correctness": "error",
-    "suspicious": "error",
-    "perf": "error",
-    "pedantic": "error"
-  },
+  "plugins": ["typescript"],
+  "categories": { "correctness": "error" },
+  "options": { "typeAware": true, "typeCheck": true },
   "rules": {
     "typescript/consistent-type-assertions": ["error", { "assertionStyle": "never" }],
-    "typescript/no-non-null-assertion": "error",
+    "typescript/no-unsafe-type-assertion": "error",
     "typescript/no-explicit-any": "error",
+    "typescript/no-unsafe-argument": "error",
+    "typescript/no-unsafe-assignment": "error",
+    "typescript/no-unsafe-call": "error",
+    "typescript/no-unsafe-member-access": "error",
+    "typescript/no-unsafe-return": "error",
     "typescript/ban-ts-comment": [
       "error",
       {
+        "ts-expect-error": true,
         "ts-ignore": true,
         "ts-nocheck": true,
-        "ts-check": false,
-        "ts-expect-error": "allow-with-description",
-        "minimumDescriptionLength": 6
+        "ts-check": false
       }
-    ]
+    ],
+    "typescript/no-floating-promises": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/await-thenable": "error",
+    "typescript/no-unnecessary-type-assertion": "error",
+    "typescript/no-redundant-type-constituents": "error",
+    "typescript/restrict-template-expressions": [
+      "error",
+      {
+        "allowNumber": true,
+        "allowBoolean": true
+      }
+    ],
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
+      }
+    ],
+    "typescript/no-non-null-assertion": "error",
+    "typescript/prefer-nullish-coalescing": "error",
+    "no-console": "warn",
+    "no-debugger": "error"
   },
-  "ignorePatterns": ["node_modules", "dist"]
+  "ignorePatterns": ["node_modules", "dist", "coverage"]
 }
