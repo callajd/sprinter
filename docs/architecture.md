@@ -80,6 +80,15 @@ which host). Layers mix freely (e.g. local execution + hosted state + a GitHub
 `Repository`). The client mirrors this discipline: the SwiftUI app depends on a
 `Backend`, never on a *local* daemon (see §7–8).
 
+> **We make the agent runtime itself a provider (D16, amends D1).**
+> `ExecutionRunner` is the abstract agent-runtime port; `pi --mode rpc`
+> (`PiAgentRunner`) is its first and only current adapter. Our core depends on the
+> owned, provider-neutral session model, never on Pi — we mirror Pi's (already
+> model-provider-general) event shape as our owned `Schema` and translate it at the
+> adapter boundary. And **we keep everything maximally reactive end-to-end (D17,
+> INV-REACTIVE)** — we run a push spine from Pi stdout → `Stream` → `PubSub` →
+> streaming RPC → reactive UI.
+
 ```ts
 // illustrative
 import { Context, Effect, Layer, Stream, Scope, Schema } from "effect"

@@ -125,6 +125,43 @@ warnings-as-errors** (force-unwrap/cast/try banned) on the Swift side; **all dep
 pinned to exact versions** with committed lockfiles; **GitHub Actions CI**
 enforcing both `check`s on every push to `main` and on PRs.
 
+### D16 — Agent runtime is a provider abstraction; Pi is one implementation (amends D1)
+D1 held Pi as the *exclusive* runtime; we amend it. We treat the agent runtime as
+an **abstract provider** — the `ExecutionRunner` port — and make `pi --mode rpc`
+its first, and for now **only**, adapter (`PiAgentRunner`). We extend D14 (we make
+the provider abstraction universal) onto the runtime itself: our core depends on
+the **owned, provider-neutral session model**, never on Pi. We treat "where it
+runs" (local/remote) as a separate adapter sub-axis *within* an adapter, distinct
+from "which engine."
+
+*Key nuance:* Pi's own event/session abstractions **already generalize across
+model providers** (Pi drives many underlying models), so they themselves make a
+good neutral abstraction. We therefore **mirror Pi's shape as our owned Effect
+`Schema`** — we give our types plain names and translate the foreign
+`Rpc*`/`AgentSessionEvent` → our `SessionEvent`/`SessionInput`/`UiResponse` at the
+adapter boundary — rather than reinventing a different denominator. We do **not**
+import Pi's types (D12), and we validate the owned schema against real
+`pi --mode rpc` output. We target no second runtime now: we build the abstraction
+as insurance against lock-in, not as a multi-runtime program, and we validate the
+neutral model against Pi's real output only. Consequence: the frozen RPC contract
+(FE2.3) and the client never see a Pi concept, and adding or swapping a runtime
+never ripples to the contract.
+
+### D17 — Maximally reactive end-to-end (INV-REACTIVE)
+**We push everything reactively from the agent harness to the UI render — we never
+poll where a stream fits.** We build the reactive spine as: Pi stdout (NDJSON) →
+Effect `Stream` → per-session `PubSub` → streaming RPC (`RpcSchema.Stream` over
+`effect/unstable/rpc`) → client subscription → reactive UI render (SwiftUI
+`@Observable`; the eventual web client the same way). We thread INV-REACTIVE into
+every layer's acceptance:
+- we make the contract's `events` (work-graph deltas) and `sessionEvents` channels
+  **streaming-first**, not request/response polling;
+- we make the owned `SessionEvent` stream carry the **full reactive flow** —
+  fine-grained message/tool **deltas** *and* the durable transcript **entries** —
+  so a client renders live and reconciles deltas into the transcript-grade record;
+- we compose the daemon side with `Stream`/`PubSub`/`Scope`, not poll loops;
+- we hydrate with snapshot-on-connect + live-subscribe (D4), not periodic refetch.
+
 ---
 
 ## Deferred (see architecture §10)
