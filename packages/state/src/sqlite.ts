@@ -1,0 +1,489 @@
+/**
+ * The SQLite ADAPTER behind the {@link StateStore} port (Track A, task AE2.1).
+ *
+ * This is the ONLY module in the codebase permitted to reference a concrete
+ * backing (INV-PORT): `@effect/sql-sqlite-bun` (`SqliteClient` / `SqliteMigrator`)
+ * driven through Effect's own SQL layer `effect/unstable/sql` (`SqlClient`,
+ * `SqlSchema`, `Migrator`), and SQL strings. It is Bun-native (`bun:sqlite` under
+ * the client) — never `node:*`. The port ({@link ./store.ts}) and every consumer
+ * build to the Service, never to this instance; the exported {@link layer} hides
+ * the backing entirely behind a `Layer<StateStore, StateStoreError>`.
+ *
+ * Persistence strategy (all reads decode raw driver rows back through `Schema` —
+ * never `as` / `!` / `any`, INV-NOCAST):
+ *
+ * - Each node is one row keyed by its id; child lists (`Workstream.epics`,
+ *   `Epic.issues`) are stored as JSON columns via {@link Schema.fromJsonString}.
+ * - The dependency DAG (`Issue.dependsOn`) is stored as real edges in a dedicated
+ *   `issue_dependency` table and reconstructed, ordered, on read — the DAG is
+ *   persisted as edges, not as an opaque blob.
+ * - Optional links (`Issue.pr`, `Job.sessionId` / `Job.transcriptRef` / `Job.pr`)
+ *   are nullable columns; `PullRequestRef` is stored as a JSON column.
+ * - The event feed is an `AUTOINCREMENT` table; the auto-assigned rowid is the
+ *   monotonic offset.
+ *
+ * Query building, migrations, and row decoding are all Effect's own SQL layer —
+ * nothing hand-rolled.
+ */
+import { Array as Arr, Effect, Layer, Option, Schema } from "effect";
+import { SqlClient, SqlSchema } from "effect/unstable/sql";
+import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-bun";
+import {
+  EpicId,
+  type Issue,
+  IssueId,
+  type Job,
+  JobId,
+  JobKind,
+  JobStatus,
+  NonNegativeInt,
+  PositiveInt,
+  PullRequestRef,
+  Session,
+  SessionId,
+  SessionStatus,
+  WorkstreamId,
+  WorkStatus,
+  IssueStatus,
+} from "@sprinter/domain";
+import {
+  type AppendEvent,
+  type EventLogStore,
+  type JobStore,
+  type PersistedEvent,
+  StateStore,
+  StateStoreError,
+  type WorkGraphStore,
+} from "./store.ts";
+
+// ============================================================================
+// Error mapping — backing failures → the owned StateStoreError (INV-PORT)
+// ============================================================================
+
+/**
+ * Translate any backing failure (a `SqlError`, a `Schema.SchemaError`, a
+ * `MigrationError`) into the owned {@link StateStoreError}. Every backing error
+ * carries a `message`; that is the only surface this adapter leaks upward, so no
+ * consumer ever sees a SQL/SQLite error type (INV-PORT).
+ */
+const fail =
+  (operation: string) =>
+  (error: { readonly message: string }): StateStoreError =>
+    new StateStoreError({ operation, detail: error.message });
+
+// ============================================================================
+// Persistence schemas — `.Type` is the owned domain shape, `.Encoded` is the row
+// ============================================================================
+
+/** A workstream row: `epics` is a JSON-encoded child list. */
+const WorkstreamRow = Schema.Struct({
+  id: WorkstreamId,
+  name: Schema.NonEmptyString,
+  repo: Schema.NonEmptyString,
+  status: WorkStatus,
+  epics: Schema.fromJsonString(Schema.Array(EpicId)),
+});
+
+/** An epic row: `issues` is a JSON-encoded child list. */
+const EpicRow = Schema.Struct({
+  id: EpicId,
+  workstreamId: WorkstreamId,
+  name: Schema.NonEmptyString,
+  status: WorkStatus,
+  issues: Schema.fromJsonString(Schema.Array(IssueId)),
+});
+
+/** A session row — no optional or JSON columns. */
+const SessionRow = Schema.Struct({
+  id: SessionId,
+  jobId: JobId,
+  status: SessionStatus,
+});
+
+/**
+ * A `PullRequestRef` column: a JSON-encoded ref, or SQL `NULL` when the owning
+ * node has no PR yet. Decodes to `PullRequestRef | null`; the owning node's
+ * `optionalKey` field is assembled from that (absent when null).
+ */
+const PrColumn = Schema.NullOr(Schema.fromJsonString(PullRequestRef));
+
+/**
+ * An issue's scalar columns (its `dependsOn` edges live in `issue_dependency` and
+ * are joined in separately). `pr` is a nullable JSON column.
+ */
+const IssueRow = Schema.Struct({
+  id: IssueId,
+  epicId: EpicId,
+  number: PositiveInt,
+  title: Schema.NonEmptyString,
+  status: IssueStatus,
+  pr: PrColumn,
+});
+
+/** A single `issue_dependency` edge row (the `depends_on` target). */
+const DependencyRow = Schema.Struct({ dependsOn: IssueId });
+
+/** A job row: `sessionId` / `transcriptRef` are nullable; `pr` is a nullable JSON column. */
+const JobRow = Schema.Struct({
+  id: JobId,
+  issueId: IssueId,
+  kind: JobKind,
+  status: JobStatus,
+  sessionId: Schema.NullOr(SessionId),
+  transcriptRef: Schema.NullOr(Schema.NonEmptyString),
+  pr: PrColumn,
+});
+
+/** An event-feed row: `payload` is a JSON column; `offset` is the auto-assigned rowid. */
+const EventRow = Schema.Struct({
+  offset: NonNegativeInt,
+  kind: Schema.NonEmptyString,
+  payload: Schema.UnknownFromJsonString,
+});
+
+/** The single row returned by an event append's `RETURNING "offset"`. */
+const OffsetRow = Schema.Struct({ offset: NonNegativeInt });
+
+// ============================================================================
+// Schema (DDL) — one migration, run at layer construction via SqliteMigrator
+// ============================================================================
+
+/**
+ * Programmatic migrations (no filesystem — deterministic and offline, suitable
+ * for a temp/in-memory database). Keyed `<id>_<name>` per {@link SqliteMigrator.fromRecord}.
+ */
+const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClient>> = {
+  "1_initial": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE workstream (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      repo TEXT NOT NULL,
+      status TEXT NOT NULL,
+      epics TEXT NOT NULL
+    )`;
+    yield* sql`CREATE TABLE epic (
+      id TEXT PRIMARY KEY NOT NULL,
+      "workstreamId" TEXT NOT NULL,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL,
+      issues TEXT NOT NULL
+    )`;
+    yield* sql`CREATE INDEX epic_workstream ON epic ("workstreamId")`;
+    yield* sql`CREATE TABLE issue (
+      id TEXT PRIMARY KEY NOT NULL,
+      "epicId" TEXT NOT NULL,
+      number INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL,
+      pr TEXT
+    )`;
+    yield* sql`CREATE INDEX issue_epic ON issue ("epicId")`;
+    yield* sql`CREATE TABLE issue_dependency (
+      "issueId" TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      "dependsOn" TEXT NOT NULL,
+      PRIMARY KEY ("issueId", seq)
+    )`;
+    yield* sql`CREATE TABLE job (
+      id TEXT PRIMARY KEY NOT NULL,
+      "issueId" TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      "sessionId" TEXT,
+      "transcriptRef" TEXT,
+      pr TEXT
+    )`;
+    yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
+    yield* sql`CREATE TABLE session (
+      id TEXT PRIMARY KEY NOT NULL,
+      "jobId" TEXT NOT NULL,
+      status TEXT NOT NULL
+    )`;
+    // UNIQUE enforces the domain invariant 1 Job = 1 session (conventions): at most
+    // one session per job, so `getSessionForJob` is deterministic by construction and
+    // a stray second session for a job fails at the backing (surfacing as a
+    // StateStoreError) rather than silently returning an arbitrary row.
+    yield* sql`CREATE UNIQUE INDEX session_job ON session ("jobId")`;
+    yield* sql`CREATE TABLE event_log (
+      "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,
+      payload TEXT NOT NULL
+    )`;
+  }),
+};
+
+// ============================================================================
+// Service construction
+// ============================================================================
+
+/**
+ * Build the {@link StateStore} implementation over the ambient {@link SqlClient}.
+ * Each method encodes its request, runs a parameterised statement, and decodes
+ * rows back through `Schema`; all backing failures are mapped to
+ * {@link StateStoreError} at the boundary.
+ */
+const make = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+
+  // ── WorkGraphStore ──────────────────────────────────────────────────────
+
+  const putWorkstream = SqlSchema.void({
+    Request: WorkstreamRow,
+    execute: (row) =>
+      sql`INSERT INTO workstream ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
+  });
+
+  const putEpic = SqlSchema.void({
+    Request: EpicRow,
+    execute: (row) =>
+      sql`INSERT INTO epic ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
+  });
+
+  const getWorkstreamQuery = SqlSchema.findOneOption({
+    Request: WorkstreamId,
+    Result: WorkstreamRow,
+    execute: (id) => sql`SELECT * FROM workstream WHERE id = ${id}`,
+  });
+
+  const getEpicQuery = SqlSchema.findOneOption({
+    Request: EpicId,
+    Result: EpicRow,
+    execute: (id) => sql`SELECT * FROM epic WHERE id = ${id}`,
+  });
+
+  const listEpicsQuery = SqlSchema.findAll({
+    Request: WorkstreamId,
+    Result: EpicRow,
+    execute: (workstreamId) =>
+      sql`SELECT * FROM epic WHERE "workstreamId" = ${workstreamId} ORDER BY id`,
+  });
+
+  /**
+   * Reconstruct one {@link Issue} from its scalar row plus its ordered `dependsOn`
+   * edges. `operation` is the calling store method (`getIssue` / `listIssues`) so a
+   * failure reports the caller, not a fixed label.
+   */
+  const hydrateIssue = (row: unknown, operation: string): Effect.Effect<Issue, StateStoreError> =>
+    Effect.gen(function* () {
+      const base = yield* Schema.decodeUnknownEffect(IssueRow)(row);
+      const edgeRows =
+        yield* sql`SELECT "dependsOn" FROM issue_dependency WHERE "issueId" = ${base.id} ORDER BY seq`;
+      const edges = yield* Schema.decodeUnknownEffect(Schema.Array(DependencyRow))(edgeRows);
+      const issue: Issue = {
+        id: base.id,
+        epicId: base.epicId,
+        number: base.number,
+        title: base.title,
+        status: base.status,
+        dependsOn: edges.map((edge) => edge.dependsOn),
+        ...(base.pr !== null ? { pr: base.pr } : {}),
+      };
+      return issue;
+    }).pipe(Effect.mapError(fail(operation)));
+
+  const putWorkGraph: WorkGraphStore = {
+    putWorkstream: (workstream) =>
+      putWorkstream(workstream).pipe(Effect.mapError(fail("putWorkstream"))),
+    putEpic: (epic) => putEpic(epic).pipe(Effect.mapError(fail("putEpic"))),
+    putIssue: (issue) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const pr = yield* Schema.encodeEffect(PrColumn)(issue.pr ?? null);
+            const row = {
+              id: issue.id,
+              epicId: issue.epicId,
+              number: issue.number,
+              title: issue.title,
+              status: issue.status,
+              pr,
+            };
+            yield* sql`INSERT INTO issue ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`;
+            yield* sql`DELETE FROM issue_dependency WHERE "issueId" = ${issue.id}`;
+            if (issue.dependsOn.length > 0) {
+              const edges = issue.dependsOn.map((dependsOn, seq) => ({
+                issueId: issue.id,
+                seq,
+                dependsOn,
+              }));
+              yield* sql`INSERT INTO issue_dependency ${sql.insert(edges)}`;
+            }
+          }),
+        )
+        .pipe(Effect.mapError(fail("putIssue"))),
+    getWorkstream: (id) => getWorkstreamQuery(id).pipe(Effect.mapError(fail("getWorkstream"))),
+    getEpic: (id) => getEpicQuery(id).pipe(Effect.mapError(fail("getEpic"))),
+    getIssue: (id) =>
+      sql`SELECT * FROM issue WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getIssue")),
+        Effect.flatMap((rows) =>
+          Option.match(Arr.head(rows), {
+            onNone: () => Effect.succeedNone,
+            onSome: (row) => Effect.asSome(hydrateIssue(row, "getIssue")),
+          }),
+        ),
+      ),
+    listWorkstreams: sql`SELECT * FROM workstream ORDER BY id`.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(WorkstreamRow))),
+      Effect.mapError(fail("listWorkstreams")),
+    ),
+    listEpics: (workstreamId) =>
+      listEpicsQuery(workstreamId).pipe(Effect.mapError(fail("listEpics"))),
+    listIssues: (epicId) =>
+      sql`SELECT * FROM issue WHERE "epicId" = ${epicId} ORDER BY number`.pipe(
+        Effect.mapError(fail("listIssues")),
+        Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateIssue(row, "listIssues"))),
+      ),
+  };
+
+  // ── JobStore ────────────────────────────────────────────────────────────
+
+  /**
+   * Reconstruct one {@link Job} from its row, dropping SQL `NULL`s to absent
+   * optionals. `operation` is the calling store method (`getJob` /
+   * `listJobsForIssue`) so a failure reports the caller, not a fixed label.
+   */
+  const hydrateJob = (row: unknown, operation: string): Effect.Effect<Job, StateStoreError> =>
+    Schema.decodeUnknownEffect(JobRow)(row).pipe(
+      Effect.map(
+        (r): Job => ({
+          id: r.id,
+          issueId: r.issueId,
+          kind: r.kind,
+          status: r.status,
+          ...(r.sessionId !== null ? { sessionId: r.sessionId } : {}),
+          ...(r.transcriptRef !== null ? { transcriptRef: r.transcriptRef } : {}),
+          ...(r.pr !== null ? { pr: r.pr } : {}),
+        }),
+      ),
+      Effect.mapError(fail(operation)),
+    );
+
+  const putSession = SqlSchema.void({
+    Request: Session,
+    execute: (row) =>
+      sql`INSERT INTO session ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
+  });
+
+  const getSessionQuery = SqlSchema.findOneOption({
+    Request: SessionId,
+    Result: SessionRow,
+    execute: (id) => sql`SELECT * FROM session WHERE id = ${id}`,
+  });
+
+  const getSessionForJobQuery = SqlSchema.findOneOption({
+    Request: JobId,
+    Result: SessionRow,
+    execute: (jobId) => sql`SELECT * FROM session WHERE "jobId" = ${jobId}`,
+  });
+
+  const jobs: JobStore = {
+    putJob: (job) =>
+      Effect.gen(function* () {
+        const pr = yield* Schema.encodeEffect(PrColumn)(job.pr ?? null);
+        const row = {
+          id: job.id,
+          issueId: job.issueId,
+          kind: job.kind,
+          status: job.status,
+          sessionId: job.sessionId ?? null,
+          transcriptRef: job.transcriptRef ?? null,
+          pr,
+        };
+        yield* sql`INSERT INTO job ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`;
+      }).pipe(Effect.mapError(fail("putJob"))),
+    getJob: (id) =>
+      sql`SELECT * FROM job WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getJob")),
+        Effect.flatMap((rows) =>
+          Option.match(Arr.head(rows), {
+            onNone: () => Effect.succeedNone,
+            onSome: (row) => Effect.asSome(hydrateJob(row, "getJob")),
+          }),
+        ),
+      ),
+    listJobsForIssue: (issueId) =>
+      sql`SELECT * FROM job WHERE "issueId" = ${issueId} ORDER BY id`.pipe(
+        Effect.mapError(fail("listJobsForIssue")),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) => hydrateJob(row, "listJobsForIssue")),
+        ),
+      ),
+    putSession: (session) => putSession(session).pipe(Effect.mapError(fail("putSession"))),
+    getSession: (id) => getSessionQuery(id).pipe(Effect.mapError(fail("getSession"))),
+    getSessionForJob: (jobId) =>
+      getSessionForJobQuery(jobId).pipe(Effect.mapError(fail("getSessionForJob"))),
+  };
+
+  // ── EventLogStore ─────────────────────────────────────────────────────────
+
+  const events: EventLogStore = {
+    append: (event: AppendEvent) =>
+      Effect.gen(function* () {
+        const payload = yield* Schema.encodeEffect(Schema.UnknownFromJsonString)(event.payload);
+        const rows =
+          yield* sql`INSERT INTO event_log ${sql.insert({ kind: event.kind, payload })} RETURNING "offset"`;
+        const decoded = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(OffsetRow))(rows);
+        const persisted: PersistedEvent = {
+          offset: decoded[0].offset,
+          kind: event.kind,
+          payload: event.payload,
+        };
+        return persisted;
+      }).pipe(Effect.mapError(fail("append"))),
+    read: sql`SELECT * FROM event_log ORDER BY "offset"`.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(EventRow))),
+      Effect.mapError(fail("read")),
+    ),
+    tail: (offset) =>
+      sql`SELECT * FROM event_log WHERE "offset" > ${offset} ORDER BY "offset"`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(EventRow))),
+        Effect.mapError(fail("tail")),
+      ),
+  };
+
+  return StateStore.of({ workGraph: putWorkGraph, jobs, events });
+});
+
+// ============================================================================
+// Adapter layer
+// ============================================================================
+
+/** Configuration for the SQLite adapter. */
+export interface StateStoreConfig {
+  /**
+   * The SQLite database file. Use `":memory:"` for an ephemeral in-memory
+   * database (tests). A file path persists across restarts (AE5).
+   */
+  readonly filename: string;
+  /**
+   * Disable WAL journal mode. Defaults to disabled for `":memory:"` (WAL is
+   * meaningless for an in-memory database) and enabled otherwise.
+   */
+  readonly disableWAL?: boolean;
+}
+
+/**
+ * The SQLite adapter for {@link StateStore}. Opens the database, runs the schema
+ * migration at construction, and provides the `StateStore` service — all behind a
+ * `Layer<StateStore, StateStoreError>` that exposes no backing type (INV-PORT).
+ */
+export const layer = (config: StateStoreConfig): Layer.Layer<StateStore, StateStoreError> => {
+  const disableWAL = config.disableWAL ?? config.filename === ":memory:";
+  const clientLayer = SqliteClient.layer({ filename: config.filename, disableWAL });
+  const migrationsLayer = Layer.effectDiscard(
+    SqliteMigrator.run({ loader: SqliteMigrator.fromRecord(migrations) }).pipe(
+      Effect.mapError(fail("migrate")),
+    ),
+  );
+  return Layer.effect(StateStore, make).pipe(
+    Layer.provide(migrationsLayer),
+    Layer.provide(clientLayer),
+  );
+};
+
+/** Convenience adapter for an ephemeral in-memory database (deterministic, offline — tests). */
+export const layerMemory: Layer.Layer<StateStore, StateStoreError> = layer({
+  filename: ":memory:",
+});
