@@ -1,13 +1,11 @@
 /**
- * `@sprinter/contract` — versioned RPC contract surface.
+ * `@sprinter/contract` — the versioned daemon↔client RPC contract surface.
  *
- * Scaffold-stage seed. `FE2.3` replaces this with the real `RpcGroup`
- * (`effect/unstable/rpc`) over the domain schemas. For now it carries the
- * contract version so the `check` gate exercises a real module.
+ * Exports the FE2.3 `RpcGroup` (`effect/unstable/rpc`) — {@link SprinterRpc} —
+ * built over the FE2.1 owned domain schemas, its contract-version marker, the
+ * neutral error types, and the aggregate request/response + streamed-event
+ * schemas ({@link ./rpc.ts}). Provider-neutral (D16) and maximally reactive
+ * (D17): the surface speaks only owned domain types and streams its `events`
+ * and `sessionEvents` feeds.
  */
-
-/** Current contract version. Bumped whenever the RPC surface changes (INV-CONTRACT). */
-export const CONTRACT_VERSION = 1 as const;
-
-/** Format the contract version as a `v`-prefixed tag. */
-export const contractTag = (version: number = CONTRACT_VERSION): string => `v${version}`;
+export * from "./rpc.ts";

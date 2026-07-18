@@ -20,6 +20,10 @@
     "packages/contract": {
       "name": "@sprinter/contract",
       "version": "0.0.0",
+      "dependencies": {
+        "@sprinter/domain": "workspace:*",
+        "effect": "4.0.0-beta.97",
+      },
     },
     "packages/daemon": {
       "name": "@sprinter/daemon",
