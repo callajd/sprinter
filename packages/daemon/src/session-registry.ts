@@ -70,7 +70,17 @@ export const layer: Layer.Layer<SessionRegistry> = Layer.effect(
         ),
       register: (id, handle) =>
         Effect.acquireRelease(Ref.update(handles, HashMap.set(id, handle)), () =>
-          Ref.update(handles, HashMap.remove(id)),
+          // Remove ONLY if this handle is still the one mapped: under session-id
+          // reuse (1 Job = 1 session — a re-dispatch registers a fresh handle under
+          // the same id), a blind `remove(id)` on this handle's scope-close would
+          // evict the live SUCCESSOR. Guard on identity so a superseded entry's
+          // teardown never removes its replacement.
+          Ref.update(handles, (map) =>
+            Option.match(HashMap.get(map, id), {
+              onNone: () => map,
+              onSome: (current) => (current === handle ? HashMap.remove(map, id) : map),
+            }),
+          ),
         ).pipe(Effect.asVoid),
     });
   }),

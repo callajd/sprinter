@@ -9,9 +9,11 @@
  */
 import { it } from "@effect/vitest";
 import {
+  Cause,
   Context,
   Deferred,
   Effect,
+  Exit,
   Fiber,
   Layer,
   Option,
@@ -45,7 +47,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
-import type { SessionHandle } from "@sprinter/runner";
+import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
 import { handlers } from "./rpc-handlers.ts";
 import { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
@@ -478,6 +480,31 @@ it.effect("sessionSend drives the input into the live session", () =>
 
       const driven = yield* Queue.take(fake.sent);
       expect(driven).toEqual(input);
+    }),
+  ),
+);
+
+it.effect("a session infra failure becomes a defect, never a leaked SessionNotFound", () =>
+  harness(({ client, sessions }) =>
+    Effect.gen(function* () {
+      // A live, REGISTERED session whose `send` fails with an infra error
+      // (PiTransportError). The handler `orDie`s it, so it must NOT surface as the
+      // typed contract error `SessionNotFound` — the error channel stays exactly
+      // SessionNotFound (INV-CONTRACT), and infra failures cross as defects.
+      const failing = yield* makeFakeSession([]);
+      const handle: SessionHandle = {
+        ...failing.handle,
+        send: () => Effect.fail(new PiTransportError({ reason: "closed", detail: "gone" })),
+      };
+      yield* sessions.register(sessionId, handle);
+
+      const exit = yield* client
+        .sessionSend({ sessionId, input: { text: "go", mode: "prompt" } })
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      const leaked = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+      // The session IS registered, so any SessionNotFound here would be a leak.
+      expect(Option.isSome(leaked) && leaked.value instanceof SessionNotFound).toBe(false);
     }),
   ),
 );

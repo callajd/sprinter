@@ -7,7 +7,7 @@
  * cross this surface).
  */
 import { it } from "@effect/vitest";
-import { Effect, Schema, Stream } from "effect";
+import { Effect, Exit, Schema, Scope, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import { SessionNotFound } from "@sprinter/contract";
@@ -18,14 +18,16 @@ import { layer, SessionRegistry } from "./session-registry.ts";
 const sessionId = Schema.decodeUnknownSync(SessionId)("ses-1");
 
 /** A minimal fake {@link SessionHandle}: an empty event stream; inert verbs. */
-const fakeHandle: SessionHandle = {
+const makeHandle = (): SessionHandle => ({
   pid: ChildProcessSpawner.ProcessId(4242),
   events: Stream.empty,
   send: () => Effect.void,
   interrupt: Effect.void,
   answerUi: () => Effect.void,
   result: Effect.succeed({ _tag: "Completed" }),
-};
+});
+
+const fakeHandle = makeHandle();
 
 it.effect("get resolves a registered handle to the same instance", () =>
   Effect.gen(function* () {
@@ -52,5 +54,25 @@ it.effect("register is Scope-managed: the entry is removed when its scope closes
     yield* Effect.scoped(registry.register(sessionId, fakeHandle));
     const error = yield* registry.get(sessionId).pipe(Effect.flip);
     expect(error).toBeInstanceOf(SessionNotFound);
+  }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.effect("id reuse: a superseded entry's teardown does not evict its live successor", () =>
+  Effect.gen(function* () {
+    const registry = yield* SessionRegistry;
+    const first = makeHandle();
+    const second = makeHandle();
+
+    // `first` registers in its OWN scope; `second` (same id) registers in the
+    // ambient scope, overwriting `first` as the current mapping.
+    const scopeA = yield* Scope.make();
+    yield* registry.register(sessionId, first).pipe(Scope.provide(scopeA));
+    yield* registry.register(sessionId, second);
+
+    // Closing `first`'s scope must NOT evict `second` — the finalizer is
+    // identity-guarded, so the live successor survives.
+    yield* Scope.close(scopeA, Exit.void);
+    const resolved = yield* registry.get(sessionId);
+    expect(resolved).toBe(second);
   }).pipe(Effect.scoped, Effect.provide(layer)),
 );
