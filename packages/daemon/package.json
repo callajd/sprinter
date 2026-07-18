@@ -11,8 +11,12 @@
     "@sprinter/contract": "workspace:*",
     "@sprinter/domain": "workspace:*",
     "@sprinter/job": "workspace:*",
+    "@sprinter/repository": "workspace:*",
     "@sprinter/runner": "workspace:*",
     "@sprinter/state": "workspace:*",
     "effect": "4.0.0-beta.97"
+  },
+  "devDependencies": {
+    "@effect/platform-bun": "4.0.0-beta.97"
   }
 }
