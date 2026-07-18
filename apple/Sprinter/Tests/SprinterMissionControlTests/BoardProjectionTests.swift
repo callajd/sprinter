@@ -79,6 +79,34 @@ struct BoardProjectionTests {
     #expect(byId[IssueId(rawValue: "iss-idle")]?.hasLiveAgent == false)
   }
 
+  /// A TERMINAL job is not a live agent even with a lingering `active` session; and
+  /// a job made live by its session names that session when the job's own
+  /// `sessionId` is nil.
+  @Test("a terminal job is not live; an active session's id is the fallback")
+  func terminalExclusionAndSessionFallback() {
+    let snapshot = BoardFixtures.singleEpicSnapshot(
+      issueIds: ["iss-done", "iss-fb"],
+      jobs: [
+        BoardFixtures.job("job-done", issue: "iss-done", status: .succeeded, session: nil),
+        BoardFixtures.job("job-fb", issue: "iss-fb", status: .queued, session: nil)
+      ],
+      sessions: [
+        Session(
+          id: SessionId(rawValue: "sess-done"), jobId: JobId(rawValue: "job-done"), status: .active),
+        Session(
+          id: SessionId(rawValue: "sess-fb"), jobId: JobId(rawValue: "job-fb"), status: .active)
+      ])
+
+    let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
+    let byId = Dictionary(uniqueKeysWithValues: issues.map { ($0.id, $0) })
+    // N2: a succeeded job with a stale active session is NOT a live agent.
+    #expect(byId[IssueId(rawValue: "iss-done")]?.hasLiveAgent == false)
+    // N1: a job live via its active session (declared sessionId nil) names it.
+    let fallback = byId[IssueId(rawValue: "iss-fb")]
+    #expect(fallback?.hasLiveAgent == true)
+    #expect(fallback?.activity?.sessionId == SessionId(rawValue: "sess-fb"))
+  }
+
   /// A child id listed by its parent but absent from the snapshot is skipped, not
   /// force-resolved (INV-NOFORCE) — the projection stays total on a dangling ref.
   @Test("skips a dangling child reference")

@@ -50,19 +50,26 @@ public enum BoardProjection {
 
   /// Which issues currently have a live agent, keyed by issue id.
   ///
-  /// An issue is "live" when it has a `running` ``Job`` or a job whose ``Session``
-  /// is `active` — the two signals BE2.1 surfaces as per-agent activity. The first
-  /// live job encountered (in snapshot order) represents the issue, so activity is
-  /// deterministic for a given snapshot.
+  /// An issue is "live" when it has a `running` ``Job``, or a non-terminal job whose
+  /// ``Session`` is `active` — the signals BE2.1 surfaces as per-agent activity. A
+  /// TERMINAL job (`succeeded`/`failed`/`cancelled`) is never live even if a stale
+  /// `active` session still points at it. The first live job encountered (in
+  /// snapshot order) represents the issue, so activity is deterministic for a
+  /// given snapshot.
   private static func liveActivity(in snapshot: Snapshot) -> [IssueId: IssueActivity] {
     let sessionsByJob = indexed(snapshot.sessions, by: \.jobId)
     var activity: [IssueId: IssueActivity] = [:]
     for job in snapshot.jobs {
-      let sessionActive = sessionsByJob[job.id]?.status == .active
-      guard job.status == .running || sessionActive else { continue }
+      let session = sessionsByJob[job.id]
+      let terminal = job.status == .succeeded || job.status == .failed || job.status == .cancelled
+      let live = job.status == .running || (session?.status == .active && !terminal)
+      guard live else { continue }
       if activity[job.issueId] == nil {
+        // Prefer the job's declared session; fall back to the session that
+        // references the job, so a live session is named even when `job.sessionId`
+        // has not been persisted yet.
         activity[job.issueId] = IssueActivity(
-          jobId: job.id, kind: job.kind, sessionId: job.sessionId)
+          jobId: job.id, kind: job.kind, sessionId: job.sessionId ?? session?.id)
       }
     }
     return activity

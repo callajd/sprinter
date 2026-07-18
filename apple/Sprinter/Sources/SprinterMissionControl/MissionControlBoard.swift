@@ -45,9 +45,14 @@ public final class MissionControlBoard {
   }
 
   /// Starts consuming `feed` in a detached-from-caller task (retained for
-  /// ``stop``). Calling again replaces the prior driver.
+  /// ``stop``). **Idempotent while already running: a second call is a no-op** — it
+  /// does NOT cancel-and-respin. ``WorkGraphResync`` is single-consumer (its
+  /// `states()` yields the live stream only once), so re-consuming a feed already
+  /// being consumed would blank the board. A board therefore consumes ONE feed for
+  /// its running lifetime; to reconnect, ``stop()`` then `start(freshFeed)` with a
+  /// **freshly-constructed** ``WorkGraphResync`` (never a reused one).
   public func start(_ feed: WorkGraphResync) {
-    driver?.cancel()
+    guard driver == nil else { return }
     driver = Task { [weak self] in
       await self?.consume(feed)
     }

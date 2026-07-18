@@ -53,22 +53,35 @@ struct MissionControlBoardTests {
     #expect(board.workstreams.first?.status == .complete)
   }
 
-  /// `start` replaces a prior driver and `stop` cancels it; the feed finishing
-  /// leaves the board on its last projection.
-  @Test("start replaces the driver and stop cancels consumption")
+  /// `start` is idempotent while running (a second call is a no-op, never a
+  /// cancel-and-respin that would blank the single-consumer feed); `stop` cancels;
+  /// and a reconnect via a FRESH feed re-consumes deterministically. Uses distinct
+  /// feeds per `start` (WorkGraphResync is single-consumer), so this validates the
+  /// contract without relying on cross-test scheduling.
+  @Test("start is idempotent; stop then start on a fresh feed re-consumes")
   func startAndStopLifecycle() async throws {
-    let backend = ScriptedBackend(snapshot: BoardFixtures.snapshot)
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let backend1 = ScriptedBackend(snapshot: BoardFixtures.snapshot)
+    let feed1 = WorkGraphResync(connect: { backend1 }, retryDelay: .zero)
     let board = MissionControlBoard()
 
-    board.start(feed)
-    // Calling start again replaces the prior driver (no crash, still projects).
-    board.start(feed)
+    board.start(feed1)
+    // A second start while already consuming is a NO-OP — the first driver keeps
+    // projecting the single-consumer feed (re-consuming it would blank the board).
+    board.start(feed1)
     #expect(await waitUntil(board) { !$0.isEmpty })
 
     board.stop()
     board.stop()  // idempotent
-    await backend.close()
+
+    // Reconnect: a freshly-constructed feed re-consumes deterministically.
+    let backend2 = ScriptedBackend(snapshot: BoardFixtures.snapshot)
+    let feed2 = WorkGraphResync(connect: { backend2 }, retryDelay: .zero)
+    board.start(feed2)
+    #expect(await waitUntil(board) { !$0.isEmpty })
+
+    board.stop()
+    await backend1.close()
+    await backend2.close()
   }
 
   /// Polls the main-actor board until `predicate` holds, yielding between checks so
