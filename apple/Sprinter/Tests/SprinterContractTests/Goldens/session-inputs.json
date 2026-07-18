@@ -1,0 +1,17 @@
+[
+  {
+    "text": "kick it off",
+    "images": [
+      "img-ref-1"
+    ],
+    "mode": "prompt"
+  },
+  {
+    "text": "actually, focus here",
+    "mode": "steer"
+  },
+  {
+    "text": "one more thing",
+    "mode": "followUp"
+  }
+]

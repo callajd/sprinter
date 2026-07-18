@@ -1,0 +1,78 @@
+{
+  "workstreams": [
+    {
+      "id": "ws-1",
+      "name": "Foundation",
+      "repo": "callajd/sprinter",
+      "status": "active",
+      "epics": [
+        "ep-1"
+      ]
+    }
+  ],
+  "epics": [
+    {
+      "id": "ep-1",
+      "workstreamId": "ws-1",
+      "name": "FE2",
+      "status": "active",
+      "issues": [
+        "iss-1",
+        "iss-2"
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "id": "iss-1",
+      "epicId": "ep-1",
+      "number": 10,
+      "title": "RPC contract v1",
+      "status": "in_review",
+      "dependsOn": [
+        "iss-0"
+      ],
+      "pr": {
+        "number": 16,
+        "url": "https://github.com/callajd/sprinter/pull/16",
+        "merged": false
+      }
+    },
+    {
+      "id": "iss-2",
+      "epicId": "ep-1",
+      "number": 11,
+      "title": "Swift contract bridge",
+      "status": "in_progress",
+      "dependsOn": []
+    }
+  ],
+  "jobs": [
+    {
+      "id": "job-1",
+      "issueId": "iss-1",
+      "kind": "implement",
+      "status": "running",
+      "sessionId": "ses-1",
+      "transcriptRef": "transcripts/ses-1.jsonl",
+      "pr": {
+        "number": 15,
+        "url": "https://github.com/callajd/sprinter/pull/15",
+        "merged": true
+      }
+    },
+    {
+      "id": "job-2",
+      "issueId": "iss-2",
+      "kind": "review",
+      "status": "queued"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "ses-1",
+      "jobId": "job-1",
+      "status": "active"
+    }
+  ]
+}

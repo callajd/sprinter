@@ -1,0 +1,10 @@
+{
+  "sessionId": "ses-1",
+  "response": {
+    "requestId": "req-1",
+    "answer": {
+      "_tag": "Confirmed",
+      "confirmed": true
+    }
+  }
+}

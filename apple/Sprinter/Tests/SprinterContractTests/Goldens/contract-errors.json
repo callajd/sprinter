@@ -1,0 +1,18 @@
+[
+  {
+    "_tag": "WorkstreamNotFound",
+    "id": "ws-9"
+  },
+  {
+    "_tag": "IssueNotFound",
+    "id": "iss-9"
+  },
+  {
+    "_tag": "SessionNotFound",
+    "id": "ses-9"
+  },
+  {
+    "_tag": "PlanRejected",
+    "reason": "empty spec"
+  }
+]
