@@ -49,8 +49,12 @@ export const contractTag = (version: number = CONTRACT_VERSION): string => `v${v
 
 /**
  * Annotation key carrying the {@link CONTRACT_VERSION} on the {@link SprinterRpc}
- * group — the explicit, in-band version marker consumers read to negotiate the
- * surface (INV-CONTRACT).
+ * group. This is a **group-level (compile-time) marker**, NOT an in-band wire
+ * field — `RpcGroup` annotations are not serialized into RPC messages, and there
+ * is no version/handshake procedure. Consumers (incl. the hand-written Swift
+ * mirror, FE2.4) track the version as their own constant against this one; a bump
+ * ripples to the mirror + its decode tests (INV-CONTRACT). Add a `hello` RPC later
+ * if over-the-wire negotiation is ever needed.
  */
 export const ContractVersion = Context.Service<typeof CONTRACT_VERSION>(
   "@sprinter/contract/ContractVersion",
@@ -100,6 +104,12 @@ export type Snapshot = (typeof Snapshot)["Type"];
  * Each variant carries the new owned value for one changed node; a client folds
  * these into the {@link Snapshot} it hydrated on connect. Upsert semantics — the
  * carried node replaces any prior node with the same id.
+ *
+ * v1 model: the work graph is **upsert-only — nodes are never removed**. A node's
+ * end of life is a terminal STATUS (`done`/`cancelled`), carried as an ordinary
+ * change; it stays in the snapshot. So there is deliberately no `*Removed` delta.
+ * If a future model ever drops nodes from the graph, a `*Removed` variant (id
+ * only) is a backward-compatible additive change.
  */
 export const WorkGraphEvent = Schema.TaggedUnion({
   WorkstreamChanged: { workstream: Workstream },
