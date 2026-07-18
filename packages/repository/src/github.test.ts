@@ -4,12 +4,13 @@
  * {@link FetchHttpClient}). Deterministic and OFFLINE — no live GitHub call in the
  * gate (INV-GATE): every request is answered by a canned in-memory route table.
  *
- * The suite proves the adapter issues the right GitHub REST paths, decodes each
- * wire response through `Schema` into the OWNED port types (never a cast,
- * INV-NOCAST), and translates every host failure into the owned
- * {@link RepositoryError} (INV-PORT). The tests depend ONLY on the package's public
- * surface plus the standard `FetchHttpClient` transport seam — never a concrete
- * GitHub client.
+ * The suite proves the adapter issues the right GitHub REST paths AND the GraphQL
+ * closing-PR query (`closedByPullRequestsReferences`), decodes each wire response
+ * through `Schema` into the OWNED port types (never a cast, INV-NOCAST), and
+ * translates every host failure — an HTTP error, a decode error, a GraphQL
+ * `errors[]` — into the owned {@link RepositoryError} (INV-PORT). The tests depend
+ * ONLY on the package's public surface plus the standard `FetchHttpClient` transport
+ * seam — never a concrete GitHub client.
  */
 import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Schema } from "effect";
@@ -144,76 +145,82 @@ it.effect("reads a PR and reports whether it merged", () =>
   ),
 );
 
-it.effect("detects the PR that closes an Issue from its timeline", () =>
+/** A GraphQL `closedByPullRequestsReferences` response with the given closing-PR nodes. */
+const gqlClosing =
+  (...numbers: ReadonlyArray<number>): Route =>
+  () =>
+    json({
+      data: {
+        repository: {
+          issue: {
+            closedByPullRequestsReferences: { nodes: numbers.map((number) => ({ number })) },
+          },
+        },
+      },
+    });
+
+it.effect("detects the PR that CLOSED an Issue via GraphQL closedByPullRequestsReferences", () =>
   Effect.gen(function* () {
     const repo = yield* Repository;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
-  }).pipe(
-    Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": () =>
-          json([
-            { event: "labeled" },
-            { event: "cross-referenced", source: { issue: { number: 7 } } },
-            {
-              event: "cross-referenced",
-              source: { issue: { number: 42, pull_request: { url: "x" } } },
-            },
-          ]),
-      }),
-    ),
-  ),
+  }).pipe(Effect.provide(backend({ "/graphql": gqlClosing(42) }))),
 );
 
-it.effect("follows timeline pagination — finds a closing PR referenced on a later page", () =>
-  Effect.gen(function* () {
-    const repo = yield* Repository;
-    // The closing PR's cross-reference is on page 2; the adapter must follow the
-    // `Link: rel="next"` header rather than stop at the first page.
-    const found = yield* repo.pullRequests.closingPullRequest(num(25));
-    expect(found).toStrictEqual(Option.some(99));
-  }).pipe(
-    Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": (() => {
-          let call = 0;
-          return () => {
-            call += 1;
-            if (call === 1) {
-              // Page 1: only noise, with a `Link` header advertising page 2.
-              return new Response(JSON.stringify([{ event: "labeled" }, { event: "commented" }]), {
-                status: 200,
-                headers: {
-                  "content-type": "application/json",
-                  link: '<https://api.github.com/repos/callajd/sprinter/issues/25/timeline?per_page=100&page=2>; rel="next"',
-                },
-              });
-            }
-            // Page 2: the closing PR reference, and no further `Link` → stop.
-            return json([
-              {
-                event: "cross-referenced",
-                source: { issue: { number: 99, pull_request: { url: "x" } } },
-              },
-            ]);
-          };
-        })(),
-      }),
-    ),
-  ),
+it.effect(
+  "does NOT attribute an unrelated PR that merely mentions a hand-closed Issue as the closer",
+  () =>
+    // The authoritative signal (`closedByPullRequestsReferences`) reports NO closing
+    // PR for an Issue that was hand-closed while a different merged PR only mentions
+    // it — where the retired timeline `cross-referenced` heuristic false-positived,
+    // GraphQL returns an empty node set, so the reconciler never mis-lands (D18/CE1.3).
+    Effect.gen(function* () {
+      const repo = yield* Repository;
+      const found = yield* repo.pullRequests.closingPullRequest(num(25));
+      expect(found).toStrictEqual(Option.none());
+    }).pipe(Effect.provide(backend({ "/graphql": gqlClosing() }))),
 );
 
-it.effect("reports no closing PR when nothing references the Issue", () =>
+it.effect("reports no closing PR when the host has no record of the Issue (null issue)", () =>
   Effect.gen(function* () {
     const repo = yield* Repository;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.none());
   }).pipe(
+    Effect.provide(backend({ "/graphql": () => json({ data: { repository: { issue: null } } }) })),
+  ),
+);
+
+it.effect("surfaces a GraphQL errors[] response as RepositoryError", () =>
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error.operation).toBe("closingPullRequest");
+    expect(error.detail).toContain("rate limited");
+  }).pipe(
+    Effect.provide(backend({ "/graphql": () => json({ errors: [{ message: "rate limited" }] }) })),
+  ),
+);
+
+it.effect("addresses the GraphQL endpoint for a GitHub Enterprise base URL", () =>
+  // GHE exposes REST at `/api/v3` and GraphQL at `/api/graphql`; the adapter must
+  // POST the closing-PR query to the latter, not `baseUrl + /graphql`.
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.some(7));
+  }).pipe(
     Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": () => json([{ event: "labeled" }]),
-      }),
+      layer({ ...config, baseUrl: "https://ghe.example/api/v3" }).pipe(
+        Layer.provide(
+          FetchHttpClient.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FetchHttpClient.Fetch, makeFetch({ "/api/graphql": gqlClosing(7) })),
+            ),
+          ),
+        ),
+      ),
     ),
   ),
 );

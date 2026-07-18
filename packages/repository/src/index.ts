@@ -12,4 +12,5 @@ export type { CodeOps, IssueOps, PullRequestOps } from "./repository.ts";
 export { IssueState, Repository, RepositoryError, RepositoryIssue } from "./repository.ts";
 export type { RepositoryConfig } from "./github.ts";
 export { layer, layerFetch } from "./github.ts";
+export type { ReconcileFailure, ReconcileOutcome } from "./reconcile.ts";
 export { reconcileWorkstream } from "./reconcile.ts";

@@ -173,9 +173,18 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
 
       const run = Effect.gen(function* () {
         // 1. Reconcile + roll up every Workstream (per-issue host errors isolated in
-        //    the reconciler). Discard the results; we re-read the rolled-up graph next.
+        //    the reconciler). We re-read the rolled-up graph next, but the isolated
+        //    per-issue failures are only in the outcomes — surface them here as a
+        //    startup warning so a partially-degraded roll-up is not silent (CE1.3).
         const workstreams = yield* store.workGraph.listWorkstreams;
-        yield* Effect.forEach(workstreams, (ws) => reconcile(ws.id), { discard: true });
+        const outcomes = yield* Effect.forEach(workstreams, (ws) => reconcile(ws.id));
+        const skippedIssues = outcomes.flatMap((outcome) => outcome.failures);
+        if (skippedIssues.length > 0) {
+          yield* Effect.logWarning(
+            `startup: ${skippedIssues.length} issue(s) skipped after host errors during roll-up`,
+            skippedIssues,
+          );
+        }
 
         // 2. Walk the post-roll-up graph and resume the in-flight Jobs control state
         //    allows. Re-read so a Workstream flipped to `done`/`blocked` is respected.

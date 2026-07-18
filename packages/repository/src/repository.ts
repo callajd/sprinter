@@ -104,19 +104,19 @@ export interface IssueOps {
 
 /**
  * PR detection + reconciliation. Two capabilities, composed by the reconciler:
- * {@link closingPullRequest} finds a PR REFERENCING an Issue (a heuristic for the
- * closing PR), and {@link getPullRequest} reads WHETHER that PR merged. Together —
- * with the Issue also reported closed — they answer "has this Issue's work landed?"
+ * {@link closingPullRequest} finds the PR that CLOSED an Issue, and
+ * {@link getPullRequest} reads WHETHER that PR merged. Together — with the Issue
+ * also reported closed — they answer "has this Issue's work landed?"
  * one-directionally (D13).
  */
 export interface PullRequestOps {
   /**
-   * A PR that references the given Issue, if one exists — a HEURISTIC for the
-   * closing PR (the GitHub adapter scans the Issue timeline for a cross-referencing
-   * PR). `Option.none` when no PR references it yet. The reconciler gates on the
-   * Issue being closed AND this PR being merged; keeping this offline heuristic
-   * (with its residual risk documented) vs. a robust GraphQL signal is a resolved
-   * decision (D18), the robust signal tracked as deferred provisioning.
+   * The PR that CLOSED the given Issue, if any — the authoritative signal (the
+   * GitHub adapter reads GraphQL `closedByPullRequestsReferences`, the PRs GitHub
+   * itself records as closing the Issue). `Option.none` when no PR closed it. This
+   * no longer false-positives on a PR that merely *references* a hand-closed Issue
+   * (the retired timeline heuristic did — D18, resolved by CE1.3). The reconciler
+   * still gates on the Issue being closed AND this PR being merged.
    */
   readonly closingPullRequest: (
     issueNumber: PositiveInt,

@@ -24,7 +24,7 @@ import {
   Workstream,
 } from "@sprinter/domain";
 import { layerMemory, StateStore } from "@sprinter/state";
-import { reconcileWorkstream, Repository, RepositoryIssue } from "./index.ts";
+import { reconcileWorkstream, Repository, RepositoryError, RepositoryIssue } from "./index.ts";
 
 // ============================================================================
 // Fixtures — decoded through the owned schemas (no casts)
@@ -72,6 +72,8 @@ interface HostState {
   readonly closing: ReadonlyMap<number, number>;
   /** PR number → whether it merged; absent ⇒ not merged. */
   readonly pulls: ReadonlyMap<number, boolean>;
+  /** Issue numbers whose `getIssue` fails with a host error (a 404/403/429). */
+  readonly failing?: ReadonlySet<number>;
 }
 
 const posInt = (n: number): PositiveInt => decode(PositiveInt, n);
@@ -95,7 +97,12 @@ const fakeRepository = (host: HostState): Layer.Layer<Repository> =>
         branchExists: () => Effect.succeed(true),
       },
       issues: {
-        getIssue: (number) => Effect.succeed(repoIssue(number, host.issues.get(number) ?? "open")),
+        getIssue: (number) =>
+          host.failing?.has(number) === true
+            ? Effect.fail(
+                new RepositoryError({ operation: "getIssue", detail: `host 404 #${number}` }),
+              )
+            : Effect.succeed(repoIssue(number, host.issues.get(number) ?? "open")),
       },
       pullRequests: {
         closingPullRequest: (issueNumber) => {
@@ -247,6 +254,46 @@ it.effect("leaves an epic and workstream unfinished while any issue is unlanded"
       ),
     ),
   ),
+);
+
+it.effect(
+  "isolates one issue's host error, still lands its siblings, and surfaces the failure",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* seed;
+
+      // issue-100's host read fails (a 404/403/429); issue-101 is closed + merged.
+      const outcome = yield* reconcileWorkstream(workstream.id);
+
+      // The sibling still landed — one flaky read did not abort the roll-up.
+      const i100 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(100).id));
+      const i101 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(101).id));
+      expect(i100.status).toBe("in_progress");
+      expect(isIssueLanded(i101)).toBe(true);
+
+      // The failure is SURFACED (not swallowed), naming the failed issue number.
+      expect(outcome.failures).toStrictEqual([{ issueNumber: 100, detail: "host 404 #100" }]);
+
+      // Roll-up stays conservative: a failed issue can't be observed landed, so its
+      // Epic and Workstream are held back from auto-`done`.
+      const ep = Option.getOrThrow(yield* store.workGraph.getEpic(epic.id));
+      const ws = Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream.id));
+      expect(isComplete(ep)).toBe(false);
+      expect(isComplete(ws)).toBe(false);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerMemory,
+          fakeRepository({
+            issues: new Map([[101, "closed"]]),
+            closing: new Map([[101, 101]]),
+            pulls: new Map([[101, true]]),
+            failing: new Set([100]),
+          }),
+        ),
+      ),
+    ),
 );
 
 it.effect(
