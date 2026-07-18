@@ -7,11 +7,17 @@
  * Task AE1.1 ships the process + NDJSON wire substrate ({@link ./pi-transport.ts}).
  * That substrate necessarily traffics in Pi wire types, so it is INTERNAL and is
  * deliberately NOT re-exported here — the package's public surface stays Pi-free.
- * The neutral `SessionHandle` + `SessionEvent` translation that packages above
- * the runner consume is built on the substrate in AE1.2 and exported then.
  *
- * For now the public surface is the spawn configuration and the transport error
- * types (all provider-neutral: no Pi wire type crosses this boundary).
+ * Task AE1.2 adds the neutral {@link SessionHandle} ({@link ./session-handle.ts}):
+ * it consumes the substrate and translates Pi's wire events into the owned
+ * `SessionEvent` model, so everything exported here is expressed ONLY in neutral
+ * types (`SessionEvent` / `SessionInput` / `UiResponse` from `@sprinter/domain`).
+ * No Pi wire type crosses this boundary (INV-BOUNDARY).
+ *
+ * The public surface: the session factory + handle, its terminal result, the
+ * spawn configuration, and the transport error types.
  */
 export type { PiProcessConfig } from "./pi-transport.ts";
 export { PiRpcError, PiTransportError } from "./pi-transport.ts";
+export { make as makeSession, SessionResult } from "./session-handle.ts";
+export type { SessionHandle } from "./session-handle.ts";
