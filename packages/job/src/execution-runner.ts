@@ -41,6 +41,17 @@ export class ExecutionRunnerError extends Schema.TaggedErrorClass<ExecutionRunne
  * is `Scope`-managed by the caller: it lives for the dispatch and is torn down when
  * the caller's scope closes. `run` fails with the owned {@link ExecutionRunnerError}
  * when the session cannot be started.
+ *
+ * **Terminal-result contract (CONSUMER-CRITICAL):** the returned session MUST reach
+ * a terminal `SessionResult` for the driven work — i.e. its `events` stream ends and
+ * its `result` resolves. The {@link JobRunner} awaits `handle.result` as the terminal
+ * authority, so an adapter over a long-lived `pi --mode rpc` process (which stays
+ * alive, idle, after a single turn) MUST make the session one-shot for the dispatch —
+ * either spawn a per-job process that exits after the turn, or drive to `SessionIdle`
+ * and close the session's scope so `result` resolves. A session that idles forever
+ * without exiting would hang `dispatch`. AE3.1 builds to this contract and tests it
+ * with a settling fake; enforcing it is the concrete LocalPi adapter's responsibility
+ * (lands with the daemon runtime wiring, AE4/AE5).
  */
 export class ExecutionRunner extends Context.Service<
   ExecutionRunner,

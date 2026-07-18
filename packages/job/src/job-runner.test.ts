@@ -56,10 +56,16 @@ const fakeRunner = (handle: SessionHandle): Layer.Layer<ExecutionRunner> =>
 const provide =
   (handle: SessionHandle) =>
   <A, E>(effect: Effect.Effect<A, E, JobRunner | StateStore | Scope>) =>
+    provideRunner(fakeRunner(handle))(effect);
+
+/** As {@link provide}, but with a caller-supplied {@link ExecutionRunner} layer (e.g. one that fails `run`). */
+const provideRunner =
+  (runnerLayer: Layer.Layer<ExecutionRunner>) =>
+  <A, E>(effect: Effect.Effect<A, E, JobRunner | StateStore | Scope>) =>
     effect.pipe(
       Effect.scoped,
       Effect.provide(layer),
-      Effect.provide(fakeRunner(handle)),
+      Effect.provide(runnerLayer),
       Effect.provide(layerMemory),
     );
 
@@ -120,9 +126,11 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
 
     expect(result.status).toBe("failed");
     expect(result.error).toBe("pi transport closed");
+    // The one entry emitted BEFORE the stream tore down is preserved — the count is
+    // held in a Ref, so a teardown of the fold no longer discards it.
     expect(result.payload).toStrictEqual({
       transcriptRef: "transcript://session-job-1",
-      entries: 0,
+      entries: 1,
     });
 
     const store = yield* StateStore;
@@ -143,6 +151,56 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
         { _tag: "Failed", error: "pi transport closed" },
       ),
     ),
+  ),
+);
+
+// ============================================================================
+// Failure paths through dispatch move the durable rows OUT of limbo (no stuck running)
+// ============================================================================
+
+it.effect("fails and persists a failed terminal when the runner cannot start the session", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+
+    const error = yield* runner.dispatch(job).pipe(Effect.flip);
+    expect(error._tag).toBe("ExecutionRunnerError");
+
+    // The initial persist wrote running/starting; a run failure must not leave that
+    // limbo — the durable rows are moved to a failed terminal.
+    const store = yield* StateStore;
+    expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
+    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id)).status).toBe("failed");
+  }).pipe(
+    provideRunner(
+      Layer.succeed(
+        ExecutionRunner,
+        ExecutionRunner.of({
+          run: () =>
+            Effect.fail(new ExecutionRunnerError({ operation: "run", detail: "spawn refused" })),
+        }),
+      ),
+    ),
+  ),
+);
+
+it.effect("fails and persists a failed terminal when driving the session fails", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+
+    const error = yield* runner.dispatch(job).pipe(Effect.flip);
+    expect(error._tag).toBe("PiTransportError");
+
+    const store = yield* StateStore;
+    expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
+    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id)).status).toBe("failed");
+  }).pipe(
+    provide({
+      ...fakeHandle(Stream.empty, { _tag: "Completed" }),
+      send: () =>
+        Effect.fail(new PiTransportError({ reason: "closed", detail: "send after close" })),
+    }),
   ),
 );
 

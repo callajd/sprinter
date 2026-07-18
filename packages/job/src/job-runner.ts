@@ -17,7 +17,7 @@
  * `sessionId`), so a re-dispatch/restart re-attaches by upserting the SAME session
  * id, never a new one (the store's `UNIQUE(session.jobId)` enforces the invariant).
  */
-import { Context, Effect, Layer, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type Job,
@@ -84,6 +84,23 @@ const toJobResult = (result: SessionResult, payload: unknown): JobResult => {
 };
 
 /**
+ * Best-effort persist of a `failed` terminal Job/session when starting or driving
+ * the session fails — so a `run`/`send` failure never leaves the durable rows stuck
+ * in the `running`/`starting` limbo the initial persist wrote. The terminal write is
+ * best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
+ * error still propagates to the caller.
+ */
+const persistFailedTerminal = (
+  store: Context.Service.Shape<typeof StateStore>,
+  job: Job,
+  sessionId: SessionId,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    yield* store.jobs.putSession({ id: sessionId, jobId: job.id, status: "failed" });
+    yield* store.jobs.putJob({ ...job, status: "failed", sessionId });
+  }).pipe(Effect.orElseSucceed(() => undefined));
+
+/**
  * The one bounded cognitive dispatch: persist the initial Job/session rows, start
  * the session, drive the prompt, consume events, await the terminal outcome, and
  * persist the terminal rows — returning the {@link JobResult}.
@@ -91,7 +108,9 @@ const toJobResult = (result: SessionResult, payload: unknown): JobResult => {
  * Events are consumed by folding the live stream (counting durable transcript
  * entries) so the runner is a real consumer of the session's reactive output; a
  * transport teardown of the stream is tolerated (the terminal authority is
- * {@link SessionHandle.result}, which reports the failure).
+ * {@link SessionHandle.result}, which reports the failure). If instead STARTING or
+ * DRIVING the session fails (`run`/`send`), the durable rows are moved to a `failed`
+ * terminal before the error propagates — the job never stays durably `running`.
  */
 const dispatch = (
   runner: Context.Service.Shape<typeof ExecutionRunner>,
@@ -107,25 +126,38 @@ const dispatch = (
     yield* store.jobs.putSession(startSession);
     yield* store.jobs.putJob({ ...job, status: "running", sessionId });
 
-    const handle = yield* runner.run(job);
-    yield* handle.send(promptForJob(job));
+    // Start + drive the session and await its terminal outcome. On failure of
+    // starting/driving (not a mere stream teardown), record a `failed` terminal so
+    // the durable state is never left in limbo, then re-raise (F2).
+    const settled = yield* Effect.gen(function* () {
+      const handle = yield* runner.run(job);
+      yield* handle.send(promptForJob(job));
 
-    // Consume the session's events (fold durable entries); a transport teardown of
-    // the stream is not the terminal authority — `handle.result` is.
-    const entries = yield* handle.events.pipe(
-      Stream.runFold(
-        () => 0,
-        (count, event) => (event._tag === "EntryAppended" ? count + 1 : count),
-      ),
-      Effect.orElseSucceed(() => 0),
-    );
+      // Count durable transcript entries in a `Ref` so the count SURVIVES a stream
+      // teardown — `Stream.runFold` drops its accumulator on failure, `Ref` keeps it.
+      // The stream is not the terminal authority (`handle.result` is), so a typed
+      // teardown of the fold is tolerated while preserving the count observed so far.
+      const entriesRef = yield* Ref.make(0);
+      yield* handle.events.pipe(
+        Stream.runForEach((event) =>
+          event._tag === "EntryAppended" ? Ref.update(entriesRef, (n) => n + 1) : Effect.void,
+        ),
+        Effect.orElseSucceed(() => undefined),
+      );
+      const entries = yield* Ref.get(entriesRef);
+      const result = yield* handle.result;
+      return { result, entries };
+    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, sessionId)));
 
-    const result = yield* handle.result;
     const transcriptRef = yield* transcriptRefFor(sessionId);
-    const jobResult = toJobResult(result, { transcriptRef, entries });
+    const jobResult = toJobResult(settled.result, { transcriptRef, entries: settled.entries });
 
     // Persist the terminal Job/session rows.
-    yield* store.jobs.putSession({ id: sessionId, jobId: job.id, status: toSessionStatus(result) });
+    yield* store.jobs.putSession({
+      id: sessionId,
+      jobId: job.id,
+      status: toSessionStatus(settled.result),
+    });
     yield* store.jobs.putJob({ ...job, status: jobResult.status, sessionId, transcriptRef });
 
     return jobResult;
