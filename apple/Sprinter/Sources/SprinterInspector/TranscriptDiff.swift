@@ -71,9 +71,12 @@ extension TranscriptToolCall {
 
   /// Splits `text` into per-line ``DiffLine``s of the given kind, dropping a single
   /// trailing empty line so a payload with a terminal newline does not render a
-  /// spurious blank line.
+  /// spurious blank line. An empty payload (a pure-insertion `Edit`'s empty
+  /// `old_string`, or an empty `Write` `content`) yields no lines at all — not one
+  /// blank line — so an empty side of the edit renders as nothing.
   private static func lines(of kind: DiffLine.Kind) -> (String) -> [DiffLine] {
     { text in
+      guard !text.isEmpty else { return [] }
       var parts = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
       if parts.count > 1, parts.last == "" { parts.removeLast() }
       return parts.map { DiffLine(kind: kind, text: $0) }

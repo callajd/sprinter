@@ -71,6 +71,33 @@ struct TranscriptDiffTests {
       ])
   }
 
+  /// A pure-insertion `Edit` (empty `old_string`) renders only added lines — the
+  /// empty side yields NO lines, not a spurious blank removed line.
+  @Test("a pure-insertion Edit renders no blank line for the empty side")
+  func pureInsertionHasNoBlankLine() {
+    let call = toolCall(
+      name: "Edit",
+      input: .object([
+        "file_path": .string("/src/main.swift"),
+        "old_string": .string(""),
+        "new_string": .string("let added = 1")
+      ]))
+    #expect(
+      call.fileDiff?.lines == [DiffLine(kind: .added, text: "let added = 1")])
+  }
+
+  /// A `Write` of empty `content` renders no lines at all — not one blank added line.
+  @Test("an empty Write renders no lines")
+  func emptyWriteHasNoLines() {
+    let call = toolCall(
+      name: "Write",
+      input: .object([
+        "file_path": .string("/src/empty.swift"),
+        "content": .string("")
+      ]))
+    #expect(call.fileDiff?.lines.isEmpty == true)
+  }
+
   /// A non-edit tool call is not a diff (so the transcript renders it plainly).
   @Test("a non-edit tool call yields no diff")
   func nonEditYieldsNil() {
