@@ -30,7 +30,16 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import { Job } from "@sprinter/domain";
 import { SessionResult } from "@sprinter/runner";
-import { ExecutionRunner, layerLocalPi } from "./index.ts";
+import { ExecutionRunner, layerInheritCwd, layerLocalPi } from "./index.ts";
+
+/**
+ * The adapter under test, with the no-op {@link layerInheritCwd} spawn router
+ * provided (CE1.1-F2): these tests exercise the terminal-result contract and the
+ * boundary, not per-Job worktree routing (covered in `./spawn-router.test.ts`), so
+ * a Job inherits the parent cwd. Only the `ChildProcessSpawner` stays a per-test
+ * substitution (the fake `pi`).
+ */
+const runnerLayer = layerLocalPi.pipe(Layer.provide(layerInheritCwd));
 
 // ============================================================================
 // Fixtures & fakes
@@ -110,7 +119,7 @@ it.effect("makes the dispatch one-shot: events end at agent_settled and result i
         const result = yield* handle.result;
         expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
       }),
-    ).pipe(Effect.provide(layerLocalPi), Effect.provide(fake.layer));
+    ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
   }),
 );
 
@@ -133,8 +142,71 @@ it.effect("settles Completed when pi output closes cleanly before any settle", (
         const result = yield* handle.result;
         expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
       }),
-    ).pipe(Effect.provide(layerLocalPi), Effect.provide(fake.layer));
+    ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
   }),
+);
+
+it.effect(
+  "gates the settle-watcher: a pre-prompt agent_settled does NOT truncate or complete (CE1.1-F1)",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const runner = yield* ExecutionRunner;
+          const job = yield* makeJob();
+          const handle = yield* runner.run(job);
+
+          const collecting = yield* Effect.forkChild(Stream.runCollect(handle.events));
+
+          // The stdout queue is FIFO, so the pump processes these in order:
+          //  1. a real `pi` idles-on-startup, emitting `agent_settled` BEFORE any
+          //     prompt — the gate must DROP it (never truncate/complete here);
+          //  2. the prompt drives a turn (`turn_start`), the agent works, and it
+          //     settles — NOW the one-shot truncates, after real work.
+          // A broken gate would truncate at (1), ending the collect as `[SessionIdle]`
+          // (or `[]`) with the later events ignored — which this assertion catches.
+          yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
+          yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
+          yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
+
+          const events = yield* Fiber.join(collecting);
+          // The pre-prompt settle was dropped; the terminal settle follows a real turn.
+          expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "SessionIdle" }]);
+
+          const result = yield* handle.result;
+          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+        }),
+      ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
+    }),
+);
+
+it.effect(
+  "pre-arms the terminal watcher at run(): the gate observes turn+settle with NO consumer attached (CE1.1-F1)",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const runner = yield* ExecutionRunner;
+          const job = yield* makeJob();
+          // `run` returns only AFTER the watcher's subscription is established
+          // (subscribe-before-emit: `oneShot` arms it eagerly via `Stream.toPull`).
+          // So events emitted NOW — with NO consumer ever collecting `handle.events` —
+          // are still seen by the pre-armed watcher, which arms the gate on
+          // `turn_start` and truncates on the following `agent_settled`, resolving the
+          // terminal `result`. A watcher that subscribed lazily (after emit) could
+          // miss `turn_start` under burst and hang the gate.
+          const handle = yield* runner.run(job);
+
+          yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
+          yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
+
+          const result = yield* handle.result;
+          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+        }),
+      ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
+    }),
 );
 
 it.effect("settles Failed with a neutral detail when the transport tears down", () =>
@@ -157,7 +229,7 @@ it.effect("settles Failed with a neutral detail when the transport tears down", 
         expect(result._tag).toBe("Failed");
         if (result._tag === "Failed") expect(result.error.length).toBeGreaterThan(0);
       }),
-    ).pipe(Effect.provide(layerLocalPi), Effect.provide(fake.layer));
+    ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
   }),
 );
 
@@ -186,7 +258,7 @@ it.effect("translates a spawn failure into the owned ExecutionRunnerError", () =
         const job = yield* makeJob();
         return yield* runner.run(job).pipe(Effect.flip);
       }),
-    ).pipe(Effect.provide(layerLocalPi), Effect.provide(failingLayer));
+    ).pipe(Effect.provide(runnerLayer), Effect.provide(failingLayer));
 
     expect(error._tag).toBe("ExecutionRunnerError");
     expect(error.operation).toBe("run");

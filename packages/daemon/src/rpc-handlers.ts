@@ -63,6 +63,7 @@ import {
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { StateStore } from "@sprinter/state";
+import { resyncEvents } from "./event-journal.ts";
 import { SessionRegistry } from "./session-registry.ts";
 import { WorkGraphEvents } from "./work-graph-events.ts";
 
@@ -352,13 +353,16 @@ export const handlers = SprinterRpc.toLayer(
     const scope = yield* Effect.scope;
     return {
       snapshot: () => buildSnapshot(store),
-      // Live work-graph deltas. `changes` subscribes lazily (on first pull), so a
-      // delta emitted between a client's `snapshot` and its `events` stream
-      // attaching can be missed: a client must treat `snapshot` as the baseline and
-      // reconcile deltas onto it (D4), subscribing before/around the snapshot read.
-      // A durable offset-based resync via `EventLogStore.tail` (D17 reconciliation)
-      // is AE5's to wire — see the workstream ledger.
-      events: () => feed.changes,
+      // Live work-graph deltas with DURABLE offset-based resync (CE1.2 / D17): the
+      // feed eagerly subscribes live, replays the durable event log from the origin
+      // (`EventLogStore.tail`, journaled by the store decorator), then streams the
+      // live tail — so a reconnecting client catches up on the whole persisted
+      // history deterministically, not only the deltas after it attaches. Subscribe-
+      // before-replay closes the gap; upsert-idempotent deltas (D8) absorb the
+      // boundary overlap. (The frozen `events` payload carries no cursor, so the
+      // served endpoint replays from origin; per-offset resume is CE2.2's, over the
+      // same `resyncFrom` primitive.)
+      events: () => resyncEvents(store, feed),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),

@@ -26,7 +26,7 @@
  * nothing hand-rolled.
  */
 import { Array as Arr, Effect, Layer, Option, Schema } from "effect";
-import { SqlClient, SqlSchema } from "effect/unstable/sql";
+import { SqlClient, SqlError, SqlSchema } from "effect/unstable/sql";
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-bun";
 import {
   EpicId,
@@ -443,7 +443,29 @@ const make = Effect.gen(function* () {
       ),
   };
 
-  return StateStore.of({ workGraph: putWorkGraph, jobs, events });
+  // ── transactions ──────────────────────────────────────────────────────────
+
+  /**
+   * Run `effect` in a single SQLite transaction on the ambient {@link SqlClient}:
+   * all its writes commit together or roll back together, and a nested
+   * `withTransaction` (e.g. `putIssue`'s own) folds into it as a savepoint. The
+   * backing's own `SqlError` from BEGIN/COMMIT is mapped to the owned
+   * {@link StateStoreError} at the boundary (INV-PORT); the caller's error channel
+   * `E` passes through untouched.
+   */
+  const withTransaction = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | StateStoreError, R> =>
+    sql.withTransaction(effect).pipe(
+      // Only the backing's own BEGIN/COMMIT `SqlError` is mapped to the owned error
+      // (INV-PORT); the caller's `E` (already-owned `StateStoreError`s from the inner
+      // writes) passes through untouched.
+      Effect.mapError((error): E | StateStoreError =>
+        SqlError.isSqlError(error) ? fail("withTransaction")(error) : error,
+      ),
+    );
+
+  return StateStore.of({ workGraph: putWorkGraph, jobs, events, withTransaction });
 });
 
 // ============================================================================

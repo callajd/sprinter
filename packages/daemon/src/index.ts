@@ -21,9 +21,28 @@
  * the `StateStore` / `Repository` / `JobRunner` PORTS, that on boot reconciles the
  * durable graph against the host and resumes any in-flight Job onto its persisted
  * session — without loss or double-run (INV-PORT).
+ *
+ * Task CE1.2 provisions the runnable daemon: {@link mainLayer} — the composition
+ * root, a single Effect layer graph wiring the file-backed `StateStore`, the real
+ * `ExecutionRunner`, `Repository`, and the `RpcServer` handlers into a served
+ * endpoint over a concrete socket transport (INV-EFFECT-DI); {@link layerJournaling}
+ * + {@link resyncEvents} — durable, offset-based `events` resync (D17); and
+ * {@link bootLayer} — the boot-time `StartupReconcile` run. The runnable process
+ * entrypoint is the sibling `run.ts` (`sprinter-daemon` bin).
  */
 import { contractTag } from "@sprinter/contract";
 
+export { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
+export type { DaemonConfig } from "./main.ts";
+export {
+  appLayer,
+  bootLayer,
+  configFromEnv,
+  executionRunnerLayer,
+  mainLayer,
+  socketProtocolLayer,
+  stateStoreLayer,
+} from "./main.ts";
 export { handlers } from "./rpc-handlers.ts";
 export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";
