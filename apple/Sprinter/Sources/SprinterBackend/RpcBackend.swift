@@ -58,6 +58,40 @@ public struct RpcBackend: Backend {
     }
   }
 
+  // MARK: - Session channel (BE1.2)
+
+  public func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+    AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
+          for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {
+            continuation.yield(try fromJSONValue(SessionEvent.self, value))
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  public func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
+    let payload = try toJSONValue(SessionSendPayload(sessionId: sessionId, input: input))
+    _ = try await connection.request(tag: "sessionSend", payload: payload)
+  }
+
+  public func interrupt(sessionId: SessionId) async throws {
+    let payload = try toJSONValue(InterruptPayload(sessionId: sessionId))
+    _ = try await connection.request(tag: "interrupt", payload: payload)
+  }
+
+  public func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
+    let payload = try toJSONValue(AnswerUiRequestPayload(sessionId: sessionId, response: response))
+    _ = try await connection.request(tag: "answerUiRequest", payload: payload)
+  }
+
   public func close() async {
     await connection.close()
   }
