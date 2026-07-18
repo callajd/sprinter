@@ -16,6 +16,13 @@
  * once all its Issues have landed; a Workstream rolls to `done` once all its Epics
  * are complete.
  *
+ * **Per-issue error isolation (AE3.2 / #27 F4, resolved AE5.1 / #32).** The Issue
+ * loop is catch-and-continue on a host failure: a single Issue's `RepositoryError`
+ * (a 404 for a deleted Issue, a 403/429 rate-limit) is caught and logged, and the
+ * roll-up proceeds with the remaining Issues — one flaky host read never aborts the
+ * whole Workstream roll-up. A {@link StateStoreError} is NOT isolated: our own
+ * durable store failing is a real abort, not a transient host hiccup.
+ *
  * **Wiring-constraint (AE2 / #23 F4).** The work graph stores parentage TWICE —
  * parent child-lists (`Workstream.epics` / `Epic.issues`) AND child FK refs
  * (`Epic.workstreamId` / `Issue.epicId`) — with no FK enforcement. This roll-up
@@ -96,11 +103,23 @@ const ensureIssueInEpic = (
  */
 const reconcileEpic = (
   epic: Epic,
-): Effect.Effect<boolean, RepositoryError | StateStoreError, Repository | StateStore> =>
+): Effect.Effect<boolean, StateStoreError, Repository | StateStore> =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const issues = yield* store.workGraph.listIssues(epic.id);
-    yield* Effect.forEach(issues, (issue) => reconcileIssue(epic, issue));
+    // Per-issue error isolation (F4): a host failure on one Issue is caught and
+    // logged so the roll-up continues; a StateStoreError is NOT caught (our own
+    // store failing is a real abort). `catchTag` narrows the loop's error to the
+    // owned StateStoreError, leaving `Repository` in the requirement.
+    yield* Effect.forEach(issues, (issue) =>
+      reconcileIssue(epic, issue).pipe(
+        Effect.catchTag("RepositoryError", (error) =>
+          Effect.logWarning(
+            `reconcile: skipping issue #${issue.number} after host error: ${error.detail}`,
+          ),
+        ),
+      ),
+    );
 
     const refreshed = yield* store.workGraph.listIssues(epic.id);
     const allLanded = refreshed.length > 0 && refreshed.every(isIssueLanded);
@@ -125,7 +144,7 @@ const reconcileEpic = (
  */
 export const reconcileWorkstream = (
   workstreamId: WorkstreamId,
-): Effect.Effect<void, RepositoryError | StateStoreError, Repository | StateStore> =>
+): Effect.Effect<void, StateStoreError, Repository | StateStore> =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const found = yield* store.workGraph.getWorkstream(workstreamId);

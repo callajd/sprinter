@@ -94,9 +94,10 @@ const GhTimelineEvent = Schema.Struct({
  * whenever an Issue is merely mentioned, so this can pick a PR that references but
  * does not close the Issue. The caller (`reconcileIssue`) further gates on the
  * Issue being closed AND the referenced PR being merged, which is sufficient for
- * the common case. Robust closing-PR detection (GraphQL
- * `closedByPullRequestsReferences`, or the `closed` event's associated PR) is a
- * live-wiring concern deferred to AE4/AE5 — see the workstream ledger.
+ * the common case. Keeping this offline heuristic (gated by closed + merged) with
+ * its residual risk documented — vs. a robust GraphQL
+ * `closedByPullRequestsReferences` / `closed`-event signal — is a resolved decision
+ * (D18); the robust live-wiring signal is tracked as deferred provisioning.
  */
 const findClosingPr = (
   events: ReadonlyArray<(typeof GhTimelineEvent)["Type"]>,

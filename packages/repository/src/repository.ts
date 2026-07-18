@@ -114,8 +114,9 @@ export interface PullRequestOps {
    * A PR that references the given Issue, if one exists — a HEURISTIC for the
    * closing PR (the GitHub adapter scans the Issue timeline for a cross-referencing
    * PR). `Option.none` when no PR references it yet. The reconciler gates on the
-   * Issue being closed AND this PR being merged; robust closing-PR detection is a
-   * live-wiring concern deferred to AE4/AE5.
+   * Issue being closed AND this PR being merged; keeping this offline heuristic
+   * (with its residual risk documented) vs. a robust GraphQL signal is a resolved
+   * decision (D18), the robust signal tracked as deferred provisioning.
    */
   readonly closingPullRequest: (
     issueNumber: PositiveInt,

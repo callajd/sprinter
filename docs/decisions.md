@@ -163,11 +163,43 @@ every layer's acceptance:
 - we compose the daemon side with `Stream`/`PubSub`/`Scope`, not poll loops;
 - we hydrate with snapshot-on-connect + live-subscribe (D4), not periodic refetch.
 
+### D18 — Closing-PR detection stays an offline heuristic, gated + documented (AE5.1)
+The `Repository` port's `closingPullRequest` finds a PR *referencing* an Issue by
+scanning the Issue timeline for a `cross-referenced` event whose source carries a
+`pull_request` (the GitHub adapter). This is a **heuristic**, not a guarantee:
+GitHub emits `cross-referenced` on any mention, so it can pick a PR that references
+but does not actually close the Issue. Since startup reconciliation (AE5.1) now
+drives real "landed" decisions, we resolve the carried risk (AE3.2 / #27 F1)
+**explicitly** rather than silently inheriting it:
+
+- **We keep the offline heuristic**, but the reconciler NEVER lands on it alone: an
+  Issue is landed only when the host reports it **closed** AND the referenced PR is
+  **merged** (`reconcileIssue`). That gate makes the common case correct offline and
+  needs no live GraphQL round-trip.
+- **Residual risk (accepted, documented):** an Issue closed for an unrelated reason
+  while a *different* merged PR merely references it could be mis-landed. The robust
+  signal — GraphQL `closedByPullRequestsReferences`, or gating on the timeline
+  `closed` event's associated PR — is a **live-wiring** concern of the GitHub
+  adapter (it can only be validated against the real host, not the offline suite),
+  so it is tracked as deferred provisioning below, NOT a dropped AE5.1 criterion.
+  Roll-up is one-directional (D13) and idempotent, so a future robust signal
+  supersedes a stale landing on the next reconcile with no migration.
+
 ---
 
 ## Deferred (see architecture §10)
 
 - Pi binary provisioning + schema/version-compat policy.
+- **Concrete LocalPi `ExecutionRunner` adapter + runnable daemon `main` entrypoint**
+  (AE5.1 scope note): AE5.1 delivers the persist/reconcile/re-dispatch **logic** —
+  the `StartupReconcile` service wired to the `StateStore`/`Repository`/`JobRunner`
+  ports and tested offline (`layerMemory` + a real tmpfile SQLite + fakes). The
+  adapter that spawns a real `pi` process and the boot entrypoint that wires the
+  production adapters and calls `StartupReconcile.run` are **provisioning**, not part
+  of AE5.1's Done.
+- **Robust closing-PR signal** (D18): GraphQL `closedByPullRequestsReferences` (or
+  the `closed`-event PR) in the GitHub adapter — a live-wiring concern; the offline
+  cross-reference heuristic + closed/merged gate is what ships now.
 - Inspector transcript rendering: native vs. embed `export-html`.
 - StateStore local backing; how much of resume is `WorkflowEngine` vs. custom.
 - Remote adapters: `effect/unstable/cluster` vs. hand-rolled tunnel.

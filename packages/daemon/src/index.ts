@@ -16,11 +16,18 @@
  * {@link SessionRegistry} PORT (`sessionId → live SessionHandle`) the four
  * session-channel handlers resolve against, bridging a live `@sprinter/runner`
  * session's neutral surface (INV-BOUNDARY / INV-PORT).
+ *
+ * Task AE5.1 adds restart safety: the {@link StartupReconcile} service, wired to
+ * the `StateStore` / `Repository` / `JobRunner` PORTS, that on boot reconciles the
+ * durable graph against the host and resumes any in-flight Job onto its persisted
+ * session — without loss or double-run (INV-PORT).
  */
 import { contractTag } from "@sprinter/contract";
 
 export { handlers } from "./rpc-handlers.ts";
 export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
+export type { StartupSummary } from "./startup-reconcile.ts";
+export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 export { layerPublishing } from "./store-publishing.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
