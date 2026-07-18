@@ -17,9 +17,10 @@
  * `sessionId`), so a re-dispatch/restart re-attaches by upserting the SAME session
  * id, never a new one (the store's `UNIQUE(session.jobId)` enforces the invariant).
  */
-import { Context, Effect, Layer, Ref, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
+  type Issue,
   type Job,
   type JobResult,
   type Session,
@@ -54,9 +55,20 @@ const sessionIdFor = (job: Job): Effect.Effect<SessionId> =>
 const transcriptRefFor = (sessionId: SessionId): Effect.Effect<string> =>
   Schema.decodeUnknownEffect(Schema.NonEmptyString)(`transcript://${sessionId}`).pipe(Effect.orDie);
 
-/** The prompt driven into a fresh session — derived from the owned job (no Pi concept). */
-const promptForJob = (job: Job): SessionInput => ({
-  text: `Work the ${job.kind} job for issue ${job.issueId}.`,
+/**
+ * The prompt driven into a fresh session — built from the REAL Issue content the
+ * job advances (its number + title), decoded from the durable {@link StateStore},
+ * never the id-only placeholder. It is expressed in owned, neutral terms only (no
+ * Pi concept): the concrete `pi` prompt encoding happens below the
+ * {@link ExecutionRunner} port. When the Issue row is absent (a degraded path that
+ * should not occur once planning has persisted the graph), it falls back to the
+ * job's own fields so a dispatch is still driveable rather than blocked.
+ */
+const promptForJob = (job: Job, issue: Option.Option<Issue>): SessionInput => ({
+  text: Option.match(issue, {
+    onNone: () => `Work the ${job.kind} job for issue ${job.issueId}.`,
+    onSome: (found) => `Work the ${job.kind} job for issue #${found.number}: ${found.title}`,
+  }),
   mode: "prompt",
 });
 
@@ -131,7 +143,11 @@ const dispatch = (
     // the durable state is never left in limbo, then re-raise (F2).
     const settled = yield* Effect.gen(function* () {
       const handle = yield* runner.run(job);
-      yield* handle.send(promptForJob(job));
+      // Drive the REAL Issue-content prompt (title/number), read from the durable
+      // graph — never the id-only placeholder. The concrete `pi` encoding is below
+      // the ExecutionRunner port; this stays in owned, neutral terms (INV-PORT).
+      const issue = yield* store.workGraph.getIssue(job.issueId);
+      yield* handle.send(promptForJob(job, issue));
 
       // Count durable transcript entries in a `Ref` so the count SURVIVES a stream
       // teardown — `Stream.runFold` drops its accumulator on failure, `Ref` keeps it.
