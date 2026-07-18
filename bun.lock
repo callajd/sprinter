@@ -40,6 +40,14 @@
         "effect": "4.0.0-beta.97",
       },
     },
+    "packages/runner": {
+      "name": "@sprinter/runner",
+      "version": "0.0.0",
+      "dependencies": {
+        "@sprinter/domain": "workspace:*",
+        "effect": "4.0.0-beta.97",
+      },
+    },
   },
   "packages": {
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
@@ -239,6 +247,8 @@
     "@sprinter/daemon": ["@sprinter/daemon@workspace:packages/daemon"],
 
     "@sprinter/domain": ["@sprinter/domain@workspace:packages/domain"],
+
+    "@sprinter/runner": ["@sprinter/runner@workspace:packages/runner"],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
 
