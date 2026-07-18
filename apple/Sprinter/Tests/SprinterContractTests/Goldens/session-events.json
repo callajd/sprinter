@@ -97,6 +97,7 @@
   },
   {
     "_tag": "Notice",
+    "id": "notice-disk",
     "level": "warn",
     "message": "disk space low"
   },
@@ -113,5 +114,10 @@
       "text": "done",
       "reasoning": "because"
     }
+  },
+  {
+    "_tag": "Notice",
+    "level": "error",
+    "message": "retry failed after 5 attempt(s)"
   }
 ]

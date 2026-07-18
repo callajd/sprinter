@@ -37,7 +37,7 @@ struct SessionLifecycleTests {
 
     // A second start while running must not respin the single-consumer feed.
     model.start()
-    backend.emit(.notice(level: .info, message: "once"))
+    backend.emit(.notice(id: "n-once", level: .info, message: "once"))
     #expect(await waitUntil { model.transcript.items.count == 1 })
 
     // Still one feed, and the event surfaced exactly once — no duplicate feed.
@@ -97,7 +97,7 @@ struct SessionLifecycleTests {
     // The prior (cancelled) feed task's terminal cleanup must NOT clobber the fresh
     // task's `feed`/`isRunning`: after restart the session is `.live`…
     #expect(await waitUntil { model.lifecycle == .live })
-    backend.emit(.notice(level: .info, message: "after restart"))
+    backend.emit(.notice(id: "n-restart", level: .info, message: "after restart"))
     #expect(await waitUntil { model.transcript.items.count == 1 })
     // …and STAYS live — the superseded task ran its cleanup during the waits above
     // and, guarded by generation, left the live state intact.

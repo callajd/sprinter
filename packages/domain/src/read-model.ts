@@ -18,10 +18,13 @@ import { PositiveInt } from "./numeric.ts";
 
 /**
  * Lifecycle status shared by the planning nodes `Workstream` and `Epic`: work is
- * queued (`pending`), being driven (`active`), reached its terminal state
- * (`done`), or waiting on an unmet dependency (`blocked`).
+ * queued (`pending`), being driven (`active`), completed (`done`), waiting on an
+ * unmet dependency (`blocked`), or deliberately stopped before completion
+ * (`cancelled`). `done` and `cancelled` are BOTH terminal, but distinct: a
+ * cancelled node was abandoned, not finished, so the board and roll-up render it
+ * apart from a completed one ({@link isTerminal} / {@link isComplete}).
  */
-export const WorkStatus = Schema.Literals(["pending", "active", "done", "blocked"]);
+export const WorkStatus = Schema.Literals(["pending", "active", "done", "blocked", "cancelled"]);
 export type WorkStatus = (typeof WorkStatus)["Type"];
 
 /**
@@ -171,6 +174,16 @@ export type JobResult = (typeof JobResult)["Type"];
 
 /** True when a planning node (`Workstream`/`Epic`) has reached the terminal `done` status. */
 export const isComplete = (node: Workstream | Epic): boolean => node.status === "done";
+
+/**
+ * True when a planning node has reached ANY terminal status — completed (`done`)
+ * OR cancelled. A terminal node is settled: the status roll-up never resurrects or
+ * overwrites it (a cancelled node stays cancelled even once its Issues land). This
+ * is broader than {@link isComplete}, which is `done`-only — `cancelled` is
+ * terminal-but-not-`done`.
+ */
+export const isTerminal = (node: Workstream | Epic): boolean =>
+  node.status === "done" || node.status === "cancelled";
 
 /** True when an issue is closed by a merged PR — i.e. its work is fully landed. */
 export const isIssueLanded = (issue: Issue): boolean =>

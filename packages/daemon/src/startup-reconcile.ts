@@ -33,10 +33,10 @@
  *   Job, or a not-yet-started `queued` one) is not a candidate at all;
  * - a Job whose Issue has already landed (reconciled to `done` + merged PR,
  *   {@link isIssueLanded}) is settled to `succeeded` — its work landed, not re-run;
- * - a Job of a Workstream persisted `done` (cancelled) is settled to `cancelled`; one
- *   of a `blocked` (paused) Workstream is settled to `queued` so a later `control
- *   resume` re-dispatches it — a cancelled/paused Workstream stays that way across a
- *   restart (AE4.1 / #30 N1).
+ * - a Job of a Workstream persisted `cancelled` is settled to `cancelled`; one of a
+ *   `blocked` (paused) Workstream is settled to `queued` so a later `control resume`
+ *   re-dispatches it — a cancelled/paused Workstream stays that way across a restart
+ *   (AE4.1 / #30 N1; the distinct terminal `cancelled` status is CE5.1).
  *
  * A single resume failure is isolated (logged in its background fiber) so one bad Job
  * never disturbs the others; a {@link StateStoreError} reading/writing the durable
@@ -82,8 +82,8 @@ export interface StartupSummary {
   /**
    * The ids of the `running` Jobs NOT resumed — each reconciled to a terminal/pending
    * status so no durable `running` limbo survives: a landed Issue's Job → `succeeded`,
-   * a `done` Workstream's Job → `cancelled`, a `blocked` (paused) Workstream's Job →
-   * `queued` (so a later `control resume` re-dispatches it).
+   * a `cancelled` Workstream's Job → `cancelled`, a `blocked` (paused) Workstream's Job
+   * → `queued` (so a later `control resume` re-dispatches it).
    */
   readonly skipped: ReadonlyArray<JobId>;
 }
@@ -92,8 +92,9 @@ export interface StartupSummary {
  * What restart does with a `running` Job given its (post-roll-up) Issue and its
  * Workstream's control state: resume it in the background, or settle its durable row
  * to a terminal/pending status so it never lingers as a stale `running` across
- * restarts. A landed Issue's work succeeded; a `done` Workstream's Job is cancelled; a
- * `blocked` (paused) Workstream's Job is re-queued to resume on the next `control`.
+ * restarts. A landed Issue's work succeeded; a `cancelled` Workstream's Job is
+ * cancelled; a `blocked` (paused) Workstream's Job is re-queued to resume on the next
+ * `control`.
  */
 type ResumeAction =
   | { readonly _tag: "resume" }
@@ -102,7 +103,7 @@ type ResumeAction =
 const decideRunning = (issue: Issue, workstreamStatus: WorkStatus): ResumeAction =>
   isIssueLanded(issue)
     ? { _tag: "settle", status: "succeeded" }
-    : workstreamStatus === "done"
+    : workstreamStatus === "cancelled"
       ? { _tag: "settle", status: "cancelled" }
       : workstreamStatus === "blocked"
         ? { _tag: "settle", status: "queued" }

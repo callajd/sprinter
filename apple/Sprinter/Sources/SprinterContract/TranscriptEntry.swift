@@ -9,7 +9,7 @@ public enum TranscriptEntry: Codable, Equatable, Sendable {
   case assistantMessage(id: String, text: String, reasoning: String?)
   case toolCall(id: String, name: String, input: JSONValue)
   case toolResult(id: String, output: JSONValue, isError: Bool)
-  case noticeEntry(level: NoticeLevel, message: String)
+  case noticeEntry(id: String, level: NoticeLevel, message: String)
 
   private enum CodingKeys: String, CodingKey {
     case tag = "_tag"
@@ -53,6 +53,7 @@ public enum TranscriptEntry: Codable, Equatable, Sendable {
       )
     case "NoticeEntry":
       self = .noticeEntry(
+        id: try container.decode(String.self, forKey: .id),
         level: try container.decode(NoticeLevel.self, forKey: .level),
         message: try container.decode(String.self, forKey: .message)
       )
@@ -87,8 +88,9 @@ public enum TranscriptEntry: Codable, Equatable, Sendable {
       try container.encode(id, forKey: .id)
       try container.encode(output, forKey: .output)
       try container.encode(isError, forKey: .isError)
-    case .noticeEntry(let level, let message):
+    case .noticeEntry(let id, let level, let message):
       try container.encode("NoticeEntry", forKey: .tag)
+      try container.encode(id, forKey: .id)
       try container.encode(level, forKey: .level)
       try container.encode(message, forKey: .message)
     }

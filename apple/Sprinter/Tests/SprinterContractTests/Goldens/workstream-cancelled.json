@@ -1,0 +1,9 @@
+{
+  "id": "ws-1",
+  "name": "Foundation",
+  "repo": "callajd/sprinter",
+  "status": "cancelled",
+  "epics": [
+    "ep-1"
+  ]
+}

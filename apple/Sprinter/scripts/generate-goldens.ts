@@ -140,6 +140,11 @@ write("job-minimal", Job, jobMinimal);
 write("session", Session, session);
 write("pull-request-ref", PullRequestRef, prMerged);
 
+// The distinct terminal `cancelled` WorkStatus (contract v2 / CE5.1) — a cancelled
+// planning node is terminal-but-not-`done`, so the mirror + board render it apart.
+write("workstream-cancelled", Workstream, { ...workstream, status: "cancelled" });
+write("epic-cancelled", Epic, { ...epic, status: "cancelled" });
+
 // ── WorkGraphEvent — every variant ───────────────────────────────────────────
 
 write("work-graph-events", Schema.Array(WorkGraphEvent), [
@@ -178,12 +183,16 @@ write("session-events", Schema.Array(SessionEvent), [
   { _tag: "ContextCompacted" },
   { _tag: "UiRequestRaised", id: "req-1", kind: "select", prompt: "Pick one", options: ["a", "b"] },
   { _tag: "UiRequestRaised", id: "req-2", kind: "confirm", prompt: "Proceed?" },
-  { _tag: "Notice", level: "warn", message: "disk space low" },
+  { _tag: "Notice", id: "notice-disk", level: "warn", message: "disk space low" },
   { _tag: "StatusChanged", key: "phase", text: "planning" },
   {
     _tag: "EntryAppended",
     entry: { _tag: "AssistantMessage", id: "a1", text: "done", reasoning: "because" },
   },
+  // A content-derived notice with NO reconciliation key — the `NoticeId` optional-key
+  // is ABSENT (contract v2 / CE5.2). The consumer keys these by arrival sequence so
+  // distinct occurrences stay distinct rather than collapsing onto one item.
+  { _tag: "Notice", level: "error", message: "retry failed after 5 attempt(s)" },
 ]);
 
 // ── TranscriptEntry — every variant ──────────────────────────────────────────
@@ -194,7 +203,7 @@ write("transcript-entries", Schema.Array(TranscriptEntry), [
   { _tag: "AssistantMessage", id: "a2", text: "no reasoning here" },
   { _tag: "ToolCall", id: "c1", name: "grep", input: { pattern: "TODO" } },
   { _tag: "ToolResult", id: "c1", output: { matches: 3 }, isError: false },
-  { _tag: "NoticeEntry", level: "error", message: "compilation failed" },
+  { _tag: "NoticeEntry", id: "notice-compile", level: "error", message: "compilation failed" },
 ]);
 
 // ── Usage — full + minimal ───────────────────────────────────────────────────

@@ -122,8 +122,8 @@ public enum TranscriptProjection {
         // Surfaced inline via `InteractiveSession.outstandingRequests`, not the
         // transcript.
         break
-      case .notice(let level, let message):
-        appendNotice(level: level, message: message)
+      case .notice(let id, let level, let message):
+        appendNotice(id: id, level: level, message: message)
       case .statusChanged(let key, let text):
         upsert("status:\(key)") { _ in .status(TranscriptStatus(key: key, text: text)) }
       case .retryScheduled(let attempt, let delayMs, let error):
@@ -165,8 +165,8 @@ public enum TranscriptProjection {
           call.isError = isError
           call.isComplete = true
         }
-      case .noticeEntry(let level, let message):
-        appendNotice(level: level, message: message)
+      case .noticeEntry(let id, let level, let message):
+        appendNotice(id: id, level: level, message: message)
       }
     }
 
@@ -206,10 +206,26 @@ public enum TranscriptProjection {
       }
     }
 
-    private mutating func appendNotice(level: NoticeLevel, message: String) {
-      let id = nextSequence()
-      upsert("notice:\(id)") { _ in
-        .notice(TranscriptNotice(id: id, level: level, message: message))
+    /// Reconciles a notice onto its item by the wire reconciliation key (`NoticeId`):
+    /// a live `Notice` and the durable `NoticeEntry` of the SAME logical event share
+    /// the key, so they render as ONE item rather than double-rendering (CE5.2 /
+    /// INV-REACTIVE — mirroring how message/tool ids coalesce their live deltas and
+    /// durable entries). Distinct notices carry distinct keys and stay distinct.
+    ///
+    /// The key is OPTIONAL on a live `Notice`: a content-derived notice with no stable
+    /// cross-emission identity (`id == nil`) has no durable counterpart to reconcile
+    /// with, so it takes a fresh arrival-sequence key and stays distinct from every
+    /// other occurrence — never collapsing two separate occurrences onto one item. A
+    /// notice WITH an `id` (and every durable `NoticeEntry`, whose id is required)
+    /// keys by it so the live+durable pair reconciles.
+    private mutating func appendNotice(id: String?, level: NoticeLevel, message: String) {
+      // Keyed (caller `id`) and id-less (arrival-sequence) notices live in DISJOINT
+      // key namespaces, so a caller id that happens to be a bare decimal (a `NoticeId`
+      // carries no format constraint) can never collide with a sequence value and
+      // silently collapse a keyed notice and an unrelated id-less one onto one item.
+      let key = id.map { "key:\($0)" } ?? "seq:\(nextSequence())"
+      upsert("notice:\(key)") { _ in
+        .notice(TranscriptNotice(id: key, level: level, message: message))
       }
     }
 

@@ -245,7 +245,18 @@ const translateUiRequest = (event: PiRpcExtensionUIRequest): ReadonlyArray<Sessi
     case "editor":
       return [{ _tag: "UiRequestRaised", id: event.id, kind: "editor", prompt: event.title }];
     case "notify":
-      return [{ _tag: "Notice", level: notifyLevel(event.notifyType), message: event.message }];
+      // The notify request's own id is the notice's reconciliation key (NoticeId):
+      // the same logical notify keeps its key across a live/durable pair. NOTE: a
+      // future durable `NoticeEntry` producer for this notice MUST reproduce this
+      // EXACT key derivation (`event.id`) or the live+durable pair won't share a key.
+      return [
+        {
+          _tag: "Notice",
+          id: event.id,
+          level: notifyLevel(event.notifyType),
+          message: event.message,
+        },
+      ];
     case "setStatus":
       return [{ _tag: "StatusChanged", key: event.statusKey, text: event.statusText ?? "" }];
     case "setTitle":
@@ -339,6 +350,13 @@ export const translateServerEvent = (event: PiServerEvent): ReadonlyArray<Sessio
         : [
             {
               _tag: "Notice",
+              // No stable cross-emission identity: `auto_retry_end` carries only
+              // `attempt`, which is NOT occurrence-unique — two independent retry
+              // sequences can each give up at the same attempt number. So OMIT the
+              // (optional) NoticeId; the consumer keys this by arrival sequence and
+              // distinct give-ups stay distinct. There is no durable counterpart to
+              // reconcile with. (A future durable producer would need a genuinely
+              // occurrence-unique key reproduced identically on both paths.)
               level: "error",
               message: event.finalError ?? `retry failed after ${event.attempt} attempt(s)`,
             },
@@ -351,6 +369,12 @@ export const translateServerEvent = (event: PiServerEvent): ReadonlyArray<Sessio
       return [
         {
           _tag: "Notice",
+          // No stable cross-emission identity: `extension_error` carries only
+          // extensionPath+event, which is NOT occurrence-unique — the same extension
+          // can fail the same event more than once. So OMIT the (optional) NoticeId;
+          // the consumer keys this by arrival sequence and distinct failures stay
+          // distinct. There is no durable counterpart to reconcile with. (A future
+          // durable producer would need an occurrence-unique key reproduced on both.)
           level: "error",
           message: `extension ${event.extensionPath} failed handling ${event.event}: ${event.error}`,
         },

@@ -370,6 +370,37 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
   }),
 );
 
+it.effect("settles a running Job of a cancelled Workstream to cancelled, not resumed (CE5.1)", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
+      yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.jobs.putSession(session());
+      yield* store.jobs.putJob(job());
+
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+
+      // The cancelled workstream stays cancelled (the roll-up never resurrects it);
+      // its running job is settled to `cancelled`, never re-dispatched (no limbo).
+      const ws = Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream().id));
+      expect(ws.status).toBe("cancelled");
+      expect(summary.resumed).toStrictEqual([]);
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+      const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
+      expect(j1.status).toBe("cancelled");
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
+
 // ============================================================================
 // resume-failure isolation — one bad dispatch does not abort the startup
 // ============================================================================

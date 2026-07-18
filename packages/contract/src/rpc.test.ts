@@ -75,13 +75,13 @@ it("carries every model of contract v1 as a procedure", () => {
 });
 
 it("marks the group with an explicit contract version (INV-CONTRACT)", () => {
-  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(1);
+  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(2);
   // The version key is a `Context.Reference`, so it resolves to CONTRACT_VERSION
   // from an empty context via its default.
   expect(Context.get(Context.empty(), ContractVersion)).toBe(CONTRACT_VERSION);
-  expect(CONTRACT_VERSION).toBe(1);
-  expect(contractTag()).toBe("v1");
-  expect(contractTag(2)).toBe("v2");
+  expect(CONTRACT_VERSION).toBe(2);
+  expect(contractTag()).toBe("v2");
+  expect(contractTag(1)).toBe("v1");
 });
 
 it("streams the reactive feeds and not the request/response models (INV-REACTIVE)", () => {

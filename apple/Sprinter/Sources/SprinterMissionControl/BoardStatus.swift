@@ -18,6 +18,9 @@ public enum BoardStatus: String, Sendable, Equatable, CaseIterable {
   case paused
   /// Work has reached its terminal state (`.done` on either vocabulary).
   case complete
+  /// Work was deliberately stopped before completion (`WorkStatus.cancelled`) —
+  /// terminal but distinct from ``complete`` (CE5.1).
+  case cancelled
 }
 
 extension BoardStatus {
@@ -28,6 +31,7 @@ extension BoardStatus {
     case .active: self = .ongoing
     case .blocked: self = .paused
     case .done: self = .complete
+    case .cancelled: self = .cancelled
     }
   }
 

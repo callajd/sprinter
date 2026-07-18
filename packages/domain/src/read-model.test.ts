@@ -6,6 +6,7 @@ import {
   isComplete,
   Issue,
   isIssueLanded,
+  isTerminal,
   Job,
   PullRequestRef,
   Session,
@@ -119,6 +120,26 @@ it.effect("isComplete tracks the terminal done status", () =>
     const done = yield* Schema.decodeUnknownEffect(Epic)({ ...epic, status: "done" });
     expect(isComplete(active)).toBe(false);
     expect(isComplete(done)).toBe(true);
+  }),
+);
+
+it.effect("decodes the distinct terminal cancelled WorkStatus (CE5.1)", () =>
+  Effect.gen(function* () {
+    yield* assertRoundTrip(Workstream, { ...workstream, status: "cancelled" });
+    yield* assertRoundTrip(Epic, { ...epic, status: "cancelled" });
+  }),
+);
+
+it.effect("isTerminal covers done AND cancelled; isComplete stays done-only", () =>
+  Effect.gen(function* () {
+    const active = yield* Schema.decodeUnknownEffect(Workstream)(workstream);
+    const done = yield* Schema.decodeUnknownEffect(Epic)({ ...epic, status: "done" });
+    const cancelled = yield* Schema.decodeUnknownEffect(Epic)({ ...epic, status: "cancelled" });
+    expect(isTerminal(active)).toBe(false);
+    expect(isTerminal(done)).toBe(true);
+    expect(isTerminal(cancelled)).toBe(true);
+    // cancelled is terminal-but-not-done.
+    expect(isComplete(cancelled)).toBe(false);
   }),
 );
 

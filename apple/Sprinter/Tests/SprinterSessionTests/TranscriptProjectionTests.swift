@@ -124,11 +124,11 @@ struct TranscriptProjectionTests {
   @Test("notices, statuses, retries and compaction surface; status collapses by key")
   func signalsSurface() {
     let transcript = TranscriptProjection.project([
-      .notice(level: .info, message: "first"),
+      .notice(id: "n1", level: .info, message: "first"),
       .statusChanged(key: "phase", text: "planning"),
       .retryScheduled(attempt: 1, delayMs: 500, error: "rate limit"),
       .statusChanged(key: "phase", text: "executing"),
-      .notice(level: .warn, message: "second"),
+      .notice(id: "n2", level: .warn, message: "second"),
       .contextCompacted
     ])
 
@@ -159,7 +159,7 @@ struct TranscriptProjectionTests {
   @Test("a durable notice entry surfaces as a notice item")
   func durableNoticeEntry() {
     let transcript = TranscriptProjection.project([
-      .entryAppended(entry: .noticeEntry(level: .error, message: "boom"))
+      .entryAppended(entry: .noticeEntry(id: "n-boom", level: .error, message: "boom"))
     ])
     let notices = transcript.items.compactMap { item -> TranscriptNotice? in
       if case .notice(let notice) = item { return notice }
@@ -167,6 +167,77 @@ struct TranscriptProjectionTests {
     }
     #expect(notices.map(\.message) == ["boom"])
     #expect(notices.first?.level == .error)
+  }
+
+  /// CE5.2: a live `Notice` and the durable `NoticeEntry` of the SAME logical event
+  /// share a reconciliation key (`NoticeId`), so they reconcile onto ONE item — the
+  /// durable value is canonical — rather than double-rendering. Two notices with
+  /// distinct keys stay distinct.
+  @Test("a live Notice and its durable NoticeEntry reconcile by shared key to one item")
+  func noticeReconciliationKey() {
+    let transcript = TranscriptProjection.project([
+      .notice(id: "retry-5", level: .warn, message: "retrying"),
+      .notice(id: "other", level: .info, message: "unrelated"),
+      .entryAppended(entry: .noticeEntry(id: "retry-5", level: .error, message: "gave up"))
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // The shared-key live+durable pair collapsed to one item (durable value wins);
+    // the distinct-key notice remains its own item.
+    #expect(notices.count == 2)
+    // Keyed notices live in the `key:` namespace (disjoint from the id-less `seq:`
+    // namespace) so a caller id can never collide with an arrival-sequence value.
+    let reconciled = notices.first { $0.id == "key:retry-5" }
+    #expect(reconciled?.level == .error)
+    #expect(reconciled?.message == "gave up")
+    #expect(notices.contains { $0.id == "key:other" })
+  }
+
+  /// CE5.2 regression: a keyed notice whose `id` is a bare decimal (a `NoticeId`
+  /// carries no format constraint, so it can look like a JSON-RPC integer id) and an
+  /// id-less notice that reaches the SAME arrival-sequence value must stay TWO
+  /// distinct items. Keyed and id-less notices occupy DISJOINT key namespaces, so a
+  /// caller id can never collide with a sequence value and silently collapse them.
+  @Test("a bare-decimal keyed id and an equal id-less sequence value stay distinct")
+  func keyedDecimalIdAndSequenceValueStayDistinct() {
+    // The id-less notice takes arrival sequence "1"; the keyed notice carries id "1".
+    // Without disjoint namespaces both would key to "notice:1" and collapse.
+    let transcript = TranscriptProjection.project([
+      .notice(id: nil, level: .error, message: "id-less occurrence"),
+      .notice(id: "1", level: .warn, message: "keyed occurrence")
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // Both survive as separate items with distinct ids — neither is silently dropped.
+    #expect(notices.count == 2)
+    #expect(Set(notices.map(\.id)).count == 2)
+    #expect(notices.map(\.message) == ["id-less occurrence", "keyed occurrence"])
+  }
+
+  /// CE5.2 regression: two content-derived notices with NO reconciliation key
+  /// (`id == nil`) — e.g. two independent retry sequences that each gave up at the
+  /// same attempt number, or the same extension failing the same event twice — must
+  /// stay TWO distinct items. A shared derived key used to collapse them onto one,
+  /// silently dropping the earlier occurrence; keying id-less notices by arrival
+  /// sequence keeps them distinct.
+  @Test("two id-less notices with identical content stay distinct (no silent collapse)")
+  func idLessNoticesStayDistinct() {
+    let transcript = TranscriptProjection.project([
+      .notice(id: nil, level: .error, message: "retry failed after 5 attempt(s)"),
+      .notice(id: nil, level: .error, message: "retry failed after 5 attempt(s)")
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // Both occurrences survive as separate items with distinct ids — neither is lost.
+    #expect(notices.count == 2)
+    #expect(Set(notices.map(\.id)).count == 2)
+    #expect(notices.allSatisfy { $0.message == "retry failed after 5 attempt(s)" })
   }
 
   /// Turn lifecycle drives the transcript chrome (not items): a running turn sets

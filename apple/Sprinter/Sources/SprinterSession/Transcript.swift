@@ -71,8 +71,10 @@ public struct TranscriptToolCall: Identifiable, Equatable, Sendable {
 }
 
 /// A notice surfaced in the transcript — a `Notice` event or a durable
-/// `NoticeEntry`. Notices are point-in-time, so each is a distinct item keyed by
-/// its arrival sequence (never coalesced).
+/// `NoticeEntry`. Its ``id`` is the wire reconciliation key (`NoticeId`, CE5.2): a
+/// live `Notice` and the durable `NoticeEntry` of the SAME logical event share it,
+/// so the two reconcile onto one item instead of double-rendering; distinct notices
+/// carry distinct keys and stay distinct.
 public struct TranscriptNotice: Identifiable, Equatable, Sendable {
   public let id: String
   public let level: NoticeLevel
