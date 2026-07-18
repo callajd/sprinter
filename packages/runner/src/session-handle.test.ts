@@ -282,6 +282,30 @@ it("translates message session entries into durable EntryAppended records", () =
   );
 });
 
+it("emits durable ToolCall entries for an assistant message's tool-call blocks", () => {
+  // An assistant entry that both says something and calls tools yields the
+  // AssistantMessage entry followed by one durable ToolCall entry per block, so a
+  // client reconciling from EntryAppended has the ToolCall its ToolResult refers to.
+  const withToolCalls = assistantMessage({
+    content: [
+      { type: "text", text: "running it" },
+      { type: "toolCall", id: "call-1", name: "bash", arguments: { cmd: "ls" } },
+      { type: "toolCall", id: "call-2", name: "read", arguments: { path: "a.ts" } },
+    ],
+  });
+  expectTranslation(entry("e6", withToolCalls), [
+    { _tag: "EntryAppended", entry: { _tag: "AssistantMessage", id: "e6", text: "running it" } },
+    {
+      _tag: "EntryAppended",
+      entry: { _tag: "ToolCall", id: "call-1", name: "bash", input: { cmd: "ls" } },
+    },
+    {
+      _tag: "EntryAppended",
+      entry: { _tag: "ToolCall", id: "call-2", name: "read", input: { path: "a.ts" } },
+    },
+  ]);
+});
+
 it("drops non-message session entries", () => {
   expectTranslation(
     {
@@ -319,12 +343,16 @@ it("translates auto-retry into RetryScheduled, truncating a fractional delay", (
     { type: "auto_retry_start", attempt: 2, maxAttempts: 5, delayMs: 1500.7, errorMessage: "429" },
     [{ _tag: "RetryScheduled", attempt: 2, delayMs: 1500, error: "429" }],
   );
-  // A successful retry-end is silent; a failed one surfaces a Notice.
+  // A successful retry-end is silent; a failed one always surfaces a give-up
+  // Notice — using pi's finalError when present, else a synthesized message so a
+  // client watching for give-up never misses it.
   expectTranslation({ type: "auto_retry_end", success: true, attempt: 2 }, []);
   expectTranslation({ type: "auto_retry_end", success: false, attempt: 5, finalError: "gave up" }, [
     { _tag: "Notice", level: "error", message: "gave up" },
   ]);
-  expectTranslation({ type: "auto_retry_end", success: false, attempt: 5 }, []);
+  expectTranslation({ type: "auto_retry_end", success: false, attempt: 5 }, [
+    { _tag: "Notice", level: "error", message: "retry failed after 5 attempt(s)" },
+  ]);
 });
 
 it("translates interactive UI requests to UiRequestRaised", () => {
@@ -648,6 +676,33 @@ it.effect("resolves result as Completed and ends events when pi output closes", 
       }),
     ).pipe(Effect.provide(fake.layer));
   }),
+);
+
+it.effect(
+  "replays recent events and the terminal to a subscriber that attaches after the end",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const handle = yield* make();
+          // Emit events and close BEFORE anyone subscribes.
+          yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
+          yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
+          yield* Queue.end(fake.stdoutRaw);
+
+          // `result` resolves only after the pump published the terminal, so once it
+          // resolves the whole stream (tail + end) is already in the replay window.
+          const result = yield* handle.result;
+          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+
+          // A subscriber attaching now must still replay the retained tail and see
+          // the end (the load-bearing sliding-PubSub replay contract) — not hang.
+          const events = yield* Stream.runCollect(handle.events);
+          expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "SessionIdle" }]);
+        }),
+      ).pipe(Effect.provide(fake.layer));
+    }),
 );
 
 it.effect("resolves result as Failed and fails events on a transport error", () =>

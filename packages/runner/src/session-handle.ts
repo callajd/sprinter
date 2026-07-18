@@ -182,8 +182,32 @@ const translateEntry = (entry: PiSessionEntry): ReadonlyArray<SessionEvent> => {
         id: entry.id,
         text: assistantText(message),
       };
+      // The durable transcript must record the tool calls the assistant issued —
+      // they live as `toolCall` content blocks on the message (D17: EntryAppended
+      // is the transcript-grade record, and a client reconciling from it would
+      // otherwise get orphan ToolResult entries with no matching ToolCall). Emit
+      // the AssistantMessage entry, then one durable ToolCall entry per block.
+      const toolCalls = message.content.reduce<ReadonlyArray<SessionEvent>>(
+        (acc, block) =>
+          block.type === "toolCall"
+            ? [
+                ...acc,
+                {
+                  _tag: "EntryAppended",
+                  entry: {
+                    _tag: "ToolCall",
+                    id: block.id,
+                    name: block.name,
+                    input: block.arguments,
+                  },
+                },
+              ]
+            : acc,
+        [],
+      );
       return [
         { _tag: "EntryAppended", entry: reasoning.length > 0 ? { ...base, reasoning } : base },
+        ...toolCalls,
       ];
     }
     case "toolResult":
@@ -307,9 +331,18 @@ export const translateServerEvent = (event: PiServerEvent): ReadonlyArray<Sessio
         },
       ];
     case "auto_retry_end":
-      return !event.success && event.finalError !== undefined
-        ? [{ _tag: "Notice", level: "error", message: event.finalError }]
-        : [];
+      // A failed retry-end means the agent gave up — always surface it, even when
+      // Pi omits `finalError` (otherwise a client watching for give-up sees
+      // nothing). A successful retry-end needs no neutral signal.
+      return event.success
+        ? []
+        : [
+            {
+              _tag: "Notice",
+              level: "error",
+              message: event.finalError ?? `retry failed after ${event.attempt} attempt(s)`,
+            },
+          ];
     // ── Interactive UI requests ─────────────────────────────────────────────
     case "extension_ui_request":
       return translateUiRequest(event);
