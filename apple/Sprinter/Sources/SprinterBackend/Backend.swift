@@ -30,6 +30,28 @@ public protocol Backend: Sendable {
   /// ``WorkGraphEvent`` fed until the daemon ends the subscription.
   func events() -> AsyncThrowingStream<WorkGraphEvent, any Error>
 
+  // MARK: - Session channel (BE1.2 / D9)
+
+  /// The live session feed: a stream of owned ``SessionEvent`` for `sessionId`
+  /// (turn lifecycle, message/tool deltas, `UiRequestRaised`, …), fed until the
+  /// daemon ends the subscription. An unknown `_tag` is a decode failure, never a
+  /// silent drop.
+  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error>
+
+  /// Drives input INTO a session (a fresh prompt, a mid-turn steer, or a
+  /// follow-up); throws ``ContractError/sessionNotFound(id:)`` for an unknown
+  /// session.
+  func sessionSend(sessionId: SessionId, input: SessionInput) async throws
+
+  /// Interrupts a running session (D9 — every session is interruptible); throws
+  /// ``ContractError/sessionNotFound(id:)`` for an unknown session.
+  func interrupt(sessionId: SessionId) async throws
+
+  /// Answers an outstanding `UiRequestRaised` with the neutral ``UiResponse`` that
+  /// keys the answer to its request id; throws ``ContractError/sessionNotFound(id:)``
+  /// for an unknown session.
+  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws
+
   /// Tears the connection down deterministically: cancels the inbound receive
   /// loop, closes the underlying transport, and fails every in-flight request with
   /// ``BackendError/connectionClosed``. Idempotent. Downstream `.app`/feature
