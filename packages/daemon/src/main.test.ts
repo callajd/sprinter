@@ -77,7 +77,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   databasePath: `${dir}/state.db`,
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
-  repository: { owner: "callajd", repo: "sprinter" },
+  repository: { owner: "callajd", repo: "sprinter", token: "test-token" },
 });
 
 /** The full graph with the leaves substituted by fakes/real-Bun services. */
@@ -92,7 +92,7 @@ const served = (config: DaemonConfig) => appLayer(config).pipe(Layer.provide(ser
 
 // ── configFromEnv ─────────────────────────────────────────────────────────────
 
-it("configFromEnv maps the environment with sensible defaults and an optional token", () => {
+it("configFromEnv maps the environment with sensible defaults and the required token", () => {
   const withToken = configFromEnv({
     SPRINTER_DB: "/var/sprinter.db",
     SPRINTER_SOCKET: "/run/sprinter.sock",
@@ -108,13 +108,21 @@ it("configFromEnv maps the environment with sensible defaults and an optional to
     repository: { owner: "acme", repo: "widgets", token: "ghp_secret" },
   });
 
-  const defaults = configFromEnv({});
+  // Only GITHUB_TOKEN supplied: everything else falls back to the local defaults.
+  const defaults = configFromEnv({ GITHUB_TOKEN: "ghp_secret" });
   expect(defaults.databasePath).toBe("./sprinter.db");
   expect(defaults.socketPath).toBe("./sprinter.sock");
   expect(defaults.workspaceRoot).toBe("./worktrees");
-  expect(defaults.repository).toEqual({ owner: "callajd", repo: "sprinter" });
-  // The token is OMITTED (not `undefined`) when absent (exactOptionalPropertyTypes).
-  expect("token" in defaults.repository).toBe(false);
+  expect(defaults.repository).toEqual({ owner: "callajd", repo: "sprinter", token: "ghp_secret" });
+});
+
+it("configFromEnv FAILS FAST when GITHUB_TOKEN is absent or empty (B1)", () => {
+  // Token-less is not a supported mode: GitHub's GraphQL API 401s every
+  // unauthenticated request, so a token-less daemon would silently never observe an
+  // Issue as landed. Boot must refuse loudly with an actionable message.
+  expect(() => configFromEnv({})).toThrow(/GITHUB_TOKEN is required/);
+  expect(() => configFromEnv({ GITHUB_TOKEN: "" })).toThrow(/GITHUB_TOKEN is required/);
+  expect(() => configFromEnv({ GITHUB_TOKEN: "   " })).toThrow(/GITHUB_TOKEN is required/);
 });
 
 // ── the served graph composes ─────────────────────────────────────────────────
@@ -214,7 +222,9 @@ it("mainLayer assembles the full served graph (transport + boot) without error",
   // proves the production graph — RpcServer over the socket transport, the real
   // Repository, boot reconcile, Bun services — type-checks and assembles as ONE
   // Effect layer graph (INV-EFFECT-DI). The BUILD is exercised below.
-  const layer = mainLayer(configFromEnv({ SPRINTER_SOCKET: "/tmp/sprinter-test.sock" }));
+  const layer = mainLayer(
+    configFromEnv({ SPRINTER_SOCKET: "/tmp/sprinter-test.sock", GITHUB_TOKEN: "ghp_secret" }),
+  );
   expect(layer).toBeDefined();
 });
 

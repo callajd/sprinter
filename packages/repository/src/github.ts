@@ -76,23 +76,38 @@ const GhPull = Schema.Struct({
  * that references it. This retires the timeline `cross-referenced` heuristic
  * (D18, resolved by CE1.3): an unrelated merged PR that only *mentions* a
  * hand-closed Issue is never returned here, so it can no longer be mis-attributed
- * as the closer. `first: 1` — the reconciler consumes a single closing PR and
- * pairs it with a merged-gate (`getPullRequest().merged`); `includeClosedPrs`
- * keeps a closing PR that is itself in a closed state so the gate, not the query,
- * is the final landing check.
+ * as the closer.
+ *
+ * `first: 10` with `includeClosedPrs: true` — the connection can hold MORE than one
+ * reference (an Issue closed by an unmerged PR, reopened, then closed/merged by a
+ * later PR), and a closed-but-UNMERGED reference can sort ahead of the MERGED one.
+ * So we fetch a small page and each node also carries `merged`, and the reconciler's
+ * landing signal is "is there a MERGED closing PR among the nodes" — NOT blindly
+ * `nodes[0]`. `includeClosedPrs` keeps a closing PR that is itself in a closed state
+ * so the merged reference is not filtered away before we can see it.
+ *
+ * VERSION NOTE (NB1): `closedByPullRequestsReferences` exists only on GitHub.com and
+ * on GitHub Enterprise Server at or above the release that shipped it — the field
+ * landed on GitHub.com on 2024-07-16. Older GHE hosts do NOT expose it and this
+ * closing-PR path is unsupported there; there is no runtime guard because Sprinter
+ * targets github.com (D14).
  */
 const CLOSING_PR_QUERY = `query ($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
-      closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
-        nodes { number }
+      closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
+        nodes { number merged }
       }
     }
   }
 }`;
 
-/** A `closedByPullRequestsReferences` node — a PR that closed the Issue. */
-const GhClosingPrNode = Schema.Struct({ number: PositiveInt });
+/**
+ * A `closedByPullRequestsReferences` node — a PR that closed the Issue, with the
+ * `merged` flag GitHub itself reports so the MERGED closing PR can be selected among
+ * several references (NB2) without a second round-trip.
+ */
+const GhClosingPrNode = Schema.Struct({ number: PositiveInt, merged: Schema.Boolean });
 
 /** A single GraphQL `errors[]` entry — only its human-readable `message`. */
 const GhGraphqlError = Schema.Struct({ message: Schema.String });
@@ -128,9 +143,11 @@ const GhClosingPrResponse = Schema.Struct({
 /**
  * Extract the closing PR number from a decoded GraphQL response. A non-empty
  * `errors` array is a real host failure (surfaced as a `message` the caller maps to
- * {@link RepositoryError}); otherwise the first `closedByPullRequestsReferences`
- * node is the closing PR, and its absence (no closing PR, or a missing repo/issue)
- * is `Option.none`.
+ * {@link RepositoryError}); otherwise the MERGED `closedByPullRequestsReferences`
+ * node is the authoritative closing PR (NB2 — a closed-but-unmerged reference can
+ * precede the merged one, so we select on `merged` rather than taking `nodes[0]`),
+ * and the absence of any merged closer (no closing PR, only unmerged references, or
+ * a missing repo/issue) is `Option.none`.
  */
 const closingPrFromResponse = (
   body: (typeof GhClosingPrResponse)["Type"],
@@ -141,8 +158,8 @@ const closingPrFromResponse = (
     });
   }
   const nodes = body.data?.repository?.issue?.closedByPullRequestsReferences.nodes ?? [];
-  const first = nodes[0];
-  return Effect.succeed(first === undefined ? Option.none() : Option.some(first.number));
+  const merged = nodes.find((node) => node.merged);
+  return Effect.succeed(merged === undefined ? Option.none() : Option.some(merged.number));
 };
 
 /**
@@ -150,13 +167,16 @@ const closingPrFromResponse = (
  * `https://api.github.com` with GraphQL at `.../graphql`; a GitHub Enterprise host
  * exposes REST at `https://HOST/api/v3` and GraphQL at `https://HOST/api/graphql`.
  * The `Repository` port is unchanged — this is still the GitHub adapter, just
- * addressing the host's GraphQL surface for the authoritative closing-PR signal.
+ * addressing the host's GraphQL surface for the authoritative closing-PR signal. A
+ * trailing slash on the base (`https://api.github.com/`) is normalized first so the
+ * endpoint is `.../graphql`, never `...//graphql` (NB3).
  */
 const graphqlEndpoint = (baseUrl: string): string => {
+  const normalized = baseUrl.replace(/\/$/, "");
   const enterpriseRest = "/api/v3";
-  return baseUrl.endsWith(enterpriseRest)
-    ? `${baseUrl.slice(0, -enterpriseRest.length)}/api/graphql`
-    : `${baseUrl}/graphql`;
+  return normalized.endsWith(enterpriseRest)
+    ? `${normalized.slice(0, -enterpriseRest.length)}/api/graphql`
+    : `${normalized}/graphql`;
 };
 
 // ============================================================================
@@ -170,10 +190,17 @@ export interface RepositoryConfig {
   /** The repository name, e.g. `"sprinter"`. */
   readonly repo: string;
   /**
-   * A GitHub token for authenticated requests. Omit for anonymous access (public
-   * reads). Sent as a `Bearer` credential; never logged.
+   * A GitHub token for authenticated requests — REQUIRED (B1, CE1.3). Token-less
+   * access is NOT a supported mode: GitHub's GraphQL API rejects ALL unauthenticated
+   * requests with 401 (even on public repos), so the authoritative closing-PR
+   * signal ({@link CLOSING_PR_QUERY}) cannot work anonymously, and the daemon drives
+   * authenticated Issue→PR work regardless. Sent as a `Bearer` credential; never
+   * logged. Must be non-empty — the composition root fails fast at boot when
+   * `GITHUB_TOKEN` is absent, and {@link closingPullRequest} raises a distinct,
+   * loud error if ever invoked with an empty token rather than silently reporting
+   * "no closing PR".
    */
-  readonly token?: string;
+  readonly token: string;
   /**
    * The REST API base URL. Defaults to `https://api.github.com` (GitHub.com); a
    * GitHub Enterprise host overrides it. The port abstraction is unchanged — this
@@ -199,10 +226,13 @@ const make = (config: RepositoryConfig) =>
   Effect.gen(function* () {
     const base = yield* HttpClient.HttpClient;
     const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
+    // The token is REQUIRED (B1) — always authenticate. GitHub's GraphQL endpoint
+    // 401s every unauthenticated request, so a token-less adapter can never observe a
+    // closing PR; token-less is not a supported mode.
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      ...(config.token !== undefined ? { Authorization: `Bearer ${config.token}` } : {}),
+      Authorization: `Bearer ${config.token}`,
     };
     const client = base.pipe(
       HttpClient.mapRequest((request) =>
@@ -257,23 +287,36 @@ const make = (config: RepositoryConfig) =>
 
     const pullRequests: PullRequestOps = {
       closingPullRequest: (issueNumber) =>
-        base
-          .execute(
-            HttpClientRequest.post(graphqlUrl).pipe(
-              HttpClientRequest.setHeaders(headers),
-              HttpClientRequest.bodyJsonUnsafe({
-                query: CLOSING_PR_QUERY,
-                variables: { owner: config.owner, repo: config.repo, number: issueNumber },
+        // Belt-and-suspenders (B1): a token-less GraphQL POST 401s, and the reconcile
+        // isolation would fold that into `failures` — indistinguishable from "no
+        // closing PR", silently starving the roll-up. So an empty token is refused
+        // here with a DISTINCT, loud error (never `Option.none`), backing up the
+        // boot-time fail-fast in the daemon composition root.
+        config.token.trim() === ""
+          ? Effect.fail(
+              new RepositoryError({
+                operation: "closingPullRequest",
+                detail:
+                  "a GitHub token is required (set GITHUB_TOKEN); GitHub's GraphQL API rejects unauthenticated requests with 401",
               }),
-            ),
-          )
-          .pipe(
-            Effect.flatMap(HttpClientResponse.filterStatusOk),
-            Effect.flatMap((response) => response.json),
-            Effect.flatMap(Schema.decodeUnknownEffect(GhClosingPrResponse)),
-            Effect.flatMap(closingPrFromResponse),
-            Effect.mapError(fail("closingPullRequest")),
-          ),
+            )
+          : base
+              .execute(
+                HttpClientRequest.post(graphqlUrl).pipe(
+                  HttpClientRequest.setHeaders(headers),
+                  HttpClientRequest.bodyJsonUnsafe({
+                    query: CLOSING_PR_QUERY,
+                    variables: { owner: config.owner, repo: config.repo, number: issueNumber },
+                  }),
+                ),
+              )
+              .pipe(
+                Effect.flatMap(HttpClientResponse.filterStatusOk),
+                Effect.flatMap((response) => response.json),
+                Effect.flatMap(Schema.decodeUnknownEffect(GhClosingPrResponse)),
+                Effect.flatMap(closingPrFromResponse),
+                Effect.mapError(fail("closingPullRequest")),
+              ),
       getPullRequest: (number) =>
         client.execute(HttpClientRequest.get(`${repoPath}/pulls/${number}`)).pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
