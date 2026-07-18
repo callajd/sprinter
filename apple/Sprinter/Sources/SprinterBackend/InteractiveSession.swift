@@ -37,6 +37,10 @@ public final class InteractiveSession {
   public private(set) var outstandingRequests: [OutstandingUiRequest] = []
   /// Whether the live feed is currently subscribed.
   public private(set) var isRunning = false
+  /// The error that terminated the feed, when it ended abnormally — a transport
+  /// drop or a failure `Exit`. `nil` after a clean end (the session ended) or an
+  /// intentional ``stop()``, so a view can distinguish "ended" from "dropped".
+  public private(set) var terminationError: (any Error)?
 
   private let backend: any Backend
   private let sessionId: SessionId
@@ -51,6 +55,7 @@ public final class InteractiveSession {
   public func start() {
     guard feed == nil else { return }
     isRunning = true
+    terminationError = nil
     feed = Task { @MainActor [weak self] in
       guard let self else { return }
       do {
@@ -58,7 +63,12 @@ public final class InteractiveSession {
           self.ingest(event)
         }
       } catch {
-        // The feed ended (a drop or a failure exit); reflected by `isRunning`.
+        // A transport drop or a failure `Exit` — surface it (unless this is an
+        // intentional `stop()` cancellation) so a consumer can tell "dropped" from
+        // a clean "ended".
+        if !Task.isCancelled {
+          self.terminationError = error
+        }
       }
       self.isRunning = false
       self.feed = nil
@@ -85,6 +95,9 @@ public final class InteractiveSession {
   /// Answers an outstanding UI request by id and clears it once the daemon
   /// accepts the reply — the `extension_ui_request` round-trip.
   public func answer(requestId: String, _ answer: UiAnswer) async throws {
+    // Only answer an actually-outstanding request — never send for an unknown or
+    // already-answered id (which would let a caller double-answer).
+    guard outstandingRequests.contains(where: { $0.id == requestId }) else { return }
     let response = UiResponse(requestId: requestId, answer: answer)
     try await backend.answerUiRequest(sessionId: sessionId, response: response)
     outstandingRequests.removeAll { $0.id == requestId }

@@ -6,17 +6,28 @@ import SprinterContract
 ///
 /// It is expressed purely on the ``Backend`` port (INV-PORT): construction takes a
 /// `connect` seam that yields a freshly connected ``Backend`` per attempt, so the
-/// engine never names a transport or where the daemon runs. Each attempt runs the
-/// **snapshot-then-stream resync**: fetch the `snapshot` baseline FIRST, publish
-/// it, THEN subscribe to live `events`, folding each delta onto the baseline with
-/// ``SnapshotReconciler`` and publishing the updated state. Because every
-/// published value is a full baseline-consistent ``Snapshot`` (never a bare
-/// delta), a slow consumer can coalesce to the latest without losing information.
+/// engine never names a transport or where the daemon runs. Each attempt
+/// **subscribes AROUND the snapshot read** (D4): it starts the live `events` reader
+/// FIRST (buffering deltas into ``BoundedDeltaQueue``), THEN fetches the `snapshot`
+/// baseline, THEN folds the buffered + live deltas onto it with
+/// ``SnapshotReconciler``. This is the ordering the daemon's own `events` handler
+/// requires (`changes` subscribes lazily and does not replay pre-subscribe deltas,
+/// so a client must subscribe before/around the snapshot). Reconcile is idempotent
+/// (upsert-by-id), so a buffered delta already reflected in the snapshot is a
+/// harmless re-apply — not a double-count. Every published value is a full
+/// baseline-consistent ``Snapshot`` (never a bare delta), so a slow consumer can
+/// coalesce to the latest without losing information.
 ///
 /// A dropped connection, a clean end, or a bounded-buffer overflow all re-run
-/// snapshot-then-subscribe: a fresh snapshot re-derives the baseline and live
-/// events resume, so the exposed state is always snapshot-consistent and never
-/// delta-only (which could miss the pre-subscribe gap).
+/// subscribe-around-snapshot: a fresh snapshot re-derives the baseline and live
+/// events resume.
+///
+/// **Residual (deferred).** Subscribing around the snapshot closes the gross
+/// snapshot-then-subscribe window, but COMPLETE gap-freeness across a long
+/// disconnect needs durable **offset-based replay** (the daemon's AE5
+/// `EventLogStore.tail`) so the client resumes from its last-seen offset rather
+/// than re-deriving from a fresh snapshot. That offset resync is convergence-layer
+/// work (the daemon defers it too) — see the workstream ledger.
 ///
 /// The un-reconciled delta backlog is bounded by ``BoundedDeltaQueue``: if the
 /// reconciler falls behind BE1.1's ack-on-receipt `events` stream, the overflow
@@ -76,7 +87,12 @@ public actor WorkGraphResync {
   /// the first call; terminating the returned stream stops the loop. A second call
   /// returns an already-finished stream (single consumer).
   public func states() -> AsyncStream<Snapshot> {
-    let (stream, continuation) = AsyncStream<Snapshot>.makeStream()
+    // `.bufferingNewest(1)` makes "coalesce to latest" real: a slow consumer that
+    // reads only via `states()` (no `observer` backpressure) keeps just the newest
+    // baseline-consistent snapshot rather than an unbounded backlog of full
+    // `Snapshot`s — each published value already supersedes the prior one.
+    let (stream, continuation) = AsyncStream<Snapshot>.makeStream(
+      bufferingPolicy: .bufferingNewest(1))
     guard !started else {
       continuation.finish()
       return stream
@@ -112,66 +128,62 @@ public actor WorkGraphResync {
     continuation.finish()
   }
 
-  /// One snapshot-then-subscribe attempt. Any failure (snapshot error, transport
-  /// drop, or bounded-buffer overflow) returns so the loop reconnects.
+  /// One subscribe-around-snapshot attempt: start the `events` reader FIRST (so
+  /// deltas emitted during the snapshot read are buffered), fetch the `snapshot`
+  /// baseline, then fold buffered + live deltas onto it. Any failure (snapshot
+  /// error, transport drop, or bounded-buffer overflow) returns so the loop
+  /// reconnects.
   private func runAttempt(
     _ backend: any Backend,
     _ continuation: AsyncStream<Snapshot>.Continuation
   ) async {
-    do {
-      let base = try await backend.snapshot()
-      await publish(base, to: continuation)
-      try await consume(backend, base: base, to: continuation)
-    } catch {
-      // Reconnect: the next attempt re-fetches a fresh baseline.
-    }
-  }
-
-  /// Publishes the baseline, then folds live deltas onto it through the bounded
-  /// buffer. Throws on drop/overflow so the caller reconnects.
-  private func consume(
-    _ backend: any Backend,
-    base: Snapshot,
-    to continuation: AsyncStream<Snapshot>.Continuation
-  ) async throws {
     let queue = BoundedDeltaQueue<WorkGraphEvent>(limit: bufferLimit)
-    try await withThrowingTaskGroup(of: Void.self) { group in
-      group.addTask {
-        do {
-          for try await event in backend.events() {
-            try await queue.enqueue(event)
+    // Establish the subscription BEFORE the snapshot request (subscribe-around-
+    // snapshot): on the connection's serialized send path this issues the `events`
+    // Request ahead of `snapshot`, so the daemon attaches the live subscription
+    // before it builds the baseline.
+    let events = backend.events()
+    do {
+      try await withThrowingTaskGroup(of: Void.self) { group in
+        // Reader: buffer live deltas into the bounded queue from the moment the
+        // subscription is live — including any emitted while the snapshot is read.
+        group.addTask {
+          do {
+            for try await event in events {
+              try await queue.enqueue(event)
+            }
+            await queue.finish()
+          } catch {
+            // A transport drop or a bounded-buffer overflow: unblock the reconciler
+            // (so the group can tear down) and surface the failure to reconnect.
+            await queue.finish()
+            throw error
           }
-          await queue.finish()
+        }
+        // Folder: fetch the baseline, publish it, then fold buffered + live deltas.
+        // Reconcile is idempotent, so a buffered delta already in the snapshot is a
+        // harmless re-apply.
+        group.addTask { [reconciler, observer] in
+          let base = try await backend.snapshot()
+          await observer?(base)
+          continuation.yield(base)
+          var state = base
+          while let event = await queue.next() {
+            state = reconciler.reconcile(state, applying: event)
+            await observer?(state)
+            continuation.yield(state)
+          }
+        }
+        do {
+          try await group.next()
         } catch {
-          // A transport drop or a bounded-buffer overflow: unblock the reconciler
-          // (so the group can tear down) and surface the failure to reconnect.
-          await queue.finish()
+          group.cancelAll()
           throw error
         }
-      }
-      group.addTask { [reconciler, observer] in
-        var state = base
-        while let event = await queue.next() {
-          state = reconciler.reconcile(state, applying: event)
-          await observer?(state)
-          continuation.yield(state)
-        }
-      }
-      do {
-        try await group.next()
-      } catch {
         group.cancelAll()
-        throw error
       }
-      group.cancelAll()
+    } catch {
+      // Reconnect: the next attempt re-subscribes and re-fetches a fresh baseline.
     }
-  }
-
-  private func publish(
-    _ state: Snapshot,
-    to continuation: AsyncStream<Snapshot>.Continuation
-  ) async {
-    await observer?(state)
-    continuation.yield(state)
   }
 }

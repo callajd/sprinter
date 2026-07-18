@@ -6,11 +6,13 @@ import Testing
 
 @Suite("Reconnect / snapshot-then-stream resync")
 struct WorkGraphResyncTests {
-  /// The core D4 property: on (re)connect the engine fetches the `snapshot`
-  /// baseline FIRST, publishes it, then folds live deltas onto it — and a dropped
-  /// connection re-runs snapshot-then-subscribe (a fresh baseline), never a
-  /// delta-only stream. Driven in lockstep so every published state is observed
-  /// (no missed / duplicated state).
+  /// The core D4 property: on (re)connect the engine subscribes AROUND the snapshot
+  /// read — it issues both the `events` subscription and the `snapshot` request,
+  /// publishes the baseline, then folds live deltas onto it — and a dropped
+  /// connection re-runs subscribe-around-snapshot (a fresh baseline), never a
+  /// delta-only stream. The two requests race on the wire at this layer, so the
+  /// test responds by request TAG, not by order. Driven in lockstep so every
+  /// published state is observed (no missed / duplicated state).
   @Test("reconnect re-fetches the snapshot then resumes live events")
   func reconnectResync() async throws {
     let harness = ReconnectHarness()
@@ -18,34 +20,34 @@ struct WorkGraphResyncTests {
     var transports = harness.transports.makeAsyncIterator()
     var states = await engine.states().makeAsyncIterator()
 
-    // ── Attempt 1: snapshot baseline, then one live delta ──
+    // ── Attempt 1: the engine issues events + snapshot (order not wire-guaranteed) ──
     let first = try #require(await transports.next())
     var out1 = first.outbound.makeAsyncIterator()
-    let snapshotRequest = try await nextSent(&out1)
-    #expect(snapshotRequest.rpcTag == "snapshot")
+    let byTag1 = try await requestsByTag(&out1)
+    let snapshotRequest = try #require(byTag1["snapshot"])
+    let eventsRequest = try #require(byTag1["events"])
+
+    // Baseline first (the folder publishes the snapshot before folding deltas).
     first.emit(
       Wire.exitSuccess(
         requestId: try #require(snapshotRequest.id), value: try Wire.encoded(Fixtures.snapshot)))
     #expect(await states.next() == Fixtures.snapshot)
 
-    let eventsRequest = try await nextSent(&out1)
-    #expect(eventsRequest.rpcTag == "events")
+    // One live delta upserts the issue onto the baseline — applied, not missed.
     first.emit(
       Wire.chunk(
         requestId: try #require(eventsRequest.id),
         values: [try Wire.encoded(WorkGraphEvent.issueChanged(Fixtures.issueInReview))]))
-    // The delta upserts the issue onto the baseline — applied, not missed.
     let reconciled = try #require(await states.next())
     #expect(reconciled.issues == [Fixtures.issueInReview])
 
     // ── Drop the connection ──
     first.close()
 
-    // ── Attempt 2: a fresh baseline is re-fetched (snapshot-then-subscribe) ──
+    // ── Attempt 2: a fresh baseline is re-fetched (subscribe-around-snapshot) ──
     let second = try #require(await transports.next())
     var out2 = second.outbound.makeAsyncIterator()
-    let reconnectSnapshot = try await nextSent(&out2)
-    #expect(reconnectSnapshot.rpcTag == "snapshot")
+    let reconnectSnapshot = try #require(try await requestsByTag(&out2)["snapshot"])
     second.emit(
       Wire.exitSuccess(
         requestId: try #require(reconnectSnapshot.id),
@@ -54,6 +56,21 @@ struct WorkGraphResyncTests {
 
     await engine.stop()
     second.close()
+  }
+
+  /// Reads the two requests one attempt issues (`events` + `snapshot`, order not
+  /// wire-guaranteed) and indexes them by rpc tag.
+  private func requestsByTag(
+    _ outbound: inout AsyncStream<Data>.Iterator
+  ) async throws -> [String: SentFrame] {
+    var byTag: [String: SentFrame] = [:]
+    for _ in 0..<2 {
+      let frame = try await nextSent(&outbound)
+      if let tag = frame.rpcTag {
+        byTag[tag] = frame
+      }
+    }
+    return byTag
   }
 
   /// The carried #36 F1 recovery: when the reconciler stalls behind BE1.1's
@@ -79,14 +96,15 @@ struct WorkGraphResyncTests {
     let states = await engine.states()
 
     // Attempt 1: answer the snapshot, then flood deltas past the bound while the
-    // reconciler is stalled.
+    // reconciler is stalled (requests race on the wire — index by tag).
     let first = try #require(await transports.next())
     var out1 = first.outbound.makeAsyncIterator()
+    let byTag1 = try await requestsByTag(&out1)
     first.emit(
       Wire.exitSuccess(
-        requestId: try #require(try await nextSent(&out1).id),
+        requestId: try #require(byTag1["snapshot"]?.id),
         value: try Wire.encoded(Fixtures.snapshot)))
-    let eventsId = try #require(try await nextSent(&out1).id)
+    let eventsId = try #require(byTag1["events"]?.id)
     let delta = try Wire.encoded(Fixtures.issueEvent)
     first.emit(Wire.chunk(requestId: eventsId, values: [delta, delta, delta]))
 
@@ -94,7 +112,7 @@ struct WorkGraphResyncTests {
     // a fresh snapshot — the resync recovery.
     let second = try #require(await transports.next())
     var out2 = second.outbound.makeAsyncIterator()
-    #expect(try await nextSent(&out2).rpcTag == "snapshot")
+    #expect(try await requestsByTag(&out2)["snapshot"] != nil)
 
     await engine.stop()
     first.close()

@@ -38,6 +38,31 @@ struct SessionChannelTests {
     transport.close()
   }
 
+  @Test("sessionEvents surfaces the mirrored SessionNotFound off a failure Exit")
+  func sessionEventsSessionNotFound() async throws {
+    let transport = FakeTransport()
+    let backend = RpcBackend(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    // The contract declares `error: SessionNotFound` on the sessionEvents STREAM —
+    // a failure Exit must surface the mirrored ContractError through the stream.
+    let collector = Task { () -> [SessionEvent] in
+      var events: [SessionEvent] = []
+      for try await event in backend.sessionEvents(sessionId: Fixtures.sessionId) {
+        events.append(event)
+      }
+      return events
+    }
+    let id = try #require(try await nextSent(&outbound).id)
+    transport.emit(
+      Wire.exitFail(requestId: id, error: #"{"_tag":"SessionNotFound","id":"sess-1"}"#))
+
+    await #expect(throws: ContractError.sessionNotFound(id: Fixtures.sessionId)) {
+      _ = try await collector.value
+    }
+    transport.close()
+  }
+
   @Test("sessionSend sends the input payload and resolves on void success")
   func sessionSend() async throws {
     let transport = FakeTransport()
