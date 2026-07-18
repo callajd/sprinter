@@ -25,6 +25,10 @@ let package = Package(
     // The platform-neutral RPC-contract mirror (FE2.4). No AppKit/UIKit — client
     // shells (macOS, later iOS) consume it as a plain SwiftPM library.
     .library(name: "SprinterContract", targets: ["SprinterContract"]),
+    // The Swift RPC client + `Backend` port (BE1.1): the transport-generic
+    // envelope framing over the frozen `SprinterContract` DTOs, behind the
+    // `Backend` seam feature code depends on (INV-PORT / INV-CONTRACT).
+    .library(name: "SprinterBackend", targets: ["SprinterBackend"]),
   ],
   dependencies: [
     // SwiftLint pinned via SPM plugin so the linter version is locked in
@@ -55,6 +59,22 @@ let package = Package(
       name: "SprinterContractTests",
       dependencies: ["SprinterContract"],
       resources: [.copy("Goldens")],
+      swiftSettings: swiftSettings
+    ),
+    // The RPC client + `Backend` port (BE1.1). Speaks the `effect/unstable/rpc`
+    // envelope (NDJSON-framed) over an INJECTED transport; reuses the frozen
+    // `SprinterContract` message DTOs and adds only the transport envelope.
+    // Foundation only, platform-neutral (no new SPM deps, INV-PIN).
+    .target(
+      name: "SprinterBackend",
+      dependencies: ["SprinterContract"],
+      swiftSettings: swiftSettings
+    ),
+    // Envelope + framing + client + port tested against a FAKE in-memory
+    // transport — deterministic and offline, no live daemon/network in the gate.
+    .testTarget(
+      name: "SprinterBackendTests",
+      dependencies: ["SprinterBackend"],
       swiftSettings: swiftSettings
     ),
   ]
