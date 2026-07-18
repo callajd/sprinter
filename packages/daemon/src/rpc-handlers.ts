@@ -108,6 +108,13 @@ const slugify = (name: string): string =>
  * A blank spec, or a name that yields no slug, is a {@link PlanRejected}. The
  * epic/issue breakdown is produced later by a planning Job — a fresh workstream
  * has an empty `epics` list, so FK/child-list consistency holds trivially.
+ *
+ * The id is derived from BOTH the plan name and its repo (a workstream is
+ * repo-scoped, D14), so the same name for different repos does not collide. And
+ * because `putWorkstream` is an UPSERT, a create whose id already exists would
+ * silently clobber the existing workstream — resetting its `name`/`repo` and its
+ * `epics` list while the epics' FK rows persist (a parentage desync). The contract
+ * materializes a NEW workstream, so a colliding create is rejected, not upserted.
  */
 const materialize = (
   store: Store,
@@ -123,8 +130,17 @@ const materialize = (
         new PlanRejected({ reason: "cannot derive a workstream id from the plan name" }),
       );
     }
-    // `ws-<slug>` is non-empty by construction, so the branded decode cannot fail.
-    const id = yield* Schema.decodeUnknownEffect(WorkstreamId)(`ws-${slug}`).pipe(Effect.orDie);
+    const repoSlug = slugify(plan.repo);
+    // Both parts are slugified; `ws-<slug>[-<repoSlug>]` is non-empty by
+    // construction, so the branded decode cannot fail.
+    const idString = repoSlug.length > 0 ? `ws-${slug}-${repoSlug}` : `ws-${slug}`;
+    const id = yield* Schema.decodeUnknownEffect(WorkstreamId)(idString).pipe(Effect.orDie);
+    const existing = yield* store.workGraph.getWorkstream(id).pipe(Effect.orDie);
+    if (Option.isSome(existing)) {
+      return yield* Effect.fail(
+        new PlanRejected({ reason: "a workstream already exists for this plan name and repo" }),
+      );
+    }
     const workstream: Workstream = {
       id,
       name: plan.name,
@@ -151,7 +167,15 @@ const dispatchInBackground = (runner: Runner, scope: Scope, job: Job): Effect.Ef
     Effect.asVoid,
   );
 
-/** Lifecycle status a workstream takes on for each control action. */
+/**
+ * Lifecycle status a workstream takes on for each control action. NOTE (AE4.1
+ * scope): `pause`/`cancel` are status-only here — they transition the workstream
+ * node but do NOT interrupt an in-flight session (that rides on the session
+ * `interrupt` channel, AE4.2) nor roll status down to epics/issues/jobs. `cancel`
+ * maps to `done` because the FROZEN `WorkStatus` (D-contract, INV-CONTRACT) has no
+ * `cancelled` variant — a cancelled workstream is indistinguishable from a completed
+ * one until a contract v2 adds one.
+ */
 const statusFor: Record<ControlAction, WorkStatus> = {
   start: "active",
   resume: "active",
@@ -219,6 +243,12 @@ const freshJobFor = (issueId: IssueId): Effect.Effect<Job> =>
  * the issue's most recent persisted Job — which carries its `sessionId`, so the
  * `JobRunner` re-attaches to the SAME session (1 Job = 1 session) — or mints a
  * fresh implement Job when the issue has never been dispatched.
+ *
+ * "Most recent" is `listJobsForIssue`'s last row (ordered by id); under the current
+ * one-job-per-issue `job-<issueId>` scheme that IS the issue's only Job. A retry of
+ * a Job still IN FLIGHT (queued/running) is a no-op — re-dispatching it would fork a
+ * second `dispatch` racing the same session rows; retry acts only on a terminal or
+ * absent Job.
  */
 const retry = (
   store: Store,
@@ -233,6 +263,9 @@ const retry = (
     }
     const jobs = yield* store.jobs.listJobsForIssue(issueId).pipe(Effect.orDie);
     const existing = jobs.at(-1);
+    if (existing !== undefined && (existing.status === "queued" || existing.status === "running")) {
+      return;
+    }
     const job = existing ?? (yield* freshJobFor(issueId));
     yield* dispatchInBackground(runner, scope, job);
   });
@@ -253,6 +286,12 @@ export const handlers = SprinterRpc.toLayer(
     const scope = yield* Effect.scope;
     return {
       snapshot: () => buildSnapshot(store),
+      // Live work-graph deltas. `changes` subscribes lazily (on first pull), so a
+      // delta emitted between a client's `snapshot` and its `events` stream
+      // attaching can be missed: a client must treat `snapshot` as the baseline and
+      // reconcile deltas onto it (D4), subscribing before/around the snapshot read.
+      // A durable offset-based resync via `EventLogStore.tail` (D17 reconciliation)
+      // is AE5's to wire — see the workstream ledger.
       events: () => feed.changes,
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>

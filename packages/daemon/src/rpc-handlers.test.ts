@@ -160,7 +160,8 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
       const id = yield* client.createWorkstreamFromPlan({
         plan: { name: "Payments Revamp", repo: "callajd/sprinter", spec: "ship it" },
       });
-      expect(id).toBe("ws-payments-revamp");
+      // The id is derived from BOTH the name and the (repo-scoped, D14) repo.
+      expect(id).toBe("ws-payments-revamp-callajd-sprinter");
 
       const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(id));
       expect(persisted.name).toBe("Payments Revamp");
@@ -197,6 +198,43 @@ it.effect("createWorkstreamFromPlan rejects a name with no derivable id", () =>
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PlanRejected);
       expect(error.reason).toBe("cannot derive a workstream id from the plan name");
+    }),
+  ),
+);
+
+it.effect("createWorkstreamFromPlan rejects a colliding create rather than clobbering", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      const plan = { name: "Payments Revamp", repo: "callajd/sprinter", spec: "v1" } as const;
+      const id = yield* client.createWorkstreamFromPlan({ plan });
+
+      // A second create with the same name+repo must NOT upsert-clobber the first
+      // (which would reset its name/repo/epics) — it is rejected.
+      const error = yield* client
+        .createWorkstreamFromPlan({ plan: { ...plan, name: "Payments Revamp", spec: "v2" } })
+        .pipe(Effect.flip);
+      expect(error).toBeInstanceOf(PlanRejected);
+      expect(error.reason).toBe("a workstream already exists for this plan name and repo");
+
+      // The original workstream is intact.
+      const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(id));
+      expect(persisted.name).toBe("Payments Revamp");
+    }),
+  ),
+);
+
+it.effect("createWorkstreamFromPlan does not collide the same name across different repos", () =>
+  harness(({ client }) =>
+    Effect.gen(function* () {
+      const a = yield* client.createWorkstreamFromPlan({
+        plan: { name: "Revamp", repo: "callajd/one", spec: "s" },
+      });
+      const b = yield* client.createWorkstreamFromPlan({
+        plan: { name: "Revamp", repo: "callajd/two", spec: "s" },
+      });
+      // Repo-scoped ids (D14): the same name for different repos yields distinct
+      // workstreams, not a silent overwrite.
+      expect(a).not.toBe(b);
     }),
   ),
 );
@@ -300,6 +338,27 @@ it.effect("retryIssue mints a fresh implement job when the issue has none", () =
   ),
 );
 
+it.effect("retryIssue is a no-op when the issue's latest job is still in flight", () =>
+  harness(({ client, store, dispatched }) =>
+    Effect.gen(function* () {
+      yield* seedGraph(store);
+      const runningJob = Schema.decodeUnknownSync(Job)({
+        id: "job-1",
+        issueId: "iss-1",
+        kind: "implement",
+        status: "running",
+        sessionId: "ses-1",
+      });
+      yield* store.jobs.putJob(runningJob);
+
+      // Retrying a running job must NOT fork a second dispatch racing the same
+      // session rows — nothing is dispatched.
+      yield* client.retryIssue({ issueId: issue.id });
+      expect(yield* Queue.size(dispatched)).toBe(0);
+    }),
+  ),
+);
+
 it.effect("retryIssue fails with IssueNotFound for an unknown issue", () =>
   harness(({ client }) =>
     Effect.gen(function* () {
@@ -313,22 +372,24 @@ it.effect("retryIssue fails with IssueNotFound for an unknown issue", () =>
 // ── events (streaming, INV-REACTIVE) ─────────────────────────────────────────
 
 it.effect("events streams a work-graph delta produced by a command", () =>
-  harness(({ client }) =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
+      yield* seedGraph(store);
       const collector = yield* client
         .events()
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
-      // Drive the command until the (lazily-subscribing) events stream attaches.
+      // Drive a REPEATABLE command until the (lazily-subscribing) events stream
+      // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
+      // call (idempotent), unlike `createWorkstreamFromPlan` which now rejects a
+      // second create for the same workstream.
       yield* client
-        .createWorkstreamFromPlan({
-          plan: { name: "Reactive", repo: "callajd/sprinter", spec: "stream me" },
-        })
+        .control({ workstreamId: workstream.id, action: "start" })
         .pipe(Effect.andThen(Effect.yieldNow), Effect.forever, Effect.forkChild);
 
       const delta = Option.getOrThrow(yield* Fiber.join(collector));
       expect(delta._tag).toBe("WorkstreamChanged");
       if (delta._tag !== "WorkstreamChanged") throw new Error("expected WorkstreamChanged");
-      expect(delta.workstream.id).toBe("ws-reactive");
+      expect(delta.workstream.id).toBe("ws-1");
     }),
   ),
 );
