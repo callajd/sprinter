@@ -12,6 +12,14 @@ later iOS) client shells consume it as a plain SwiftPM library.
 This is the **divergence gate**: once this mirror decodes contract v1, Track A
 (daemon) and Track B (UI) proceed against the frozen contract.
 
+**Scope — message DTOs, not the transport envelope.** The mirror and its goldens
+cover the contract's *message bodies* (`Schema.encode` output of each payload),
+**not** the `RpcGroup` transport framing around them — request ids, the streaming
+envelope, error-vs-success framing. That wire framing is the client's concern and
+is built in Track B (the RPC client that speaks `effect/unstable/rpc` over a
+transport). So "decodes the same bytes" here means the same *message* bytes, not
+the full on-the-wire RPC frame.
+
 ## Wire-shape mapping (contract → Swift)
 
 | Contract (`effect/Schema`)        | Swift mirror                                             |

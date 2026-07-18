@@ -10,6 +10,10 @@
 public enum JSONValue: Codable, Equatable, Sendable {
   case null
   case bool(Bool)
+  // All JSON numbers decode to `Double`: the integer/float distinction is not
+  // preserved and integers above 2^53 lose precision. These tool payloads are
+  // receive-only and opaque (rendered, not re-serialized), so this is acceptable;
+  // add an integer case if a consumer ever needs lossless large-integer round-trip.
   case number(Double)
   case string(String)
   case array([JSONValue])
