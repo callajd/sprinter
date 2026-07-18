@@ -1,0 +1,157 @@
+import Foundation
+import SprinterBackend
+import SprinterContract
+
+/// A deterministic, offline fake ``Backend`` for BE3.1's session view-model tests.
+///
+/// It vends a **fresh** live ``SessionEvent`` feed on each `sessionEvents` call
+/// (modelling BE1's single-consumer feed re-subscribed on a restart), keeping the
+/// latest stream's continuation so a test can `emit`/`finish`/`fail` the current
+/// feed. It records every `sessionSend`/`interrupt`/`answerUiRequest` it observes
+/// on inspectable streams so a test can assert the exact input/response was driven
+/// back — all without a daemon or network. Every call for a session id other than
+/// the known one throws ``ContractError/sessionNotFound(id:)``, so the not-found
+/// path is exercised too.
+final class SessionFakeBackend: Backend {
+  private let knownSession: SessionId
+
+  /// Lock-guarded mutable feed state — the latest vended feed's continuation and
+  /// the count of feeds vended (a restart re-subscribes, so this increments).
+  private let feed = Locked(FeedState())
+
+  /// Every `sessionSend` observed, in call order.
+  let sent: AsyncStream<SessionInput>
+  private let sentContinuation: AsyncStream<SessionInput>.Continuation
+  /// Every `interrupt` observed, in call order.
+  let interrupted: AsyncStream<SessionId>
+  private let interruptedContinuation: AsyncStream<SessionId>.Continuation
+  /// Every `answerUiRequest` observed, in call order.
+  let answered: AsyncStream<UiResponse>
+  private let answeredContinuation: AsyncStream<UiResponse>.Continuation
+
+  init(knownSession: SessionId) {
+    self.knownSession = knownSession
+    (sent, sentContinuation) = AsyncStream.makeStream()
+    (interrupted, interruptedContinuation) = AsyncStream.makeStream()
+    (answered, answeredContinuation) = AsyncStream.makeStream()
+    // Prepare the first feed eagerly so its buffer is live before the model's feed
+    // task subscribes — an `emit` right after `start()` is buffered, not lost.
+    let (stream, continuation) = AsyncThrowingStream<SessionEvent, any Error>.makeStream()
+    feed.withLock {
+      $0.pending = stream
+      $0.continuation = continuation
+    }
+  }
+
+  /// The number of live feeds vended so far (one per `start`; a restart adds one).
+  var feedCount: Int { feed.withLock { $0.count } }
+
+  /// Raises one event on the current live feed.
+  func emit(_ event: SessionEvent) {
+    feed.withLock { _ = $0.continuation?.yield(event) }
+  }
+
+  /// Ends the current live feed cleanly (the session ended).
+  func finish() {
+    feed.withLock { $0.continuation?.finish() }
+  }
+
+  /// Drops the current live feed with an error (a transport drop / failure `Exit`).
+  func fail(_ error: any Error) {
+    feed.withLock { $0.continuation?.finish(throwing: error) }
+  }
+
+  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+    guard sessionId == knownSession else {
+      return AsyncThrowingStream {
+        $0.finish(throwing: ContractError.sessionNotFound(id: sessionId))
+      }
+    }
+    return feed.withLock { state in
+      state.count += 1
+      // Vend the eagerly-prepared feed on the first subscribe; a restart
+      // (re-subscribe) gets a FRESH stream, modelling BE1's per-(re)start feed.
+      if let pending = state.pending {
+        state.pending = nil
+        return pending
+      }
+      let (stream, continuation) = AsyncThrowingStream<SessionEvent, any Error>.makeStream()
+      state.continuation = continuation
+      return stream
+    }
+  }
+
+  func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
+    try requireKnown(sessionId)
+    sentContinuation.yield(input)
+  }
+
+  func interrupt(sessionId: SessionId) async throws {
+    try requireKnown(sessionId)
+    interruptedContinuation.yield(sessionId)
+  }
+
+  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
+    try requireKnown(sessionId)
+    answeredContinuation.yield(response)
+  }
+
+  func close() async {
+    feed.withLock { $0.continuation?.finish() }
+    sentContinuation.finish()
+    interruptedContinuation.finish()
+    answeredContinuation.finish()
+  }
+
+  private func requireKnown(_ sessionId: SessionId) throws {
+    guard sessionId == knownSession else { throw ContractError.sessionNotFound(id: sessionId) }
+  }
+
+  private struct FeedState {
+    /// The eagerly-prepared first feed, vended on the first `sessionEvents` call.
+    var pending: AsyncThrowingStream<SessionEvent, any Error>?
+    /// The latest vended feed's continuation, targeted by `emit`/`finish`/`fail`.
+    var continuation: AsyncThrowingStream<SessionEvent, any Error>.Continuation?
+    var count = 0
+  }
+
+  // MARK: - Unused board / write surface (the session model only uses the session channel)
+
+  func snapshot() async throws -> Snapshot {
+    throw ContractError.planRejected(reason: "unsupported in SessionFakeBackend")
+  }
+
+  func createWorkstreamFromPlan(_ plan: WorkstreamPlan) async throws -> WorkstreamId {
+    throw ContractError.planRejected(reason: "unsupported in SessionFakeBackend")
+  }
+
+  func control(workstreamId: WorkstreamId, action: ControlAction) async throws {
+    throw ContractError.workstreamNotFound(id: workstreamId)
+  }
+
+  func retryIssue(issueId: IssueId) async throws {
+    throw ContractError.issueNotFound(id: issueId)
+  }
+
+  func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
+    AsyncThrowingStream { $0.finish() }
+  }
+}
+
+/// A minimal lock-guarded box, so the fake's mutable feed state is safely shared
+/// across the (nonisolated) `Backend` calls without opting out of concurrency
+/// checking beyond this one audited boundary.
+private final class Locked<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: Value
+
+  init(_ value: Value) {
+    self.value = value
+  }
+
+  func withLock<Result>(_ body: (inout Value) -> Result) -> Result {
+    lock.lock()
+    defer { lock.unlock() }
+    return body(&value)
+  }
+}
