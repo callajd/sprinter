@@ -27,9 +27,17 @@ SOURCES_DIR = Path(__file__).resolve().parent.parent / "Sources"
 
 # Shipped sources exempt from the presence requirement, each needing a written
 # justification (policy.md §Coverage: exclusions must be explicitly justified —
-# generated code, app entry points, pure view layout with no logic). Empty
-# today; add a `/Sources/...`-suffixed path with a comment saying why.
-EXEMPT_SOURCES: set[str] = set()
+# generated code, app entry points, pure view layout with no logic). Add a
+# `/Sources/...`-suffixed path with a comment saying why.
+EXEMPT_SOURCES: set[str] = {
+    # Declaration-only files: a `protocol` (and a plain error `enum`) carry no
+    # executable statements, so llvm-cov emits no coverage record for them and
+    # they can never appear in the report. Their conformers/values ARE exercised
+    # (RpcBackend, the fake transport, BackendError assertions) in the files that
+    # do report; the seams themselves have no logic to cover.
+    "/Sources/SprinterBackend/RpcTransport.swift",
+    "/Sources/SprinterBackend/Backend.swift",
+}
 
 
 def sources_on_disk() -> set[str]:
