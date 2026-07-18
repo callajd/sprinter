@@ -35,6 +35,13 @@ let package = Package(
     // logic is verified by `make check`; the SwiftUI `View` + `.app` shell is
     // convergence, not this epic.
     .library(name: "SprinterMissionControl", targets: ["SprinterMissionControl"]),
+    // Interactive-session feature logic (BE3.1): the one reusable session view
+    // model (D9), projecting BE1's port-based `InteractiveSession` feed into a
+    // view-facing transcript with input/interrupt + inline `extension_ui_request`
+    // handling. Platform-neutral (Foundation + Observation, no AppKit/UIKit, D10)
+    // so the logic is verified by `make check`; the SwiftUI `View` + `.app` shell
+    // is convergence, not this epic.
+    .library(name: "SprinterSession", targets: ["SprinterSession"]),
   ],
   dependencies: [
     // SwiftLint pinned via SPM plugin so the linter version is locked in
@@ -98,6 +105,23 @@ let package = Package(
     .testTarget(
       name: "SprinterMissionControlTests",
       dependencies: ["SprinterMissionControl"],
+      swiftSettings: swiftSettings
+    ),
+    // Interactive-session view model (BE3.1). Projects BE1's `InteractiveSession`
+    // feed into a view-facing transcript and drives input/interrupt + the inline
+    // `extension_ui_request` round-trip; consumes the mirrored `SprinterContract`
+    // DTOs over the `Backend` port, never a transport (INV-PORT / INV-CONTRACT).
+    .target(
+      name: "SprinterSession",
+      dependencies: ["SprinterBackend", "SprinterContract"],
+      swiftSettings: swiftSettings
+    ),
+    // Transcript projection + view model tested against a FAKE scripted `Backend`
+    // driving a real `InteractiveSession` — deterministic and offline, no live
+    // daemon/network in the gate.
+    .testTarget(
+      name: "SprinterSessionTests",
+      dependencies: ["SprinterSession"],
       swiftSettings: swiftSettings
     ),
   ]
