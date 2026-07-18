@@ -14,10 +14,7 @@
  */
 import { Schema } from "effect";
 import { EpicId, IssueId, JobId, SessionId, WorkstreamId } from "./ids.ts";
-
-/** A positive integer — GitHub Issue/PR numbers and the like. */
-export const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0));
-export type PositiveInt = (typeof PositiveInt)["Type"];
+import { PositiveInt } from "./numeric.ts";
 
 /**
  * Lifecycle status shared by the planning nodes `Workstream` and `Epic`: work is
@@ -149,12 +146,8 @@ export const Session = Schema.Struct({
 });
 export type Session = (typeof Session)["Type"];
 
-/** Decode untrusted input into a validated {@link Workstream}, throwing on failure. */
-export const decodeWorkstream = Schema.decodeUnknownSync(Workstream);
-
 /** True when a planning node (`Workstream`/`Epic`) has reached the terminal `done` status. */
-export const isComplete = (node: { readonly status: WorkStatus }): boolean =>
-  node.status === "done";
+export const isComplete = (node: Workstream | Epic): boolean => node.status === "done";
 
 /** True when an issue is closed by a merged PR — i.e. its work is fully landed. */
 export const isIssueLanded = (issue: Issue): boolean =>

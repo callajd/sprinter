@@ -108,6 +108,11 @@ export const PiImageContent = tagged("image", {
 });
 export type PiImageContent = (typeof PiImageContent)["Type"];
 
+/** An array of text/image content blocks. */
+const PiContentBlocks = Schema.Array(Schema.Union([PiTextContent, PiImageContent]));
+/** Raw text, or an array of text/image content blocks. */
+const PiTextOrBlocks = Schema.Union([Str, PiContentBlocks]);
+
 /** An assistant-issued tool call. */
 export const PiToolCall = tagged("toolCall", {
   id: Str,
@@ -135,16 +140,10 @@ export const PiUsage = Schema.Struct({
 });
 export type PiUsage = (typeof PiUsage)["Type"];
 
-/** Content of a user message: raw text, or an array of text/image blocks. */
-const PiUserContent = Schema.Union([
-  Str,
-  Schema.Array(Schema.Union([PiTextContent, PiImageContent])),
-]);
-
 /** A user message. */
 export const PiUserMessage = Schema.Struct({
   role: Schema.Literal("user"),
-  content: PiUserContent,
+  content: PiTextOrBlocks,
   timestamp: Num,
 });
 
@@ -169,7 +168,7 @@ export const PiToolResultMessage = Schema.Struct({
   role: Schema.Literal("toolResult"),
   toolCallId: Str,
   toolName: Str,
-  content: Schema.Array(Schema.Union([PiTextContent, PiImageContent])),
+  content: PiContentBlocks,
   details: Schema.optionalKey(Opaque),
   addedToolNames: Schema.optionalKey(Schema.Array(Str)),
   isError: Schema.Boolean,
@@ -238,12 +237,6 @@ const sessionEntryBase = {
   timestamp: Str,
 };
 
-/** Content of a custom-message entry. */
-const PiCustomMessageContent = Schema.Union([
-  Str,
-  Schema.Array(Schema.Union([PiTextContent, PiImageContent])),
-]);
-
 /** A durable session entry appended to the transcript (`SessionEntry`). */
 export const PiSessionEntry = Schema.Union([
   tagged("message", { ...sessionEntryBase, message: PiAgentMessage }),
@@ -268,7 +261,7 @@ export const PiSessionEntry = Schema.Union([
   tagged("custom_message", {
     ...sessionEntryBase,
     customType: Str,
-    content: PiCustomMessageContent,
+    content: PiTextOrBlocks,
     details: Schema.optionalKey(Opaque),
     display: Schema.Boolean,
   }),

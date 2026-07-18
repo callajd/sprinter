@@ -76,6 +76,9 @@ it("carries every model of contract v1 as a procedure", () => {
 
 it("marks the group with an explicit contract version (INV-CONTRACT)", () => {
   expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(1);
+  // The version key is a `Context.Reference`, so it resolves to CONTRACT_VERSION
+  // from an empty context via its default.
+  expect(Context.get(Context.empty(), ContractVersion)).toBe(CONTRACT_VERSION);
   expect(CONTRACT_VERSION).toBe(1);
   expect(contractTag()).toBe("v1");
   expect(contractTag(2)).toBe("v2");

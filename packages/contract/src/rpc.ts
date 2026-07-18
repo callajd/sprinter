@@ -56,8 +56,11 @@ export const contractTag = (version: number = CONTRACT_VERSION): string => `v${v
  * ripples to the mirror + its decode tests (INV-CONTRACT). Add a `hello` RPC later
  * if over-the-wire negotiation is ever needed.
  */
-export const ContractVersion = Context.Service<typeof CONTRACT_VERSION>(
+export const ContractVersion = Context.Reference<typeof CONTRACT_VERSION>(
   "@sprinter/contract/ContractVersion",
+  {
+    defaultValue: () => CONTRACT_VERSION,
+  },
 );
 
 // ── Errors (owned, neutral) ─────────────────────────────────────────────────
