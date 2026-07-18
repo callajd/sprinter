@@ -203,6 +203,61 @@ it.effect("leaves an epic and workstream unfinished while any issue is unlanded"
   ),
 );
 
+it.effect(
+  "repairs the Epic→Workstream child-list from the FK when the workstream omits an epic",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+      // The workstream lists NO epics, but epic-9 names it via its FK (`workstreamId`)
+      // — an inconsistent twice-stored parentage the roll-up must repair (wiring-
+      // constraint), the Epic→Workstream direction (`consistentEpics`).
+      const ws = decode(Workstream, {
+        id: "ws-x",
+        name: "X",
+        repo: "callajd/sprinter",
+        status: "active",
+        epics: [],
+      });
+      const ep = decode(Epic, {
+        id: "epic-9",
+        workstreamId: "ws-x",
+        name: "E",
+        status: "pending",
+        issues: ["issue-900"],
+      });
+      const iss = decode(Issue, {
+        id: "issue-900",
+        epicId: "epic-9",
+        number: 900,
+        title: "I",
+        status: "in_progress",
+        dependsOn: [],
+      });
+      yield* store.workGraph.putWorkstream(ws);
+      yield* store.workGraph.putEpic(ep);
+      yield* store.workGraph.putIssue(iss);
+
+      yield* reconcileWorkstream(ws.id);
+
+      // The workstream's `epics` list is repaired to include epic-9 (reached via its
+      // FK), even though it started empty; and the fully-landed workstream is done.
+      const repaired = Option.getOrThrow(yield* store.workGraph.getWorkstream(ws.id));
+      expect(repaired.epics).toStrictEqual(["epic-9"]);
+      expect(isComplete(repaired)).toBe(true);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerMemory,
+          fakeRepository({
+            issues: new Map([[900, "closed"]]),
+            closing: new Map([[900, 900]]),
+            pulls: new Map([[900, true]]),
+          }),
+        ),
+      ),
+    ),
+);
+
 it.effect("is a no-op for a missing workstream", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

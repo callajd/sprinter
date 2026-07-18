@@ -23,6 +23,7 @@
 import { Effect, Layer, Option, Schema } from "effect";
 import {
   FetchHttpClient,
+  Headers,
   HttpClient,
   HttpClientRequest,
   HttpClientResponse,
@@ -69,9 +70,9 @@ const GhPull = Schema.Struct({
 
 /**
  * A `GET /repos/{owner}/{repo}/issues/{number}/timeline` entry — only the fields
- * that identify a PR cross-referencing (and thereby closing) the Issue. Excess
- * wire fields are ignored on decode. A `cross-referenced` event whose `source`
- * issue carries a `pull_request` is the referencing PR.
+ * that identify a PR *referencing* the Issue. Excess wire fields are ignored on
+ * decode. A `cross-referenced` event whose `source` issue carries a `pull_request`
+ * is a referencing PR.
  */
 const GhTimelineEvent = Schema.Struct({
   event: Schema.String,
@@ -87,7 +88,16 @@ const GhTimelineEvent = Schema.Struct({
   ),
 });
 
-/** The first PR cross-referencing (closing) the Issue in its timeline, if any. */
+/**
+ * The first PR that cross-references the Issue in its timeline, if any — a
+ * HEURISTIC for the closing PR, not a guarantee: GitHub emits `cross-referenced`
+ * whenever an Issue is merely mentioned, so this can pick a PR that references but
+ * does not close the Issue. The caller (`reconcileIssue`) further gates on the
+ * Issue being closed AND the referenced PR being merged, which is sufficient for
+ * the common case. Robust closing-PR detection (GraphQL
+ * `closedByPullRequestsReferences`, or the `closed` event's associated PR) is a
+ * live-wiring concern deferred to AE4/AE5 — see the workstream ledger.
+ */
 const findClosingPr = (
   events: ReadonlyArray<(typeof GhTimelineEvent)["Type"]>,
 ): Option.Option<PositiveInt> => {
@@ -163,22 +173,24 @@ const make = (config: RepositoryConfig) =>
         Effect.mapError(fail("defaultBranch")),
       ),
       branchExists: (name) =>
-        client.execute(HttpClientRequest.get(`${repoPath}/branches/${name}`)).pipe(
-          Effect.mapError(fail("branchExists")),
-          Effect.flatMap(
-            HttpClientResponse.matchStatus({
-              200: () => Effect.succeed(true),
-              404: () => Effect.succeed(false),
-              orElse: (response) =>
-                Effect.fail(
-                  new RepositoryError({
-                    operation: "branchExists",
-                    detail: `unexpected status ${response.status}`,
-                  }),
-                ),
-            }),
+        client
+          .execute(HttpClientRequest.get(`${repoPath}/branches/${encodeURIComponent(name)}`))
+          .pipe(
+            Effect.mapError(fail("branchExists")),
+            Effect.flatMap(
+              HttpClientResponse.matchStatus({
+                200: () => Effect.succeed(true),
+                404: () => Effect.succeed(false),
+                orElse: (response) =>
+                  Effect.fail(
+                    new RepositoryError({
+                      operation: "branchExists",
+                      detail: `unexpected status ${response.status}`,
+                    }),
+                  ),
+              }),
+            ),
           ),
-        ),
     };
 
     const issues: IssueOps = {
@@ -193,13 +205,31 @@ const make = (config: RepositoryConfig) =>
 
     const pullRequests: PullRequestOps = {
       closingPullRequest: (issueNumber) =>
-        client.execute(HttpClientRequest.get(`${repoPath}/issues/${issueNumber}/timeline`)).pipe(
-          Effect.flatMap(HttpClientResponse.filterStatusOk),
-          Effect.flatMap((response) => response.json),
-          Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(GhTimelineEvent))),
-          Effect.map(findClosingPr),
-          Effect.mapError(fail("closingPullRequest")),
-        ),
+        Effect.gen(function* () {
+          // The timeline is paginated (30/page by default, and comments/labels/
+          // reviews all consume slots), so a single page can omit the closing PR's
+          // cross-reference. Request 100/page and follow `Link: rel="next"` to the
+          // end, accumulating every event before scanning for the referencing PR.
+          const collected: Array<(typeof GhTimelineEvent)["Type"]> = [];
+          let page = 1;
+          let more = true;
+          while (more) {
+            const response = yield* client
+              .execute(
+                HttpClientRequest.get(
+                  `${repoPath}/issues/${issueNumber}/timeline?per_page=100&page=${page}`,
+                ),
+              )
+              .pipe(Effect.flatMap(HttpClientResponse.filterStatusOk));
+            const json = yield* response.json;
+            const events = yield* Schema.decodeUnknownEffect(Schema.Array(GhTimelineEvent))(json);
+            collected.push(...events);
+            const link = Headers.get(response.headers, "link");
+            more = events.length > 0 && Option.isSome(link) && link.value.includes('rel="next"');
+            page += 1;
+          }
+          return findClosingPr(collected);
+        }).pipe(Effect.mapError(fail("closingPullRequest"))),
       getPullRequest: (number) =>
         client.execute(HttpClientRequest.get(`${repoPath}/pulls/${number}`)).pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),

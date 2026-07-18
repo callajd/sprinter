@@ -104,14 +104,18 @@ export interface IssueOps {
 
 /**
  * PR detection + reconciliation. Two capabilities, composed by the reconciler:
- * {@link closingPullRequest} finds WHICH PR closes an Issue (if any), and
- * {@link getPullRequest} reads WHETHER that PR merged. Together they answer "has
- * this Issue's work landed?" one-directionally (D13).
+ * {@link closingPullRequest} finds a PR REFERENCING an Issue (a heuristic for the
+ * closing PR), and {@link getPullRequest} reads WHETHER that PR merged. Together —
+ * with the Issue also reported closed — they answer "has this Issue's work landed?"
+ * one-directionally (D13).
  */
 export interface PullRequestOps {
   /**
-   * The PR that closes the given Issue, if one exists — the PR cross-referencing
-   * (and thereby closing) the Issue. `Option.none` when no PR references it yet.
+   * A PR that references the given Issue, if one exists — a HEURISTIC for the
+   * closing PR (the GitHub adapter scans the Issue timeline for a cross-referencing
+   * PR). `Option.none` when no PR references it yet. The reconciler gates on the
+   * Issue being closed AND this PR being merged; robust closing-PR detection is a
+   * live-wiring concern deferred to AE4/AE5.
    */
   readonly closingPullRequest: (
     issueNumber: PositiveInt,

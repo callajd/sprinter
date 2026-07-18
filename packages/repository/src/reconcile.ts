@@ -19,10 +19,10 @@
  * **Wiring-constraint (AE2 / #23 F4).** The work graph stores parentage TWICE —
  * parent child-lists (`Workstream.epics` / `Epic.issues`) AND child FK refs
  * (`Epic.workstreamId` / `Issue.epicId`) — with no FK enforcement. This roll-up
- * keeps the two consistent on every write: when it writes a child, it also upserts
- * the parent with that child present in its list (`ensureIssueInEpic` /
- * `ensureEpicInWorkstream`), so a child reached via its FK is never missing from
- * its parent's list.
+ * keeps the two consistent: the `Issue → Epic` edge is repaired per-landing
+ * (`ensureIssueInEpic`), and the `Epic → Workstream` edge is repaired once,
+ * unconditionally, by `reconcileWorkstream`'s final `consistentEpics` fold — so a
+ * child reached via its FK is never missing from its parent's list.
  */
 import { Effect, Option } from "effect";
 import {
@@ -89,28 +89,10 @@ const ensureIssueInEpic = (
   });
 
 /**
- * Wiring-constraint repair for the `Epic → Workstream` edge: ensure the
- * Workstream's `epics` child-list contains `epicId`.
- */
-const ensureEpicInWorkstream = (
-  workstreamId: WorkstreamId,
-  epicId: Epic["id"],
-): Effect.Effect<void, StateStoreError, StateStore> =>
-  Effect.gen(function* () {
-    const store = yield* StateStore;
-    const current = yield* store.workGraph.getWorkstream(workstreamId);
-    if (Option.isNone(current)) return;
-    const workstream = current.value;
-    const epics = withChild(workstream.epics, epicId);
-    if (epics === workstream.epics) return;
-    yield* store.workGraph.putWorkstream({ ...workstream, epics });
-  });
-
-/**
  * Roll one Epic up: reconcile each of its Issues, then flip the Epic to `done` if
- * every Issue has landed. On flipping, upsert the Epic (`done`) AND — per the
- * wiring-constraint — ensure the parent Workstream lists it. Returns whether the
- * Epic is now complete, so the Workstream roll-up can decide its own status.
+ * every Issue has landed. Returns whether the Epic is now complete, so the
+ * Workstream roll-up can decide its own status and (per the wiring-constraint)
+ * keep its `epics` child-list consistent with the Epics' FKs in one final upsert.
  */
 const reconcileEpic = (
   epic: Epic,
@@ -128,7 +110,8 @@ const reconcileEpic = (
     if (allLanded && currentEpic.status !== "done") {
       const done: Epic = { ...currentEpic, status: "done" };
       yield* store.workGraph.putEpic(done);
-      yield* ensureEpicInWorkstream(currentEpic.workstreamId, currentEpic.id);
+      // The Epic→Workstream child-list repair is handled once, unconditionally, by
+      // `reconcileWorkstream`'s final `consistentEpics` fold — not here.
       return true;
     }
     return isComplete(currentEpic);

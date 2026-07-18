@@ -166,6 +166,44 @@ it.effect("detects the PR that closes an Issue from its timeline", () =>
   ),
 );
 
+it.effect("follows timeline pagination — finds a closing PR referenced on a later page", () =>
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    // The closing PR's cross-reference is on page 2; the adapter must follow the
+    // `Link: rel="next"` header rather than stop at the first page.
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.some(99));
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter/issues/25/timeline": (() => {
+          let call = 0;
+          return () => {
+            call += 1;
+            if (call === 1) {
+              // Page 1: only noise, with a `Link` header advertising page 2.
+              return new Response(JSON.stringify([{ event: "labeled" }, { event: "commented" }]), {
+                status: 200,
+                headers: {
+                  "content-type": "application/json",
+                  link: '<https://api.github.com/repos/callajd/sprinter/issues/25/timeline?per_page=100&page=2>; rel="next"',
+                },
+              });
+            }
+            // Page 2: the closing PR reference, and no further `Link` → stop.
+            return json([
+              {
+                event: "cross-referenced",
+                source: { issue: { number: 99, pull_request: { url: "x" } } },
+              },
+            ]);
+          };
+        })(),
+      }),
+    ),
+  ),
+);
+
 it.effect("reports no closing PR when nothing references the Issue", () =>
   Effect.gen(function* () {
     const repo = yield* Repository;
