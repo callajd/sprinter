@@ -11,10 +11,16 @@
  *   feed behind the streaming `events` RPC (D17).
  * - {@link layerPublishing} — the `StateStore` decorator that fans every persisted
  *   mutation out onto that feed, so the daemon is reactive end-to-end.
+ *
+ * Task AE4.2 adds the session channel behind the same frozen contract: the
+ * {@link SessionRegistry} PORT (`sessionId → live SessionHandle`) the four
+ * session-channel handlers resolve against, bridging a live `@sprinter/runner`
+ * session's neutral surface (INV-BOUNDARY / INV-PORT).
  */
 import { contractTag } from "@sprinter/contract";
 
 export { handlers } from "./rpc-handlers.ts";
+export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
 export { layerPublishing } from "./store-publishing.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 

@@ -8,8 +8,20 @@
  * tests stay green (INV-CONTRACT).
  */
 import { it } from "@effect/vitest";
-import { Context, Effect, Fiber, Layer, Option, PubSub, Queue, Schema, Stream } from "effect";
+import {
+  Context,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  PubSub,
+  Queue,
+  Schema,
+  Stream,
+} from "effect";
 import type { Scope } from "effect/Scope";
+import { ChildProcessSpawner } from "effect/unstable/process";
 import { RpcTest } from "effect/unstable/rpc";
 import { expect } from "vitest";
 import {
@@ -25,12 +37,18 @@ import {
   Job,
   type JobResult,
   Session,
+  type SessionEvent,
+  type SessionId,
+  type SessionInput,
+  type UiResponse,
   Workstream,
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import type { SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
 import { handlers } from "./rpc-handlers.ts";
+import { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
 import { layerPublishing } from "./store-publishing.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
@@ -81,6 +99,7 @@ interface Ctx {
   readonly client: Client;
   readonly store: Context.Service.Shape<typeof StateStore>;
   readonly feed: Context.Service.Shape<typeof WorkGraphEvents>;
+  readonly sessions: Context.Service.Shape<typeof SessionRegistry>;
   readonly dispatched: Queue.Dequeue<Job>;
 }
 
@@ -97,7 +116,7 @@ const harness = <A, E>(
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(layerPublishing(layerMemory), runner).pipe(
+        Layer.mergeAll(layerPublishing(layerMemory), runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
         ),
       ),
@@ -106,7 +125,8 @@ const harness = <A, E>(
       const client = yield* clientEffect();
       const store = yield* StateStore;
       const feed = yield* WorkGraphEvents;
-      return yield* body({ client, store, feed, dispatched });
+      const sessions = yield* SessionRegistry;
+      return yield* body({ client, store, feed, sessions, dispatched });
     }).pipe(Effect.provide(app));
   }).pipe(Effect.scoped);
 
@@ -394,35 +414,141 @@ it.effect("events streams a work-graph delta produced by a command", () =>
   ),
 );
 
-// ── session channel (AE4.2 placeholders) ─────────────────────────────────────
+// ── session channel (AE4.2 — bridge a live SessionHandle) ─────────────────────
 
-it.effect("session-channel procedures answer with SessionNotFound (AE4.2 placeholder)", () =>
+const sessionId = session.id;
+
+const uiRequest: SessionEvent = {
+  _tag: "UiRequestRaised",
+  id: "req-1",
+  kind: "confirm",
+  prompt: "Proceed?",
+};
+const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+
+/**
+ * A fake live {@link SessionHandle}: a caller-supplied owned `SessionEvent` stream
+ * for `events`, and queues/deferred that RECORD the neutral inputs driven into it
+ * so a test can observe the round-trip (input sent, turn interrupted, UI answered).
+ * No Pi type appears — the fake speaks only the owned neutral surface.
+ */
+interface FakeSession {
+  readonly handle: SessionHandle;
+  readonly sent: Queue.Dequeue<SessionInput>;
+  readonly answered: Queue.Dequeue<UiResponse>;
+  readonly interrupted: Deferred.Deferred<void>;
+}
+
+const makeFakeSession = (events: ReadonlyArray<SessionEvent>): Effect.Effect<FakeSession> =>
+  Effect.gen(function* () {
+    const sent = yield* Queue.unbounded<SessionInput>();
+    const answered = yield* Queue.unbounded<UiResponse>();
+    const interrupted = yield* Deferred.make<void>();
+    const handle: SessionHandle = {
+      pid: ChildProcessSpawner.ProcessId(4242),
+      events: Stream.fromIterable(events),
+      send: (input) => Queue.offer(sent, input).pipe(Effect.asVoid),
+      interrupt: Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid),
+      answerUi: (response) => Queue.offer(answered, response).pipe(Effect.asVoid),
+      result: Effect.succeed({ _tag: "Completed" }),
+    };
+    return { handle, sent, answered, interrupted };
+  });
+
+it.effect("sessionEvents bridges the live session's owned event stream", () =>
+  harness(({ client, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([turnStarted, uiRequest]);
+      yield* sessions.register(sessionId, fake.handle);
+
+      const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      expect(received).toEqual([turnStarted, uiRequest]);
+    }),
+  ),
+);
+
+it.effect("sessionSend drives the input into the live session", () =>
+  harness(({ client, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      yield* sessions.register(sessionId, fake.handle);
+
+      const input: SessionInput = { text: "go", mode: "prompt" };
+      yield* client.sessionSend({ sessionId, input });
+
+      const driven = yield* Queue.take(fake.sent);
+      expect(driven).toEqual(input);
+    }),
+  ),
+);
+
+it.effect("interrupt aborts the live session's in-flight turn", () =>
+  harness(({ client, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      yield* sessions.register(sessionId, fake.handle);
+
+      yield* client.interrupt({ sessionId });
+      // The fake resolves this deferred only when its `interrupt` is called.
+      yield* Deferred.await(fake.interrupted);
+    }),
+  ),
+);
+
+it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
+  harness(({ client, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([uiRequest]);
+      yield* sessions.register(sessionId, fake.handle);
+
+      // A `UiRequestRaised` surfaces on the live sessionEvents feed…
+      const raised = Option.getOrThrow(
+        yield* client.sessionEvents({ sessionId }).pipe(Stream.runHead),
+      );
+      expect(raised._tag).toBe("UiRequestRaised");
+      if (raised._tag !== "UiRequestRaised") throw new Error("expected UiRequestRaised");
+
+      // …the client answers it, keyed by the raised request id…
+      const response: UiResponse = {
+        requestId: raised.id,
+        answer: { _tag: "Confirmed", confirmed: true },
+      };
+      yield* client.answerUiRequest({ sessionId, response });
+
+      // …and the neutral UiResponse reaches the live session.
+      const observed = yield* Queue.take(fake.answered);
+      expect(observed).toEqual(response);
+    }),
+  ),
+);
+
+it.effect("session-channel procedures fail with SessionNotFound for an unknown session", () =>
   harness(({ client }) =>
     Effect.gen(function* () {
-      const sessionId = Schema.decodeUnknownSync(Session)({
+      const missing: SessionId = Schema.decodeUnknownSync(Session)({
         id: "ses-x",
         jobId: "job-1",
         status: "starting",
       }).id;
 
       const sendError = yield* client
-        .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+        .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
         .pipe(Effect.flip);
       expect(sendError).toBeInstanceOf(SessionNotFound);
 
-      const interruptError = yield* client.interrupt({ sessionId }).pipe(Effect.flip);
+      const interruptError = yield* client.interrupt({ sessionId: missing }).pipe(Effect.flip);
       expect(interruptError).toBeInstanceOf(SessionNotFound);
 
       const answerError = yield* client
         .answerUiRequest({
-          sessionId,
+          sessionId: missing,
           response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
         })
         .pipe(Effect.flip);
       expect(answerError).toBeInstanceOf(SessionNotFound);
 
       const streamError = yield* client
-        .sessionEvents({ sessionId })
+        .sessionEvents({ sessionId: missing })
         .pipe(Stream.runHead, Effect.flip);
       expect(streamError).toBeInstanceOf(SessionNotFound);
     }),
