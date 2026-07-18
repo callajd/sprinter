@@ -123,6 +123,51 @@ struct MissionControlInboxTests {
     await backend.close()
   }
 
+  /// `untrack` drops a single session (and its feed) from the inbox, leaving the
+  /// other tracked sessions' entries intact.
+  @Test("untrack removes one session's entries, leaving the others")
+  func untrackRemovesOneSession() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
+    let inbox = MissionControlInbox(backend: backend)
+    inbox.track(Self.sessionA)
+    inbox.track(Self.sessionB)
+    backend.emit(
+      .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
+    backend.emit(
+      .uiRequestRaised(id: "req-b", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionB)
+    #expect(await waitUntil(inbox) { $0.count == 2 })
+
+    // Untrack A: its feed is torn down and its entry drops; only B remains.
+    inbox.untrack(Self.sessionA)
+    #expect(inbox.entries.map(\.sessionId) == [Self.sessionB])
+    #expect(inbox.entries.first?.requestId == "req-b")
+
+    inbox.stop()
+    await backend.close()
+  }
+
+  /// Identical request ids on different sessions get DISTINCT composite entry ids —
+  /// the `sessionId ⨝ requestId` key disambiguates (request ids are unique only
+  /// within a session).
+  @Test("identical request ids across sessions get distinct composite entry ids")
+  func compositeIdDisambiguatesAcrossSessions() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
+    let inbox = MissionControlInbox(backend: backend)
+    inbox.track(Self.sessionA)
+    inbox.track(Self.sessionB)
+    backend.emit(
+      .uiRequestRaised(id: "req-1", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
+    backend.emit(
+      .uiRequestRaised(id: "req-1", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionB)
+    #expect(await waitUntil(inbox) { $0.count == 2 })
+
+    #expect(inbox.entries.allSatisfy { $0.requestId == "req-1" })
+    #expect(Set(inbox.entries.map(\.id)).count == 2)
+
+    inbox.stop()
+    await backend.close()
+  }
+
   /// Polls the main-actor inbox until `predicate` holds over its entries, yielding
   /// between checks so each session's feed-ingestion task can run. Returns `false`
   /// if the bound is exhausted.
