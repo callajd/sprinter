@@ -21,7 +21,10 @@ let package = Package(
   name: "Sprinter",
   platforms: [.macOS(.v14)],
   products: [
-    .library(name: "SprinterCore", targets: ["SprinterCore"])
+    .library(name: "SprinterCore", targets: ["SprinterCore"]),
+    // The platform-neutral RPC-contract mirror (FE2.4). No AppKit/UIKit — client
+    // shells (macOS, later iOS) consume it as a plain SwiftPM library.
+    .library(name: "SprinterContract", targets: ["SprinterContract"]),
   ],
   dependencies: [
     // SwiftLint pinned via SPM plugin so the linter version is locked in
@@ -36,6 +39,22 @@ let package = Package(
     .testTarget(
       name: "SprinterCoreTests",
       dependencies: ["SprinterCore"],
+      swiftSettings: swiftSettings
+    ),
+    // The RPC-contract mirror — hand-written `Codable` DTOs, platform-neutral
+    // (Foundation only, no AppKit/UIKit). Foreign consumer of the TS contract
+    // (D10): it decodes the SAME wire bytes the contract emits (INV-CONTRACT).
+    .target(
+      name: "SprinterContract",
+      swiftSettings: swiftSettings
+    ),
+    // Decode tests over committed goldens generated FROM the TS contract
+    // (`scripts/generate-goldens.ts`). The gate only DECODES the goldens — no bun
+    // dependency inside `make check`.
+    .testTarget(
+      name: "SprinterContractTests",
+      dependencies: ["SprinterContract"],
+      resources: [.copy("Goldens")],
       swiftSettings: swiftSettings
     ),
   ]

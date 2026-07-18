@@ -1,0 +1,22 @@
+[
+  {
+    "requestId": "req-1",
+    "answer": {
+      "_tag": "Value",
+      "value": "option-a"
+    }
+  },
+  {
+    "requestId": "req-2",
+    "answer": {
+      "_tag": "Confirmed",
+      "confirmed": true
+    }
+  },
+  {
+    "requestId": "req-3",
+    "answer": {
+      "_tag": "Cancelled"
+    }
+  }
+]
