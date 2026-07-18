@@ -1,0 +1,133 @@
+import SprinterBackend
+import SprinterContract
+import Testing
+
+@testable import SprinterSession
+
+/// Tests for the planner view model (BE3.2) against a FAKE, deterministic, offline
+/// `Backend`: planning runs as a normal interactive session (the reused
+/// `SessionViewModel`'s transcript builds), and the distinct materialize step
+/// submits the `WorkstreamPlan` through the port, reflecting the created
+/// `WorkstreamId` or the mirrored `PlanRejected` reason. No daemon, no network.
+@Suite("Planner view model")
+@MainActor
+struct PlannerViewModelTests {
+  private static let session = SessionId(rawValue: "plan-session")
+  private static let plan = WorkstreamPlan(
+    name: "Postgres sink", repo: "acme/pipe", spec: "batch writes to Postgres")
+
+  /// Planning IS a normal interactive session: the reused `SessionViewModel`'s
+  /// transcript builds live off the scripted planning feed, driven by the fake.
+  @Test("planning runs as an interactive session — the transcript builds")
+  func planningSessionTranscriptBuilds() async throws {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    planner.session.start()
+
+    backend.emit(.turnStarted)
+    backend.emit(.messageStarted(messageId: "m1"))
+    backend.emit(.messageDelta(messageId: "m1", text: "Let's plan", reasoning: nil))
+
+    #expect(await waitUntil { planner.session.transcript.items.map(\.id) == ["message:m1"] })
+    #expect(planner.session.transcript.isTurnActive)
+    // No materialize yet — the planner starts idle.
+    #expect(planner.outcome == .idle)
+    #expect(planner.createdWorkstreamId == nil)
+
+    planner.session.stop()
+    await backend.close()
+  }
+
+  /// The materialize step submits the exact `WorkstreamPlan` through the port and,
+  /// on success, reflects the created `WorkstreamId` (so the shell can navigate).
+  @Test("materialize submits the plan and reflects the created WorkstreamId")
+  func materializeCreatesWorkstream() async throws {
+    let created = WorkstreamId(rawValue: "ws-42")
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(created))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    var observed = backend.submittedPlans.makeAsyncIterator()
+
+    try await planner.materialize(Self.plan)
+
+    // The fake observed exactly the submitted plan payload.
+    #expect(await observed.next() == Self.plan)
+    // The outcome reflects the new workstream id.
+    #expect(planner.outcome == .created(created))
+    #expect(planner.createdWorkstreamId == created)
+    #expect(planner.rejectionReason == nil)
+
+    await backend.close()
+  }
+
+  /// A rejected plan surfaces the mirrored `PlanRejected` reason for correction and
+  /// retry — reflected into the outcome, not thrown at the caller.
+  @Test("materialize surfaces the mirrored PlanRejected reason")
+  func materializeSurfacesPlanRejected() async throws {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session,
+      materializeResult: .failure(.planRejected(reason: "repo not connected")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+
+    try await planner.materialize(Self.plan)
+
+    #expect(planner.outcome == .rejected(reason: "repo not connected"))
+    #expect(planner.rejectionReason == "repo not connected")
+    #expect(planner.createdWorkstreamId == nil)
+
+    await backend.close()
+  }
+
+  /// An unexpected (non-`PlanRejected`) error from the port is NOT silently dropped:
+  /// it is rethrown and the outcome resets to `.idle` so the caller can retry.
+  @Test("materialize rethrows an unexpected port error and resets to idle")
+  func materializeRethrowsUnexpectedError() async throws {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session,
+      materializeResult: .failure(.sessionNotFound(id: Self.session)))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+
+    await #expect(throws: ContractError.sessionNotFound(id: Self.session)) {
+      try await planner.materialize(Self.plan)
+    }
+    #expect(planner.outcome == .idle)
+
+    await backend.close()
+  }
+
+  /// After a rejection, a corrected plan can be re-submitted (retry) and the outcome
+  /// flips to `.created` — the reject → correct → retry loop.
+  @Test("a corrected plan retries to success after a rejection")
+  func rejectionThenRetrySucceeds() async throws {
+    // First a rejecting backend, then a fresh accepting one (a corrected retry).
+    let rejecting = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .failure(.planRejected(reason: "bad spec")))
+    let planner = PlannerViewModel(backend: rejecting, planningSessionId: Self.session)
+
+    try await planner.materialize(Self.plan)
+    #expect(planner.outcome == .rejected(reason: "bad spec"))
+    await rejecting.close()
+
+    let created = WorkstreamId(rawValue: "ws-retry")
+    let accepting = PlannerViewModel(
+      backend: PlannerFakeBackend(
+        knownSession: Self.session, materializeResult: .success(created)),
+      planningSessionId: Self.session)
+    let corrected = WorkstreamPlan(
+      name: Self.plan.name, repo: Self.plan.repo, spec: "corrected spec")
+    try await accepting.materialize(corrected)
+    #expect(accepting.outcome == .created(created))
+    #expect(accepting.createdWorkstreamId == created)
+  }
+
+  /// Polls the main-actor model until `predicate` holds, yielding so the feed task
+  /// can run. Returns `false` if the bound is exhausted.
+  private func waitUntil(_ predicate: () -> Bool) async -> Bool {
+    for _ in 0..<100_000 {
+      if predicate() { return true }
+      await Task.yield()
+    }
+    return false
+  }
+}
