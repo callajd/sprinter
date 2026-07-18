@@ -19,7 +19,6 @@ import { existsSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { BunServices } from "@effect/platform-bun";
 import { it } from "@effect/vitest";
 import { Effect, Exit, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -64,7 +63,13 @@ const captureLines = (cwd: string, n: number) =>
 it.live.skipIf(!hasPi)("decodes real `pi --mode rpc` NDJSON output against the wire schema", () =>
   Effect.gen(function* () {
     const cwd = mkdtempSync(join(tmpdir(), "sprinter-pi-rpc-"));
-    const lines = yield* captureLines(cwd, commands.length);
+    // Import the Bun platform layer DYNAMICALLY, inside the (skipped-on-CI) test
+    // body: `@effect/platform-bun` transitively `import`s the `bun` builtin, which
+    // vitest cannot resolve when it merely collects this file on a runner. A static
+    // import would fail collection even though the test is skipped; deferring it
+    // means CI never loads it, while a machine with pi loads it at run time.
+    const { BunServices } = yield* Effect.promise(() => import("@effect/platform-bun"));
+    const lines = yield* captureLines(cwd, commands.length).pipe(Effect.provide(BunServices.layer));
 
     // Parse each captured NDJSON line once.
     const parsed: Array<unknown> = [];
@@ -105,5 +110,5 @@ it.live.skipIf(!hasPi)("decodes real `pi --mode rpc` NDJSON output against the w
     if (!(prompt?.type === "response" && prompt.command === "prompt")) {
       throw new Error(`no prompt response among ${JSON.stringify(lines)}`);
     }
-  }).pipe(Effect.provide(BunServices.layer), Effect.timeout("30 seconds")),
+  }).pipe(Effect.timeout("30 seconds")),
 );
