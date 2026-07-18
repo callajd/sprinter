@@ -1,0 +1,16 @@
+{
+  "name": "@sprinter/job",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@sprinter/domain": "workspace:*",
+    "@sprinter/runner": "workspace:*",
+    "@sprinter/state": "workspace:*",
+    "effect": "4.0.0-beta.97"
+  }
+}

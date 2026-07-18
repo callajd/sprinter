@@ -146,6 +146,29 @@ export const Session = Schema.Struct({
 });
 export type Session = (typeof Session)["Type"];
 
+/**
+ * The terminal result of a {@link Job}, captured when its {@link Session} settles
+ * — the minimal, OPEN result envelope (D6). The daemon core treats it as opaque;
+ * per-kind handlers own and interpret the `payload`. It carries only:
+ *
+ * - `status` — the terminal outcome, reusing {@link JobStatus}. A settled job is
+ *   always one of its terminal values (`succeeded` / `failed`); the envelope
+ *   imposes no tighter constraint (D6: minimal constraints).
+ * - `payload` — optional, open, JSON-serialisable data whose shape the producing
+ *   Job kind owns and narrows (`unknown` here; the core never inspects it).
+ * - `error` — optional, neutral, human-readable failure detail on a failed job.
+ *
+ * This is a pure description of shape; it references no runner, session instance,
+ * or backing store (INV-PORT). The Job runner (AE3) maps a settled session's
+ * outcome onto this envelope.
+ */
+export const JobResult = Schema.Struct({
+  status: JobStatus,
+  payload: Schema.optionalKey(Schema.Unknown),
+  error: Schema.optionalKey(Schema.String),
+});
+export type JobResult = (typeof JobResult)["Type"];
+
 /** True when a planning node (`Workstream`/`Epic`) has reached the terminal `done` status. */
 export const isComplete = (node: Workstream | Epic): boolean => node.status === "done";
 
