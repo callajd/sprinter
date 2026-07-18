@@ -16,9 +16,7 @@
  * into the transcript-grade record.
  */
 import { Schema } from "effect";
-
-/** A non-negative integer — token counts, retry attempts, delays. */
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0));
+import { NonNegativeInt } from "./numeric.ts";
 
 /**
  * Arbitrary JSON carried through tool boundaries (input / output / partial).

@@ -10,5 +10,6 @@
  *   `SessionInput`, `UiResponse` ({@link ./session.ts}).
  */
 export * from "./ids.ts";
+export * from "./numeric.ts";
 export * from "./read-model.ts";
 export * from "./session.ts";

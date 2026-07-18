@@ -2,7 +2,6 @@ import { it } from "@effect/vitest";
 import { Effect, Exit, Schema } from "effect";
 import { expect } from "vitest";
 import {
-  decodeWorkstream,
   Epic,
   isComplete,
   Issue,
@@ -106,9 +105,9 @@ it.effect("rejects representative invalid inputs", () =>
   }),
 );
 
-it.effect("decodeWorkstream returns a validated workstream", () =>
-  Effect.sync(() => {
-    const ws = decodeWorkstream(workstream);
+it.effect("decodes a valid workstream", () =>
+  Effect.gen(function* () {
+    const ws = yield* Schema.decodeUnknownEffect(Workstream)(workstream);
     expect(ws.name).toBe("Foundation");
     expect(ws.epics).toHaveLength(2);
   }),
