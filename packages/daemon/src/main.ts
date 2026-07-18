@@ -28,7 +28,7 @@
  * entrypoint (env → config → `runMain`) lives in the sibling `./run.ts`; this module
  * is the pure, tested graph.
  */
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Schema } from "effect";
 import { FileSystem } from "effect/FileSystem";
 import type { PlatformError } from "effect/PlatformError";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
@@ -149,15 +149,89 @@ export const bootLayer = Layer.effectDiscard(
 );
 
 /**
- * Idempotently unlink a stale Unix-domain socket FILE before a bind (INV-RESTART):
- * a daemon that crashed leaves its `sprinter.sock` on disk, and `bind(2)` on an
- * existing socket path fails with `EADDRINUSE` — so a naive restart could never
- * rebind. `BunSocketServer.layer` (→ `@effect/platform-node-shared` `NodeSocketServer`,
- * `Net.createServer` + `server.listen`) does NOT unlink first, so we do. `force: true`
- * makes it a no-op when the path does not exist (the normal fresh-start case).
+ * The fail-fast signal that a second daemon cannot bind the socket: either a LIVE
+ * daemon is already listening on the path (double-run protection — unlinking it would
+ * split-brain two daemons on one `SPRINTER_SOCKET`), or the path is occupied by a
+ * non-socket file (which must never be force-deleted). Raised at boot so the socket
+ * bind fails fast with a clear cause instead of silently clobbering a live peer.
  */
-export const unlinkStaleSocket = (path: string): Effect.Effect<void, PlatformError, FileSystem> =>
-  Effect.flatMap(FileSystem, (fs) => fs.remove(path, { force: true }));
+export class DaemonSocketInUseError extends Schema.TaggedErrorClass<DaemonSocketInUseError>()(
+  "DaemonSocketInUseError",
+  {
+    /** The Unix-domain socket path that could not be safely bound. */
+    path: Schema.String,
+    /** A neutral, human-readable description of why the bind was refused. */
+    detail: Schema.String,
+  },
+) {}
+
+/**
+ * Probe whether a LIVE listener is accepting connections on a Unix-domain socket
+ * path: connect and, if it SUCCEEDS, a daemon is listening (`"live"`); if the
+ * connection is refused (`ECONNREFUSED` — the socket file exists but its owner is
+ * dead), it is a stale leftover (`"stale"`). This runs only against a path already
+ * confirmed to be a socket, so ANY connect failure means there is no live owner —
+ * safe to unlink. Bun-native (`Bun.connect`), never `node:*` (matching the codebase's
+ * Bun-native substrate). The probe connection is closed immediately.
+ */
+export const probeSocket = (path: string): Effect.Effect<"live" | "stale"> =>
+  Effect.tryPromise(() => Bun.connect({ unix: path, socket: { data() {} } })).pipe(
+    Effect.flatMap((socket) =>
+      Effect.sync(() => {
+        socket.end();
+      }).pipe(Effect.as("live" as const)),
+    ),
+    // A refused/failed connect on a confirmed-socket path means the owner is gone.
+    Effect.catch(() => Effect.succeed("stale" as const)),
+  );
+
+/**
+ * CONDITIONALLY unlink a stale Unix-domain socket before a bind (INV-RESTART), while
+ * preserving double-run protection. A daemon that crashed leaves its `sprinter.sock`
+ * on disk and `bind(2)` on an existing socket path fails with `EADDRINUSE`, so a
+ * crashed daemon must be able to rebind. But `BunSocketServer.layer` (→
+ * `@effect/platform-node-shared` `NodeSocketServer`, `Net.createServer` +
+ * `server.listen`) does NOT unlink first — and unconditionally removing the path
+ * would let a SECOND daemon silently unlink a LIVE peer's socket and bind a
+ * split-brain listener.
+ *
+ * So the decision is conditional on the socket actually being STALE:
+ *
+ * - Path absent → fresh start; nothing to unlink (bind directly).
+ * - Path present but NOT a socket → fail fast; never force-delete an arbitrary path.
+ * - Path present and a socket → PROBE it: a LIVE listener → fail fast (a daemon is
+ *   already running; do NOT unlink); a refused connection → stale (dead owner) →
+ *   unlink so the bind can succeed.
+ *
+ * Only an actual dead unix socket is ever removed.
+ */
+export const unlinkStaleSocket = (
+  path: string,
+): Effect.Effect<void, PlatformError | DaemonSocketInUseError, FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem;
+    // Fresh start: nothing bound at the path — bind directly (no unlink needed).
+    if (!(yield* fs.exists(path))) return;
+    // The path exists but is NOT a socket — never force-delete an arbitrary path.
+    const info = yield* fs.stat(path);
+    if (info.type !== "Socket") {
+      return yield* Effect.fail(
+        new DaemonSocketInUseError({
+          path,
+          detail: `socket path exists and is not a socket (type: ${info.type})`,
+        }),
+      );
+    }
+    // A socket file is present: probe for a live owner.
+    const state = yield* probeSocket(path);
+    if (state === "live") {
+      return yield* Effect.fail(
+        new DaemonSocketInUseError({ path, detail: "a daemon is already running on this socket" }),
+      );
+    }
+    // Stale socket (owner dead, connection refused) — safe to unlink and rebind.
+    yield* fs.remove(path);
+  });
 
 /**
  * The bound socket transport: unlink any stale socket FILE, THEN bind. `Layer.unwrap`

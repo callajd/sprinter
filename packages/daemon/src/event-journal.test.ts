@@ -6,7 +6,7 @@
  * `WorkGraphEvents` `PubSub` — deterministic and offline (INV-PORT).
  */
 import { it } from "@effect/vitest";
-import { Context, Effect, Fiber, Schema, Stream } from "effect";
+import { Context, Effect, Fiber, Option, Schema, Stream } from "effect";
 import { expect } from "vitest";
 import type { WorkGraphEvent } from "@sprinter/contract";
 import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
@@ -50,6 +50,17 @@ const session = Schema.decodeUnknownSync(Session)({
   id: "ses-1",
   jobId: "job-1",
   status: "active",
+});
+// An issue WITH dependency edges, so `putIssue` is genuinely multi-statement
+// (rewrite the issue row + its `issue_dependency` edges) and opens its own inner
+// transaction — the NESTED SAVEPOINT case (FIX 3).
+const issueWithDeps = Schema.decodeUnknownSync(Issue)({
+  id: "iss-2",
+  epicId: "ep-1",
+  number: 53,
+  title: "Nested rollback",
+  status: "in_progress",
+  dependsOn: ["iss-1"],
 });
 
 // ── harness: publishing over journaling over layerMemory ──────────────────────
@@ -119,6 +130,42 @@ it.effect(
       expect(committed._tag).toBe("Some");
       const journaled = yield* store.events.tail(0);
       expect(journaled.map((e) => e.kind)).toEqual(["WorkstreamChanged"]);
+    }).pipe(Effect.scoped, Effect.provide(layerJournaling(layerMemory))),
+);
+
+it.effect(
+  "journals a NESTED multi-statement putIssue ATOMICALLY: a failed outer transaction rolls back BOTH the issue's node writes and its delta (INV-RESTART)",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+
+      // `putIssue` is multi-statement (rewrite the issue row + its dependency edges)
+      // and opens its OWN inner transaction, so under the outer `withTransaction` the
+      // journaling decorator opens it must nest as a SAVEPOINT. A failure after the
+      // journaled put must roll back BOTH the nested savepoint's issue rows AND the
+      // offset-log delta — never the node-persisted-but-delta-missing split a crash
+      // between two separate commits would leave. This exercises the deep savepoint
+      // nesting (outer BEGIN → journaling SAVEPOINT → putIssue's own SAVEPOINT).
+      const boom = new StateStoreError({ operation: "test", detail: "boom" });
+      const failure = yield* store.workGraph
+        .putIssue(issueWithDeps)
+        .pipe(Effect.andThen(Effect.fail(boom)), store.withTransaction, Effect.flip);
+      expect(failure).toBe(boom);
+
+      // Nothing committed: neither the issue node (with its edges) nor its delta survive.
+      const persisted = yield* store.workGraph.getIssue(issueWithDeps.id);
+      expect(persisted._tag).toBe("None");
+      const entries = yield* store.events.tail(0);
+      expect(entries).toEqual([]);
+
+      // And a NORMAL nested putIssue commits both together — the issue (with its
+      // reconstructed `dependsOn` edges) is readable and exactly one delta is journaled.
+      yield* store.workGraph.putIssue(issueWithDeps);
+      const committed = yield* store.workGraph.getIssue(issueWithDeps.id);
+      expect(committed._tag).toBe("Some");
+      expect(Option.getOrThrow(committed).dependsOn).toEqual(["iss-1"]);
+      const journaled = yield* store.events.tail(0);
+      expect(journaled.map((e) => e.kind)).toEqual(["IssueChanged"]);
     }).pipe(Effect.scoped, Effect.provide(layerJournaling(layerMemory))),
 );
 

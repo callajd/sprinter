@@ -28,7 +28,16 @@ import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
 import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
 import { StateStore } from "@sprinter/state";
-import { appLayer, bootLayer, configFromEnv, type DaemonConfig, mainLayer } from "./main.ts";
+import {
+  appLayer,
+  bootLayer,
+  configFromEnv,
+  type DaemonConfig,
+  DaemonSocketInUseError,
+  mainLayer,
+  probeSocket,
+  unlinkStaleSocket,
+} from "./main.ts";
 import { StartupReconcile } from "./startup-reconcile.ts";
 
 // ── substitutable leaves (fakes) ──────────────────────────────────────────────
@@ -225,4 +234,79 @@ it.effect("mainLayer BUILDS the full served graph (real transport bind + boot) i
     // cleared), and the scope tears the socket server down deterministically.
     yield* Layer.build(mainLayer(testConfig(dir))).pipe(Effect.scoped);
   }).pipe(Effect.provide(BunFileSystem.layer)),
+);
+
+// ── conditional stale-socket unlink (FIX 2: live peer fails fast) ─────────────
+
+/** A scoped, real Bun Unix-domain listener bound to `path` — a "live daemon". */
+const liveListener = (path: string) =>
+  Effect.acquireRelease(
+    Effect.sync(() => Bun.listen({ unix: path, socket: { data() {} } })),
+    (listener) => Effect.sync(() => listener.stop(true)),
+  );
+
+it.effect(
+  "probeSocket reports `live` for a bound listener and `stale` for a refused connection",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-sock-" });
+
+      // A bound listener accepts the probe connection → live.
+      const livePath = `${dir}/live.sock`;
+      yield* liveListener(livePath);
+      expect(yield* probeSocket(livePath)).toBe("live");
+
+      // A path with no listener refuses the probe connection → stale.
+      expect(yield* probeSocket(`${dir}/absent.sock`)).toBe("stale");
+    }).pipe(Effect.scoped, Effect.provide(BunFileSystem.layer)),
+);
+
+it.effect(
+  "unlinkStaleSocket FAILS FAST on a LIVE peer without unlinking (double-run protection)",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-sock-" });
+      const path = `${dir}/live.sock`;
+
+      // A real daemon is already listening on the path.
+      yield* liveListener(path);
+
+      // A second daemon must NOT unlink the live socket (that would split-brain two
+      // daemons on one socket) — it fails fast instead.
+      const error = yield* unlinkStaleSocket(path).pipe(Effect.flip);
+      expect(error instanceof DaemonSocketInUseError).toBe(true);
+      // The live socket is untouched — no unlink of a live peer.
+      expect(yield* fs.exists(path)).toBe(true);
+    }).pipe(Effect.scoped, Effect.provide(BunFileSystem.layer)),
+);
+
+it.effect(
+  "unlinkStaleSocket binds fresh (absent), rebinds after a crashed daemon (stale), but refuses a non-socket path",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-sock-" });
+
+      // Absent: a fresh start — nothing to unlink, succeeds.
+      yield* unlinkStaleSocket(`${dir}/fresh.sock`);
+
+      // Non-socket path: never force-delete an arbitrary file — fail fast, file kept.
+      const filePath = `${dir}/not-a-socket`;
+      yield* fs.writeFileString(filePath, "data");
+      const err = yield* unlinkStaleSocket(filePath).pipe(Effect.flip);
+      expect(err instanceof DaemonSocketInUseError).toBe(true);
+      expect(yield* fs.exists(filePath)).toBe(true);
+
+      // Stale: a crashed daemon leaves a socket with no live listener — the rebind
+      // path must succeed and clear the way (the socket is gone afterwards).
+      const stalePath = `${dir}/stale.sock`;
+      const listener = yield* Effect.sync(() =>
+        Bun.listen({ unix: stalePath, socket: { data() {} } }),
+      );
+      yield* Effect.sync(() => listener.stop(true));
+      yield* unlinkStaleSocket(stalePath);
+      expect(yield* fs.exists(stalePath)).toBe(false);
+    }).pipe(Effect.scoped, Effect.provide(BunFileSystem.layer)),
 );

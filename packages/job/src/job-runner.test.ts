@@ -124,6 +124,40 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
 );
 
 // ============================================================================
+// F1 terminal-result contract — the events fold is BOUNDED by handle.result
+// ============================================================================
+
+it.effect(
+  "completes dispatch even when the events stream never naturally ends (handle.result bounds the fold)",
+  () =>
+    Effect.gen(function* () {
+      const job = yield* makeJob();
+
+      const runner = yield* JobRunner;
+      // Dispatch MUST complete — not hang. If the fold were not bounded by
+      // `handle.result`, `Stream.never` would block it forever (the fold reads
+      // `handle.result` only AFTER the fold ends). The already-settled terminal
+      // interrupts the fold so dispatch proceeds. Guarded by the test timeout: a
+      // regression here fails as a timeout rather than hanging the suite.
+      const result = yield* runner.dispatch(job);
+      expect(result.status).toBe("succeeded");
+
+      // The terminal rows are still persisted from the (bounded) dispatch.
+      const store = yield* StateStore;
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("succeeded");
+    }).pipe(
+      // An events stream that emits, then NEVER ends — simulating a truncating event
+      // that slid out of this subscription's window (or a still-live `pi`). Only
+      // `handle.result` (Completed) can bound the fold.
+      provide(
+        fakeHandle(Stream.make(entryEvent).pipe(Stream.concat(Stream.never)), {
+          _tag: "Completed",
+        }),
+      ),
+    ),
+);
+
+// ============================================================================
 // Real Issue-content prompt (CE1.1) — not the id-only placeholder
 // ============================================================================
 

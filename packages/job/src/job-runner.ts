@@ -150,11 +150,24 @@ const dispatch = (
       yield* handle.send(promptForJob(job, issue));
 
       // Count durable transcript entries in a `Ref` so the count SURVIVES a stream
-      // teardown — `Stream.runFold` drops its accumulator on failure, `Ref` keeps it.
-      // The stream is not the terminal authority (`handle.result` is), so a typed
-      // teardown of the fold is tolerated while preserving the count observed so far.
+      // teardown — `Stream.runForEach` drops its accumulator on failure/interrupt, a
+      // `Ref` keeps it. The stream is not the terminal authority (`handle.result` is),
+      // so a typed teardown of the fold is tolerated while preserving the count so far.
+      //
+      // BOUND the fold by the terminal `result` (F1 terminal-result contract), so it
+      // can NEVER outlive the session. `handle.events` is a fresh, lazily-subscribed
+      // view over a bounded/sliding PubSub: if the truncating event slid out of THIS
+      // subscription's replay window before its first pull (a real-`pi` burst / a
+      // still-live session), the stream would never end and the fold would HANG —
+      // even though `handle.result` has already settled (its watcher subscribes
+      // eagerly, so the terminal resolves regardless of this subscription's window).
+      // `Stream.interruptWhen(handle.result)` interrupts the fold the moment the
+      // session reaches its terminal — deterministic and window-independent, not
+      // reliant on the sliding-window timing — so dispatch always proceeds to read the
+      // already-settled result instead of blocking on an idle-but-alive events stream.
       const entriesRef = yield* Ref.make(0);
       yield* handle.events.pipe(
+        Stream.interruptWhen(handle.result),
         Stream.runForEach((event) =>
           event._tag === "EntryAppended" ? Ref.update(entriesRef, (n) => n + 1) : Effect.void,
         ),
