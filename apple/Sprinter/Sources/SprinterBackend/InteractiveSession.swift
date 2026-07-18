@@ -45,6 +45,11 @@ public final class InteractiveSession {
   private let backend: any Backend
   private let sessionId: SessionId
   private var feed: Task<Void, Never>?
+  /// Bumped on each ``start()``; the feed task's terminal cleanup runs only if its
+  /// generation is still current, so a rapid `stop()`+`start()` (whose prior,
+  /// cancelled task finishes its cleanup AFTER the new task is installed) cannot
+  /// clobber the new task's `feed`/`isRunning`.
+  private var generation = 0
 
   public init(backend: any Backend, sessionId: SessionId) {
     self.backend = backend
@@ -56,6 +61,8 @@ public final class InteractiveSession {
     guard feed == nil else { return }
     isRunning = true
     terminationError = nil
+    generation += 1
+    let generation = generation
     feed = Task { @MainActor [weak self] in
       guard let self else { return }
       do {
@@ -65,11 +72,15 @@ public final class InteractiveSession {
       } catch {
         // A transport drop or a failure `Exit` — surface it (unless this is an
         // intentional `stop()` cancellation) so a consumer can tell "dropped" from
-        // a clean "ended".
-        if !Task.isCancelled {
+        // a clean "ended". A SUPERSEDED task (a newer start() bumped the
+        // generation) records nothing — its outcome is stale.
+        if !Task.isCancelled && self.generation == generation {
           self.terminationError = error
         }
       }
+      // Only the CURRENT feed task tears down the running state; a superseded task
+      // leaves the new task's `feed`/`isRunning` intact.
+      guard self.generation == generation else { return }
       self.isRunning = false
       self.feed = nil
     }

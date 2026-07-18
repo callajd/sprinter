@@ -50,6 +50,23 @@ struct TranscriptProjectionTests {
     #expect(message.isComplete)
   }
 
+  /// A stale delta arriving AFTER the message was finalized by its durable entry is
+  /// ignored, not appended onto the canonical text (defensive against out-of-order
+  /// wire delivery, matching the tool path's `toolResultBeforeCall`).
+  @Test("a delta after the message is finalized is ignored, not appended")
+  func messageDeltaAfterFinalizedIsIgnored() throws {
+    let transcript = TranscriptProjection.project([
+      .entryAppended(entry: .assistantMessage(id: "m1", text: "Final answer", reasoning: "r")),
+      .messageDelta(messageId: "m1", text: " CORRUPTION", reasoning: " noise")
+    ])
+
+    #expect(transcript.items.count == 1)
+    let message = try requireMessage(transcript.items.first)
+    #expect(message.text == "Final answer")
+    #expect(message.reasoning == "r")
+    #expect(message.isComplete)
+  }
+
   /// A durable user message appears as a `.user` transcript message.
   @Test("a durable user-message entry projects to a user message")
   func durableUserMessage() throws {

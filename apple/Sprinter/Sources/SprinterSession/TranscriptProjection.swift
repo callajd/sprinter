@@ -79,6 +79,11 @@ public enum TranscriptProjection {
         upsertMessage(messageId) { _ in }
       case .messageDelta(let messageId, let text, let reasoning):
         upsertMessage(messageId) { message in
+          // A delta arriving AFTER the message was finalized — by its durable
+          // `AssistantMessage` entry or a `messageCompleted` — is stale, out-of-order
+          // wire noise; ignore it rather than append onto the canonical text (the
+          // same defensiveness the tool path already has for out-of-order results).
+          guard !message.isComplete else { return }
           if let text { message.text += text }
           if let reasoning { message.reasoning = (message.reasoning ?? "") + reasoning }
         }
