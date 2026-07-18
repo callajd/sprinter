@@ -29,6 +29,12 @@ let package = Package(
     // envelope framing over the frozen `SprinterContract` DTOs, behind the
     // `Backend` seam feature code depends on (INV-PORT / INV-CONTRACT).
     .library(name: "SprinterBackend", targets: ["SprinterBackend"]),
+    // Mission Control feature logic (BE2.1): the board + activity view model,
+    // projected from `SprinterBackend`'s port-based `WorkGraphResync` feed.
+    // Platform-neutral (Foundation + Observation, no AppKit/UIKit, D10) so the
+    // logic is verified by `make check`; the SwiftUI `View` + `.app` shell is
+    // convergence, not this epic.
+    .library(name: "SprinterMissionControl", targets: ["SprinterMissionControl"]),
   ],
   dependencies: [
     // SwiftLint pinned via SPM plugin so the linter version is locked in
@@ -75,6 +81,23 @@ let package = Package(
     .testTarget(
       name: "SprinterBackendTests",
       dependencies: ["SprinterBackend"],
+      swiftSettings: swiftSettings
+    ),
+    // Mission Control board + activity view model (BE2.1). Projects the
+    // `Workstream ⊃ Epic ⊃ Issue` hierarchy from the port-based `WorkGraphResync`
+    // feed; consumes the mirrored `SprinterContract` DTOs, never a transport
+    // (INV-PORT / INV-CONTRACT).
+    .target(
+      name: "SprinterMissionControl",
+      dependencies: ["SprinterBackend", "SprinterContract"],
+      swiftSettings: swiftSettings
+    ),
+    // Board projection + view model tested against a FAKE scripted `Backend`
+    // driven through a real `WorkGraphResync` — deterministic and offline, no
+    // live daemon/network in the gate.
+    .testTarget(
+      name: "SprinterMissionControlTests",
+      dependencies: ["SprinterMissionControl"],
       swiftSettings: swiftSettings
     ),
   ]
