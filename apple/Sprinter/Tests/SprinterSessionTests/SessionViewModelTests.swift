@@ -30,7 +30,8 @@ struct SessionViewModelTests {
     let transcript = model.transcript
     #expect(transcript.isTurnActive)
     #expect(
-      transcript.items.map(\.id) == ["message:m1", "tool:t1", "notice:n-headsup", "message:u1"])
+      transcript.items.map(\.id) == ["message:m1", "tool:t1", "notice:key:n-headsup", "message:u1"]
+    )
 
     model.stop()
     await backend.close()

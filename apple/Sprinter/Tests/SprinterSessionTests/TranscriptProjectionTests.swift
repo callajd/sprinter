@@ -187,10 +187,35 @@ struct TranscriptProjectionTests {
     // The shared-key live+durable pair collapsed to one item (durable value wins);
     // the distinct-key notice remains its own item.
     #expect(notices.count == 2)
-    let reconciled = notices.first { $0.id == "retry-5" }
+    // Keyed notices live in the `key:` namespace (disjoint from the id-less `seq:`
+    // namespace) so a caller id can never collide with an arrival-sequence value.
+    let reconciled = notices.first { $0.id == "key:retry-5" }
     #expect(reconciled?.level == .error)
     #expect(reconciled?.message == "gave up")
-    #expect(notices.contains { $0.id == "other" })
+    #expect(notices.contains { $0.id == "key:other" })
+  }
+
+  /// CE5.2 regression: a keyed notice whose `id` is a bare decimal (a `NoticeId`
+  /// carries no format constraint, so it can look like a JSON-RPC integer id) and an
+  /// id-less notice that reaches the SAME arrival-sequence value must stay TWO
+  /// distinct items. Keyed and id-less notices occupy DISJOINT key namespaces, so a
+  /// caller id can never collide with a sequence value and silently collapse them.
+  @Test("a bare-decimal keyed id and an equal id-less sequence value stay distinct")
+  func keyedDecimalIdAndSequenceValueStayDistinct() {
+    // The id-less notice takes arrival sequence "1"; the keyed notice carries id "1".
+    // Without disjoint namespaces both would key to "notice:1" and collapse.
+    let transcript = TranscriptProjection.project([
+      .notice(id: nil, level: .error, message: "id-less occurrence"),
+      .notice(id: "1", level: .warn, message: "keyed occurrence")
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // Both survive as separate items with distinct ids — neither is silently dropped.
+    #expect(notices.count == 2)
+    #expect(Set(notices.map(\.id)).count == 2)
+    #expect(notices.map(\.message) == ["id-less occurrence", "keyed occurrence"])
   }
 
   /// CE5.2 regression: two content-derived notices with NO reconciliation key

@@ -219,7 +219,11 @@ public enum TranscriptProjection {
     /// notice WITH an `id` (and every durable `NoticeEntry`, whose id is required)
     /// keys by it so the live+durable pair reconciles.
     private mutating func appendNotice(id: String?, level: NoticeLevel, message: String) {
-      let key = id ?? nextSequence()
+      // Keyed (caller `id`) and id-less (arrival-sequence) notices live in DISJOINT
+      // key namespaces, so a caller id that happens to be a bare decimal (a `NoticeId`
+      // carries no format constraint) can never collide with a sequence value and
+      // silently collapse a keyed notice and an unrelated id-less one onto one item.
+      let key = id.map { "key:\($0)" } ?? "seq:\(nextSequence())"
       upsert("notice:\(key)") { _ in
         .notice(TranscriptNotice(id: key, level: level, message: message))
       }

@@ -136,6 +136,12 @@ const reconcileEpic = (
       // `reconcileWorkstream`'s final `consistentEpics` fold — not here.
       return true;
     }
+    // Intentionally done-only (not `isTerminal`): a `cancelled` Epic is terminal but
+    // NOT complete, so it deliberately holds its parent Workstream back from
+    // auto-`done` (abandoned work must not auto-declare the parent finished).
+    // Unreachable today — `control cancel` targets Workstreams only, nothing sets an
+    // Epic to `cancelled` — so whoever adds Epic-level cancellation owns revisiting
+    // this roll-up semantics.
     return isComplete(currentEpic);
   });
 

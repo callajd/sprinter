@@ -185,6 +185,14 @@ drives real "landed" decisions, we resolve the carried risk (AE3.2 / #27 F1)
   Roll-up is one-directional (D13) and idempotent, so a future robust signal
   supersedes a stale landing on the next reconcile with no migration.
 
+### D19 — A `cancelled` Epic is terminal-but-not-complete for parent roll-up
+`reconcileEpic` returns `isComplete` (done-only), NOT `isTerminal` (done OR
+cancelled): a `cancelled` Epic deliberately holds its parent Workstream back from
+auto-`done`, because a Workstream containing abandoned work must not auto-declare
+itself finished. This is unreachable today — `control cancel` targets Workstreams
+only, nothing sets an Epic to `cancelled` — so whoever introduces Epic-level
+cancellation owns revisiting the roll-up semantics.
+
 ---
 
 ## Deferred (see architecture §10)
