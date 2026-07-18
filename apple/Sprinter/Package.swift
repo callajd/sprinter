@@ -42,6 +42,13 @@ let package = Package(
     // so the logic is verified by `make check`; the SwiftUI `View` + `.app` shell
     // is convergence, not this epic.
     .library(name: "SprinterSession", targets: ["SprinterSession"]),
+    // Inspector feature logic (BE4.1): the transcript↔PR view model, pairing the
+    // reused `SprinterSession` transcript with the PR the session produced (resolved
+    // over the `Snapshot` and kept live off BE1's `WorkGraphResync` feed).
+    // Platform-neutral (Foundation + Observation, no AppKit/UIKit, D10) so the logic
+    // is verified by `make check`; the SwiftUI `View` + `.app` shell is convergence,
+    // not this epic.
+    .library(name: "SprinterInspector", targets: ["SprinterInspector"]),
   ],
   dependencies: [
     // SwiftLint pinned via SPM plugin so the linter version is locked in
@@ -122,6 +129,24 @@ let package = Package(
     .testTarget(
       name: "SprinterSessionTests",
       dependencies: ["SprinterSession"],
+      swiftSettings: swiftSettings
+    ),
+    // Inspector view model (BE4.1). Pairs the REUSED `SprinterSession` transcript
+    // (incl. the diff transform over an edit/write tool call's `JSONValue` payload)
+    // with the session→PR resolver over the `Snapshot`, kept live off BE1's
+    // `WorkGraphResync` feed; consumes the mirrored `SprinterContract` DTOs over the
+    // `Backend` port, never a transport (INV-PORT / INV-CONTRACT).
+    .target(
+      name: "SprinterInspector",
+      dependencies: ["SprinterSession", "SprinterBackend", "SprinterContract"],
+      swiftSettings: swiftSettings
+    ),
+    // Diff transform + session→PR resolver + view model tested against a FAKE
+    // scripted `Backend` driving a real session feed AND a real `WorkGraphResync` —
+    // deterministic and offline, no live daemon/network in the gate.
+    .testTarget(
+      name: "SprinterInspectorTests",
+      dependencies: ["SprinterInspector"],
       swiftSettings: swiftSettings
     ),
   ]
