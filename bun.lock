@@ -31,6 +31,9 @@
       "dependencies": {
         "@sprinter/contract": "workspace:*",
         "@sprinter/domain": "workspace:*",
+        "@sprinter/job": "workspace:*",
+        "@sprinter/state": "workspace:*",
+        "effect": "4.0.0-beta.97",
       },
     },
     "packages/domain": {
