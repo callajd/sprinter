@@ -29,6 +29,14 @@ public protocol Backend: Sendable {
   /// The live work-graph delta subscription (INV-REACTIVE): a stream of
   /// ``WorkGraphEvent`` fed until the daemon ends the subscription.
   func events() -> AsyncThrowingStream<WorkGraphEvent, any Error>
+
+  /// Tears the connection down deterministically: cancels the inbound receive
+  /// loop, closes the underlying transport, and fails every in-flight request with
+  /// ``BackendError/connectionClosed``. Idempotent. Downstream `.app`/feature
+  /// wiring (and the future live transport) needs this to drop a connection without
+  /// leaking the receive task or the socket — so the port contract owns teardown,
+  /// not just the transport provider.
+  func close() async
 }
 
 /// Transport / protocol-level failures surfaced by the client, distinct from the

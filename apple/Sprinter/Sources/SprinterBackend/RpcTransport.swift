@@ -21,4 +21,9 @@ public protocol RpcTransport: Sendable {
   /// The inbound byte stream. Each element is an arbitrary chunk (not necessarily
   /// a whole line); the client buffers and splits on the newline delimiter.
   func receive() -> AsyncThrowingStream<Data, any Error>
+
+  /// Closes the transport: ends the inbound `receive()` stream and releases the
+  /// underlying resource (a real socket; a no-op once already closed). Called by
+  /// the connection's teardown so a dropped ``Backend`` does not leak the transport.
+  func close()
 }

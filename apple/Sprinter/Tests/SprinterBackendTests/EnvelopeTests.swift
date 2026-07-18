@@ -45,11 +45,21 @@ struct EnvelopeTests {
     #expect(try encode(.ping)["_tag"] == .string("Ping"))
   }
 
-  @Test("RequestId decodes from a string or a number")
+  @Test("RequestId decodes from a string or an integer number, normalizing to the integer string")
   func decodesRequestId() throws {
     #expect(
       try JSONDecoder().decode(RequestId.self, from: Data(#""abc""#.utf8)) == RequestId("abc"))
     #expect(try JSONDecoder().decode(RequestId.self, from: Data("42".utf8)) == RequestId("42"))
+    // An integer-valued JSON number normalizes to its integer key ("1", not "1.0"),
+    // so it correlates with the client's minted integer-string ids.
+    #expect(try JSONDecoder().decode(RequestId.self, from: Data("1.0".utf8)) == RequestId("1"))
+  }
+
+  @Test("a non-integral numeric RequestId is a decode failure, never a mis-correlating key")
+  func rejectsFractionalRequestId() {
+    #expect(throws: (any Error).self) {
+      try JSONDecoder().decode(RequestId.self, from: Data("1.5".utf8))
+    }
   }
 
   @Test("a non string/number RequestId is a decode failure")

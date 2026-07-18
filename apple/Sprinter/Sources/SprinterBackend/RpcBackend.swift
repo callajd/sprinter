@@ -58,6 +58,10 @@ public struct RpcBackend: Backend {
     }
   }
 
+  public func close() async {
+    await connection.close()
+  }
+
   /// Decodes a required (non-void) success value, or throws
   /// ``BackendError/malformedResponse`` when the `Exit` carried no value.
   private func requireValue<Value: Decodable>(_ value: JSONValue?) throws -> Value {

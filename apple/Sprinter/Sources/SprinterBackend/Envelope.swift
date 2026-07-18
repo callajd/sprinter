@@ -28,11 +28,15 @@ public struct RequestId: Hashable, Sendable, Codable {
       value = string
     } else if let integer = try? container.decode(Int.self) {
       value = String(integer)
-    } else if let number = try? container.decode(Double.self) {
-      value = String(number)
+    } else if let number = try? container.decode(Double.self), let integer = Int(exactly: number) {
+      // A JSON number id is normalized to its INTEGER string so it matches the
+      // client's minted integer-string keys. A non-integral number (e.g. `1.5`)
+      // would stringify to a key that can never correlate — reject it rather than
+      // silently drop the response (`Int(exactly:)` is nil for a fractional value).
+      value = String(integer)
     } else {
       throw DecodingError.dataCorruptedError(
-        in: container, debugDescription: "RequestId is neither a string nor a number")
+        in: container, debugDescription: "RequestId is neither a string nor an integer number")
     }
   }
 

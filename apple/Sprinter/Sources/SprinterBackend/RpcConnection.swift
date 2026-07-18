@@ -21,9 +21,22 @@ actor RpcConnection {
   private var pending: [RequestId: PendingEntry] = [:]
   private var nextRequestId = 0
   private var receiveTask: Task<Void, Never>?
+  private var closed = false
 
   init(transport: any RpcTransport) {
     self.transport = transport
+  }
+
+  /// Tears the connection down: cancels the receive loop, closes the transport, and
+  /// fails every in-flight request with ``BackendError/connectionClosed``. Idempotent
+  /// — a second call is a no-op — so the port's `close()` is safe to call repeatedly.
+  func close() {
+    guard !closed else { return }
+    closed = true
+    receiveTask?.cancel()
+    receiveTask = nil
+    transport.close()
+    failAll(with: BackendError.connectionClosed)
   }
 
   /// One in-flight request, resolved off its correlated terminal `Exit`.
@@ -37,6 +50,7 @@ actor RpcConnection {
   /// Sends a request/response `Request` and awaits the value (or error) carried by
   /// its correlated `Exit`. A void-success RPC resolves to `nil`.
   func request(tag: String, payload: JSONValue?) async throws -> JSONValue? {
+    guard !closed else { throw BackendError.connectionClosed }
     startReceiving()
     let id = allocateId()
     return try await withCheckedThrowingContinuation { continuation in
@@ -49,9 +63,13 @@ actor RpcConnection {
   /// correlated `Chunk` frames until the terminal `Exit`. Early consumer
   /// termination sends an `Interrupt` for the request.
   func stream(tag: String, payload: JSONValue?) async -> JSONStream {
+    let (stream, continuation) = JSONStream.makeStream()
+    guard !closed else {
+      continuation.finish(throwing: BackendError.connectionClosed)
+      return stream
+    }
     startReceiving()
     let id = allocateId()
-    let (stream, continuation) = JSONStream.makeStream()
     continuation.onTermination = { [weak self] _ in
       guard let self else { return }
       Task { await self.interruptIfPending(id) }
@@ -131,7 +149,12 @@ actor RpcConnection {
     for value in values {
       continuation.yield(value)
     }
-    // Acknowledge the batch to release stream backpressure (`supportsAck`).
+    // Send the per-batch `Ack` flow-control frame the envelope defines. NOTE: this
+    // acks on RECEIPT, not on consumer DEMAND — it does not yet gate the server on
+    // downstream consumption, so it is the handshake, not true backpressure. Demand-
+    // gated acking (defer the `Ack` until the consumer drains) + a bounded buffer
+    // with overflow→resync belong with the live streaming transport and BE1.2's
+    // snapshot-resync (which owns the recovery); see the workstream ledger.
     await transmit(.ack(requestId: id))
   }
 

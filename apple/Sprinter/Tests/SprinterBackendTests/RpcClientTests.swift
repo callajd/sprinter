@@ -23,6 +23,27 @@ struct RpcClientTests {
     transport.close()
   }
 
+  @Test("close() fails an in-flight request, rejects new ones, and is idempotent (teardown seam)")
+  func closeTearsDownTheConnection() async throws {
+    let transport = FakeTransport()
+    let backend = RpcBackend(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    // An in-flight request whose Exit never arrives — the connection is torn down
+    // under it. Awaiting the sent Request guarantees it is registered as pending.
+    let inflight = Task { try await backend.snapshot() }
+    _ = try await nextSent(&outbound)
+
+    await backend.close()
+
+    // The in-flight request fails with connectionClosed (the receive loop was
+    // cancelled and the transport closed — no leak against a real socket).
+    await #expect(throws: BackendError.connectionClosed) { try await inflight.value }
+    // A second close is a no-op, and a request after close is rejected.
+    await backend.close()
+    await #expect(throws: BackendError.connectionClosed) { try await backend.snapshot() }
+  }
+
   @Test("createWorkstreamFromPlan sends the plan payload and returns the id")
   func createWorkstreamQuery() async throws {
     let transport = FakeTransport()
