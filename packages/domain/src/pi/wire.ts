@@ -342,7 +342,9 @@ export const PiAgentSessionEvent = Schema.Union([
   tagged("auto_retry_start", {
     attempt: NonNegativeInt,
     maxAttempts: NonNegativeInt,
-    delayMs: NonNegativeInt,
+    // Pi types `delayMs` as plain `number` (`baseDelayMs * 2**(attempt-1)`), which
+    // is fractional if `baseDelayMs` is — mirror it faithfully, not as an int.
+    delayMs: Num,
     errorMessage: Str,
   }),
   tagged("auto_retry_end", {
@@ -504,9 +506,14 @@ export type PiRpcExtensionUIResponse = (typeof PiRpcExtensionUIResponse)["Type"]
 // ============================================================================
 
 /**
- * Anything Pi emits on stdout: a response envelope, a streaming session event,
- * an extension UI request, or an extension error. The live decode test feeds
- * every captured NDJSON line through this to catch drift (INV-CONTRACT).
+ * Anything Pi emits on stdout that the adapter drives: a response envelope, a
+ * streaming session event, an extension UI request, or an extension error. The
+ * live decode test feeds captured NDJSON lines through this to catch drift
+ * (INV-CONTRACT) — but only WITHIN the mirrored subset: a line for a command or
+ * event we deliberately do not mirror (e.g. a `set_model`/`bash` success, or a
+ * future event type) is not covered here and would fail this decode. That is
+ * intended for the adapter's controlled command set; it is not a whole-protocol
+ * validator.
  */
 export const PiServerMessage = Schema.Union([
   PiRpcResponse,
