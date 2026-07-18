@@ -19,17 +19,34 @@ final class PlannerFakeBackend: Backend {
   private let knownSession: SessionId
   private let materializeResult: Result<WorkstreamId, ContractError>
 
+  /// When `true`, `createWorkstreamFromPlan` suspends after recording the plan until
+  /// ``releaseGate()`` — so a test can hold one materialize in flight and prove a
+  /// concurrent second call is a no-op (the re-entrancy guard).
+  private let gated: Bool
+
   /// Lock-guarded mutable feed state — the latest vended feed's continuation and
   /// the count of feeds vended (a restart re-subscribes, so this increments).
   private let feed = Locked(FeedState())
+
+  /// The gate continuation (set while a gated call is suspended) + whether it has
+  /// been opened, so ``releaseGate()`` before the call suspends still lets it through.
+  private let gate = Locked(GateState())
+
+  /// How many times `createWorkstreamFromPlan` was actually invoked — a re-entrant
+  /// `materialize` must NOT increment this (its guard returns before the port call).
+  private let submissions = Locked(0)
 
   /// Every ``WorkstreamPlan`` submitted through `createWorkstreamFromPlan`, in order.
   let submittedPlans: AsyncStream<WorkstreamPlan>
   private let submittedPlansContinuation: AsyncStream<WorkstreamPlan>.Continuation
 
-  init(knownSession: SessionId, materializeResult: Result<WorkstreamId, ContractError>) {
+  init(
+    knownSession: SessionId, materializeResult: Result<WorkstreamId, ContractError>,
+    gated: Bool = false
+  ) {
     self.knownSession = knownSession
     self.materializeResult = materializeResult
+    self.gated = gated
     (submittedPlans, submittedPlansContinuation) = AsyncStream.makeStream()
     // Prepare the first feed eagerly so its buffer is live before the model's feed
     // task subscribes — an `emit` right after `start()` is buffered, not lost.
@@ -43,6 +60,20 @@ final class PlannerFakeBackend: Backend {
   /// The number of live feeds vended so far (one per `start`; a restart adds one).
   var feedCount: Int { feed.withLock { $0.count } }
 
+  /// How many times `createWorkstreamFromPlan` reached the port (see ``submissions``).
+  var submissionCount: Int { submissions.withLock { $0 } }
+
+  /// Releases a gated `createWorkstreamFromPlan` so it resolves its result. Safe to
+  /// call before the call suspends — it marks the gate open and the call sails through.
+  func releaseGate() {
+    let waiter = gate.withLock { state -> CheckedContinuation<Void, Never>? in
+      state.isOpen = true
+      defer { state.continuation = nil }
+      return state.continuation
+    }
+    waiter?.resume()
+  }
+
   /// Raises one event on the current live feed.
   func emit(_ event: SessionEvent) {
     feed.withLock { _ = $0.continuation?.yield(event) }
@@ -54,7 +85,18 @@ final class PlannerFakeBackend: Backend {
   }
 
   func createWorkstreamFromPlan(_ plan: WorkstreamPlan) async throws -> WorkstreamId {
+    submissions.withLock { $0 += 1 }
     submittedPlansContinuation.yield(plan)
+    if gated {
+      await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let alreadyOpen = gate.withLock { state -> Bool in
+          if state.isOpen { return true }
+          state.continuation = cont
+          return false
+        }
+        if alreadyOpen { cont.resume() }
+      }
+    }
     switch materializeResult {
     case .success(let id):
       return id
@@ -110,6 +152,13 @@ final class PlannerFakeBackend: Backend {
     /// The latest vended feed's continuation, targeted by `emit`/`finish`.
     var continuation: AsyncThrowingStream<SessionEvent, any Error>.Continuation?
     var count = 0
+  }
+
+  private struct GateState {
+    /// The suspended gated call's continuation, resumed by ``releaseGate()``.
+    var continuation: CheckedContinuation<Void, Never>?
+    /// Set once the gate is opened, so a release racing ahead of the suspend still lets it through.
+    var isOpen = false
   }
 
   // MARK: - Unused board surface (the planner uses only session + createWorkstreamFromPlan)

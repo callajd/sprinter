@@ -61,6 +61,36 @@ struct PlannerViewModelTests {
     await backend.close()
   }
 
+  /// A `materialize` issued while one is already in flight is a no-op: the guard
+  /// returns before a second `createWorkstreamFromPlan`, so a double-submit can't
+  /// race the reflected `outcome` or create a duplicate workstream.
+  @Test("a re-entrant materialize while one is in flight is a no-op")
+  func reentrantMaterializeIsNoOp() async throws {
+    let created = WorkstreamId(rawValue: "ws-once")
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(created), gated: true)
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+
+    // First call: enters materialize, sets `.materializing`, then suspends on the gate.
+    let first = Task { try await planner.materialize(Self.plan) }
+    #expect(await waitUntil { planner.outcome == .materializing })
+
+    // Second call WHILE the first is in flight — the guard makes it a no-op (no
+    // second port call, `outcome` untouched).
+    try await planner.materialize(Self.plan)
+    #expect(backend.submissionCount == 1)
+    #expect(planner.outcome == .materializing)
+
+    // Release the first; it resolves to the created workstream — still one submission.
+    backend.releaseGate()
+    try await first.value
+    #expect(planner.outcome == .created(created))
+    #expect(planner.createdWorkstreamId == created)
+    #expect(backend.submissionCount == 1)
+
+    await backend.close()
+  }
+
   /// A rejected plan surfaces the mirrored `PlanRejected` reason for correction and
   /// retry — reflected into the outcome, not thrown at the caller.
   @Test("materialize surfaces the mirrored PlanRejected reason")

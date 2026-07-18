@@ -27,8 +27,10 @@ public enum PlanningOutcome: Equatable, Sendable {
 /// `send`/`interrupt`, the inline `extension_ui_request` round-trip, and the
 /// idempotent single-consumer feed lifecycle) for a FRESH planning session. The
 /// planner adds only one thing on top: the distinct, explicit **materialize** step
-/// that submits the session's product — a ``WorkstreamPlan`` — through the
-/// ``Backend`` port's ``Backend/createWorkstreamFromPlan(_:)``, reflecting the
+/// that submits a ``WorkstreamPlan`` — the plan the shell constructs from the planning
+/// conversation (name/repo/spec); the contract carries no structured "plan produced"
+/// event, so plan construction is the shell's job, not an extraction seam here — through
+/// the ``Backend`` port's ``Backend/createWorkstreamFromPlan(_:)``, reflecting the
 /// result into ``outcome``.
 ///
 /// It owns no transport and no localness — it depends only on the ``Backend`` port
@@ -79,7 +81,14 @@ public final class PlannerViewModel {
   /// ``ContractError/planRejected(reason:)`` (surfacing the reason for retry). Any
   /// other (transport-level) error resets ``outcome`` to `.idle` and is rethrown —
   /// it is never silently dropped.
+  ///
+  /// Re-entrant calls are a no-op: a `materialize` while one is already in flight
+  /// (``outcome`` == `.materializing`) returns immediately without issuing a second
+  /// ``Backend/createWorkstreamFromPlan(_:)``, so a double-submit can't race the
+  /// reflected ``outcome`` or create a duplicate workstream. The `@MainActor`
+  /// isolation makes the `.materializing` guard-and-set atomic against the suspension.
   public func materialize(_ plan: WorkstreamPlan) async throws {
+    guard outcome != .materializing else { return }
     outcome = .materializing
     do {
       let workstreamId = try await backend.createWorkstreamFromPlan(plan)
