@@ -114,5 +114,10 @@
       "text": "done",
       "reasoning": "because"
     }
+  },
+  {
+    "_tag": "Notice",
+    "level": "error",
+    "message": "retry failed after 5 attempt(s)"
   }
 ]

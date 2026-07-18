@@ -5,8 +5,9 @@
 ///
 /// Decoding and encoding are split into per-category helpers so each stays small
 /// and auditable (the union is wide); an unknown `_tag` is a decode failure.
-/// Optional-key fields (`usage`, `text`, `reasoning`, `options`) round-trip as
-/// Swift optionals via `decodeIfPresent` / `encodeIfPresent`.
+/// Optional-key fields (`usage`, `text`, `reasoning`, `options`, and a `Notice`'s
+/// reconciliation-key `id`) round-trip as Swift optionals via `decodeIfPresent` /
+/// `encodeIfPresent`.
 public enum SessionEvent: Codable, Equatable, Sendable {
   case turnStarted
   case turnCompleted(usage: Usage?)
@@ -20,7 +21,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
   case retryScheduled(attempt: Int, delayMs: Int, error: String)
   case contextCompacted
   case uiRequestRaised(id: String, kind: UiRequestKind, prompt: String, options: [String]?)
-  case notice(id: String, level: NoticeLevel, message: String)
+  case notice(id: String?, level: NoticeLevel, message: String)
   case statusChanged(key: String, text: String)
   case entryAppended(entry: TranscriptEntry)
 
@@ -146,8 +147,10 @@ extension SessionEvent {
         prompt: try container.decode(String.self, forKey: .prompt),
         options: try container.decodeIfPresent([String].self, forKey: .options))
     case "Notice":
+      // `id` is the OPTIONAL NoticeId reconciliation key — absent for content-derived
+      // notices with no stable cross-emission identity (mirrors `Schema.optionalKey`).
       return .notice(
-        id: try container.decode(String.self, forKey: .id),
+        id: try container.decodeIfPresent(String.self, forKey: .id),
         level: try container.decode(NoticeLevel.self, forKey: .level),
         message: try container.decode(String.self, forKey: .message))
     case "StatusChanged":
@@ -243,7 +246,7 @@ extension SessionEvent {
       try container.encodeIfPresent(options, forKey: .options)
     case .notice(let id, let level, let message):
       try container.encode("Notice", forKey: .tag)
-      try container.encode(id, forKey: .id)
+      try container.encodeIfPresent(id, forKey: .id)
       try container.encode(level, forKey: .level)
       try container.encode(message, forKey: .message)
     case .statusChanged(let key, let text):

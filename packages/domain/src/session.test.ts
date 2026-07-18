@@ -55,6 +55,8 @@ const events: ReadonlyArray<unknown> = [
     options: ["a", "b"],
   },
   { _tag: "Notice", id: "notice-1", level: "info", message: "started" },
+  // A content-derived Notice with the optional reconciliation `id` absent (CE5.2).
+  { _tag: "Notice", level: "warn", message: "retry failed after 5 attempt(s)" },
   { _tag: "StatusChanged", key: "phase", text: "implementing" },
   { _tag: "EntryAppended", entry: { _tag: "UserMessage", id: "m1", text: "hi" } },
   {
@@ -100,10 +102,12 @@ it.effect("rejects representative invalid session inputs", () =>
       [SessionEvent, { _tag: "RetryScheduled", attempt: 1.5, delayMs: 0, error: "x" }],
       [SessionEvent, { _tag: "UiRequestRaised", id: "u1", kind: "toast", prompt: "?" }],
       [SessionEvent, { _tag: "Notice", id: "n1", level: "fatal", message: "x" }],
-      // Notice/NoticeEntry require a non-empty reconciliation `id` (NoticeId, CE5.2).
+      // The reconciliation `id` (NoticeId, CE5.2) is OPTIONAL on a live Notice but,
+      // WHEN PRESENT, must be a non-empty string — and it is REQUIRED on a durable
+      // NoticeEntry. An empty-string id is invalid on both.
       [SessionEvent, { _tag: "Notice", id: "", level: "info", message: "x" }],
-      [SessionEvent, { _tag: "Notice", level: "info", message: "x" }],
       [TranscriptEntry, { _tag: "NoticeEntry", id: "", level: "info", message: "x" }],
+      [TranscriptEntry, { _tag: "NoticeEntry", level: "info", message: "x" }],
       [SessionEvent, { _tag: "EntryAppended", entry: { _tag: "UnknownEntry" } }],
       [TranscriptEntry, { _tag: "ToolResult", id: "t1", output: {} }],
       [SessionInput, { text: "go", mode: "resume" }],

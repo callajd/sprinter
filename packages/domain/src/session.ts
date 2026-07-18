@@ -54,6 +54,16 @@ export type NoticeLevel = (typeof NoticeLevel)["Type"];
  * a consumer reconciles them onto one rendered item (exactly as message/tool ids
  * coalesce their deltas and durable entries). Producers derive `id` from the
  * notice's stable identity, so the same logical notice always yields the same key.
+ *
+ * The key is REQUIRED on a durable `NoticeEntry` (it is transcript-grade) but
+ * OPTIONAL on a live `Notice`: a live notice carries it only when it has a stable
+ * cross-emission identity worth reconciling on. A content-derived notice with no such
+ * identity (e.g. one keyed only by a non-occurrence-unique attribute) OMITS it, and
+ * the consumer falls back to arrival-sequence keying so distinct occurrences stay
+ * distinct rather than silently collapsing. NOTE for a future durable-notice
+ * producer: it MUST reproduce the EXACT same key derivation as the live producer of
+ * the same logical notice, or the live+durable pair will not share a key and will
+ * double-render.
  */
 export const NoticeId = Schema.NonEmptyString;
 export type NoticeId = (typeof NoticeId)["Type"];
@@ -135,9 +145,12 @@ export const SessionEvent = Schema.TaggedUnion({
   },
 
   // ── Status / notices ──────────────────────────────────────────────
-  // `id` is the reconciliation key (see {@link NoticeId}): a live notice shares it
-  // with the durable `NoticeEntry` of the same logical event so they render once.
-  Notice: { id: NoticeId, level: NoticeLevel, message: Schema.String },
+  // `id` is the OPTIONAL reconciliation key (see {@link NoticeId}). Present when the
+  // notice has a stable cross-emission identity — a live notice shares it with the
+  // durable `NoticeEntry` of the same logical event so they render once. Omitted for
+  // content-derived notices with no such identity (no durable counterpart), so the
+  // consumer keys them by arrival sequence and distinct occurrences stay distinct.
+  Notice: { id: Schema.optionalKey(NoticeId), level: NoticeLevel, message: Schema.String },
   StatusChanged: { key: Schema.NonEmptyString, text: Schema.String },
 
   // ── Durable transcript entry ──────────────────────────────────────

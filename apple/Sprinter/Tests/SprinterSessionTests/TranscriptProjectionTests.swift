@@ -193,6 +193,28 @@ struct TranscriptProjectionTests {
     #expect(notices.contains { $0.id == "other" })
   }
 
+  /// CE5.2 regression: two content-derived notices with NO reconciliation key
+  /// (`id == nil`) — e.g. two independent retry sequences that each gave up at the
+  /// same attempt number, or the same extension failing the same event twice — must
+  /// stay TWO distinct items. A shared derived key used to collapse them onto one,
+  /// silently dropping the earlier occurrence; keying id-less notices by arrival
+  /// sequence keeps them distinct.
+  @Test("two id-less notices with identical content stay distinct (no silent collapse)")
+  func idLessNoticesStayDistinct() {
+    let transcript = TranscriptProjection.project([
+      .notice(id: nil, level: .error, message: "retry failed after 5 attempt(s)"),
+      .notice(id: nil, level: .error, message: "retry failed after 5 attempt(s)")
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // Both occurrences survive as separate items with distinct ids — neither is lost.
+    #expect(notices.count == 2)
+    #expect(Set(notices.map(\.id)).count == 2)
+    #expect(notices.allSatisfy { $0.message == "retry failed after 5 attempt(s)" })
+  }
+
   /// Turn lifecycle drives the transcript chrome (not items): a running turn sets
   /// `isTurnActive`, and `TurnCompleted` reports usage and clears it.
   @Test("turn lifecycle drives isTurnActive and lastUsage, not items")

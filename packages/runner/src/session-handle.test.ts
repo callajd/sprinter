@@ -345,19 +345,35 @@ it("translates auto-retry into RetryScheduled, truncating a fractional delay", (
   );
   // A successful retry-end is silent; a failed one always surfaces a give-up
   // Notice — using pi's finalError when present, else a synthesized message so a
-  // client watching for give-up never misses it.
+  // client watching for give-up never misses it. The give-up carries NO reconciliation
+  // key: `attempt` is not occurrence-unique, so the (optional) NoticeId is omitted and
+  // the consumer keys it by arrival sequence (distinct give-ups stay distinct).
   expectTranslation({ type: "auto_retry_end", success: true, attempt: 2 }, []);
   expectTranslation({ type: "auto_retry_end", success: false, attempt: 5, finalError: "gave up" }, [
-    { _tag: "Notice", id: "auto-retry-5", level: "error", message: "gave up" },
+    { _tag: "Notice", level: "error", message: "gave up" },
   ]);
   expectTranslation({ type: "auto_retry_end", success: false, attempt: 5 }, [
     {
       _tag: "Notice",
-      id: "auto-retry-5",
       level: "error",
       message: "retry failed after 5 attempt(s)",
     },
   ]);
+});
+
+it("gives two distinct give-ups at the same attempt distinct (id-less) notices", () => {
+  // Regression (CE5.2): two independent retry sequences that each give up at the SAME
+  // attempt number must NOT collapse. Neither notice carries a NoticeId, so nothing
+  // ties them together — the consumer keys each by arrival sequence and both survive.
+  const first = translateServerEvent({ type: "auto_retry_end", success: false, attempt: 3 });
+  const second = translateServerEvent({ type: "auto_retry_end", success: false, attempt: 3 });
+  expect(first).toEqual([
+    { _tag: "Notice", level: "error", message: "retry failed after 3 attempt(s)" },
+  ]);
+  expect(second).toEqual(first);
+  // The give-up notice has no `id` key at all (not merely undefined): distinct
+  // occurrences share no reconciliation anchor.
+  expect(first[0]).not.toHaveProperty("id");
 });
 
 it("translates interactive UI requests to UiRequestRaised", () => {
@@ -441,13 +457,15 @@ it("translates fire-and-forget UI methods to notices and status, dropping the re
   );
 });
 
-it("translates extension errors to an error Notice", () => {
+it("translates extension errors to an id-less error Notice", () => {
+  // extensionPath+event is not occurrence-unique (the same extension can fail the same
+  // event twice), so the give-up carries NO reconciliation key — the consumer keys it
+  // by arrival sequence and distinct failures stay distinct.
   expectTranslation(
     { type: "extension_error", extensionPath: "/ext/a", event: "onStart", error: "kaboom" },
     [
       {
         _tag: "Notice",
-        id: "extension-error-/ext/a-onStart",
         level: "error",
         message: "extension /ext/a failed handling onStart: kaboom",
       },

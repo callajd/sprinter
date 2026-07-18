@@ -189,6 +189,10 @@ write("session-events", Schema.Array(SessionEvent), [
     _tag: "EntryAppended",
     entry: { _tag: "AssistantMessage", id: "a1", text: "done", reasoning: "because" },
   },
+  // A content-derived notice with NO reconciliation key — the `NoticeId` optional-key
+  // is ABSENT (contract v2 / CE5.2). The consumer keys these by arrival sequence so
+  // distinct occurrences stay distinct rather than collapsing onto one item.
+  { _tag: "Notice", level: "error", message: "retry failed after 5 attempt(s)" },
 ]);
 
 // ── TranscriptEntry — every variant ──────────────────────────────────────────

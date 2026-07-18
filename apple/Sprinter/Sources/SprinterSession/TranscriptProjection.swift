@@ -211,9 +211,17 @@ public enum TranscriptProjection {
     /// the key, so they render as ONE item rather than double-rendering (CE5.2 /
     /// INV-REACTIVE — mirroring how message/tool ids coalesce their live deltas and
     /// durable entries). Distinct notices carry distinct keys and stay distinct.
-    private mutating func appendNotice(id: String, level: NoticeLevel, message: String) {
-      upsert("notice:\(id)") { _ in
-        .notice(TranscriptNotice(id: id, level: level, message: message))
+    ///
+    /// The key is OPTIONAL on a live `Notice`: a content-derived notice with no stable
+    /// cross-emission identity (`id == nil`) has no durable counterpart to reconcile
+    /// with, so it takes a fresh arrival-sequence key and stays distinct from every
+    /// other occurrence — never collapsing two separate occurrences onto one item. A
+    /// notice WITH an `id` (and every durable `NoticeEntry`, whose id is required)
+    /// keys by it so the live+durable pair reconciles.
+    private mutating func appendNotice(id: String?, level: NoticeLevel, message: String) {
+      let key = id ?? nextSequence()
+      upsert("notice:\(key)") { _ in
+        .notice(TranscriptNotice(id: key, level: level, message: message))
       }
     }
 

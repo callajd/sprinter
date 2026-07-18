@@ -8,7 +8,7 @@ struct SessionModelTests {
   @Test("decodes every SessionEvent variant and round-trips it")
   func decodesSessionEvents() throws {
     let events = try Golden.decode([SessionEvent].self, from: "session-events")
-    #expect(events.count == 20)
+    #expect(events.count == 21)
     for event in events {
       #expect(try Golden.roundTrip(event) == event)
     }
@@ -61,6 +61,10 @@ struct SessionModelTests {
         ))
     #expect(events[17] == .notice(id: "notice-disk", level: .warn, message: "disk space low"))
     #expect(events[18] == .statusChanged(key: "phase", text: "planning"))
+    // The reconciliation-key-less Notice (optional NoticeId absent) decodes to a nil id.
+    #expect(
+      events[20]
+        == .notice(id: nil, level: .error, message: "retry failed after 5 attempt(s)"))
   }
 
   @Test("decodes an EntryAppended carrying a transcript entry")
