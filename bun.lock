@@ -40,6 +40,16 @@
         "effect": "4.0.0-beta.97",
       },
     },
+    "packages/job": {
+      "name": "@sprinter/job",
+      "version": "0.0.0",
+      "dependencies": {
+        "@sprinter/domain": "workspace:*",
+        "@sprinter/runner": "workspace:*",
+        "@sprinter/state": "workspace:*",
+        "effect": "4.0.0-beta.97",
+      },
+    },
     "packages/runner": {
       "name": "@sprinter/runner",
       "version": "0.0.0",
@@ -258,6 +268,8 @@
     "@sprinter/daemon": ["@sprinter/daemon@workspace:packages/daemon"],
 
     "@sprinter/domain": ["@sprinter/domain@workspace:packages/domain"],
+
+    "@sprinter/job": ["@sprinter/job@workspace:packages/job"],
 
     "@sprinter/runner": ["@sprinter/runner@workspace:packages/runner"],
 
