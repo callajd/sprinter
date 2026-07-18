@@ -104,6 +104,13 @@ export type PersistedEvent = (typeof PersistedEvent)["Type"];
  * domain schemas back out, including reconstructing each issue's `dependsOn`
  * edges. `listEpics` / `listIssues` read a node's children so a consumer can roll
  * status up the hierarchy (D13).
+ *
+ * Parentage is stored twice — a parent's child list (`Workstream.epics`,
+ * `Epic.issues`) AND each child's parent reference (`Epic.workstreamId`,
+ * `Issue.epicId`). `getWorkstream`/`getEpic` echo the stored child list, while
+ * `listEpics`/`listIssues` read by the parent reference. Keeping the two consistent
+ * on upsert is the CALLER's responsibility: when adding a child, upsert both the
+ * child (with its parent reference) and the parent (with the child in its list).
  */
 export interface WorkGraphStore {
   /** Upsert a {@link Workstream} (including its `epics` child list). */
@@ -145,7 +152,12 @@ export interface JobStore {
   readonly listJobsForIssue: (
     issueId: IssueId,
   ) => Effect.Effect<ReadonlyArray<Job>, StateStoreError>;
-  /** Upsert a {@link Session}. */
+  /**
+   * Upsert a {@link Session} (by session id). At most one session may exist per
+   * job (1 Job = 1 session); attaching a second, distinct session to a job that
+   * already has one fails with {@link StateStoreError}. A restart re-attaches by
+   * upserting the SAME session id, not a new one.
+   */
   readonly putSession: (session: Session) => Effect.Effect<void, StateStoreError>;
   /** Read a {@link Session} by id, if present. */
   readonly getSession: (id: SessionId) => Effect.Effect<Option.Option<Session>, StateStoreError>;
@@ -160,11 +172,16 @@ export interface JobStore {
  * monotonic `offset` and returns the persisted entry; `read` returns the whole
  * feed in order; `tail` returns every entry strictly after a given offset — the
  * primitive a consumer uses to resume reading where it left off (D17).
+ *
+ * `tail(offset)` is the INCREMENTAL primitive and the one to reach for on a live
+ * or large feed; `read` materialises the ENTIRE feed in memory and is intended for
+ * bounded snapshot use (e.g. AE4's snapshot-on-connect), not for streaming an
+ * unbounded log.
  */
 export interface EventLogStore {
   /** Append an event, returning it stamped with its assigned {@link PersistedEvent.offset}. */
   readonly append: (event: AppendEvent) => Effect.Effect<PersistedEvent, StateStoreError>;
-  /** The entire feed, ordered by ascending offset. */
+  /** The entire feed in memory, ordered by ascending offset — bounded snapshot use (see above). */
   readonly read: Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
   /** Every entry with an offset strictly greater than `offset`, ordered ascending. */
   readonly tail: (offset: number) => Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;

@@ -17,7 +17,14 @@ import { it } from "@effect/vitest";
 import { Array as Arr, Effect, Option, Schema } from "effect";
 import { expect } from "vitest";
 import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
-import { AppendEvent, layer, layerMemory, PersistedEvent, StateStore } from "./index.ts";
+import {
+  AppendEvent,
+  layer,
+  layerMemory,
+  PersistedEvent,
+  StateStore,
+  StateStoreError,
+} from "./index.ts";
 
 // ============================================================================
 // Fixtures — decoded through the owned domain schemas (no casts)
@@ -168,6 +175,26 @@ it.effect("maps a session to and from its job", () =>
     yield* store.jobs.putSession(se);
     expect(Option.getOrThrow(yield* store.jobs.getSession(se.id))).toStrictEqual(se);
     expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(se.jobId))).toStrictEqual(se);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("enforces 1 Job = 1 session, surfacing the backing failure as StateStoreError", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const first = yield* session({ id: "session-1", jobId: "job-1" });
+    yield* store.jobs.putSession(first);
+    // A second, DISTINCT session for the same job violates the 1-session-per-job
+    // invariant. This drives a real backing (UNIQUE-constraint) failure — the one
+    // place a SQL error is produced — and asserts INV-PORT: it crosses the port as
+    // the owned StateStoreError (operation named), never as a SQL/SQLite type.
+    const error = yield* store.jobs
+      .putSession(yield* session({ id: "session-2", jobId: "job-1" }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putSession");
+    expect(error.detail.length).toBeGreaterThan(0);
+    // The first session remains the deterministic answer for the job.
+    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(first.jobId)).id).toBe("session-1");
   }).pipe(Effect.provide(layerMemory)),
 );
 

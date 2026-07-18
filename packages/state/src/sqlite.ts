@@ -200,7 +200,11 @@ const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClien
       "jobId" TEXT NOT NULL,
       status TEXT NOT NULL
     )`;
-    yield* sql`CREATE INDEX session_job ON session ("jobId")`;
+    // UNIQUE enforces the domain invariant 1 Job = 1 session (conventions): at most
+    // one session per job, so `getSessionForJob` is deterministic by construction and
+    // a stray second session for a job fails at the backing (surfacing as a
+    // StateStoreError) rather than silently returning an arbitrary row.
+    yield* sql`CREATE UNIQUE INDEX session_job ON session ("jobId")`;
     yield* sql`CREATE TABLE event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL,
@@ -255,8 +259,12 @@ const make = Effect.gen(function* () {
       sql`SELECT * FROM epic WHERE "workstreamId" = ${workstreamId} ORDER BY id`,
   });
 
-  /** Reconstruct one {@link Issue} from its scalar row plus its ordered `dependsOn` edges. */
-  const hydrateIssue = (row: unknown): Effect.Effect<Issue, StateStoreError> =>
+  /**
+   * Reconstruct one {@link Issue} from its scalar row plus its ordered `dependsOn`
+   * edges. `operation` is the calling store method (`getIssue` / `listIssues`) so a
+   * failure reports the caller, not a fixed label.
+   */
+  const hydrateIssue = (row: unknown, operation: string): Effect.Effect<Issue, StateStoreError> =>
     Effect.gen(function* () {
       const base = yield* Schema.decodeUnknownEffect(IssueRow)(row);
       const edgeRows =
@@ -272,7 +280,7 @@ const make = Effect.gen(function* () {
         ...(base.pr !== null ? { pr: base.pr } : {}),
       };
       return issue;
-    }).pipe(Effect.mapError(fail("getIssue")));
+    }).pipe(Effect.mapError(fail(operation)));
 
   const putWorkGraph: WorkGraphStore = {
     putWorkstream: (workstream) =>
@@ -312,7 +320,7 @@ const make = Effect.gen(function* () {
         Effect.flatMap((rows) =>
           Option.match(Arr.head(rows), {
             onNone: () => Effect.succeedNone,
-            onSome: (row) => Effect.asSome(hydrateIssue(row)),
+            onSome: (row) => Effect.asSome(hydrateIssue(row, "getIssue")),
           }),
         ),
       ),
@@ -325,14 +333,18 @@ const make = Effect.gen(function* () {
     listIssues: (epicId) =>
       sql`SELECT * FROM issue WHERE "epicId" = ${epicId} ORDER BY number`.pipe(
         Effect.mapError(fail("listIssues")),
-        Effect.flatMap((rows) => Effect.forEach(rows, hydrateIssue)),
+        Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateIssue(row, "listIssues"))),
       ),
   };
 
   // ── JobStore ────────────────────────────────────────────────────────────
 
-  /** Reconstruct one {@link Job} from its row, dropping SQL `NULL`s to absent optionals. */
-  const hydrateJob = (row: unknown): Effect.Effect<Job, StateStoreError> =>
+  /**
+   * Reconstruct one {@link Job} from its row, dropping SQL `NULL`s to absent
+   * optionals. `operation` is the calling store method (`getJob` /
+   * `listJobsForIssue`) so a failure reports the caller, not a fixed label.
+   */
+  const hydrateJob = (row: unknown, operation: string): Effect.Effect<Job, StateStoreError> =>
     Schema.decodeUnknownEffect(JobRow)(row).pipe(
       Effect.map(
         (r): Job => ({
@@ -345,7 +357,7 @@ const make = Effect.gen(function* () {
           ...(r.pr !== null ? { pr: r.pr } : {}),
         }),
       ),
-      Effect.mapError(fail("getJob")),
+      Effect.mapError(fail(operation)),
     );
 
   const putSession = SqlSchema.void({
@@ -387,14 +399,16 @@ const make = Effect.gen(function* () {
         Effect.flatMap((rows) =>
           Option.match(Arr.head(rows), {
             onNone: () => Effect.succeedNone,
-            onSome: (row) => Effect.asSome(hydrateJob(row)),
+            onSome: (row) => Effect.asSome(hydrateJob(row, "getJob")),
           }),
         ),
       ),
     listJobsForIssue: (issueId) =>
       sql`SELECT * FROM job WHERE "issueId" = ${issueId} ORDER BY id`.pipe(
         Effect.mapError(fail("listJobsForIssue")),
-        Effect.flatMap((rows) => Effect.forEach(rows, hydrateJob)),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) => hydrateJob(row, "listJobsForIssue")),
+        ),
       ),
     putSession: (session) => putSession(session).pipe(Effect.mapError(fail("putSession"))),
     getSession: (id) => getSessionQuery(id).pipe(Effect.mapError(fail("getSession"))),
