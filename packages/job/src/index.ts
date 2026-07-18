@@ -6,17 +6,23 @@
  * captures its terminal {@link JobResult}, and persists the durable
  * Issue→Job→session mapping.
  *
- * The public surface is two PORTS and the runner's implementation `Layer`:
+ * The public surface is two PORTS, the runner's implementation `Layer`, and the
+ * concrete `LocalPi` adapter behind the `ExecutionRunner` port:
  *
  * - {@link ExecutionRunner} — the agent-runtime port the runner dispatches
- *   through (its local adapter wraps `@sprinter/runner`'s `makeSession`), plus its
- *   owned {@link ExecutionRunnerError}.
+ *   through, plus its owned {@link ExecutionRunnerError}.
  * - {@link JobRunner} — the Job runner port, and {@link layer}, its implementation
  *   over the `ExecutionRunner` + `StateStore` ports.
+ * - {@link layerLocalPi} — the concrete `LocalPi` `ExecutionRunner` adapter over
+ *   `@sprinter/runner`'s `makeSession`; a drop-in `Layer` substitution for the test
+ *   fake, requiring only a `ChildProcessSpawner` behind it (INV-EFFECT-DI).
  *
- * Everything here depends ONLY on ports and owned, provider-neutral types — never
- * on a concrete `pi` process or SQLite instance (INV-PORT). The `JobResult`
- * envelope is owned by `@sprinter/domain`.
+ * The two ports and the Job runner depend ONLY on ports and owned, provider-neutral
+ * types — never on a concrete `pi` process or SQLite instance (INV-PORT); the
+ * `LocalPi` adapter is the ONE module that knows the runner's `makeSession`, and it
+ * exposes nothing Pi-shaped above the tag. The `JobResult` envelope is owned by
+ * `@sprinter/domain`.
  */
 export { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
 export { JobRunner, layer } from "./job-runner.ts";
+export { layerLocalPi } from "./local-pi-runner.ts";

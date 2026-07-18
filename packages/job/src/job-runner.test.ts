@@ -10,11 +10,11 @@
  * re-attach invariant (a re-dispatch upserts the SAME session id, never a new one).
  */
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema, Stream } from "effect";
+import { Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
-import { Job, type SessionEvent } from "@sprinter/domain";
+import { Issue, Job, type SessionEvent, type SessionInput } from "@sprinter/domain";
 import { PiTransportError, type SessionHandle, type SessionResult } from "@sprinter/runner";
 import { layerMemory, StateStore } from "@sprinter/state";
 import { ExecutionRunner, ExecutionRunnerError, JobRunner, layer } from "./index.ts";
@@ -46,6 +46,16 @@ const fakeHandle = (
   interrupt: Effect.void,
   answerUi: () => Effect.void,
   result: Effect.succeed(result),
+});
+
+/** As {@link fakeHandle}, but records every {@link SessionInput} driven in via `send`. */
+const recordingHandle = (
+  events: Stream.Stream<SessionEvent, PiTransportError>,
+  result: SessionResult,
+  sent: Ref.Ref<ReadonlyArray<SessionInput>>,
+): SessionHandle => ({
+  ...fakeHandle(events, result),
+  send: (input) => Ref.update(sent, (xs) => [...xs, input]),
 });
 
 /** A fake {@link ExecutionRunner} that hands back a fixed handle for every job. */
@@ -111,6 +121,47 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
     const byId = Option.getOrThrow(yield* store.jobs.getSession(forJob.id));
     expect(byId).toStrictEqual(forJob);
   }).pipe(provide(fakeHandle(Stream.make(turnStarted, entryEvent), { _tag: "Completed" }))),
+);
+
+// ============================================================================
+// Real Issue-content prompt (CE1.1) — not the id-only placeholder
+// ============================================================================
+
+it.effect("drives a prompt built from the real Issue content (number + title), not the id", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    // Persist the Issue this job advances so the prompt is derived from real content.
+    const store = yield* StateStore;
+    const issue = yield* decode(Issue, {
+      id: "issue-22",
+      epicId: "epic-1",
+      number: 22,
+      title: "Postgres sink batching",
+      status: "in_progress",
+      dependsOn: [],
+    });
+    yield* store.workGraph.putIssue(issue);
+
+    const sent = yield* Ref.make<ReadonlyArray<SessionInput>>([]);
+    const handle = recordingHandle(Stream.make(turnStarted), { _tag: "Completed" }, sent);
+
+    // Dispatch against the SAME (outer) `StateStore` — the JobRunner + fake runner
+    // layers are provided here, but `StateStore` is inherited from the outer context
+    // so the Issue persisted above is the one the prompt is derived from.
+    yield* Effect.gen(function* () {
+      const runner = yield* JobRunner;
+      yield* runner.dispatch(job);
+    }).pipe(Effect.provide(layer), Effect.provide(fakeRunner(handle)));
+
+    const driven = yield* Ref.get(sent);
+    expect(driven).toHaveLength(1);
+    const prompt = driven[0];
+    expect(prompt?.mode).toBe("prompt");
+    // The prompt carries the real Issue number and title — not the opaque issueId.
+    expect(prompt?.text).toContain("#22");
+    expect(prompt?.text).toContain("Postgres sink batching");
+    expect(prompt?.text).not.toContain("issue-22");
+  }).pipe(Effect.scoped, Effect.provide(layerMemory)),
 );
 
 // ============================================================================
