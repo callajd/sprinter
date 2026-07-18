@@ -15,7 +15,11 @@
  *   over the `ExecutionRunner` + `StateStore` ports.
  * - {@link layerLocalPi} — the concrete `LocalPi` `ExecutionRunner` adapter over
  *   `@sprinter/runner`'s `makeSession`; a drop-in `Layer` substitution for the test
- *   fake, requiring only a `ChildProcessSpawner` behind it (INV-EFFECT-DI).
+ *   fake, requiring a `ChildProcessSpawner` and a {@link PiSpawnRouter} behind it
+ *   (INV-EFFECT-DI).
+ * - {@link PiSpawnRouter} — the per-Job spawn-config (cwd/worktree) routing port the
+ *   `LocalPi` adapter reads, with {@link layerInheritCwd} (no-op default) and
+ *   {@link layerWorktreeRouter} (a per-Job `<baseDir>/<job.id>` worktree) adapters.
  *
  * The two ports and the Job runner depend ONLY on ports and owned, provider-neutral
  * types — never on a concrete `pi` process or SQLite instance (INV-PORT); the
@@ -26,3 +30,4 @@
 export { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
 export { JobRunner, layer } from "./job-runner.ts";
 export { layerLocalPi } from "./local-pi-runner.ts";
+export { layerInheritCwd, layerWorktreeRouter, PiSpawnRouter } from "./spawn-router.ts";

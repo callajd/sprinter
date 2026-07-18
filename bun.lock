@@ -28,7 +28,11 @@
     "packages/daemon": {
       "name": "@sprinter/daemon",
       "version": "0.0.0",
+      "bin": {
+        "sprinter-daemon": "./src/run.ts",
+      },
       "dependencies": {
+        "@effect/platform-bun": "4.0.0-beta.97",
         "@sprinter/contract": "workspace:*",
         "@sprinter/domain": "workspace:*",
         "@sprinter/job": "workspace:*",
@@ -36,9 +40,6 @@
         "@sprinter/runner": "workspace:*",
         "@sprinter/state": "workspace:*",
         "effect": "4.0.0-beta.97",
-      },
-      "devDependencies": {
-        "@effect/platform-bun": "4.0.0-beta.97",
       },
     },
     "packages/domain": {

@@ -18,7 +18,11 @@ export default defineConfig({
       reporter: ["text", "lcov"],
       reportsDirectory: "coverage",
       include: ["packages/*/src/**/*.ts"],
-      exclude: ["packages/*/src/**/*.test.ts"],
+      // `run.ts` is the daemon PROCESS entrypoint: it binds a real socket and runs
+      // forever (`BunRuntime.runMain`), so it cannot be exercised deterministically
+      // offline. Every unit of logic it touches lives in `main.ts` and is covered
+      // there; the entrypoint itself is verified by the documented manual smoke step.
+      exclude: ["packages/*/src/**/*.test.ts", "packages/daemon/src/run.ts"],
       all: true,
       thresholds: {
         perFile: true,
