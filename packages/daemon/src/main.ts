@@ -29,6 +29,8 @@
  * is the pure, tested graph.
  */
 import { Effect, Layer } from "effect";
+import { FileSystem } from "effect/FileSystem";
+import type { PlatformError } from "effect/PlatformError";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import { BunServices, BunSocketServer } from "@effect/platform-bun";
 import { SprinterRpc } from "@sprinter/contract";
@@ -147,6 +149,31 @@ export const bootLayer = Layer.effectDiscard(
 );
 
 /**
+ * Idempotently unlink a stale Unix-domain socket FILE before a bind (INV-RESTART):
+ * a daemon that crashed leaves its `sprinter.sock` on disk, and `bind(2)` on an
+ * existing socket path fails with `EADDRINUSE` — so a naive restart could never
+ * rebind. `BunSocketServer.layer` (→ `@effect/platform-node-shared` `NodeSocketServer`,
+ * `Net.createServer` + `server.listen`) does NOT unlink first, so we do. `force: true`
+ * makes it a no-op when the path does not exist (the normal fresh-start case).
+ */
+export const unlinkStaleSocket = (path: string): Effect.Effect<void, PlatformError, FileSystem> =>
+  Effect.flatMap(FileSystem, (fs) => fs.remove(path, { force: true }));
+
+/**
+ * The bound socket transport: unlink any stale socket FILE, THEN bind. `Layer.unwrap`
+ * runs the unlink effect to COMPLETION before it yields (and builds) the binding
+ * layer, so the two are strictly ordered — the stale file is always gone before the
+ * `listen` that would otherwise `EADDRINUSE`. Requires the `FileSystem` (the daemon
+ * edge `BunServices` provides it).
+ */
+const socketServerLayer = (config: DaemonConfig) =>
+  Layer.unwrap(
+    unlinkStaleSocket(config.socketPath).pipe(
+      Effect.as(BunSocketServer.layer({ path: config.socketPath })),
+    ),
+  );
+
+/**
  * The concrete served transport: `RpcServer` over a `SocketServer` bound to the
  * configured Unix-domain socket, with NDJSON framing — the wire the app dials. This
  * (and {@link mainLayer}) are the ONLY transport-aware edges (INV-PORT); swapping to
@@ -155,7 +182,7 @@ export const bootLayer = Layer.effectDiscard(
 export const socketProtocolLayer = (config: DaemonConfig) =>
   RpcServer.layerProtocolSocketServer.pipe(
     Layer.provide(RpcSerialization.layerNdjson),
-    Layer.provide(BunSocketServer.layer({ path: config.socketPath })),
+    Layer.provide(socketServerLayer(config)),
   );
 
 /**
@@ -165,7 +192,7 @@ export const socketProtocolLayer = (config: DaemonConfig) =>
  * Building it opens the socket, runs the boot reconcile, and starts serving; closing
  * its scope tears everything down.
  */
-export const mainLayer = (config: DaemonConfig): Layer.Layer<never, unknown> =>
+export const mainLayer = (config: DaemonConfig) =>
   Layer.mergeAll(RpcServer.layer(SprinterRpc), bootLayer).pipe(
     Layer.provide(appLayer(config)),
     Layer.provide(socketProtocolLayer(config)),

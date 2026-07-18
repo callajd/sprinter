@@ -181,6 +181,34 @@ it.effect(
     }),
 );
 
+it.effect(
+  "pre-arms the terminal watcher at run(): the gate observes turn+settle with NO consumer attached (CE1.1-F1)",
+  () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakePi;
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const runner = yield* ExecutionRunner;
+          const job = yield* makeJob();
+          // `run` returns only AFTER the watcher's subscription is established
+          // (subscribe-before-emit: `oneShot` arms it eagerly via `Stream.toPull`).
+          // So events emitted NOW — with NO consumer ever collecting `handle.events` —
+          // are still seen by the pre-armed watcher, which arms the gate on
+          // `turn_start` and truncates on the following `agent_settled`, resolving the
+          // terminal `result`. A watcher that subscribed lazily (after emit) could
+          // miss `turn_start` under burst and hang the gate.
+          const handle = yield* runner.run(job);
+
+          yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
+          yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
+
+          const result = yield* handle.result;
+          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+        }),
+      ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
+    }),
+);
+
 it.effect("settles Failed with a neutral detail when the transport tears down", () =>
   Effect.gen(function* () {
     const fake = yield* makeFakePi;

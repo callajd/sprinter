@@ -6,14 +6,17 @@
  *
  * Two pieces, both expressed only in owned types (INV-BOUNDARY / INV-PORT):
  *
- * - {@link layerJournaling} — a {@link StateStore} decorator that, after every
- *   successful `put*` mutation, APPENDS the matching owned {@link WorkGraphEvent}
- *   to the durable {@link EventLogStore} (`append`), stamping it a monotonic
- *   `offset`. Because it is itself a `StateStore` (same port), every writer through
- *   the port — the command handlers AND the `JobRunner` — journals for free, with
- *   no consumer knowing (INV-PORT). It is composed BENEATH the publishing decorator
- *   (`./store-publishing.ts`), so a mutation is journaled durably BEFORE it is fanned
- *   out live — the ordering the gap-free resync below relies on.
+ * - {@link layerJournaling} — a {@link StateStore} decorator that, for every `put*`
+ *   mutation, persists the node write AND appends the matching owned
+ *   {@link WorkGraphEvent} to the durable {@link EventLogStore} (`append`, stamping a
+ *   monotonic `offset`) inside a SINGLE {@link StateStore.withTransaction} — so the
+ *   two commit together or neither does. A crash can never leave the node persisted
+ *   with its delta un-journaled (which would make the offset feed an incomplete
+ *   history — INV-RESTART). Because it is itself a `StateStore` (same port), every
+ *   writer through the port — the command handlers AND the `JobRunner` — journals
+ *   atomically for free, with no consumer knowing (INV-PORT). It is composed BENEATH
+ *   the publishing decorator (`./store-publishing.ts`), so a mutation is journaled
+ *   durably BEFORE it is fanned out live — the ordering the gap-free resync relies on.
  *
  * - {@link resyncEvents} — the stream the `events` RPC returns: it EAGERLY subscribes
  *   to the live feed, THEN replays the durable log from a starting offset via
@@ -51,22 +54,33 @@ const journalDelta = (base: Store, event: WorkGraphEvent): Effect.Effect<void, S
     Effect.asVoid,
   );
 
+/**
+ * Persist a node write AND its offset-log delta ATOMICALLY (INV-RESTART): both run
+ * inside a single {@link StateStore.withTransaction}, so a crash can never leave the
+ * node persisted with its delta un-journaled (which would make the offset feed an
+ * incomplete history). Without the transaction these are two separate commits with a
+ * crash window between them; with it, they commit together or neither does.
+ */
+const putAndJournal = (
+  base: Store,
+  put: Effect.Effect<void, StateStoreError>,
+  event: WorkGraphEvent,
+): Effect.Effect<void, StateStoreError> =>
+  base.withTransaction(put.pipe(Effect.andThen(journalDelta(base, event))));
+
 /** Build the journaling store shape: delegate to `base`, then journal each `put*`'s delta. */
 const journaling = (base: Store): Store =>
   StateStore.of({
     workGraph: {
       putWorkstream: (workstream) =>
-        base.workGraph
-          .putWorkstream(workstream)
-          .pipe(Effect.andThen(journalDelta(base, { _tag: "WorkstreamChanged", workstream }))),
+        putAndJournal(base, base.workGraph.putWorkstream(workstream), {
+          _tag: "WorkstreamChanged",
+          workstream,
+        }),
       putEpic: (epic) =>
-        base.workGraph
-          .putEpic(epic)
-          .pipe(Effect.andThen(journalDelta(base, { _tag: "EpicChanged", epic }))),
+        putAndJournal(base, base.workGraph.putEpic(epic), { _tag: "EpicChanged", epic }),
       putIssue: (issue) =>
-        base.workGraph
-          .putIssue(issue)
-          .pipe(Effect.andThen(journalDelta(base, { _tag: "IssueChanged", issue }))),
+        putAndJournal(base, base.workGraph.putIssue(issue), { _tag: "IssueChanged", issue }),
       getWorkstream: base.workGraph.getWorkstream,
       getEpic: base.workGraph.getEpic,
       getIssue: base.workGraph.getIssue,
@@ -75,18 +89,16 @@ const journaling = (base: Store): Store =>
       listIssues: base.workGraph.listIssues,
     },
     jobs: {
-      putJob: (job) =>
-        base.jobs.putJob(job).pipe(Effect.andThen(journalDelta(base, { _tag: "JobChanged", job }))),
+      putJob: (job) => putAndJournal(base, base.jobs.putJob(job), { _tag: "JobChanged", job }),
       getJob: base.jobs.getJob,
       listJobsForIssue: base.jobs.listJobsForIssue,
       putSession: (session) =>
-        base.jobs
-          .putSession(session)
-          .pipe(Effect.andThen(journalDelta(base, { _tag: "SessionChanged", session }))),
+        putAndJournal(base, base.jobs.putSession(session), { _tag: "SessionChanged", session }),
       getSession: base.jobs.getSession,
       getSessionForJob: base.jobs.getSessionForJob,
     },
     events: base.events,
+    withTransaction: base.withTransaction,
   });
 
 /**

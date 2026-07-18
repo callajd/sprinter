@@ -57,6 +57,10 @@ const publishing = (
       getSessionForJob: base.jobs.getSessionForJob,
     },
     events: base.events,
+    // Transactions pass straight through to the backing; the live fan-out (the
+    // `tap(publish)` above) stays OUTSIDE the transaction — a delta is published
+    // only after the durable write commits, never on a rolled-back one.
+    withTransaction: base.withTransaction,
   });
 
 /**

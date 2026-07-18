@@ -20,7 +20,7 @@
  * `Scope`-managed by the caller: it is torn down when the dispatch scope closes,
  * so nothing is orphaned.
  */
-import { Cause, Deferred, Effect, Layer, Option, Ref, Stream } from "effect";
+import { Cause, Deferred, Effect, Layer, Option, Pull, Ref, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import type { Job, SessionEvent } from "@sprinter/domain";
@@ -71,44 +71,59 @@ const failedResult = (cause: Cause.Cause<PiTransportError>): SessionResult => {
  * `turn_start` → `TurnStarted`). Every pre-turn (pre-prompt) settle is DROPPED — it
  * neither ends the stream nor resolves `result` — so a truncating settle always
  * follows real agent work.
+ *
+ * **Subscribe-before-emit (CE1.1-F1 cold review).** The gate is only sound if the
+ * watcher is LISTENING before `TurnStarted` can flow: the session's `events` is a
+ * bounded SLIDING PubSub (`@sprinter/runner`), so under a real-`pi` burst a
+ * `TurnStarted` could slide out of the replay window before a late subscriber
+ * attaches — leaving the gate un-armed so the watcher never truncates and dispatch
+ * HANGS. So the watcher's subscription is established EAGERLY here (via
+ * {@link Stream.toPull}) before `run` yields the handle — hence before the
+ * `JobRunner` sends the prompt that drives `TurnStarted` (`dispatch` calls `send`
+ * only after `run` returns). The subscription is armed before any event can flow.
  */
 const oneShot = (handle: SessionHandle): Effect.Effect<SessionHandle, never, Scope> =>
   Effect.gen(function* () {
     const settled = yield* Deferred.make<SessionResult>();
-    // The gated one-shot stream. Each subscription (the consumer below AND the
-    // terminal watcher) gets its OWN `turnStarted` ref via `Stream.unwrap` — a
-    // SHARED ref would race: the watcher, draining ahead, could flip the ref from a
-    // later `turn_start` while the consumer is still on the pre-prompt settle, so the
-    // consumer would wrongly keep it. Per-subscription state keeps the gate correct
-    // regardless of interleaving. A `SessionIdle` truncates only AFTER `TurnStarted`
-    // in THAT subscription; every pre-turn settle is dropped.
-    const events = Stream.unwrap(
-      Effect.gen(function* () {
-        const turnStarted = yield* Ref.make(false);
-        return handle.events.pipe(
-          Stream.filterEffect((event) =>
-            isTurnStarted(event)
-              ? Ref.set(turnStarted, true).pipe(Effect.as(true))
-              : isSessionIdle(event)
-                ? Ref.get(turnStarted)
-                : Effect.succeed(true),
-          ),
-          Stream.takeUntil(isSessionIdle),
-        );
-      }),
-    );
-    // A fresh subscription (the fan-out stream is multi-consumer) drives the
-    // terminal outcome from the same truncated boundary the consumer observes.
-    const watch = events.pipe(
-      Stream.runDrain,
-      Effect.matchCauseEffect({
-        onFailure: (cause: Cause.Cause<PiTransportError>) =>
-          Deferred.succeed(settled, failedResult(cause)),
-        onSuccess: () => Deferred.succeed(settled, { _tag: "Completed" as const }),
-      }),
+    // A fresh gated view of the session's events. Each call gets its OWN
+    // `turnStarted` ref via `Stream.unwrap` — a SHARED ref would race: the watcher,
+    // draining ahead, could flip the ref from a later `turn_start` while the consumer
+    // is still on the pre-prompt settle, so the consumer would wrongly keep it.
+    // Per-subscription state keeps the gate correct regardless of interleaving. A
+    // `SessionIdle` truncates only AFTER `TurnStarted` in THAT subscription; every
+    // pre-turn settle is dropped.
+    const gated = (): Stream.Stream<SessionEvent, PiTransportError> =>
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const turnStarted = yield* Ref.make(false);
+          return handle.events.pipe(
+            Stream.filterEffect((event) =>
+              isTurnStarted(event)
+                ? Ref.set(turnStarted, true).pipe(Effect.as(true))
+                : isSessionIdle(event)
+                  ? Ref.get(turnStarted)
+                  : Effect.succeed(true),
+            ),
+            Stream.takeUntil(isSessionIdle),
+          );
+        }),
+      );
+    // Arm the terminal watcher's subscription EAGERLY, before returning the handle:
+    // `Stream.toPull` opens the channel (subscribing to the session's PubSub) as it
+    // runs, so the gate is listening before any event can flow (subscribe-before-emit).
+    const pull = yield* Stream.toPull(gated());
+    // Drain that pre-armed subscription to its terminal: a clean stream end (the gated
+    // `SessionIdle`, or `pi` closing) resolves `Completed`; a transport teardown
+    // resolves `Failed`. `Pull.catchDone` turns the end-of-stream halt into the clean
+    // outcome, leaving only a real `PiTransportError` cause for the failure branch.
+    const watch = Effect.forever(pull).pipe(
+      Pull.catchDone(() => Deferred.succeed(settled, { _tag: "Completed" as const })),
+      Effect.catchCause((cause: Cause.Cause<PiTransportError>) =>
+        Deferred.succeed(settled, failedResult(cause)),
+      ),
     );
     yield* Effect.forkScoped(watch);
-    return { ...handle, events, result: Deferred.await(settled) };
+    return { ...handle, events: gated(), result: Deferred.await(settled) };
   });
 
 /**

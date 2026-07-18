@@ -10,7 +10,7 @@ import { Context, Effect, Fiber, Schema, Stream } from "effect";
 import { expect } from "vitest";
 import type { WorkGraphEvent } from "@sprinter/contract";
 import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
-import { layerMemory, StateStore } from "@sprinter/state";
+import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
 import { layerPublishing } from "./store-publishing.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
@@ -87,6 +87,39 @@ it.effect("journals every persisted mutation to the durable offset log, in order
     Effect.provide(layerPublishing(layerJournaling(layerMemory))),
     Effect.provide(layerWorkGraphEvents),
   ),
+);
+
+it.effect(
+  "journals the node write AND its delta ATOMICALLY: a failed transaction rolls back both (INV-RESTART)",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+
+      // A transaction that writes a node (which itself journals its delta) then
+      // fails. The node write and its `event_log` append must be a SINGLE unit: on
+      // failure BOTH roll back — never the node-persisted-but-delta-missing split a
+      // crash between two separate commits would leave (the offset feed's history
+      // would then be incomplete).
+      const boom = new StateStoreError({ operation: "test", detail: "boom" });
+      const failure = yield* store.workGraph
+        .putWorkstream(workstream)
+        .pipe(Effect.andThen(Effect.fail(boom)), store.withTransaction, Effect.flip);
+      expect(failure).toBe(boom);
+
+      // Nothing committed: neither the node row nor its offset-log delta survive.
+      const persisted = yield* store.workGraph.getWorkstream(workstream.id);
+      expect(persisted._tag).toBe("None");
+      const entries = yield* store.events.tail(0);
+      expect(entries).toEqual([]);
+
+      // And a NORMAL put commits both together — the node is readable and its delta
+      // is journaled (the two halves the transaction binds).
+      yield* store.workGraph.putWorkstream(workstream);
+      const committed = yield* store.workGraph.getWorkstream(workstream.id);
+      expect(committed._tag).toBe("Some");
+      const journaled = yield* store.events.tail(0);
+      expect(journaled.map((e) => e.kind)).toEqual(["WorkstreamChanged"]);
+    }).pipe(Effect.scoped, Effect.provide(layerJournaling(layerMemory))),
 );
 
 it.effect("resyncFrom decodes the durable log back into owned WorkGraphEvents", () =>

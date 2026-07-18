@@ -207,5 +207,19 @@ export class StateStore extends Context.Service<
     readonly jobs: JobStore;
     /** The durable event-feed capability group. */
     readonly events: EventLogStore;
+    /**
+     * Run `effect` in a SINGLE durable transaction: every `put*`/`append` write
+     * it performs commits together or rolls back together (nested transactions
+     * fold into the outer one). This is the atomicity primitive a decorator uses
+     * to keep a node write and its offset-log delta gap-free under a crash (D17 /
+     * INV-RESTART) — without it, the two are separate commits and a crash between
+     * them leaves the node persisted but the event feed missing its delta.
+     *
+     * The adapter maps its backing transaction failure to the owned
+     * {@link StateStoreError}; the combinator adds no error beyond that (INV-PORT).
+     */
+    readonly withTransaction: <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | StateStoreError, R>;
   }
 >()("sprinter/state/StateStore") {}

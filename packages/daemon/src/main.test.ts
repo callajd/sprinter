@@ -204,7 +204,25 @@ it("mainLayer assembles the full served graph (transport + boot) without error",
   // Constructing the layer is pure (no socket bound until it is BUILT), so this
   // proves the production graph — RpcServer over the socket transport, the real
   // Repository, boot reconcile, Bun services — type-checks and assembles as ONE
-  // Effect layer graph (INV-EFFECT-DI). Its launch is the documented smoke step.
+  // Effect layer graph (INV-EFFECT-DI). The BUILD is exercised below.
   const layer = mainLayer(configFromEnv({ SPRINTER_SOCKET: "/tmp/sprinter-test.sock" }));
   expect(layer).toBeDefined();
 });
+
+it.effect("mainLayer BUILDS the full served graph (real transport bind + boot) in a scope", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem;
+    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-daemon-main-" });
+
+    // Actually BUILD the production graph — not just construct the VALUE. This binds
+    // a REAL Unix-domain socket on a temp path (via the un-widened `mainLayer`, whose
+    // now-visible error/requirement channels a build error would surface), runs the
+    // boot reconcile (a fresh/empty graph → offline, no host calls), and wires
+    // RpcServer over the socket transport, the real Repository, and Bun services. A
+    // wiring/build failure (or a failed bind) fails the test — the assurance the
+    // construct-only assertion above cannot give. Building on a temp path also
+    // exercises the stale-socket unlink-before-bind (a prior bind on the same path is
+    // cleared), and the scope tears the socket server down deterministically.
+    yield* Layer.build(mainLayer(testConfig(dir))).pipe(Effect.scoped);
+  }).pipe(Effect.provide(BunFileSystem.layer)),
+);
