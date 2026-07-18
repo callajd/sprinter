@@ -43,8 +43,9 @@ runs, and the gate agents must pass post-cutover.
   (source-instrumenting) provider is required; V8 cannot run here. Thresholds in
   `vitest.config.ts` with `all: true` + `perFile: true` (line & function ≥ 0.75), so an
   untested or weak *module* fails the gate, not just the aggregate.
-- **`bun run check`** = `check:pins` (Effect CLI) → `oxfmt --check` → `oxlint` →
-  `tsc --noEmit` → `vitest run --coverage`.
+- **`bun run check`** = `oxfmt --check` → `oxlint` → `tsc --noEmit` →
+  `vitest run --coverage`. Dependency pinning is enforced by `save-exact` +
+  `bun install --frozen-lockfile` + the committed `bun.lock` — no custom check script.
 
 ## SwiftUI / Swift side *(recommended analogs — confirm)*
 

@@ -7,12 +7,11 @@
   ],
   "type": "module",
   "scripts": {
-    "check:pins": "bun run scripts/check-pins.ts",
     "check:format": "oxfmt --check .",
-    "check:lint": "oxlint --deny-warnings packages scripts",
+    "check:lint": "oxlint --deny-warnings packages",
     "check:types": "tsc --noEmit",
     "check:test": "vitest run --coverage",
-    "check": "bun run check:pins && bun run check:format && bun run check:lint && bun run check:types && bun run check:test"
+    "check": "bun run check:format && bun run check:lint && bun run check:types && bun run check:test"
   },
   "devDependencies": {
     "@effect/platform-bun": "4.0.0-beta.97",

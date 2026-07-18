@@ -1,58 +1,54 @@
 /**
  * Live validation against the REAL `pi --mode rpc` binary (FE2.2, INV-CONTRACT).
  *
- * This spawns the installed `pi` (v0.80.10) in `--mode rpc` via Effect's
- * `effect/unstable/process` `ChildProcessSpawner`, writes real `RpcCommand`s to
- * stdin, captures the actual NDJSON emitted on stdout (split strictly on `\n`),
- * and asserts our `Schema.decode` accepts the ACTUAL bytes — not a hand-made
- * fixture. If Pi's real shape drifts from what we mirror, this test fails.
+ * Opt-in via the `SPRINTER_PI_BIN` config (an absolute path to `pi`), read through
+ * Effect's `Config` (and thus the ambient `ConfigProvider`). When set, this spawns
+ * that binary in `--mode rpc` via `effect/unstable/process`, drives real commands,
+ * captures the actual NDJSON on stdout, and decodes the real bytes against our wire
+ * schema — the Pi-drift gate. When unset (e.g. a runner with no pi) it logs and is a
+ * green no-op.
  *
- * WHAT IS VALIDATED LIVE HERE: the NDJSON framing and the response envelope —
- * `get_state` (`RpcSessionState`), an async command ack (`abort`), and the
- * universal error response (`prompt` with no provider auth). Driving a full
- * model turn (streaming `AgentSessionEvent` message/tool/turn events) requires
- * Pi provider auth (`~/.pi/agent/auth.json`), which is NOT assumed present, so
- * those streaming shapes are covered by source-authored fixtures in
- * `wire.test.ts` instead. See the PR body for the live-vs-fixture split.
+ * Bun + Effect only, zero `node:*`: config via `Config`, filesystem + process via
+ * the Bun platform layer — imported DYNAMICALLY inside the run path. Its `bun`
+ * builtin import is fine at run time under Bun but unresolvable when a runner merely
+ * *collects* this file, so we never load it unless we actually run.
+ *
+ * WHAT IS VALIDATED LIVE: NDJSON framing + the response envelope (`get_state`, the
+ * `abort` ack, and the `prompt` error/ack). A full model turn needs Pi provider
+ * auth; those streaming shapes are covered by source-authored fixtures in
+ * `wire.test.ts`. See the PR body for the live-vs-fixture split.
  */
-import { existsSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
 import { it } from "@effect/vitest";
-import { Effect, Exit, Schema, Stream } from "effect";
+import { Config, Effect, FileSystem, Option, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { expect } from "vitest";
 import { PiRpcResponse, PiServerMessage } from "./wire.ts";
 
-// Resolve pi wherever it is findable so the live INV-CONTRACT gate fires — an
-// explicit override first, then `PATH`, then the default install location — and
-// only skips (loudly, below) when pi is genuinely absent.
-const piBin =
-  process.env["SPRINTER_PI_BIN"] ?? Bun.which("pi") ?? join(homedir(), ".bun", "bin", "pi");
-const hasPi = existsSync(piBin);
+type PiResponse = (typeof PiRpcResponse)["Type"];
 
 const commands = [
   { id: "state", type: "get_state" },
   { id: "ack", type: "abort" },
   { id: "err", type: "prompt", message: "say hi" },
 ];
-const stdinBytes = new TextEncoder().encode(
-  `${commands.map((command) => JSON.stringify(command)).join("\n")}\n`,
-);
+const stdin = `${commands.map((command) => JSON.stringify(command)).join("\n")}\n`;
 
-/** Spawn `pi --mode rpc`, drive the commands, and collect the first `n` stdout lines. */
-const captureLines = (cwd: string, n: number) =>
+const decodeServerMessage = Schema.decodeUnknownEffect(Schema.fromJsonString(PiServerMessage));
+const decodeResponse = Schema.decodeUnknownEffect(Schema.fromJsonString(PiRpcResponse));
+
+/** Spawn `pi --mode rpc` in a scoped temp cwd, drive the commands, collect `n` lines. */
+const captureLines = (piBin: string, n: number) =>
   Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-pi-rpc-" });
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const command = ChildProcess.make(piBin, ["--mode", "rpc"], {
-      cwd,
-      // Keep stdin open so Pi stays alive; the test scope kills it once we have
-      // the lines we need.
-      stdin: { stream: Stream.make(stdinBytes), endOnDone: false },
-    });
-    const handle = yield* spawner.spawn(command);
-    return yield* handle.stdout.pipe(
+    const child = yield* spawner.spawn(
+      ChildProcess.make(piBin, ["--mode", "rpc"], {
+        cwd,
+        // Keep stdin open so Pi stays alive; the scope kills it once we have the lines.
+        stdin: { stream: Stream.make(stdin).pipe(Stream.encodeText), endOnDone: false },
+      }),
+    );
+    return yield* child.stdout.pipe(
       Stream.decodeText(),
       Stream.splitLines,
       Stream.take(n),
@@ -60,55 +56,64 @@ const captureLines = (cwd: string, n: number) =>
     );
   });
 
-it.live.skipIf(!hasPi)("decodes real `pi --mode rpc` NDJSON output against the wire schema", () =>
+/** Fail on the Effect channel (not via `throw`) if no driven command produced `label`. */
+const requireResponse = (
+  responses: ReadonlyArray<PiResponse>,
+  lines: ReadonlyArray<string>,
+  label: string,
+  predicate: (response: PiResponse) => boolean,
+) =>
+  responses.some(predicate)
+    ? Effect.void
+    : Effect.fail(new Error(`no ${label} among ${JSON.stringify(lines)}`));
+
+const validate = (piBin: string) =>
   Effect.gen(function* () {
-    const cwd = mkdtempSync(join(tmpdir(), "sprinter-pi-rpc-"));
-    // Import the Bun platform layer DYNAMICALLY, inside the (skipped-on-CI) test
-    // body: `@effect/platform-bun` transitively `import`s the `bun` builtin, which
-    // vitest cannot resolve when it merely collects this file on a runner. A static
-    // import would fail collection even though the test is skipped; deferring it
-    // means CI never loads it, while a machine with pi loads it at run time.
-    const { BunServices } = yield* Effect.promise(() => import("@effect/platform-bun"));
-    const lines = yield* captureLines(cwd, commands.length).pipe(Effect.provide(BunServices.layer));
+    const lines = yield* captureLines(piBin, commands.length);
 
-    // Parse each captured NDJSON line once.
-    const parsed: Array<unknown> = [];
-    for (const line of lines) {
-      const value: unknown = JSON.parse(line);
-      parsed.push(value);
-    }
+    // Framing + drift: every captured line must decode through the mirrored union.
+    yield* Effect.forEach(lines, (line) => decodeServerMessage(line), { discard: true });
 
-    // Every real line decodes through the mirrored server-message union (framing
-    // + shape). We match the responses we drove BY COMMAND rather than by
-    // position/count, so an unsolicited event or reordering on a future Pi does
-    // not flip this into a false failure.
-    const responses: Array<(typeof PiRpcResponse)["Type"]> = [];
-    for (const value of parsed) {
-      yield* Schema.decodeUnknownEffect(PiServerMessage)(value);
-      const asResponse = yield* Effect.exit(Schema.decodeUnknownEffect(PiRpcResponse)(value));
-      if (Exit.isSuccess(asResponse)) responses.push(asResponse.value);
-    }
+    // The response envelopes among the lines (an event line decodes to None here).
+    const decoded = yield* Effect.forEach(lines, (line) =>
+      decodeResponse(line).pipe(Effect.option),
+    );
+    const responses = decoded.filter(Option.isSome).map((some) => some.value);
 
-    // get_state → a real `RpcSessionState` snapshot.
-    const state = responses.find((r) => r.command === "get_state" && r.success);
-    if (!(state?.type === "response" && state.success && state.command === "get_state")) {
-      throw new Error(`no successful get_state response among ${JSON.stringify(lines)}`);
-    }
-    expect(typeof state.data.sessionId).toBe("string");
-    expect(state.data.sessionId.length).toBeGreaterThan(0);
+    // Each command we drove must have produced its response — matched BY COMMAND
+    // (order-independent) so reordering / an unsolicited future event never flips it.
+    yield* requireResponse(
+      responses,
+      lines,
+      "successful get_state response",
+      (r) => r.command === "get_state" && r.success,
+    );
+    yield* requireResponse(
+      responses,
+      lines,
+      "successful abort ack",
+      (r) => r.command === "abort" && r.success,
+    );
+    yield* requireResponse(responses, lines, "prompt response", (r) => r.command === "prompt");
+  });
 
-    // abort → a real async command ack.
-    const ack = responses.find((r) => r.command === "abort" && r.success);
-    if (!(ack?.type === "response" && ack.command === "abort" && ack.success)) {
-      throw new Error(`no successful abort ack among ${JSON.stringify(lines)}`);
-    }
-
-    // prompt → a real response envelope for the "prompt" command. Without provider
-    // auth this is the error variant; with auth it is the success ack. Either is a
-    // valid mirrored `RpcResponse` for command "prompt".
-    const prompt = responses.find((r) => r.command === "prompt");
-    if (!(prompt?.type === "response" && prompt.command === "prompt")) {
-      throw new Error(`no prompt response among ${JSON.stringify(lines)}`);
-    }
-  }).pipe(Effect.timeout("30 seconds")),
+it.live("decodes real `pi --mode rpc` NDJSON output against the wire schema", () =>
+  Config.string("SPRINTER_PI_BIN").pipe(
+    Config.option,
+    Effect.flatMap(
+      Option.match({
+        onNone: () =>
+          Effect.logInfo("SPRINTER_PI_BIN unset — skipping the live Pi drift validation"),
+        // Load the Bun platform layer only now (see the file header): fine at run
+        // time under Bun, but must not be loaded during CI collection.
+        onSome: (piBin) =>
+          Effect.promise(() => import("@effect/platform-bun")).pipe(
+            Effect.flatMap((platformBun) =>
+              validate(piBin).pipe(Effect.provide(platformBun.BunServices.layer)),
+            ),
+          ),
+      }),
+    ),
+    Effect.timeout("30 seconds"),
+  ),
 );

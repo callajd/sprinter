@@ -64,19 +64,11 @@ const events: ReadonlyArray<unknown> = [
 ];
 
 it.effect("round-trips every SessionEvent variant", () =>
-  Effect.gen(function* () {
-    for (const raw of events) {
-      yield* assertRoundTrip(SessionEvent, raw);
-    }
-  }),
+  Effect.forEach(events, (raw) => assertRoundTrip(SessionEvent, raw)),
 );
 
 it.effect("round-trips every TranscriptEntry variant", () =>
-  Effect.gen(function* () {
-    for (const raw of entries) {
-      yield* assertRoundTrip(TranscriptEntry, raw);
-    }
-  }),
+  Effect.forEach(entries, (raw) => assertRoundTrip(TranscriptEntry, raw)),
 );
 
 it.effect("round-trips Usage, SessionInput, UiResponse, and UiAnswer", () =>
@@ -115,9 +107,10 @@ it.effect("rejects representative invalid session inputs", () =>
       [UiAnswer, { _tag: "Value", value: 5 }],
       [UiResponse, { requestId: "", answer: { _tag: "Cancelled" } }],
     ];
-    for (const [schema, raw] of invalids) {
-      const exit = yield* Effect.exit(Schema.decodeUnknownEffect(schema)(raw));
-      expect(Exit.isFailure(exit)).toBe(true);
-    }
+    yield* Effect.forEach(invalids, ([schema, raw]) =>
+      Effect.exit(Schema.decodeUnknownEffect(schema)(raw)).pipe(
+        Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
+      ),
+    );
   }),
 );

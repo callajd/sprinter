@@ -419,30 +419,30 @@ it("pins the mirrored Pi version", () => {
 });
 
 it.effect("decodes every AgentSessionEvent variant, and via the server union", () =>
-  Effect.gen(function* () {
-    for (const raw of sessionEvents) {
+  Effect.forEach(sessionEvents, (raw) =>
+    Effect.gen(function* () {
       yield* decode(PiAgentSessionEvent, raw);
       yield* decode(PiServerMessage, raw);
-    }
-  }),
+    }),
+  ),
 );
 
 it.effect("decodes every extension UI request, and via the server union", () =>
-  Effect.gen(function* () {
-    for (const raw of uiRequests) {
+  Effect.forEach(uiRequests, (raw) =>
+    Effect.gen(function* () {
       yield* decode(PiRpcExtensionUIRequest, raw);
       yield* decode(PiServerMessage, raw);
-    }
-  }),
+    }),
+  ),
 );
 
 it.effect("decodes every RPC response, and via the server union", () =>
-  Effect.gen(function* () {
-    for (const raw of responses) {
+  Effect.forEach(responses, (raw) =>
+    Effect.gen(function* () {
       yield* decode(PiRpcResponse, raw);
       yield* decode(PiServerMessage, raw);
-    }
-  }),
+    }),
+  ),
 );
 
 it.effect("strips Pi's excess fields down to the mirrored subset", () =>
@@ -460,21 +460,21 @@ it.effect("strips Pi's excess fields down to the mirrored subset", () =>
 );
 
 it.effect("round-trips every command the adapter sends, and via the client union", () =>
-  Effect.gen(function* () {
-    for (const raw of commands) {
+  Effect.forEach(commands, (raw) =>
+    Effect.gen(function* () {
       yield* assertRoundTrip(PiRpcCommand, raw);
       yield* decode(PiClientMessage, raw);
-    }
-  }),
+    }),
+  ),
 );
 
 it.effect("round-trips every extension UI response, and via the client union", () =>
-  Effect.gen(function* () {
-    for (const raw of uiResponses) {
+  Effect.forEach(uiResponses, (raw) =>
+    Effect.gen(function* () {
       yield* assertRoundTrip(PiRpcExtensionUIResponse, raw);
       yield* decode(PiClientMessage, raw);
-    }
-  }),
+    }),
+  ),
 );
 
 it.effect("rejects representative malformed wire messages", () =>
@@ -516,9 +516,10 @@ it.effect("rejects representative malformed wire messages", () =>
       [PiRpcCommand, { type: "delete_everything" }],
       [PiServerMessage, { type: "totally_unknown" }],
     ];
-    for (const [schema, raw] of invalids) {
-      const exit = yield* Effect.exit(Schema.decodeUnknownEffect(schema)(raw));
-      expect(Exit.isFailure(exit)).toBe(true);
-    }
+    yield* Effect.forEach(invalids, ([schema, raw]) =>
+      Effect.exit(Schema.decodeUnknownEffect(schema)(raw)).pipe(
+        Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
+      ),
+    );
   }),
 );

@@ -98,10 +98,11 @@ it.effect("rejects representative invalid inputs", () =>
       [Session, { ...session, status: "paused" }],
       [PullRequestRef, { number: -1, url: "x", merged: true }],
     ];
-    for (const [schema, raw] of invalids) {
-      const exit = yield* Effect.exit(Schema.decodeUnknownEffect(schema)(raw));
-      expect(Exit.isFailure(exit)).toBe(true);
-    }
+    yield* Effect.forEach(invalids, ([schema, raw]) =>
+      Effect.exit(Schema.decodeUnknownEffect(schema)(raw)).pipe(
+        Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
+      ),
+    );
   }),
 );
 
