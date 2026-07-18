@@ -29,6 +29,7 @@ const entries: ReadonlyArray<unknown> = [
 
 const events: ReadonlyArray<unknown> = [
   { _tag: "TurnStarted" },
+  { _tag: "TurnCompleted" }, // usage omitted — a turn can end without a usage report
   { _tag: "TurnCompleted", usage: { inputTokens: 10, outputTokens: 20 } },
   {
     _tag: "TurnCompleted",
@@ -102,7 +103,6 @@ it.effect("rejects representative invalid session inputs", () =>
   Effect.gen(function* () {
     const invalids: ReadonlyArray<readonly [Schema.Codec<unknown, unknown>, unknown]> = [
       [SessionEvent, { _tag: "Nonexistent" }],
-      [SessionEvent, { _tag: "TurnCompleted" }],
       [SessionEvent, { _tag: "TurnCompleted", usage: { inputTokens: -1, outputTokens: 0 } }],
       [SessionEvent, { _tag: "MessageStarted", messageId: "" }],
       [SessionEvent, { _tag: "RetryScheduled", attempt: 1.5, delayMs: 0, error: "x" }],

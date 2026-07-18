@@ -74,11 +74,21 @@ export type TranscriptEntry = (typeof TranscriptEntry)["Type"];
 export const SessionEvent = Schema.TaggedUnion({
   // ── Turn lifecycle ────────────────────────────────────────────────
   TurnStarted: {},
-  TurnCompleted: { usage: Usage },
+  // `usage` is OPTIONAL: a turn can end without a usage report — an interrupted,
+  // aborted, or failed turn need not carry one, so the Pi adapter must be free to
+  // translate such a turn without fabricating usage. FE2.2 confirms against real
+  // `pi --mode rpc` output and may tighten if Pi always emits it.
+  TurnCompleted: { usage: Schema.optionalKey(Usage) },
 
   // ── Message streaming (deltas) ────────────────────────────────────
   MessageStarted: { messageId: Schema.NonEmptyString },
-  // A fine-grained delta: streamed assistant `text` and/or `reasoning` content.
+  // A fine-grained delta of streamed assistant `text` and/or `reasoning` content.
+  // Both are optional as an intentional inclusive superset: the sole producer (the
+  // Pi adapter) emits content-bearing deltas, so a contentless delta does not occur
+  // in practice; we do NOT enforce "at least one" with a TS-only runtime refinement
+  // because the hand-written Swift mirror (FE2.4) could not replicate it, which would
+  // split contract semantics across the two implementations. A consumer treats a
+  // contentless delta as a no-op.
   MessageDelta: {
     messageId: Schema.NonEmptyString,
     text: Schema.optionalKey(Schema.String),

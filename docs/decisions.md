@@ -140,10 +140,11 @@ good neutral abstraction. We therefore **mirror Pi's shape as our owned Effect
 `Schema`** — we give our types plain names and translate the foreign
 `Rpc*`/`AgentSessionEvent` → our `SessionEvent`/`SessionInput`/`UiResponse` at the
 adapter boundary — rather than reinventing a different denominator. We do **not**
-import Pi's types (D12), and we validate the owned schema against real
-`pi --mode rpc` output. We target no second runtime now: we build the abstraction
-as insurance against lock-in, not as a multi-runtime program, and we validate the
-neutral model against Pi's real output only. Consequence: the frozen RPC contract
+import Pi's types (D12); FE2.2 validates the owned **Pi-protocol** schema against
+real `pi --mode rpc` output (the neutral model is what the Pi adapter translates
+that into — the neutral schemas here are not themselves decoded from Pi bytes). We
+target no second runtime now: we build the abstraction as insurance against
+lock-in, not as a multi-runtime program. Consequence: the frozen RPC contract
 (FE2.3) and the client never see a Pi concept, and adding or swapping a runtime
 never ripples to the contract.
 
