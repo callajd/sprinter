@@ -125,10 +125,18 @@ export const make = (
   config?: PiProcessConfig,
 ): Effect.Effect<PiTransport, PlatformError, ChildProcessSpawner.ChildProcessSpawner | Scope> =>
   Effect.gen(function* () {
+    // Both queues are unbounded by deliberate choice. Bounding `eventsQueue`
+    // would apply backpressure onto the single stdout pump — stalling response
+    // correlation too (head-of-line blocking), since responses and events share
+    // that pump. The safe cap belongs at the consumer AE1.2 (#19) layers on
+    // `events`, which must consume promptly; revisit the policy there.
     const outbound = yield* Queue.make<PiClientMessage>();
     const eventsQueue = yield* Queue.make<PiServerEvent, PiTransportError | Cause.Done>();
     const pending = yield* Ref.make(HashMap.empty<string, Pending>());
     const counter = yield* Ref.make(0);
+    // Latched once the stdout pump terminates: no further response can arrive, so
+    // new requests must fail fast instead of awaiting a deferred nothing completes.
+    const closed = yield* Ref.make<Option.Option<PiTransportError>>(Option.none());
 
     // ── Spawn, Scope-managed ────────────────────────────────────────────────
     const command = ChildProcess.make(
@@ -170,11 +178,15 @@ export const make = (
 
     const closeTransport = (error: Option.Option<PiTransportError>): Effect.Effect<void> =>
       Effect.gen(function* () {
-        const outstanding = yield* Ref.getAndSet(pending, HashMap.empty<string, Pending>());
         const failure = Option.getOrElse(
           error,
           () => new PiTransportError({ reason: "closed", detail: "pi process output ended" }),
         );
+        // Latch closed BEFORE draining `pending`, so a `request` that registers
+        // concurrently either is drained here or observes `closed` on its re-check
+        // and fails itself — no deferred is left un-completed.
+        yield* Ref.set(closed, Option.some(failure));
+        const outstanding = yield* Ref.getAndSet(pending, HashMap.empty<string, Pending>());
         yield* Effect.forEach(
           HashMap.values(outstanding),
           (deferred) => Deferred.fail(deferred, failure),
@@ -207,12 +219,26 @@ export const make = (
       command_: PiRpcCommand,
     ): Effect.Effect<PiRpcResponse, PiRpcError | PiTransportError> =>
       Effect.gen(function* () {
+        const alreadyClosed = yield* Ref.get(closed);
+        if (Option.isSome(alreadyClosed)) return yield* Effect.fail(alreadyClosed.value);
         const seq = yield* Ref.updateAndGet(counter, (n) => n + 1);
         const id = `${ID_PREFIX}${seq}`;
         const deferred = yield* Deferred.make<PiRpcResponse, PiRpcError | PiTransportError>();
         yield* Ref.update(pending, HashMap.set(id, deferred));
+        // Re-check: if the transport closed between the guard above and registering,
+        // `closeTransport` may have already drained `pending` — fail fast rather than
+        // await a deferred that nothing will complete.
+        const closedNow = yield* Ref.get(closed);
+        if (Option.isSome(closedNow)) {
+          yield* Ref.update(pending, HashMap.remove(id));
+          return yield* Effect.fail(closedNow.value);
+        }
         yield* Queue.offer(outbound, { ...command_, id });
-        return yield* Deferred.await(deferred);
+        // Drop our pending entry on ANY exit — including interruption/timeout before
+        // the response arrives — so an abandoned caller never leaks its id.
+        return yield* Deferred.await(deferred).pipe(
+          Effect.onExit(() => Ref.update(pending, HashMap.remove(id))),
+        );
       });
 
     const send = (message: PiClientMessage): Effect.Effect<void> =>
@@ -232,5 +258,9 @@ const buildOptions = (config: PiProcessConfig | undefined): ChildProcess.Command
   // risk blocking the child once its stderr buffer fills.
   stderr: "inherit",
   ...(config?.cwd !== undefined ? { cwd: config.cwd } : {}),
-  ...(config?.env !== undefined ? { env: config.env } : {}),
+  // `extendEnv: true` MERGES `env` over the inherited environment (per the field
+  // docs). Without it the spawner treats `env` as the child's ENTIRE environment,
+  // dropping PATH/HOME and any credentials `pi` needs to start — so a config `env`
+  // must always extend, never replace.
+  ...(config?.env !== undefined ? { env: config.env, extendEnv: true } : {}),
 });

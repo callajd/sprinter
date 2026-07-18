@@ -34,7 +34,7 @@ import {
   Stream,
 } from "effect";
 import { Ndjson } from "effect/unstable/encoding";
-import { ChildProcessSpawner } from "effect/unstable/process";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import { PiClientMessage } from "@sprinter/domain/pi/wire";
 import { make } from "./pi-transport.ts";
@@ -57,30 +57,37 @@ const makeFakePi = Effect.gen(function* () {
   const stdoutRaw = yield* Queue.make<unknown, Cause.Done>();
   const stdinBytes = yield* Queue.make<Uint8Array, Cause.Done>();
   const killed = yield* Ref.make(false);
+  // Captures the resolved `Command` the transport asked to spawn, so a test can
+  // assert the command/args/options (e.g. that `env` extends rather than replaces).
+  const spawned = yield* Ref.make<Option.Option<ChildProcess.Command>>(Option.none());
 
-  const spawner = ChildProcessSpawner.make(() =>
-    Effect.acquireRelease(
-      Effect.succeed(
-        ChildProcessSpawner.makeHandle({
-          pid: ChildProcessSpawner.ProcessId(4321),
-          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
-          isRunning: Effect.succeed(true),
-          kill: () => Effect.void,
-          stdin: Sink.forEach<Uint8Array, boolean, never, never>((chunk) =>
-            Queue.offer(stdinBytes, chunk),
+  const spawner = ChildProcessSpawner.make((command) =>
+    Ref.set(spawned, Option.some(command)).pipe(
+      Effect.andThen(
+        Effect.acquireRelease(
+          Effect.succeed(
+            ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(4321),
+              exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+              isRunning: Effect.succeed(true),
+              kill: () => Effect.void,
+              stdin: Sink.forEach<Uint8Array, boolean, never, never>((chunk) =>
+                Queue.offer(stdinBytes, chunk),
+              ),
+              stdout: Stream.fromQueue(stdoutRaw).pipe(
+                Stream.pipeThroughChannel(Ndjson.encode()),
+                Stream.orDie,
+              ),
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+              unref: Effect.succeed(Effect.void),
+            }),
           ),
-          stdout: Stream.fromQueue(stdoutRaw).pipe(
-            Stream.pipeThroughChannel(Ndjson.encode()),
-            Stream.orDie,
-          ),
-          stderr: Stream.empty,
-          all: Stream.empty,
-          getInputFd: () => Sink.drain,
-          getOutputFd: () => Stream.empty,
-          unref: Effect.succeed(Effect.void),
-        }),
+          () => Ref.set(killed, true),
+        ),
       ),
-      () => Ref.set(killed, true),
     ),
   );
 
@@ -89,6 +96,7 @@ const makeFakePi = Effect.gen(function* () {
     stdoutRaw,
     stdinBytes,
     killed,
+    spawned,
   } as const;
 });
 
@@ -135,10 +143,44 @@ it.effect("spawns pi --mode rpc scope-managed and kills it on scope close", () =
         });
         expect(transport.pid).toBe(ChildProcessSpawner.ProcessId(4321));
         expect(yield* Ref.get(fake.killed)).toBe(false);
+
+        // The spawned command carries the configured executable/args/cwd, and
+        // `env` EXTENDS the inherited environment (`extendEnv: true`) rather than
+        // replacing it — otherwise PATH/HOME/credentials would be dropped.
+        const command = yield* Ref.get(fake.spawned);
+        if (Option.isNone(command)) throw new Error("expected the transport to have spawned");
+        if (!ChildProcess.isStandardCommand(command.value)) {
+          throw new Error("expected a standard command");
+        }
+        expect(command.value.command).toBe("pi");
+        expect(command.value.args).toEqual(["--mode", "rpc"]);
+        expect(command.value.options.cwd).toBe("/tmp");
+        expect(command.value.options.env).toEqual({ FOO: "bar" });
+        expect(command.value.options.extendEnv).toBe(true);
       }),
     ).pipe(Effect.provide(fake.layer));
     // The scope closed above → the spawn's scoped release ran.
     expect(yield* Ref.get(fake.killed)).toBe(true);
+  }),
+);
+
+it.effect("spawns with no env override when config omits env (inherits the environment)", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFakePi;
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* make();
+        const command = yield* Ref.get(fake.spawned);
+        if (Option.isNone(command)) throw new Error("expected the transport to have spawned");
+        if (!ChildProcess.isStandardCommand(command.value)) {
+          throw new Error("expected a standard command");
+        }
+        // No `env` → the spawner leaves it undefined → child inherits the parent's
+        // environment. `extendEnv` stays unset for that (correct) default path.
+        expect(command.value.options.env).toBeUndefined();
+        expect(command.value.options.extendEnv).toBeUndefined();
+      }),
+    ).pipe(Effect.provide(fake.layer));
   }),
 );
 
@@ -323,6 +365,58 @@ it.effect("fails the transport with a stream error on an undecodable stdout line
         const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
         if (Option.isSome(error) && error.value._tag === "PiTransportError") {
           expect(error.value.reason).toBe("stream");
+        } else {
+          throw new Error("expected a PiTransportError failure");
+        }
+      }),
+    ).pipe(Effect.provide(fake.layer));
+  }),
+);
+
+it.effect("drops a response whose id matches no outstanding request", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFakePi;
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const transport = yield* make();
+        // A response for an id we never sent (nor an `id`-less one) must be dropped
+        // silently — not crash the pump — and must not disturb the events stream.
+        const collecting = yield* Effect.forkChild(
+          Stream.runCollect(Stream.take(transport.events, 1)),
+        );
+        yield* Queue.offer(fake.stdoutRaw, {
+          id: "rpc-999",
+          type: "response",
+          command: "get_state",
+          success: true,
+          data: sessionStateData,
+        });
+        yield* Queue.offer(fake.stdoutRaw, { type: "agent_start" });
+        const events = yield* Fiber.join(collecting);
+        expect(events.map((event) => event.type)).toEqual(["agent_start"]);
+      }),
+    ).pipe(Effect.provide(fake.layer));
+  }),
+);
+
+it.effect("fails a request issued after the transport has closed, instead of hanging", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFakePi;
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const transport = yield* make();
+        // Drive the transport to closed: pi's stdout ends.
+        const evFiber = yield* Effect.forkChild(Stream.runCollect(transport.events));
+        yield* Queue.end(fake.stdoutRaw);
+        yield* Fiber.join(evFiber); // events completed → close has propagated
+
+        // A request now must fail fast with the terminal PiTransportError, not
+        // register a deferred that nothing will ever complete.
+        const exit = yield* Effect.exit(transport.request({ type: "get_state" }));
+        expect(Exit.isFailure(exit)).toBe(true);
+        const error = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+        if (Option.isSome(error) && error.value._tag === "PiTransportError") {
+          expect(error.value.reason).toBe("closed");
         } else {
           throw new Error("expected a PiTransportError failure");
         }
