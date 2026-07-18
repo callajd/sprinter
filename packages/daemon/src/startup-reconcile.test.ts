@@ -23,7 +23,7 @@
  * tmpfile) is proven separately in {@link ./restart-durability.test.ts}.
  */
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema } from "effect";
+import { Effect, Layer, Option, Queue, Schema } from "effect";
 import { expect } from "vitest";
 import {
   Epic,
@@ -155,29 +155,28 @@ const fakeRepository = (state: HostState): Layer.Layer<Repository> =>
 
 const okResult: JobResult = { status: "succeeded" };
 
-/** A recording {@link JobRunner}: appends every dispatched {@link Job} to `log`, then succeeds. */
-const recordingRunner = (log: Array<Job>): Layer.Layer<JobRunner> =>
+/**
+ * A recording {@link JobRunner}: offers every dispatched {@link Job} to `log` (a
+ * Queue, so the BACKGROUND resume fibers are observed deterministically — a
+ * `Queue.take` blocks until the forked fiber offers), then succeeds.
+ */
+const recordingRunner = (log: Queue.Enqueue<Job>): Layer.Layer<JobRunner> =>
   Layer.succeed(
     JobRunner,
     JobRunner.of({
-      dispatch: (dispatchedJob) =>
-        Effect.sync(() => {
-          log.push(dispatchedJob);
-        }).pipe(Effect.as(okResult)),
+      dispatch: (dispatchedJob) => Queue.offer(log, dispatchedJob).pipe(Effect.as(okResult)),
     }),
   );
 
 /** A {@link JobRunner} whose `dispatch` fails for one job id, else records + succeeds. */
-const flakyRunner = (log: Array<Job>, failFor: string): Layer.Layer<JobRunner> =>
+const flakyRunner = (log: Queue.Enqueue<Job>, failFor: string): Layer.Layer<JobRunner> =>
   Layer.succeed(
     JobRunner,
     JobRunner.of({
       dispatch: (dispatchedJob) =>
         dispatchedJob.id === failFor
           ? Effect.fail(new ExecutionRunnerError({ operation: "run", detail: "spawn refused" }))
-          : Effect.sync(() => {
-              log.push(dispatchedJob);
-            }).pipe(Effect.as(okResult)),
+          : Queue.offer(log, dispatchedJob).pipe(Effect.as(okResult)),
     }),
   );
 
@@ -193,198 +192,225 @@ const testLayer = (state: HostState, runner: Layer.Layer<JobRunner>) =>
 // reconcile roll-up with one host error isolated (F4)
 // ============================================================================
 
-it.effect("isolates one Issue's host error and still lands the rest of the roll-up", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream({ epics: ["epic-1"] }));
-    yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
-    // issue-1's host read fails (a deleted-issue 404); issue-2 is closed + merged.
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
+it.effect("isolates one Issue's host error and still lands the rest of the roll-up", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream({ epics: ["epic-1"] }));
+      yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
+      // issue-1's host read fails (a deleted-issue 404); issue-2 is closed + merged.
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
 
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
 
-    // The run did NOT abort on the host error, and reconciled the one workstream.
-    expect(summary.reconciledWorkstreams).toBe(1);
+      // The run did NOT abort on the host error, and reconciled the one workstream.
+      expect(summary.reconciledWorkstreams).toBe(1);
 
-    // issue-2 landed despite issue-1's host failure; issue-1 is left unchanged.
-    const i1 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(1).id));
-    const i2 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(2, { id: "issue-2" }).id));
-    expect(i1.status).toBe("in_progress");
-    expect(i2.status).toBe("done");
-    expect(i2.pr?.merged).toBe(true);
-  }).pipe(
-    Effect.provide(
-      testLayer(
-        host({
-          issues: new Map([[2, "closed"]]),
-          closing: new Map([[2, 20]]),
-          pulls: new Map([[20, true]]),
-          failing: new Set([1]),
-        }),
-        recordingRunner(dispatched),
+      // issue-2 landed despite issue-1's host failure; issue-1 is left unchanged.
+      const i1 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(1).id));
+      const i2 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(2, { id: "issue-2" }).id));
+      expect(i1.status).toBe("in_progress");
+      expect(i2.status).toBe("done");
+      expect(i2.pr?.merged).toBe(true);
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({
+            issues: new Map([[2, "closed"]]),
+            closing: new Map([[2, 20]]),
+            pulls: new Map([[20, true]]),
+            failing: new Set([1]),
+          }),
+          recordingRunner(dispatched),
+        ),
       ),
-    ),
-  );
-});
+    );
+  }),
+);
 
 // ============================================================================
 // running-Job resume onto the SAME persisted session id
 // ============================================================================
 
-it.effect("resumes a running Job onto its persisted session id, never a new one", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream());
-    yield* store.workGraph.putEpic(epic());
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.jobs.putSession(session());
-    yield* store.jobs.putJob(job());
+it.effect("resumes a running Job onto its persisted session id, never a new one", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream());
+      yield* store.workGraph.putEpic(epic());
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.jobs.putSession(session());
+      yield* store.jobs.putJob(job());
 
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+      expect(summary.resumed).toStrictEqual(["job-1"]);
+      expect(summary.skipped).toStrictEqual([]);
 
-    // The in-flight job was re-dispatched, carrying its PERSISTED session id.
-    expect(dispatched.map((dj) => dj.id)).toStrictEqual(["job-1"]);
-    expect(dispatched[0]?.sessionId).toBe("session-job-1");
-    expect(summary.resumed).toStrictEqual(["job-1"]);
-    expect(summary.skipped).toStrictEqual([]);
-  }).pipe(
-    Effect.provide(
-      testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
-    ),
-  );
-});
+      // The in-flight job was re-dispatched (in the background), carrying its
+      // PERSISTED session id — `Queue.take` awaits the forked resume fiber.
+      const redispatched = yield* Queue.take(dispatched);
+      expect(redispatched.id).toBe("job-1");
+      expect(redispatched.sessionId).toBe("session-job-1");
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
 
 // ============================================================================
 // no double-run — terminal Job, and a Job whose Issue reconciled to landed
 // ============================================================================
 
-it.effect("does not re-dispatch an already-terminal Job", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream());
-    yield* store.workGraph.putEpic(epic());
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.jobs.putSession(session({ status: "completed" }));
-    yield* store.jobs.putJob(job({ status: "succeeded" }));
+it.effect("does not re-dispatch an already-terminal Job", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream());
+      yield* store.workGraph.putEpic(epic());
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.jobs.putSession(session({ status: "completed" }));
+      yield* store.jobs.putJob(job({ status: "succeeded" }));
 
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
 
-    // A terminal job is not a resume candidate at all.
-    expect(dispatched).toStrictEqual([]);
-    expect(summary.resumed).toStrictEqual([]);
-    expect(summary.skipped).toStrictEqual([]);
-  }).pipe(
-    Effect.provide(
-      testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
-    ),
-  );
-});
-
-it.effect("does not re-run a running Job whose Issue reconciled to landed", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream());
-    yield* store.workGraph.putEpic(epic());
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.jobs.putSession(session());
-    yield* store.jobs.putJob(job());
-
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
-
-    // Reconcile lands issue-1 (closed + merged), so its running job is held back.
-    const i1 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(1).id));
-    expect(i1.status).toBe("done");
-    expect(dispatched).toStrictEqual([]);
-    expect(summary.resumed).toStrictEqual([]);
-    expect(summary.skipped).toStrictEqual(["job-1"]);
-  }).pipe(
-    Effect.provide(
-      testLayer(
-        host({
-          issues: new Map([[1, "closed"]]),
-          closing: new Map([[1, 10]]),
-          pulls: new Map([[10, true]]),
-        }),
-        recordingRunner(dispatched),
+      // A terminal job is not a resume candidate at all — nothing resumed, nothing
+      // settled, nothing dispatched.
+      expect(summary.resumed).toStrictEqual([]);
+      expect(summary.skipped).toStrictEqual([]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
       ),
-    ),
-  );
-});
+    );
+  }),
+);
+
+it.effect(
+  "does not re-run a running Job whose Issue reconciled to landed; settles it succeeded",
+  () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<Job>();
+      yield* Effect.gen(function* () {
+        const store = yield* StateStore;
+        yield* store.workGraph.putWorkstream(workstream());
+        yield* store.workGraph.putEpic(epic());
+        yield* store.workGraph.putIssue(issue(1));
+        yield* store.jobs.putSession(session());
+        yield* store.jobs.putJob(job());
+
+        const startup = yield* StartupReconcile;
+        const summary = yield* startup.run;
+
+        // Reconcile lands issue-1 (closed + merged), so its running job is held back and
+        // settled to `succeeded` (its work landed) — no re-dispatch, no durable limbo.
+        const i1 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(1).id));
+        expect(i1.status).toBe("done");
+        expect(summary.resumed).toStrictEqual([]);
+        expect(summary.skipped).toStrictEqual(["job-1"]);
+        expect(yield* Queue.size(dispatched)).toBe(0);
+        const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
+        expect(j1.status).toBe("succeeded");
+      }).pipe(
+        Effect.provide(
+          testLayer(
+            host({
+              issues: new Map([[1, "closed"]]),
+              closing: new Map([[1, 10]]),
+              pulls: new Map([[10, true]]),
+            }),
+            recordingRunner(dispatched),
+          ),
+        ),
+      );
+    }),
+);
 
 // ============================================================================
 // control state — a paused/cancelled (blocked) or done Workstream is skipped
 // ============================================================================
 
-it.effect("does not re-dispatch Jobs of a blocked Workstream", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
-    yield* store.workGraph.putEpic(epic({ status: "blocked" }));
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.jobs.putSession(session());
-    yield* store.jobs.putJob(job());
+it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for resume", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
+      yield* store.workGraph.putEpic(epic({ status: "blocked" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.jobs.putSession(session());
+      yield* store.jobs.putJob(job());
 
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
 
-    // The blocked workstream stays blocked; its running job is not resumed.
-    const ws = Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream().id));
-    expect(ws.status).toBe("blocked");
-    expect(dispatched).toStrictEqual([]);
-    expect(summary.resumed).toStrictEqual([]);
-    expect(summary.skipped).toStrictEqual(["job-1"]);
-  }).pipe(
-    Effect.provide(
-      testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
-    ),
-  );
-});
+      // The blocked (paused) workstream stays blocked; its running job is not resumed
+      // now, but is re-queued so a later `control resume` re-dispatches it (no limbo).
+      const ws = Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream().id));
+      expect(ws.status).toBe("blocked");
+      expect(summary.resumed).toStrictEqual([]);
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+      const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
+      expect(j1.status).toBe("queued");
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
 
 // ============================================================================
 // resume-failure isolation — one bad dispatch does not abort the startup
 // ============================================================================
 
-it.effect("isolates a resume failure so the other in-flight Jobs still resume", () => {
-  const dispatched: Array<Job> = [];
-  return Effect.gen(function* () {
-    const store = yield* StateStore;
-    yield* store.workGraph.putWorkstream(workstream());
-    yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
-    yield* store.workGraph.putIssue(issue(1));
-    yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
-    // Two running jobs; job-1's dispatch fails, job-2's succeeds.
-    yield* store.jobs.putSession(session());
-    yield* store.jobs.putJob(job());
-    yield* store.jobs.putSession(session({ id: "session-job-2", jobId: "job-2" }));
-    yield* store.jobs.putJob(job({ id: "job-2", issueId: "issue-2", sessionId: "session-job-2" }));
+it.effect("isolates a resume failure so the other in-flight Jobs still resume", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.workGraph.putWorkstream(workstream());
+      yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
+      // Two running jobs; job-1's dispatch fails, job-2's succeeds.
+      yield* store.jobs.putSession(session());
+      yield* store.jobs.putJob(job());
+      yield* store.jobs.putSession(session({ id: "session-job-2", jobId: "job-2" }));
+      yield* store.jobs.putJob(
+        job({ id: "job-2", issueId: "issue-2", sessionId: "session-job-2" }),
+      );
 
-    const startup = yield* StartupReconcile;
-    const summary = yield* startup.run;
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
 
-    // The failing job did not abort the startup; job-2 still resumed.
-    expect(dispatched.map((dj) => dj.id)).toStrictEqual(["job-2"]);
-    expect([...summary.resumed].sort()).toStrictEqual(["job-1", "job-2"]);
-  }).pipe(
-    Effect.provide(
-      testLayer(
-        host({
-          issues: new Map([
-            [1, "open"],
-            [2, "open"],
-          ]),
-        }),
-        flakyRunner(dispatched, "job-1"),
+      // BOTH were re-dispatched (forked) — `resumed` reports re-dispatch, not outcome;
+      // job-1's background dispatch fails (isolated, logged) while job-2 records.
+      expect([...summary.resumed].sort()).toStrictEqual(["job-1", "job-2"]);
+      const recorded = yield* Queue.take(dispatched);
+      expect(recorded.id).toBe("job-2");
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({
+            issues: new Map([
+              [1, "open"],
+              [2, "open"],
+            ]),
+          }),
+          flakyRunner(dispatched, "job-1"),
+        ),
       ),
-    ),
-  );
-});
+    );
+  }),
+);

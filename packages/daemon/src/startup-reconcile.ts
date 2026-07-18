@@ -21,20 +21,31 @@
  * 2. **Resume running Jobs** — walk the (post-roll-up) graph and re-dispatch each
  *    `running` Job through the `JobRunner`, which re-attaches to the Job's PERSISTED
  *    session id (1 Job = 1 session, `UNIQUE(session.jobId)`) — never a new session.
+ *    Each resume is a BACKGROUND fiber tied to the daemon scope (a session can take
+ *    minutes; boot must not block, mirroring the live `dispatchInBackground` path), so
+ *    N in-flight sessions resume concurrently and `run` returns promptly.
  *
- * The resume is guarded so it never double-runs and always respects control state:
+ * The resume is guarded so it never double-runs, respects control state, and leaves no
+ * durable `running` limbo — a `running` Job that is NOT resumed is settled to a
+ * terminal/pending status instead of being left `running` forever:
  *
  * - a Job that is NOT `running` (an already-terminal `succeeded`/`failed`/`cancelled`
- *   Job, or a not-yet-started `queued` one) is not re-dispatched;
+ *   Job, or a not-yet-started `queued` one) is not a candidate at all;
  * - a Job whose Issue has already landed (reconciled to `done` + merged PR,
- *   {@link isIssueLanded}) is not re-run;
- * - no Job of a Workstream persisted as terminal/paused (`done`/`blocked`) is
- *   re-dispatched — a cancelled/paused Workstream stays that way across a restart
- *   (AE4.1 / #30 N1).
+ *   {@link isIssueLanded}) is settled to `succeeded` — its work landed, not re-run;
+ * - a Job of a Workstream persisted `done` (cancelled) is settled to `cancelled`; one
+ *   of a `blocked` (paused) Workstream is settled to `queued` so a later `control
+ *   resume` re-dispatches it — a cancelled/paused Workstream stays that way across a
+ *   restart (AE4.1 / #30 N1).
  *
- * A single resume failure is isolated (logged, skipped) so one bad Job never aborts
- * the startup; a {@link StateStoreError} reading the durable graph is NOT isolated —
- * our own store failing at startup is a real failure the caller must see.
+ * A single resume failure is isolated (logged in its background fiber) so one bad Job
+ * never disturbs the others; a {@link StateStoreError} reading/writing the durable
+ * graph is NOT isolated — our own store failing at startup is a real failure the
+ * caller must see.
+ *
+ * A resumed Job whose session was mid-turn is re-driven from the start (the runner
+ * re-issues the prompt, reusing the session id) — idempotent full re-run is the AE5.1
+ * behavior; true mid-session continuation rides the deferred LocalPi adapter below.
  *
  * **Scope note — deferred provisioning.** The concrete LocalPi `ExecutionRunner`
  * adapter that spawns a real `pi` process (the `JobRunner`'s runtime) and a runnable
@@ -44,7 +55,7 @@
  * persist/reconcile/re-dispatch LOGIC, wired to the ports and tested offline.
  */
 import { Context, Effect, Layer } from "effect";
-import { type Issue, isIssueLanded, type Job, type JobId } from "@sprinter/domain";
+import { type Issue, isIssueLanded, type Job, type JobId, type WorkStatus } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { reconcileWorkstream, Repository } from "@sprinter/repository";
 import { StateStore, type StateStoreError } from "@sprinter/state";
@@ -60,14 +71,42 @@ import { StateStore, type StateStoreError } from "@sprinter/state";
 export interface StartupSummary {
   /** The number of persisted Workstreams reconciled against the host. */
   readonly reconciledWorkstreams: number;
-  /** The ids of the `running` Jobs re-dispatched onto their persisted sessions. */
+  /**
+   * The ids of the `running` Jobs **re-dispatched** onto their persisted sessions.
+   * Each is handed to the `JobRunner` as a BACKGROUND fiber (a session can take
+   * minutes — boot must not block on it, mirroring the live dispatch path), so this
+   * counts what was re-dispatched, NOT what has completed; a background resume's
+   * outcome is logged asynchronously, never awaited here.
+   */
   readonly resumed: ReadonlyArray<JobId>;
-  /** The ids of the `running` Jobs held back (landed Issue, or `done`/`blocked` Workstream). */
+  /**
+   * The ids of the `running` Jobs NOT resumed — each reconciled to a terminal/pending
+   * status so no durable `running` limbo survives: a landed Issue's Job → `succeeded`,
+   * a `done` Workstream's Job → `cancelled`, a `blocked` (paused) Workstream's Job →
+   * `queued` (so a later `control resume` re-dispatches it).
+   */
   readonly skipped: ReadonlyArray<JobId>;
 }
 
-/** Whether a Workstream's control state permits resuming its Jobs on restart. */
-const isResumable = (status: string): boolean => status !== "done" && status !== "blocked";
+/**
+ * What restart does with a `running` Job given its (post-roll-up) Issue and its
+ * Workstream's control state: resume it in the background, or settle its durable row
+ * to a terminal/pending status so it never lingers as a stale `running` across
+ * restarts. A landed Issue's work succeeded; a `done` Workstream's Job is cancelled; a
+ * `blocked` (paused) Workstream's Job is re-queued to resume on the next `control`.
+ */
+type ResumeAction =
+  | { readonly _tag: "resume" }
+  | { readonly _tag: "settle"; readonly status: "succeeded" | "cancelled" | "queued" };
+
+const decideRunning = (issue: Issue, workstreamStatus: WorkStatus): ResumeAction =>
+  isIssueLanded(issue)
+    ? { _tag: "settle", status: "succeeded" }
+    : workstreamStatus === "done"
+      ? { _tag: "settle", status: "cancelled" }
+      : workstreamStatus === "blocked"
+        ? { _tag: "settle", status: "queued" }
+        : { _tag: "resume" };
 
 /**
  * The {@link StartupReconcile} service PORT (INV-NAMING, `sprinter/<area>/<Name>`):
@@ -101,6 +140,9 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
       const store = yield* StateStore;
       const repo = yield* Repository;
       const jobRunner = yield* JobRunner;
+      // The daemon's boot scope: background resume fibers are tied to it, so they
+      // live for the daemon's lifetime and are interrupted when it stops.
+      const scope = yield* Effect.scope;
 
       /** Re-provide the captured store/host ports into a reconcile effect. */
       const reconcile = (workstreamId: Parameters<typeof reconcileWorkstream>[0]) =>
@@ -110,9 +152,13 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
         );
 
       /**
-       * Re-dispatch one Job onto its persisted session. The dispatch owns a fresh
-       * per-Job scope (the session lifetime), and any dispatch failure is isolated —
-       * logged and swallowed — so one bad resume never aborts the startup.
+       * Re-dispatch one Job onto its persisted session as a BACKGROUND fiber tied to
+       * the daemon scope. `JobRunner.dispatch` awaits the session's terminal outcome
+       * (a run can take minutes), so — exactly as the live command path
+       * (`dispatchInBackground`) does — boot must fork it rather than block: N
+       * in-flight sessions resume concurrently and `run` returns promptly. The
+       * dispatch owns a fresh per-Job scope (the session lifetime); any failure is
+       * isolated (logged) so one bad resume never disturbs the others.
        */
       const resume = (job: Job): Effect.Effect<void> =>
         jobRunner.dispatch(job).pipe(
@@ -120,12 +166,9 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
           Effect.catch((error) =>
             Effect.logWarning(`startup: resume failed for job ${job.id}`, error),
           ),
+          Effect.forkIn(scope, { startImmediately: true }),
           Effect.asVoid,
         );
-
-      /** True when a `running` Job should be re-dispatched given its Issue + Workstream. */
-      const shouldResume = (job: Job, issue: Issue, workstreamStatus: string): boolean =>
-        job.status === "running" && isResumable(workstreamStatus) && !isIssueLanded(issue);
 
       const run = Effect.gen(function* () {
         // 1. Reconcile + roll up every Workstream (per-issue host errors isolated in
@@ -147,10 +190,14 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
               const jobs = yield* store.jobs.listJobsForIssue(issue.id);
               for (const job of jobs) {
                 if (job.status !== "running") continue;
-                if (shouldResume(job, issue, ws.status)) {
+                const action = decideRunning(issue, ws.status);
+                if (action._tag === "resume") {
                   yield* resume(job);
                   resumed.push(job.id);
                 } else {
+                  // Settle the stale `running` row to a terminal/pending status so it
+                  // never survives as durable limbo across restarts.
+                  yield* store.jobs.putJob({ ...job, status: action.status });
                   skipped.push(job.id);
                 }
               }
