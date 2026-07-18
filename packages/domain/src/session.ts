@@ -43,6 +43,22 @@ export const NoticeLevel = Schema.Literals(["info", "warn", "error"]);
 export type NoticeLevel = (typeof NoticeLevel)["Type"];
 
 /**
+ * The wire-level reconciliation key shared by a notice's live (`Notice`
+ * {@link SessionEvent}) and durable (`NoticeEntry` {@link TranscriptEntry})
+ * emissions.
+ *
+ * A single logical notice can surface BOTH live (rendered as it happens) and
+ * durably (reconciled into the transcript-grade record) — INV-REACTIVE. Without a
+ * shared key the two would double-render. The contract is: **a producer that emits
+ * one logical notice both live and durable MUST stamp both with the same `id`**, so
+ * a consumer reconciles them onto one rendered item (exactly as message/tool ids
+ * coalesce their deltas and durable entries). Producers derive `id` from the
+ * notice's stable identity, so the same logical notice always yields the same key.
+ */
+export const NoticeId = Schema.NonEmptyString;
+export type NoticeId = (typeof NoticeId)["Type"];
+
+/**
  * A durable, transcript-grade record appended to a session's transcript. Carried
  * by the `EntryAppended` {@link SessionEvent} so a client reconciles live deltas
  * into the persisted record (INV-REACTIVE).
@@ -56,7 +72,9 @@ export const TranscriptEntry = Schema.TaggedUnion({
   },
   ToolCall: { id: Schema.NonEmptyString, name: Schema.NonEmptyString, input: JsonValue },
   ToolResult: { id: Schema.NonEmptyString, output: JsonValue, isError: Schema.Boolean },
-  NoticeEntry: { level: NoticeLevel, message: Schema.String },
+  // `id` is the reconciliation key (see {@link NoticeId}): a durable notice shares
+  // it with the live `Notice` of the same logical event so they render once.
+  NoticeEntry: { id: NoticeId, level: NoticeLevel, message: Schema.String },
 });
 export type TranscriptEntry = (typeof TranscriptEntry)["Type"];
 
@@ -117,7 +135,9 @@ export const SessionEvent = Schema.TaggedUnion({
   },
 
   // ── Status / notices ──────────────────────────────────────────────
-  Notice: { level: NoticeLevel, message: Schema.String },
+  // `id` is the reconciliation key (see {@link NoticeId}): a live notice shares it
+  // with the durable `NoticeEntry` of the same logical event so they render once.
+  Notice: { id: NoticeId, level: NoticeLevel, message: Schema.String },
   StatusChanged: { key: Schema.NonEmptyString, text: Schema.String },
 
   // ── Durable transcript entry ──────────────────────────────────────

@@ -146,6 +146,8 @@ struct BoardStatusTests {
     #expect(BoardStatus(WorkStatus.active) == .ongoing)
     #expect(BoardStatus(WorkStatus.blocked) == .paused)
     #expect(BoardStatus(WorkStatus.done) == .complete)
+    // CE5.1: cancelled is terminal but distinct from complete on the board.
+    #expect(BoardStatus(WorkStatus.cancelled) == .cancelled)
   }
 
   @Test("maps every IssueStatus onto the board vocabulary")

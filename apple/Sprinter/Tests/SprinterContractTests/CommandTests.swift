@@ -94,6 +94,6 @@ struct CommandTests {
 
   @Test("tracks the frozen contract version")
   func tracksContractVersion() {
-    #expect(SprinterContract.version == 1)
+    #expect(SprinterContract.version == 2)
   }
 }

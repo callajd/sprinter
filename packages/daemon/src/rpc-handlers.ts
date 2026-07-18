@@ -183,15 +183,15 @@ const dispatchInBackground = (runner: Runner, scope: Scope, job: Job): Effect.Ef
  * scope): `pause`/`cancel` are status-only here — they transition the workstream
  * node but do NOT interrupt an in-flight session (that rides on the session
  * `interrupt` channel, AE4.2) nor roll status down to epics/issues/jobs. `cancel`
- * maps to `done` because the FROZEN `WorkStatus` (D-contract, INV-CONTRACT) has no
- * `cancelled` variant — a cancelled workstream is indistinguishable from a completed
- * one until a contract v2 adds one.
+ * maps to the distinct terminal `cancelled` (contract v2 / CE5.1) — a cancelled
+ * workstream is terminal-but-not-`done`, so it renders and reconciles apart from a
+ * completed one ({@link isTerminal}).
  */
 const statusFor: Record<ControlAction, WorkStatus> = {
   start: "active",
   resume: "active",
   pause: "blocked",
-  cancel: "done",
+  cancel: "cancelled",
 };
 
 /** Dispatch every still-queued Job under a workstream (start / resume). */

@@ -245,7 +245,16 @@ const translateUiRequest = (event: PiRpcExtensionUIRequest): ReadonlyArray<Sessi
     case "editor":
       return [{ _tag: "UiRequestRaised", id: event.id, kind: "editor", prompt: event.title }];
     case "notify":
-      return [{ _tag: "Notice", level: notifyLevel(event.notifyType), message: event.message }];
+      // The notify request's own id is the notice's reconciliation key (NoticeId):
+      // the same logical notify keeps its key across a live/durable pair.
+      return [
+        {
+          _tag: "Notice",
+          id: event.id,
+          level: notifyLevel(event.notifyType),
+          message: event.message,
+        },
+      ];
     case "setStatus":
       return [{ _tag: "StatusChanged", key: event.statusKey, text: event.statusText ?? "" }];
     case "setTitle":
@@ -339,6 +348,9 @@ export const translateServerEvent = (event: PiServerEvent): ReadonlyArray<Sessio
         : [
             {
               _tag: "Notice",
+              // The give-up for a given retry attempt is one logical notice; key it
+              // by attempt (NoticeId) so a live/durable pair reconciles to one render.
+              id: `auto-retry-${event.attempt}`,
               level: "error",
               message: event.finalError ?? `retry failed after ${event.attempt} attempt(s)`,
             },
@@ -351,6 +363,9 @@ export const translateServerEvent = (event: PiServerEvent): ReadonlyArray<Sessio
       return [
         {
           _tag: "Notice",
+          // An extension's failure handling a given event is one logical notice; key
+          // it by path+event (NoticeId) so a live/durable pair reconciles to one.
+          id: `extension-error-${event.extensionPath}-${event.event}`,
           level: "error",
           message: `extension ${event.extensionPath} failed handling ${event.event}: ${event.error}`,
         },

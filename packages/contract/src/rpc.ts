@@ -1,7 +1,7 @@
 /**
- * The versioned daemon↔client **RPC contract v1** — an `RpcGroup`
- * (`effect/unstable/rpc`) over the FE2.1 owned domain schemas (architecture §7,
- * D8/D10/D16/D17).
+ * The versioned daemon↔client **RPC contract** (currently `v2`, see
+ * {@link CONTRACT_VERSION}) — an `RpcGroup` (`effect/unstable/rpc`) over the FE2.1
+ * owned domain schemas (architecture §7, D8/D10/D16/D17).
  *
  * The surface speaks ONLY `@sprinter/domain`'s owned, provider-neutral types
  * (INV-PORT / INV-NAMING): no Pi concept and no FE2.2 owned-Pi wire schema
@@ -41,8 +41,13 @@ import {
 /**
  * Current contract version. Bumped whenever the RPC surface changes; the Swift
  * mirror (FE2.4) and its decode tests track this bump (INV-CONTRACT).
+ *
+ * `v2` (CE5) batches two frozen-contract changes: a distinct terminal `cancelled`
+ * `WorkStatus` (CE5.1) and a reconciliation-key `id` on `Notice`/`NoticeEntry`
+ * (CE5.2). Both rippled to the Swift mirror + Track A handlers and re-froze the
+ * FE2.4 goldens in one bump (INV-CONTRACT: version once, re-freeze once).
  */
-export const CONTRACT_VERSION = 1 as const;
+export const CONTRACT_VERSION = 2 as const;
 
 /** Format the contract version as a `v`-prefixed tag, e.g. `v1`. */
 export const contractTag = (version: number = CONTRACT_VERSION): string => `v${version}`;
@@ -188,10 +193,10 @@ export const answerUiRequest = Rpc.make("answerUiRequest", {
   error: SessionNotFound,
 });
 
-// ── The RPC group (contract v1) ─────────────────────────────────────────────
+// ── The RPC group (versioned contract) ──────────────────────────────────────
 
 /**
- * The versioned RPC contract group — daemon↔client v1. Carries the four models
+ * The versioned RPC contract group — daemon↔client. Carries the four models
  * (architecture §7) as procedures and the {@link CONTRACT_VERSION} annotation.
  */
 export const SprinterRpc = RpcGroup.make(

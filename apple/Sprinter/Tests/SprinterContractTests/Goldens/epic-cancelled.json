@@ -1,0 +1,10 @@
+{
+  "id": "ep-1",
+  "workstreamId": "ws-1",
+  "name": "FE2",
+  "status": "cancelled",
+  "issues": [
+    "iss-1",
+    "iss-2"
+  ]
+}

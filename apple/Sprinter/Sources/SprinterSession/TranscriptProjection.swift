@@ -122,8 +122,8 @@ public enum TranscriptProjection {
         // Surfaced inline via `InteractiveSession.outstandingRequests`, not the
         // transcript.
         break
-      case .notice(let level, let message):
-        appendNotice(level: level, message: message)
+      case .notice(let id, let level, let message):
+        appendNotice(id: id, level: level, message: message)
       case .statusChanged(let key, let text):
         upsert("status:\(key)") { _ in .status(TranscriptStatus(key: key, text: text)) }
       case .retryScheduled(let attempt, let delayMs, let error):
@@ -165,8 +165,8 @@ public enum TranscriptProjection {
           call.isError = isError
           call.isComplete = true
         }
-      case .noticeEntry(let level, let message):
-        appendNotice(level: level, message: message)
+      case .noticeEntry(let id, let level, let message):
+        appendNotice(id: id, level: level, message: message)
       }
     }
 
@@ -206,8 +206,12 @@ public enum TranscriptProjection {
       }
     }
 
-    private mutating func appendNotice(level: NoticeLevel, message: String) {
-      let id = nextSequence()
+    /// Reconciles a notice onto its item by the wire reconciliation key (`NoticeId`):
+    /// a live `Notice` and the durable `NoticeEntry` of the SAME logical event share
+    /// the key, so they render as ONE item rather than double-rendering (CE5.2 /
+    /// INV-REACTIVE — mirroring how message/tool ids coalesce their live deltas and
+    /// durable entries). Distinct notices carry distinct keys and stay distinct.
+    private mutating func appendNotice(id: String, level: NoticeLevel, message: String) {
       upsert("notice:\(id)") { _ in
         .notice(TranscriptNotice(id: id, level: level, message: message))
       }

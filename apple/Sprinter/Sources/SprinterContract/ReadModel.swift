@@ -12,11 +12,16 @@
 /// `resolve-conflict`) carry an explicit raw value.
 
 /// Lifecycle status shared by the planning nodes ``Workstream`` and ``Epic``.
+///
+/// `done` and `cancelled` are BOTH terminal but distinct (contract v2 / CE5.1): a
+/// cancelled node was abandoned, not finished, so the board renders it apart from a
+/// completed one.
 public enum WorkStatus: String, Codable, CaseIterable, Sendable {
   case pending
   case active
   case done
   case blocked
+  case cancelled
 }
 
 /// Issue lifecycle status.

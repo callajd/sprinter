@@ -38,6 +38,7 @@ import {
   isComplete,
   isIssueLanded,
   type IssueId,
+  isTerminal,
   type Workstream,
   type WorkstreamId,
 } from "@sprinter/domain";
@@ -125,8 +126,10 @@ const reconcileEpic = (
     const allLanded = refreshed.length > 0 && refreshed.every(isIssueLanded);
 
     // Re-read the Epic so any `ensureIssueInEpic` repair from the loop is preserved.
+    // A terminal Epic (`done` OR `cancelled`) is never overwritten: a cancelled Epic
+    // stays cancelled even once its Issues land (isTerminal, CE5.1).
     const currentEpic = Option.getOrElse(yield* store.workGraph.getEpic(epic.id), () => epic);
-    if (allLanded && currentEpic.status !== "done") {
+    if (allLanded && !isTerminal(currentEpic)) {
       const done: Epic = { ...currentEpic, status: "done" };
       yield* store.workGraph.putEpic(done);
       // The Epic→Workstream child-list repair is handled once, unconditionally, by
@@ -163,8 +166,10 @@ export const reconcileWorkstream = (
     const currentEpics = yield* store.workGraph.listEpics(workstreamId);
     const epicIds = currentEpics.map((epic) => epic.id);
     const consistentEpics = epicIds.reduce<ReadonlyArray<Epic["id"]>>(withChild, currentWs.epics);
+    // A terminal Workstream (`done` OR `cancelled`) is never overwritten — a
+    // cancelled Workstream stays cancelled even if every Epic is complete (CE5.1).
     const status: Workstream["status"] =
-      allComplete && currentWs.status !== "done" ? "done" : currentWs.status;
+      allComplete && !isTerminal(currentWs) ? "done" : currentWs.status;
 
     if (status !== currentWs.status || consistentEpics !== currentWs.epics) {
       yield* store.workGraph.putWorkstream({ ...currentWs, status, epics: consistentEpics });

@@ -34,6 +34,16 @@ struct ReadModelTests {
     #expect(try Golden.roundTrip(epic) == epic)
   }
 
+  @Test("decodes the distinct terminal cancelled WorkStatus (CE5.1)")
+  func decodesCancelledStatus() throws {
+    let workstream = try Golden.decode(Workstream.self, from: "workstream-cancelled")
+    let epic = try Golden.decode(Epic.self, from: "epic-cancelled")
+    #expect(workstream.status == .cancelled)
+    #expect(epic.status == .cancelled)
+    #expect(try Golden.roundTrip(workstream) == workstream)
+    #expect(try Golden.roundTrip(epic) == epic)
+  }
+
   @Test("decodes an issue carrying its PR (optional-key present)")
   func decodesIssueWithPr() throws {
     let issue = try Golden.decode(Issue.self, from: "issue-with-pr")

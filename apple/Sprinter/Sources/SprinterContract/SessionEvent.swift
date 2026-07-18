@@ -20,7 +20,7 @@ public enum SessionEvent: Codable, Equatable, Sendable {
   case retryScheduled(attempt: Int, delayMs: Int, error: String)
   case contextCompacted
   case uiRequestRaised(id: String, kind: UiRequestKind, prompt: String, options: [String]?)
-  case notice(level: NoticeLevel, message: String)
+  case notice(id: String, level: NoticeLevel, message: String)
   case statusChanged(key: String, text: String)
   case entryAppended(entry: TranscriptEntry)
 
@@ -147,6 +147,7 @@ extension SessionEvent {
         options: try container.decodeIfPresent([String].self, forKey: .options))
     case "Notice":
       return .notice(
+        id: try container.decode(String.self, forKey: .id),
         level: try container.decode(NoticeLevel.self, forKey: .level),
         message: try container.decode(String.self, forKey: .message))
     case "StatusChanged":
@@ -240,8 +241,9 @@ extension SessionEvent {
       try container.encode(kind, forKey: .kind)
       try container.encode(prompt, forKey: .prompt)
       try container.encodeIfPresent(options, forKey: .options)
-    case .notice(let level, let message):
+    case .notice(let id, let level, let message):
       try container.encode("Notice", forKey: .tag)
+      try container.encode(id, forKey: .id)
       try container.encode(level, forKey: .level)
       try container.encode(message, forKey: .message)
     case .statusChanged(let key, let text):

@@ -33,6 +33,7 @@
   },
   {
     "_tag": "NoticeEntry",
+    "id": "notice-compile",
     "level": "error",
     "message": "compilation failed"
   }

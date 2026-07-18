@@ -348,10 +348,15 @@ it("translates auto-retry into RetryScheduled, truncating a fractional delay", (
   // client watching for give-up never misses it.
   expectTranslation({ type: "auto_retry_end", success: true, attempt: 2 }, []);
   expectTranslation({ type: "auto_retry_end", success: false, attempt: 5, finalError: "gave up" }, [
-    { _tag: "Notice", level: "error", message: "gave up" },
+    { _tag: "Notice", id: "auto-retry-5", level: "error", message: "gave up" },
   ]);
   expectTranslation({ type: "auto_retry_end", success: false, attempt: 5 }, [
-    { _tag: "Notice", level: "error", message: "retry failed after 5 attempt(s)" },
+    {
+      _tag: "Notice",
+      id: "auto-retry-5",
+      level: "error",
+      message: "retry failed after 5 attempt(s)",
+    },
   ]);
 });
 
@@ -393,10 +398,10 @@ it("translates fire-and-forget UI methods to notices and status, dropping the re
       message: "heads up",
       notifyType: "warning",
     },
-    [{ _tag: "Notice", level: "warn", message: "heads up" }],
+    [{ _tag: "Notice", id: "n1", level: "warn", message: "heads up" }],
   );
   expectTranslation({ type: "extension_ui_request", method: "notify", id: "n2", message: "fyi" }, [
-    { _tag: "Notice", level: "info", message: "fyi" },
+    { _tag: "Notice", id: "n2", level: "info", message: "fyi" },
   ]);
   expectTranslation(
     {
@@ -406,7 +411,7 @@ it("translates fire-and-forget UI methods to notices and status, dropping the re
       message: "boom",
       notifyType: "error",
     },
-    [{ _tag: "Notice", level: "error", message: "boom" }],
+    [{ _tag: "Notice", id: "n3", level: "error", message: "boom" }],
   );
   expectTranslation(
     {
@@ -442,6 +447,7 @@ it("translates extension errors to an error Notice", () => {
     [
       {
         _tag: "Notice",
+        id: "extension-error-/ext/a-onStart",
         level: "error",
         message: "extension /ext/a failed handling onStart: kaboom",
       },

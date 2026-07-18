@@ -140,6 +140,11 @@ write("job-minimal", Job, jobMinimal);
 write("session", Session, session);
 write("pull-request-ref", PullRequestRef, prMerged);
 
+// The distinct terminal `cancelled` WorkStatus (contract v2 / CE5.1) — a cancelled
+// planning node is terminal-but-not-`done`, so the mirror + board render it apart.
+write("workstream-cancelled", Workstream, { ...workstream, status: "cancelled" });
+write("epic-cancelled", Epic, { ...epic, status: "cancelled" });
+
 // ── WorkGraphEvent — every variant ───────────────────────────────────────────
 
 write("work-graph-events", Schema.Array(WorkGraphEvent), [
@@ -178,7 +183,7 @@ write("session-events", Schema.Array(SessionEvent), [
   { _tag: "ContextCompacted" },
   { _tag: "UiRequestRaised", id: "req-1", kind: "select", prompt: "Pick one", options: ["a", "b"] },
   { _tag: "UiRequestRaised", id: "req-2", kind: "confirm", prompt: "Proceed?" },
-  { _tag: "Notice", level: "warn", message: "disk space low" },
+  { _tag: "Notice", id: "notice-disk", level: "warn", message: "disk space low" },
   { _tag: "StatusChanged", key: "phase", text: "planning" },
   {
     _tag: "EntryAppended",
@@ -194,7 +199,7 @@ write("transcript-entries", Schema.Array(TranscriptEntry), [
   { _tag: "AssistantMessage", id: "a2", text: "no reasoning here" },
   { _tag: "ToolCall", id: "c1", name: "grep", input: { pattern: "TODO" } },
   { _tag: "ToolResult", id: "c1", output: { matches: 3 }, isError: false },
-  { _tag: "NoticeEntry", level: "error", message: "compilation failed" },
+  { _tag: "NoticeEntry", id: "notice-compile", level: "error", message: "compilation failed" },
 ]);
 
 // ── Usage — full + minimal ───────────────────────────────────────────────────

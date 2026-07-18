@@ -24,7 +24,7 @@ const entries: ReadonlyArray<unknown> = [
   { _tag: "AssistantMessage", id: "m3", text: "done" },
   { _tag: "ToolCall", id: "t1", name: "bash", input: { cmd: "ls" } },
   { _tag: "ToolResult", id: "t1", output: { stdout: "a\nb" }, isError: false },
-  { _tag: "NoticeEntry", level: "warn", message: "retrying" },
+  { _tag: "NoticeEntry", id: "notice-1", level: "warn", message: "retrying" },
 ];
 
 const events: ReadonlyArray<unknown> = [
@@ -54,7 +54,7 @@ const events: ReadonlyArray<unknown> = [
     prompt: "Pick one",
     options: ["a", "b"],
   },
-  { _tag: "Notice", level: "info", message: "started" },
+  { _tag: "Notice", id: "notice-1", level: "info", message: "started" },
   { _tag: "StatusChanged", key: "phase", text: "implementing" },
   { _tag: "EntryAppended", entry: { _tag: "UserMessage", id: "m1", text: "hi" } },
   {
@@ -99,7 +99,11 @@ it.effect("rejects representative invalid session inputs", () =>
       [SessionEvent, { _tag: "MessageStarted", messageId: "" }],
       [SessionEvent, { _tag: "RetryScheduled", attempt: 1.5, delayMs: 0, error: "x" }],
       [SessionEvent, { _tag: "UiRequestRaised", id: "u1", kind: "toast", prompt: "?" }],
-      [SessionEvent, { _tag: "Notice", level: "fatal", message: "x" }],
+      [SessionEvent, { _tag: "Notice", id: "n1", level: "fatal", message: "x" }],
+      // Notice/NoticeEntry require a non-empty reconciliation `id` (NoticeId, CE5.2).
+      [SessionEvent, { _tag: "Notice", id: "", level: "info", message: "x" }],
+      [SessionEvent, { _tag: "Notice", level: "info", message: "x" }],
+      [TranscriptEntry, { _tag: "NoticeEntry", id: "", level: "info", message: "x" }],
       [SessionEvent, { _tag: "EntryAppended", entry: { _tag: "UnknownEntry" } }],
       [TranscriptEntry, { _tag: "ToolResult", id: "t1", output: {} }],
       [SessionInput, { text: "go", mode: "resume" }],

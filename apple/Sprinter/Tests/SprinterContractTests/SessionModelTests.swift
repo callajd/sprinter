@@ -59,7 +59,7 @@ struct SessionModelTests {
         == .uiRequestRaised(
           id: "req-2", kind: .confirm, prompt: "Proceed?", options: nil
         ))
-    #expect(events[17] == .notice(level: .warn, message: "disk space low"))
+    #expect(events[17] == .notice(id: "notice-disk", level: .warn, message: "disk space low"))
     #expect(events[18] == .statusChanged(key: "phase", text: "planning"))
   }
 
@@ -80,7 +80,9 @@ struct SessionModelTests {
     #expect(entries[0] == .userMessage(id: "u1", text: "please fix the bug"))
     #expect(entries[1] == .assistantMessage(id: "a1", text: "on it", reasoning: "planning"))
     #expect(entries[2] == .assistantMessage(id: "a2", text: "no reasoning here", reasoning: nil))
-    #expect(entries[5] == .noticeEntry(level: .error, message: "compilation failed"))
+    #expect(
+      entries[5] == .noticeEntry(id: "notice-compile", level: .error, message: "compilation failed")
+    )
     for entry in entries {
       #expect(try Golden.roundTrip(entry) == entry)
     }

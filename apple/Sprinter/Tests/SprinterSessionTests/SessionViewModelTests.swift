@@ -23,13 +23,14 @@ struct SessionViewModelTests {
     backend.emit(.messageDelta(messageId: "m1", text: "Hello", reasoning: nil))
     backend.emit(.toolStarted(id: "t1", name: "read", input: .string("x")))
     backend.emit(.toolCompleted(id: "t1", output: .string("y"), isError: false))
-    backend.emit(.notice(level: .info, message: "heads up"))
+    backend.emit(.notice(id: "n-headsup", level: .info, message: "heads up"))
     backend.emit(.entryAppended(entry: .userMessage(id: "u1", text: "and this")))
 
     #expect(await waitUntil(model) { $0.count == 4 })
     let transcript = model.transcript
     #expect(transcript.isTurnActive)
-    #expect(transcript.items.map(\.id) == ["message:m1", "tool:t1", "notice:1", "message:u1"])
+    #expect(
+      transcript.items.map(\.id) == ["message:m1", "tool:t1", "notice:n-headsup", "message:u1"])
 
     model.stop()
     await backend.close()

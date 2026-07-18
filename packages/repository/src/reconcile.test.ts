@@ -167,6 +167,52 @@ it.effect("rolls a fully-landed workstream up to done and repairs parentage", ()
   ),
 );
 
+it.effect("never overwrites a cancelled epic/workstream to done, even once its issues land", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // A cancelled epic + workstream whose issues nonetheless land on the host: the
+    // roll-up treats cancelled as terminal-but-not-done and must NOT resurrect them.
+    yield* store.workGraph.putWorkstream({ ...workstream, status: "cancelled" });
+    yield* store.workGraph.putEpic({ ...epic, status: "cancelled" });
+    yield* store.workGraph.putIssue(issue(100));
+    yield* store.workGraph.putIssue(issue(101));
+
+    yield* reconcileWorkstream(workstream.id);
+
+    // The issues still land (Issue/PR-level reconciliation is unconditional)...
+    const i100 = Option.getOrThrow(yield* store.workGraph.getIssue(issue(100).id));
+    expect(isIssueLanded(i100)).toBe(true);
+
+    // ...but the terminal cancelled nodes are left cancelled, not flipped to done.
+    const ep = Option.getOrThrow(yield* store.workGraph.getEpic(epic.id));
+    const ws = Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream.id));
+    expect(ep.status).toBe("cancelled");
+    expect(ws.status).toBe("cancelled");
+    expect(isComplete(ep)).toBe(false);
+    expect(isComplete(ws)).toBe(false);
+  }).pipe(
+    Effect.provide(
+      Layer.mergeAll(
+        layerMemory,
+        fakeRepository({
+          issues: new Map([
+            [100, "closed"],
+            [101, "closed"],
+          ]),
+          closing: new Map([
+            [100, 100],
+            [101, 101],
+          ]),
+          pulls: new Map([
+            [100, true],
+            [101, true],
+          ]),
+        }),
+      ),
+    ),
+  ),
+);
+
 it.effect("leaves an epic and workstream unfinished while any issue is unlanded", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

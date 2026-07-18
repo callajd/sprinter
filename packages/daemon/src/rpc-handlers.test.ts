@@ -291,7 +291,7 @@ it.effect("control pause blocks the workstream without dispatching", () =>
   ),
 );
 
-it.effect("control cancel moves the workstream to its terminal status", () =>
+it.effect("control cancel moves the workstream to the distinct terminal cancelled status", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
       yield* seedGraph(store);
@@ -300,9 +300,10 @@ it.effect("control cancel moves the workstream to its terminal status", () =>
         "active",
       );
 
+      // CE5.1: cancel is a distinct terminal status, not collapsed to `done`.
       yield* client.control({ workstreamId: workstream.id, action: "cancel" });
       expect(Option.getOrThrow(yield* store.workGraph.getWorkstream(workstream.id)).status).toBe(
-        "done",
+        "cancelled",
       );
     }),
   ),

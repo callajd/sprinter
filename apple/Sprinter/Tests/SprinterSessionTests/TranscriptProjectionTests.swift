@@ -124,11 +124,11 @@ struct TranscriptProjectionTests {
   @Test("notices, statuses, retries and compaction surface; status collapses by key")
   func signalsSurface() {
     let transcript = TranscriptProjection.project([
-      .notice(level: .info, message: "first"),
+      .notice(id: "n1", level: .info, message: "first"),
       .statusChanged(key: "phase", text: "planning"),
       .retryScheduled(attempt: 1, delayMs: 500, error: "rate limit"),
       .statusChanged(key: "phase", text: "executing"),
-      .notice(level: .warn, message: "second"),
+      .notice(id: "n2", level: .warn, message: "second"),
       .contextCompacted
     ])
 
@@ -159,7 +159,7 @@ struct TranscriptProjectionTests {
   @Test("a durable notice entry surfaces as a notice item")
   func durableNoticeEntry() {
     let transcript = TranscriptProjection.project([
-      .entryAppended(entry: .noticeEntry(level: .error, message: "boom"))
+      .entryAppended(entry: .noticeEntry(id: "n-boom", level: .error, message: "boom"))
     ])
     let notices = transcript.items.compactMap { item -> TranscriptNotice? in
       if case .notice(let notice) = item { return notice }
@@ -167,6 +167,30 @@ struct TranscriptProjectionTests {
     }
     #expect(notices.map(\.message) == ["boom"])
     #expect(notices.first?.level == .error)
+  }
+
+  /// CE5.2: a live `Notice` and the durable `NoticeEntry` of the SAME logical event
+  /// share a reconciliation key (`NoticeId`), so they reconcile onto ONE item — the
+  /// durable value is canonical — rather than double-rendering. Two notices with
+  /// distinct keys stay distinct.
+  @Test("a live Notice and its durable NoticeEntry reconcile by shared key to one item")
+  func noticeReconciliationKey() {
+    let transcript = TranscriptProjection.project([
+      .notice(id: "retry-5", level: .warn, message: "retrying"),
+      .notice(id: "other", level: .info, message: "unrelated"),
+      .entryAppended(entry: .noticeEntry(id: "retry-5", level: .error, message: "gave up"))
+    ])
+    let notices = transcript.items.compactMap { item -> TranscriptNotice? in
+      if case .notice(let notice) = item { return notice }
+      return nil
+    }
+    // The shared-key live+durable pair collapsed to one item (durable value wins);
+    // the distinct-key notice remains its own item.
+    #expect(notices.count == 2)
+    let reconciled = notices.first { $0.id == "retry-5" }
+    #expect(reconciled?.level == .error)
+    #expect(reconciled?.message == "gave up")
+    #expect(notices.contains { $0.id == "other" })
   }
 
   /// Turn lifecycle drives the transcript chrome (not items): a running turn sets

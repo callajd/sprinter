@@ -147,6 +147,10 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
 /// A contract bump ripples here and to the goldens + decode tests — see the
 /// regeneration procedure in `docs/contract-mirror.md`.
 public enum SprinterContract {
-  /// The mirrored contract version (`v1`).
-  public static let version = 1
+  /// The mirrored contract version (`v2`).
+  ///
+  /// `v2` (CE5) batches the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
+  /// and the reconciliation-key `id` on ``SessionEvent``.`notice` /
+  /// ``TranscriptEntry``.`noticeEntry` (CE5.2) — rippled here and to the goldens.
+  public static let version = 2
 }

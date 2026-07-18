@@ -97,6 +97,7 @@
   },
   {
     "_tag": "Notice",
+    "id": "notice-disk",
     "level": "warn",
     "message": "disk space low"
   },
