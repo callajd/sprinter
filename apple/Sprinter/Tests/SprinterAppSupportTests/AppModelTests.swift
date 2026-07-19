@@ -61,6 +61,57 @@ struct AppModelTests {
     #expect(await waitUntil { fake.wasClosed })
   }
 
+  /// A daemon RESTART (the session backend drops) is SELF-HEALED: the reconnect loop
+  /// observes the drop via the connection's liveness watch and RE-DIALS a fresh backend, so
+  /// the shell recovers to `.connected` instead of staying stuck on a dead/`nil` backend
+  /// (CE3.1-F2 restart watch-item — the session-channel side of restart safety).
+  @Test("a dropped session backend is re-dialed (restart self-heal)")
+  func reDialsAfterDrop() async throws {
+    let model = AppModel(
+      daemon: DaemonConnection(connect: { FakeBackend(snapshot: AppSupportFixtures.snapshot) }),
+      reconnectBackoff: .noDelay)
+
+    model.start()
+    #expect(await waitUntil { model.connectionState == .connected })
+    let first = try #require(model.backend as? FakeBackend)
+
+    // The daemon goes away mid-connection: drop the current session backend.
+    first.simulateDrop()
+
+    // The loop re-dials → a fresh, DISTINCT backend, connected again (not stuck on nil).
+    #expect(
+      await waitUntil {
+        guard let current = model.backend as? FakeBackend else { return false }
+        return current !== first
+      })
+    #expect(await waitUntil { model.connectionState == .connected })
+
+    model.stop()
+  }
+
+  /// A daemon that is not up at launch does not leave the shell permanently `.failed`: the
+  /// reconnect loop retries (with backoff) and reaches `.connected` once a dial succeeds —
+  /// so a late-starting daemon is still reached.
+  @Test("an initial failed dial is retried until connected")
+  func retriesAfterInitialFailure() async throws {
+    struct DialError: Error {}
+    let dials = DialCounter(failFirst: 1)
+    let model = AppModel(
+      daemon: DaemonConnection(connect: {
+        if dials.shouldFail() { throw DialError() }
+        return FakeBackend(snapshot: AppSupportFixtures.snapshot)
+      }),
+      reconnectBackoff: .noDelay)
+
+    model.start()
+
+    // Despite the first dial throwing, the loop retries and connects a backend.
+    #expect(await waitUntil { model.connectionState == .connected })
+    #expect(model.backend != nil)
+
+    model.stop()
+  }
+
   /// `makeWorkGraphFeed()` mints a fresh single-consumer feed (for an inspector PR pane)
   /// off the same seam — a distinct engine that also drives to a baseline.
   @Test("makeWorkGraphFeed yields a fresh, drivable feed")

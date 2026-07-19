@@ -13,6 +13,18 @@ import SprinterMissionControl
 /// all rendering logic stays in the feature view models (already tested); this composes
 /// them and manages the connect lifecycle, so the testable wiring is verified by
 /// `make check` (INV-COV) while the SwiftUI Views stay thin at the platform edge.
+///
+/// **Self-healing session backend (CE4.2 / CE3.1-F2 restart watch-item).** The board feed
+/// already reconnects on its own (``WorkGraphResync`` owns a reconnect loop); before
+/// CE4.2 the session-channel ``Backend`` was dialed exactly ONCE, so a daemon RESTART left
+/// the shell stuck — either on `backend == nil` (a first connect that failed was never
+/// retried) or on a DEAD backend (a drop after a successful connect was never noticed). The
+/// connect lifecycle is now a supervised RECONNECT LOOP: it retries a failed connect with a
+/// widening ``ReconnectBackoff`` (so a daemon that starts LATE is still reached), and — once
+/// connected — watches the connection's liveness (the `events` feed ends/throws when the
+/// daemon goes away) and RE-DIALS on a drop, publishing a fresh ``Backend`` so the
+/// session-channel Views rebuild against the restarted daemon. So ``RootView`` recovers
+/// across a restart instead of staying stuck.
 @Observable
 @MainActor
 public final class AppModel {
@@ -21,11 +33,13 @@ public final class AppModel {
   /// `Sendable`/`Equatable` for the view and tests); the underlying error need not
   /// escape the connect step.
   public enum ConnectionState: Equatable, Sendable {
-    /// The connect attempt is in flight (the initial state, before ``start()`` resolves).
+    /// The connect attempt is in flight (the initial state, before ``start()`` resolves,
+    /// and again between a drop and the next successful re-dial).
     case connecting
     /// A ``Backend`` is connected; the session-channel Views can be built from it.
     case connected
-    /// The connect attempt failed — the rendered reason to surface.
+    /// The most recent connect attempt failed — the rendered reason to surface. The loop
+    /// keeps retrying underneath (with backoff), so this is not a terminal dead-end.
     case failed(reason: String)
   }
 
@@ -36,38 +50,76 @@ public final class AppModel {
   /// The daemon-connection state, observed by the shell chrome.
   public private(set) var connectionState: ConnectionState = .connecting
 
-  /// The connected ``Backend`` once ``start()`` resolves, else `nil`. The
-  /// session-channel Views (inbox / session / planner / inspector transcript) are
-  /// constructed from it. Not `Equatable`; observation tracks the reference identity.
+  /// The connected ``Backend`` once a connect resolves, else `nil`. The session-channel
+  /// Views (inbox / session / planner / inspector transcript) are constructed from it and
+  /// are rebuilt when a restart re-dials a fresh backend. Not `Equatable`; observation
+  /// tracks the reference identity, so a re-dial swapping the instance re-renders the Views.
   public private(set) var backend: (any Backend)?
 
   @ObservationIgnored private let daemon: DaemonConnection
+  @ObservationIgnored private var backoff: ReconnectBackoff
   @ObservationIgnored private var connectTask: Task<Void, Never>?
 
-  public init(daemon: DaemonConnection) {
+  public init(daemon: DaemonConnection, reconnectBackoff: ReconnectBackoff = ReconnectBackoff()) {
     self.daemon = daemon
+    self.backoff = reconnectBackoff
     self.board = MissionControlBoard()
   }
 
-  /// Starts the app: subscribes the board to a fresh live feed and dials a ``Backend``
-  /// for the session-channel Views. Idempotent — a second call does not re-dial while a
-  /// connect attempt is already outstanding (the board's own `start` is idempotent too).
+  /// Starts the app: subscribes the board to a fresh live feed and launches the supervised
+  /// backend reconnect loop for the session-channel Views. Idempotent — a second call does
+  /// not launch a second loop while one is already running (the board's own `start` is
+  /// idempotent too).
   public func start() {
     board.start(daemon.makeWorkGraphFeed())
     guard connectTask == nil else { return }
     connectTask = Task { [weak self] in
-      await self?.connect()
+      await self?.runConnectionLoop()
     }
   }
 
-  private func connect() async {
-    do {
-      let connected = try await daemon.connect()
-      backend = connected
-      connectionState = .connected
-    } catch {
-      connectionState = .failed(reason: String(describing: error))
+  /// The supervised connect lifecycle: dial the daemon, publish the ``Backend``, watch it
+  /// for a drop, and RE-DIAL — retrying a failed connect with a widening backoff. Runs until
+  /// ``stop()`` cancels it, so the session channel self-heals across a daemon restart.
+  private func runConnectionLoop() async {
+    while !Task.isCancelled {
+      do {
+        let connected = try await daemon.connect()
+        backend = connected
+        connectionState = .connected
+        // Watch the connection's liveness: `events` ends/throws when the daemon goes away
+        // (a restart). Returns whether it delivered a read — a healthy connection resets
+        // the backoff (so a healthy drop re-dials promptly); an accept-then-flap does not.
+        let wasHealthy = await awaitDrop(connected)
+        if Task.isCancelled { break }
+        // The connection dropped: retire the dead backend and fall through to re-dial.
+        backend = nil
+        connectionState = .connecting
+        await connected.close()
+        if wasHealthy { backoff.reset() }
+      } catch {
+        // The dial itself failed (daemon not up yet): surface the reason and retry.
+        connectionState = .failed(reason: String(describing: error))
+      }
+      if Task.isCancelled { break }
+      try? await Task.sleep(for: backoff.next())
     }
+  }
+
+  /// Awaits the connection dropping by consuming its `events` feed until it ends or throws
+  /// — the push-based liveness signal (a restarted daemon closes the socket, ending the
+  /// stream). Returns whether the connection delivered at least one event (it was live and
+  /// functioning), the health signal the loop resets its backoff on.
+  private func awaitDrop(_ backend: any Backend) async -> Bool {
+    var sawRead = false
+    do {
+      for try await _ in backend.events() {
+        sawRead = true
+      }
+    } catch {
+      // A transport drop surfaces here; the loop re-dials.
+    }
+    return sawRead
   }
 
   /// A fresh work-graph feed for an inspector PR pane (each single-consumer feed is its
@@ -76,12 +128,11 @@ public final class AppModel {
     daemon.makeWorkGraphFeed()
   }
 
-  /// Tears the app down: stops the board feed, cancels an in-flight connect, and closes
-  /// the connected backend. The live ``UnixSocketTransport`` holds a real thread + fd that
-  /// `close()` releases, but today this explicit teardown is exercised only by tests: the
-  /// `WindowGroup` scene wires `start()` with no matching lifecycle hook, so the running
-  /// single-process app reclaims the thread + fd at process exit. Wiring `stop()` to the
-  /// scene lifecycle is deferred to CE4. Idempotent.
+  /// Tears the app down: stops the board feed, cancels the reconnect loop, and closes the
+  /// connected backend — releasing the live ``UnixSocketTransport``'s real thread + fd
+  /// deterministically. CE4.2 wires this to the scene lifecycle (`SprinterApp`'s `.task`
+  /// cancellation), so a closed window releases the transport promptly rather than only at
+  /// process exit. Idempotent.
   public func stop() {
     connectTask?.cancel()
     connectTask = nil

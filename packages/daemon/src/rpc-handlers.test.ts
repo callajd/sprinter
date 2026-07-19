@@ -692,6 +692,46 @@ it.effect(
     ),
 );
 
+// CE4.1-R4 (the queued-orphan this closes) — `startup-reconcile` settled a stale `running`
+// Job to `queued` under a paused/`blocked` Workstream. `queued` IS mid-dispatch, so the
+// JOB-only gate would bounded-WAIT and stall the full 5s bound. The root fix ALSO settles
+// the Session row to a terminal status (`interrupted`), and the gate now fails fast on a
+// terminal Session row even while the Job is `queued` — proven by no virtual time consumed.
+it.effect(
+  "a QUEUED-ORPHAN session fails FAST — no 5s stall (Job queued, Session row settled terminal)",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        // Job re-queued for a later `control resume` (mid-dispatch), but its Session row
+        // was settled `interrupted` by the reconcile root fix — the airtight gate.
+        const queuedOrphanJob = Schema.decodeUnknownSync(Job)({
+          id: "job-1",
+          issueId: "iss-1",
+          kind: "implement",
+          status: "queued",
+        });
+        const interruptedSession = Schema.decodeUnknownSync(Session)({
+          id: "ses-1",
+          jobId: "job-1",
+          status: "interrupted",
+        });
+        yield* store.jobs.putSession(interruptedSession);
+        yield* store.jobs.putJob(queuedOrphanJob);
+
+        const before = yield* Clock.currentTimeMillis;
+        const error = yield* client
+          .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+          .pipe(Effect.flip);
+        const after = yield* Clock.currentTimeMillis;
+
+        expect(error).toBeInstanceOf(SessionNotFound);
+        // No virtual time consumed → the bounded wait was never entered despite the
+        // `queued` (mid-dispatch) Job — the terminal Session row short-circuits it.
+        expect(after).toBe(before);
+      }),
+    ),
+);
+
 // FIX A — a fully SETTLED session (durable Job AND Session row both terminal): the same
 // `!isMidDispatchJob → get` branch fails fast, the classic BE4.1 Inspector-on-settled-job
 // path. No clock advance; virtual time unchanged.

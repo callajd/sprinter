@@ -325,23 +325,42 @@ const isMidDispatchJob = (status: Job["status"]): boolean =>
   status === "queued" || status === "running";
 
 /**
+ * True while a durable {@link Session} row is still LIVE — i.e. genuinely
+ * `starting`/`active`/`idle`, so its handle is registered or about to be. The
+ * complement is a TERMINAL session (`interrupted`/`completed`/`failed`), whose registry
+ * entry is gone for good. A POSITIVE allow-list of the non-terminal statuses, so any
+ * future status defaults to fail-fast.
+ *
+ * This is the belt to {@link isMidDispatchJob}'s braces (CE4.1-R4): `startup-reconcile`
+ * can settle a stale `running` Job to `queued` under a paused Workstream — `queued` IS
+ * mid-dispatch, so a Job-only gate would bounded-WAIT on that orphan and stall the full
+ * resolve bound. Reconcile now also settles the Session row to a terminal status, so
+ * gating on BOTH (mid-dispatch Job AND live Session) fails that `queued`-orphan fast
+ * while still bridging a genuine mid-dispatch (running Job + `starting` Session).
+ */
+const isLiveSessionRow = (status: Session["status"]): boolean =>
+  status === "starting" || status === "active" || status === "idle";
+
+/**
  * Resolve the live {@link SessionHandle} for a `sessionId`, choosing wait-vs-fail-fast
  * on DURABLE state (the shared gate behind all four session-channel procedures). It
  * resolves session → job → job-status and gates on the JOB:
  *
  * - read the durable `Session` row from the {@link StateStore} to recover the `jobId`
  *   it belongs to (1 Job = 1 session); ABSENT → nothing is or will be registered, fail
- *   fast through `SessionRegistry.get`;
+ *   fast through `SessionRegistry.get`. A row that is itself TERMINAL (not
+ *   {@link isLiveSessionRow live}) also fails fast — it covers the reconcile
+ *   `queued`-orphan (CE4.1-R4) whose Job stays mid-dispatch but whose Session was settled;
  * - read that {@link Job} row; a job that is present AND still {@link isMidDispatchJob
- *   mid-dispatch} (`queued`/`running`) is bridged through `SessionRegistry.resolve`,
- *   which bounded-WAITS out the register-after-dispatch window so a client reacting to
- *   the `running` delta needs no retry;
+ *   mid-dispatch} (`queued`/`running`) — with a LIVE Session row — is bridged through
+ *   `SessionRegistry.resolve`, which bounded-WAITS out the register-after-dispatch window
+ *   so a client reacting to the `running` delta needs no retry;
  * - a job that is TERMINAL (settled) OR ABSENT is resolved through
  *   `SessionRegistry.get`, which FAILS FAST with {@link SessionNotFound} — no
- *   multi-second stall on a registration that will never land. This covers both the
- *   Inspector opening channels for SETTLED jobs (BE4.1) AND the crash-orphaned case a
- *   Session-row gate would miss: a terminal Job whose Session row `startup-reconcile`
- *   left NON-TERMINAL (see {@link isMidDispatchJob}).
+ *   multi-second stall on a registration that will never land. This covers the Inspector
+ *   opening channels for SETTLED jobs (BE4.1), the crash-orphaned case (a terminal Job
+ *   whose Session row an older reconcile left NON-TERMINAL), and — via the Session-row
+ *   check above — the `queued`-orphan the Job gate alone would miss.
  *
  * FIX B (CE4.1): a transient `StateStoreError` from either durable read is mapped to a
  * graceful {@link SessionNotFound} rather than `orDie`'d into an unrecoverable defect —
@@ -358,9 +377,13 @@ const resolveLive = (
     const session = yield* store.jobs.getSession(sessionId);
     // No Session row → never existed / already torn down; fail fast.
     if (Option.isNone(session)) return yield* registry.get(sessionId);
+    // Session row TERMINAL → registry entry gone for good (settled, or a reconcile
+    // `queued`-orphan whose Job stays mid-dispatch, CE4.1-R4); fail fast, no stall.
+    if (!isLiveSessionRow(session.value.status)) return yield* registry.get(sessionId);
     const job = yield* store.jobs.getJob(session.value.jobId);
     // Job absent, or terminal → registry entry gone for good; fail fast.
-    // Job mid-dispatch (queued/running) → bridge the register-after-dispatch window.
+    // Job mid-dispatch (queued/running) AND Session live → bridge the register-after-
+    // dispatch window (bounded wait).
     if (Option.isNone(job) || !isMidDispatchJob(job.value.status)) {
       return yield* registry.get(sessionId);
     }

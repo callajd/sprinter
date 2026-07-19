@@ -6,26 +6,38 @@ import SprinterContract
 /// fixed baseline ``Snapshot`` and keeps its `events` subscription open so a real
 /// ``WorkGraphResync`` (and the ``AppModel`` board it feeds) can be driven end to end
 /// without a daemon or network. The write/session surface is unused here and throws.
+///
+/// It supports MULTIPLE concurrent `events()` consumers (each a fresh stream), because a
+/// single connection is now consumed by BOTH the board feed and the ``AppModel`` reconnect
+/// loop's liveness watch. ``simulateDrop()`` finishes every open feed to model the daemon
+/// going away (a restart) so the loop's liveness watch observes the drop and re-dials.
 final class FakeBackend: Backend, @unchecked Sendable {
   private let baseline: Snapshot
-  private let eventStream: AsyncThrowingStream<WorkGraphEvent, any Error>
-  private let continuation: AsyncThrowingStream<WorkGraphEvent, any Error>.Continuation
+  private let feeds = EventFeeds()
   private let closedState = ClosedFlag()
 
   init(snapshot: Snapshot) {
     self.baseline = snapshot
-    (self.eventStream, self.continuation) = AsyncThrowingStream.makeStream()
   }
 
   var wasClosed: Bool { closedState.value }
 
   func snapshot() async throws -> Snapshot { baseline }
 
-  func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> { eventStream }
+  func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
+    feeds.makeStream()
+  }
+
+  /// Models the daemon going away mid-connection (a restart): finishes every open `events`
+  /// feed so a liveness watch sees the drop. Distinct from ``close()`` (the app tearing the
+  /// connection down); a dropped backend is not marked `wasClosed` by this call.
+  func simulateDrop() {
+    feeds.finishAll()
+  }
 
   func close() async {
     closedState.value = true
-    continuation.finish()
+    feeds.finishAll()
   }
 
   // MARK: - Unused write / session surface
@@ -68,6 +80,54 @@ func waitUntil(_ predicate: @MainActor () -> Bool) async -> Bool {
     await Task.yield()
   }
   return false
+}
+
+/// A lock-guarded registry of open `events` continuations, so one ``FakeBackend`` can serve
+/// several concurrent `events()` consumers (the board feed AND the ``AppModel`` liveness
+/// watch) and finish them all together on a drop/close.
+private final class EventFeeds: @unchecked Sendable {
+  private typealias Feed = AsyncThrowingStream<WorkGraphEvent, any Error>.Continuation
+  private let lock = NSLock()
+  private var continuations: [UUID: Feed] = [:]
+
+  func makeStream() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
+    let id = UUID()
+    return AsyncThrowingStream { continuation in
+      lock.withLock { continuations[id] = continuation }
+      continuation.onTermination = { [weak self] _ in
+        self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
+      }
+    }
+  }
+
+  func finishAll() {
+    let open = lock.withLock {
+      let values = Array(continuations.values)
+      continuations.removeAll()
+      return values
+    }
+    for continuation in open { continuation.finish() }
+  }
+}
+
+/// A lock-guarded counter of connect-seam calls, so a test can fail the first N dials and
+/// succeed afterward — exercising the ``AppModel`` reconnect loop's retry-with-backoff.
+final class DialCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var failuresRemaining: Int
+
+  init(failFirst: Int) {
+    self.failuresRemaining = failFirst
+  }
+
+  /// Returns `true` (and consumes one) while failures remain, else `false`.
+  func shouldFail() -> Bool {
+    lock.withLock {
+      guard failuresRemaining > 0 else { return false }
+      failuresRemaining -= 1
+      return true
+    }
+  }
 }
 
 /// A tiny lock-guarded flag so `close()` can record teardown across the actor hops the
