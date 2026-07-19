@@ -97,10 +97,27 @@ actor RpcConnection {
   }
 
   private func transmit(_ frame: ClientFrame) async {
+    let bytes: Data
     do {
-      try await transport.send(try encodeFrame(frame))
+      bytes = try encodeFrame(frame)
     } catch {
+      // Encoding an owned ``ClientFrame`` should never fail; surface it as-is if it does.
       failAll(with: error)
+      return
+    }
+    do {
+      try await transport.send(bytes)
+    } catch let error as BackendError {
+      // Already a terminal Backend failure (e.g. `connectionClosed` from a closed fd).
+      failAll(with: error)
+    } catch {
+      // A transport-level WRITE failure (e.g. ``UnixSocketTransportError/writeFailed`` on
+      // a broken pipe when the daemon drops mid-write) means a dead connection. Surface it
+      // as ``BackendError/connectionClosed`` — like every other terminal Backend failure —
+      // so feature view models switching on ``BackendError`` see it, not a transport-
+      // specific error. The typed ``UnixSocketTransportError`` stays on the DIAL path
+      // (``DaemonTransports``); transmit's only fallible transport op is the write.
+      failAll(with: BackendError.connectionClosed)
     }
   }
 

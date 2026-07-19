@@ -18,9 +18,10 @@ import Foundation
 /// `.remoteDaemon` has no counterpart yet: CE1/CE2's daemon serves ONLY a local
 /// Unix-domain socket (per `docs/architecture.md`, a remote daemon is reached over an
 /// authenticated HTTP/WS control plane, never a raw remote socket — later cutover
-/// work). Rather than silently mis-dial, this raises a typed
-/// ``UnixSocketTransportError`` so the unsupported selection surfaces loudly; the
-/// endpoint *axis* is delivered, and the remote adapter slots in here unchanged.
+/// work). Rather than silently mis-dial, this raises
+/// ``UnixSocketTransportError/remoteEndpointUnsupported`` (a dedicated "no adapter"
+/// case, not a dial failure) so the unsupported selection surfaces loudly; the endpoint
+/// *axis* is delivered, and the remote adapter slots in here unchanged.
 public struct DaemonTransports: DaemonTransportProvider {
   public init() {}
 
@@ -30,8 +31,10 @@ public struct DaemonTransports: DaemonTransportProvider {
       return try await UnixSocketTransport.connect(toUnixSocketPath: socketPath)
     case .remoteDaemon:
       // No remote transport exists yet (CE1/CE2 serve a local Unix socket only). Fail
-      // loudly instead of dialing nothing — the remote adapter lands behind this seam.
-      throw UnixSocketTransportError.connectionFailed(errno: ENOTSUP)
+      // loudly with a dedicated case — this is "no adapter exists", NOT a dial that
+      // failed to connect — so callers can tell the two apart. The remote adapter lands
+      // behind this seam.
+      throw UnixSocketTransportError.remoteEndpointUnsupported
     }
   }
 }

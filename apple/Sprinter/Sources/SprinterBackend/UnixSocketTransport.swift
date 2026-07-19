@@ -23,6 +23,13 @@ import Foundation
 /// thread; the blocking dial (`socket(2)`/`connect(2)`) is likewise hopped off the
 /// cooperative executor by ``connect(toUnixSocketPath:)``'s `async` form.
 ///
+/// SIGPIPE self-safety: every descriptor this transport writes to has `SO_NOSIGPIPE`
+/// set (``setNoSigPipe(_:)``) the moment it is created — the dial path in
+/// ``connect(toUnixSocketPath:)`` and the `socketpair(2)` test fixture alike — so a
+/// `write(2)` racing an expected daemon drop returns `EPIPE` (``UnixSocketTransportError/writeFailed``)
+/// instead of raising a process-terminating `SIGPIPE`. The transport never depends on a
+/// process-wide `signal(SIGPIPE, SIG_IGN)`.
+///
 /// It is the fd's *lifetime* — not just the `descriptor` variable — that makes a
 /// `close()` racing a `send` safe. The lock alone does NOT protect the fd across the
 /// blocking `write(2)`: were `close()` to `close(2)` the descriptor while a queued
@@ -67,11 +74,26 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
 
   /// Dials the daemon listening on `path` (CE1.2's `SPRINTER_SOCKET`) and returns a
   /// connected transport. Throws a typed ``UnixSocketTransportError`` on a failed
-  /// `socket(2)`/`connect(2)` or an over-long path — never a force-unwrap.
-  public static func connect(toUnixSocketPath path: String) throws -> UnixSocketTransport {
+  /// `socket(2)`/`connect(2)`, a failed `SO_NOSIGPIPE`, or an over-long path — never a
+  /// force-unwrap.
+  ///
+  /// `internal` (NB3): the blocking dial must never run on a cooperative executor, so
+  /// the public dial is the `async` overload below, which hops this onto ``dialQueue``.
+  /// This synchronous form only backs that overload (and the tests reach it through it).
+  static func connect(toUnixSocketPath path: String) throws -> UnixSocketTransport {
     let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
     guard descriptor >= 0 else {
       throw UnixSocketTransportError.socketCreationFailed(errno: errno)
+    }
+    // Disable SIGPIPE per-socket BEFORE any write can race a daemon drop: on Darwin a
+    // `write(2)` to a socket whose peer closed its read end otherwise raises SIGPIPE,
+    // whose default disposition TERMINATES the process. The daemon closing/restarting is
+    // EXPECTED (WorkGraphResync reconnects on drops), so the broken-pipe write must
+    // return -1/EPIPE (→ ``UnixSocketTransportError/writeFailed``), never a signal.
+    let noSigPipe = setNoSigPipe(descriptor)
+    guard noSigPipe == 0 else {
+      closeDescriptor(descriptor)
+      throw UnixSocketTransportError.socketOptionFailed(errno: noSigPipe)
     }
     let connectResult = withUnixSocketAddress(path: path) { addr, length in
       connectSocket(descriptor, addr, length)
@@ -199,10 +221,16 @@ public enum UnixSocketTransportError: Error, Equatable, Sendable {
   case socketCreationFailed(errno: Int32)
   /// `connect(2)` failed (no daemon listening, permission denied, …).
   case connectionFailed(errno: Int32)
+  /// `setsockopt(2)` could not set a required socket option (e.g. `SO_NOSIGPIPE`).
+  case socketOptionFailed(errno: Int32)
   /// The socket path is too long for the platform's `sun_path` buffer.
   case socketPathTooLong(maxBytes: Int)
   /// A `write(2)` failed before the whole frame was flushed.
   case writeFailed(errno: Int32)
+  /// A `.remoteDaemon` endpoint was selected, but no remote transport adapter exists yet
+  /// (CE1/CE2 serve only a local Unix-domain socket). Distinct from a dial failure — this
+  /// is "no adapter", not "the dial did not connect".
+  case remoteEndpointUnsupported
 }
 
 // MARK: - POSIX helpers
@@ -255,6 +283,20 @@ private func writeAll(_ descriptor: Int32, _ data: Data) throws {
       }
     }
   }
+}
+
+/// Sets `SO_NOSIGPIPE` on a stream socket so a `write(2)` to a peer that has closed its
+/// read end returns `-1`/`EPIPE` instead of raising `SIGPIPE` (whose default disposition
+/// TERMINATES the whole process). `SO_NOSIGPIPE` is the Darwin per-socket option and this
+/// codebase targets macOS/Darwin, so it is the correct mechanism here — the transport is
+/// self-safe and never relies on a process-wide `SIG_IGN`. Returns `0` on success, or the
+/// failing `errno`. Internal so both dial paths and the `socketpair(2)` test fixture set
+/// it identically, keeping test behavior matched to production.
+func setNoSigPipe(_ descriptor: Int32) -> Int32 {
+  var one: Int32 = 1
+  let result = setsockopt(
+    descriptor, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+  return result == 0 ? 0 : errno
 }
 
 // Thin file-scope wrappers so the POSIX syscalls are never shadowed by the type's own

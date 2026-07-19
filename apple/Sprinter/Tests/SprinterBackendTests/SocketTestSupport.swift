@@ -36,6 +36,15 @@ final class RawSocketPeer: @unchecked Sendable {
     var descriptors: [Int32] = [-1, -1]
     let result = socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors)
     guard result == 0 else { throw LoopbackError.setupFailed("socketpair errno \(errno)") }
+    // Mirror production: the client-side descriptor gets `SO_NOSIGPIPE` (exactly as the
+    // real dial does), so a broken-pipe `write(2)` surfaces as EPIPE/`writeFailed` instead
+    // of a process-terminating SIGPIPE — the test proves production needs no SIG_IGN.
+    let noSigPipe = setNoSigPipe(descriptors[0])
+    guard noSigPipe == 0 else {
+      _ = Darwin.close(descriptors[0])
+      _ = Darwin.close(descriptors[1])
+      throw LoopbackError.setupFailed("SO_NOSIGPIPE errno \(noSigPipe)")
+    }
     return (
       transport: UnixSocketTransport(connectedDescriptor: descriptors[0]),
       peer: RawSocketPeer(descriptor: descriptors[1])

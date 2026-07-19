@@ -146,10 +146,10 @@ struct UnixSocketTransportTests {
     // A write that loses the race to `shutdown` may see EPIPE; it must not crash the
     // test. What FIX1 guarantees is that a queued write never reaches a CLOSED fd
     // (which would surface as EBADF) — the real `close(2)` is serialized behind writes
-    // on `writeQueue` and `send` re-checks `isClosed` there.
-    let previous = signal(SIGPIPE, SIG_IGN)
-    defer { signal(SIGPIPE, previous) }
-
+    // on `writeQueue` and `send` re-checks `isClosed` there. NOTE: there is deliberately
+    // NO `signal(SIGPIPE, SIG_IGN)` guard here — FIX B1 sets `SO_NOSIGPIPE` on the
+    // transport descriptor, so a broken-pipe write returns EPIPE without a signal. If
+    // production ever regressed to needing the process-wide guard, this test would crash.
     for _ in 0..<32 {
       let (transport, peer) = try RawSocketPeer.pair()
       let frame = Data("{\"k\":\"v\"}\n".utf8)
@@ -207,11 +207,47 @@ struct UnixSocketTransportTests {
     }
   }
 
-  @Test("a remote endpoint has no transport yet and fails loudly")
+  @Test("a remote endpoint has no transport yet and fails with remoteEndpointUnsupported")
   func remoteEndpointUnsupported() async throws {
-    await #expect(throws: (any Error).self) {
+    await #expect(throws: UnixSocketTransportError.remoteEndpointUnsupported) {
       _ = try await DaemonTransports().makeTransport(
         for: .remoteDaemon(host: "daemon.internal", port: 8443))
     }
+  }
+
+  @Test("a transport write failure surfaces to the caller as BackendError.connectionClosed")
+  func writeFailureSurfacesAsConnectionClosed() async throws {
+    // NB1: a mid-write transport failure (UnixSocketTransportError.writeFailed) must reach
+    // feature code as a BackendError, like every other terminal Backend failure — not as a
+    // transport-specific error. The stub's inbound stream never ends, so the ONLY failure
+    // an in-flight query can hit is the write path (not an inbound EOF).
+    let backend = RpcBackend(transport: WriteFailingTransport())
+    await #expect(throws: BackendError.connectionClosed) { try await backend.snapshot() }
+    await backend.close()
+  }
+}
+
+/// An ``RpcTransport`` whose `send` always fails with a transport-level write error and
+/// whose inbound stream never terminates — so a request can only fail on the WRITE path,
+/// isolating the transmit-boundary error mapping (NB1).
+private final class WriteFailingTransport: RpcTransport {
+  private let inbound: AsyncThrowingStream<Data, any Error>
+  // Retained so the never-finishing inbound stream stays open for the test's lifetime.
+  private let continuation: AsyncThrowingStream<Data, any Error>.Continuation
+
+  init() {
+    (inbound, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+  }
+
+  func send(_ bytes: Data) async throws {
+    throw UnixSocketTransportError.writeFailed(errno: EPIPE)
+  }
+
+  func receive() -> AsyncThrowingStream<Data, any Error> {
+    inbound
+  }
+
+  func close() {
+    continuation.finish()
   }
 }
