@@ -204,7 +204,7 @@ const dispatchInBackground = (runner: Runner, scope: Scope, job: Job): Effect.Ef
  * scope): `pause`/`cancel` are status-only here — they transition the workstream
  * node but do NOT interrupt an in-flight session (that rides on the session
  * `interrupt` channel, AE4.2) nor roll status down to epics/issues/jobs. `cancel`
- * maps to the distinct terminal `cancelled` (contract v2 / CE5.1) — a cancelled
+ * maps to the distinct terminal `cancelled` (CE5.1) — a cancelled
  * workstream is terminal-but-not-`done`, so it renders and reconciles apart from a
  * completed one ({@link isTerminal}).
  */
@@ -485,7 +485,7 @@ export const handlers = SprinterRpc.toLayer(
       // persisted history deterministically, not only the deltas after it attaches.
       // Subscribe-before-replay closes the gap; upsert-idempotent deltas (D8) absorb
       // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
-      // durable offset (contract v3 / CE2.0), and replay + live offsets share one
+      // durable offset (CE2.0), and replay + live offsets share one
       // coordinate space, so the client can feed a streamed item's offset back as
       // `sinceOffset`. The cursor is OPTIONAL: a request with NO `sinceOffset` (a
       // present but empty `{}` payload) replays from origin, present resumes strictly

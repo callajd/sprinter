@@ -28,13 +28,13 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
 }
 
 /// Payload of `events` (streams the ``OffsetEvent`` envelope) — the OPTIONAL
-/// `sinceOffset` resume cursor (contract v3 / CE2.0). A request with no `sinceOffset`
+/// `sinceOffset` resume cursor (CE2.0). A request with no `sinceOffset`
 /// (`nil`) replays from the log ORIGIN; present resumes STRICTLY AFTER that offset.
 /// The wire is `Schema.optionalKey(NonNegativeInt)`, so the KEY is OMITTED when `nil`
 /// (never `null`) — Swift synthesized `Codable` matches this exactly. The payload
 /// OBJECT itself is still sent PRESENT (an empty `{}` when there is no cursor):
 /// ``RpcBackend/events()`` encodes an empty ``EventsPayload`` so the request carries
-/// `"payload": {}`, matching the canonical Effect client — under v3 the payload
+/// `"payload": {}`, matching the canonical Effect client — the payload
 /// schema is a `Struct`, so an omitted `payload` key would fail to decode.
 public struct EventsPayload: Codable, Equatable, Sendable {
   public let sinceOffset: Int?
@@ -152,23 +152,4 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
       try container.encode(reason, forKey: .reason)
     }
   }
-}
-
-/// The contract version this mirror tracks (INV-CONTRACT).
-///
-/// The TS contract carries `CONTRACT_VERSION` as a compile-time group annotation
-/// (not an in-band wire field); the Swift mirror tracks it as its own constant.
-/// A contract bump ripples here and to the goldens + decode tests — see the
-/// regeneration procedure in `docs/contract-mirror.md`.
-public enum SprinterContract {
-  /// The mirrored contract version (`v3`).
-  ///
-  /// `v2` (CE5) batched the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
-  /// and the reconciliation-key `id` on ``SessionEvent``.`notice` /
-  /// ``TranscriptEntry``.`noticeEntry` (CE5.2). `v3` (CE2.0) makes the `events`
-  /// cursor usable end-to-end as ONE change: the OPTIONAL `sinceOffset` resume
-  /// cursor on ``EventsPayload`` (request) AND the ``OffsetEvent`` envelope on the
-  /// streamed response, so each item carries the durable offset the client feeds
-  /// back as that cursor — rippled here and to the goldens.
-  public static let version = 3
 }

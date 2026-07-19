@@ -29,7 +29,7 @@ import type { OffsetEvent } from "@sprinter/contract";
  * {@link layer} provides the backing (INV-PORT).
  *
  * The feed carries {@link OffsetEvent}s — each delta paired with the DURABLE
- * `event_log` offset it was journaled at (contract v3 / CE2.0). The producer (the
+ * `event_log` offset it was journaled at (CE2.0). The producer (the
  * journaling `StateStore` decorator, `./event-journal.ts`) is the one layer that
  * mints that offset, so it is also the one that publishes: the live-tail offset
  * shares ONE coordinate space with the durable replay (`EventLogStore.tail`), so a

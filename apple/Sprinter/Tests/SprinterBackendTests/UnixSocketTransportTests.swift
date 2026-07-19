@@ -39,7 +39,7 @@ struct UnixSocketTransportTests {
     peer.close()
   }
 
-  @Test("the v3 OffsetEvent events stream decodes real frames and acks each batch")
+  @Test("the OffsetEvent events stream decodes real frames and acks each batch")
   func eventsStreamOverSocket() async throws {
     let (transport, peer) = try RawSocketPeer.pair()
     let backend = RpcBackend(transport: transport)

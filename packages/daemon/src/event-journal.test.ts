@@ -184,7 +184,7 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
     yield* seedGraph(store);
 
     const replay = yield* resyncFrom(store, 0).pipe(Stream.runCollect);
-    // Each item pairs the owned delta with its durable offset (contract v3 / CE2.0).
+    // Each item pairs the owned delta with its durable offset (CE2.0).
     expect(replay.map((e) => e.event)).toEqual([
       { _tag: "WorkstreamChanged", workstream },
       { _tag: "EpicChanged", epic },

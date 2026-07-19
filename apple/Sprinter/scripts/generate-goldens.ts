@@ -1,7 +1,7 @@
 /**
  * One-off golden generator for the Swift contract mirror (issue FE2.4).
  *
- * Encodes REPRESENTATIVE values of every contract-v1 message schema through the
+ * Encodes REPRESENTATIVE values of every contract message schema through the
  * MERGED TypeScript contract (`@sprinter/contract` over `@sprinter/domain`),
  * writing the resulting wire JSON to
  * `Tests/SprinterContractTests/Goldens/*.json`. The Swift `SprinterContract`
@@ -142,7 +142,7 @@ write("job-minimal", Job, jobMinimal);
 write("session", Session, session);
 write("pull-request-ref", PullRequestRef, prMerged);
 
-// The distinct terminal `cancelled` WorkStatus (contract v2 / CE5.1) — a cancelled
+// The distinct terminal `cancelled` WorkStatus (CE5.1) — a cancelled
 // planning node is terminal-but-not-`done`, so the mirror + board render it apart.
 write("workstream-cancelled", Workstream, { ...workstream, status: "cancelled" });
 write("epic-cancelled", Epic, { ...epic, status: "cancelled" });
@@ -157,7 +157,7 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
   { _tag: "SessionChanged", session },
 ]);
 
-// ── OffsetEvent — the streamed `events` success envelope (contract v3 / CE2.0) ──
+// ── OffsetEvent — the streamed `events` success envelope (CE2.0) ──
 //
 // Each streamed item pairs a WorkGraphEvent with its DURABLE offset, so a client
 // can feed the offset back as the request's `sinceOffset` cursor. Real `event_log`
@@ -206,7 +206,7 @@ write("session-events", Schema.Array(SessionEvent), [
     entry: { _tag: "AssistantMessage", id: "a1", text: "done", reasoning: "because" },
   },
   // A content-derived notice with NO reconciliation key — the `NoticeId` optional-key
-  // is ABSENT (contract v2 / CE5.2). The consumer keys these by arrival sequence so
+  // is ABSENT (CE5.2). The consumer keys these by arrival sequence so
   // distinct occurrences stay distinct rather than collapsing onto one item.
   { _tag: "Notice", level: "error", message: "retry failed after 5 attempt(s)" },
 ]);
@@ -281,7 +281,7 @@ writeFileSync(
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
 
-// The `events` request cursor is OPTIONAL (contract v3 / CE2.0): both wire forms
+// The `events` request cursor is OPTIONAL (CE2.0): both wire forms
 // are captured — present (`sinceOffset` key set) and absent (key omitted, the
 // backward-compatible origin replay) — so the Swift mirror decodes each.
 write("payload-events", events.payloadSchema, { sinceOffset: 12 });

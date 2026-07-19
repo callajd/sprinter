@@ -189,7 +189,7 @@ it.effect("the events feed does DURABLE offset-based resync for a late-attaching
       });
 
       // Attaching now REPLAYS the journaled history: the pre-subscribe delta arrives,
-      // stamped with its durable offset (contract v3 / CE2.0).
+      // stamped with its durable offset (CE2.0).
       const first = Option.getOrThrow(
         yield* client.events({}).pipe(Stream.take(1), Stream.runHead),
       );

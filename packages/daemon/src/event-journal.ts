@@ -30,7 +30,7 @@
  *   history deterministically, not just the deltas that happen after it attaches.
  *
  * The wire `events` procedure carries an OPTIONAL `sinceOffset` REQUEST cursor and an
- * {@link OffsetEvent} RESPONSE envelope (contract v3 / CE2.0, INV-CONTRACT): a request
+ * {@link OffsetEvent} RESPONSE envelope (CE2.0, INV-CONTRACT): a request
  * with NO `sinceOffset` (a present but empty `{}` payload) replays from the log ORIGIN
  * (`tail(0)`), present resumes STRICTLY AFTER that offset, and each streamed item
  * exposes the durable offset the client feeds back as its next cursor. {@link resyncFrom} is the
@@ -55,7 +55,7 @@ type Feed = Context.Service.Shape<typeof WorkGraphEvents>;
  * cannot fail (`orDie`); an {@link EventLogStore} write can, so — like the `put*` it
  * follows — the effect surfaces {@link StateStoreError}. The returned offset is the
  * SAME coordinate {@link EventLogStore.tail} / {@link resyncFrom} read, so the live
- * fan-out and the durable replay agree on one offset per delta (contract v3 / CE2.0).
+ * fan-out and the durable replay agree on one offset per delta (CE2.0).
  */
 const journalDelta = (
   base: Store,
@@ -189,8 +189,8 @@ export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEv
 
 /**
  * The `events` RPC feed: EAGERLY subscribe to the live work-graph feed, THEN replay
- * the durable log from `sinceOffset` (the client's resume cursor — contract v3 /
- * CE2.0; absent → `0`, replay from the ORIGIN), THEN stream the live tail. Every
+ * the durable log from `sinceOffset` (the client's resume cursor — CE2.0; absent →
+ * `0`, replay from the ORIGIN), THEN stream the live tail. Every
  * streamed item is an {@link OffsetEvent} carrying its durable offset; replay and
  * live offsets share one coordinate space (the journaling decorator mints and
  * publishes the same offset it appended), so a reconnecting request with

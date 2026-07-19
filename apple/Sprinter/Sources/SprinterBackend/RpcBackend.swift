@@ -73,15 +73,15 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          // The wire carries the ``OffsetEvent`` envelope (contract v3 / CE2.0): each
+          // The wire carries the ``OffsetEvent`` envelope (CE2.0): each
           // item pairs the delta with its DURABLE offset, which ``WorkGraphResync`` tracks
           // to resume STRICTLY AFTER the last-applied offset on reconnect. An unknown
           // inner `_tag` still surfaces as a decode failure, never a silent drop.
           //
           // Send a PRESENT ``EventsPayload`` (the `sinceOffset` KEY is omitted when `nil`
           // → origin replay; present → incremental resume) so the request encodes a
-          // payload object, matching the canonical Effect client (INV-CONTRACT). Under v3
-          // the payload schema is a `Struct`, so an OMITTED payload key would decode to
+          // payload object, matching the canonical Effect client (INV-CONTRACT). The
+          // payload schema is a `Struct`, so an OMITTED payload key would decode to
           // `undefined` and fail — a present object decodes correctly.
           let payload = try toJSONValue(EventsPayload(sinceOffset: sinceOffset))
           for try await value in await connection.stream(tag: "events", payload: payload) {

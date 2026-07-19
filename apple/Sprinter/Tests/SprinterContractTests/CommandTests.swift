@@ -105,9 +105,4 @@ struct CommandTests {
       #expect(try Golden.roundTrip(error) == error)
     }
   }
-
-  @Test("tracks the frozen contract version")
-  func tracksContractVersion() {
-    #expect(SprinterContract.version == 3)
-  }
 }

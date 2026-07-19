@@ -31,8 +31,6 @@
  * {@link bootLayer} — the boot-time `StartupReconcile` run. The runnable process
  * entrypoint is the sibling `run.ts` (`sprinter-daemon` bin).
  */
-import { contractTag } from "@sprinter/contract";
-
 export { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
 export type { DaemonConfig } from "./main.ts";
 export {
@@ -51,5 +49,5 @@ export type { StartupSummary } from "./startup-reconcile.ts";
 export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
-/** Human-readable daemon identity banner, keyed to the active contract version. */
-export const daemonBanner = (): string => `sprinter-daemon (contract ${contractTag()})`;
+/** Human-readable daemon identity banner. */
+export const daemonBanner = (): string => "sprinter-daemon";

@@ -112,7 +112,7 @@ struct ReadModelTests {
     }
   }
 
-  @Test("decodes the offset-stamped events-stream envelope (contract v3 / CE2.0)")
+  @Test("decodes the offset-stamped events-stream envelope (CE2.0)")
   func decodesOffsetEvents() throws {
     let items = try Golden.decode([OffsetEvent].self, from: "offset-events")
     #expect(items.count == 3)
