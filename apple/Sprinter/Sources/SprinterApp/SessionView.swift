@@ -1,6 +1,7 @@
 import SprinterAppSupport
 import SprinterBackend
 import SprinterContract
+import SprinterInspector
 import SprinterSession
 import SwiftUI
 
@@ -98,8 +99,7 @@ private struct TranscriptItemView: View {
     case .message(let message):
       messageRow(message)
     case .toolCall(let call):
-      Label(call.name.isEmpty ? "tool" : call.name, systemImage: "wrench.and.screwdriver")
-        .font(.callout)
+      toolRow(call)
     case .notice(let notice):
       Text(notice.message)
         .font(.callout)
@@ -116,6 +116,19 @@ private struct TranscriptItemView: View {
       Text("— context compacted —")
         .font(.caption)
         .foregroundStyle(.secondary)
+    }
+  }
+
+  /// A tool call: its name, plus — for a recognized edit/write — the intraline-refined
+  /// diff (`TranscriptDiff.refined`) so unchanged lines read as context, not churn.
+  @ViewBuilder
+  private func toolRow(_ call: TranscriptToolCall) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Label(call.name.isEmpty ? "tool" : call.name, systemImage: "wrench.and.screwdriver")
+        .font(.callout)
+      if let diff = call.fileDiff {
+        TranscriptDiffView(diff: diff.refined)
+      }
     }
   }
 

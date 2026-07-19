@@ -1,3 +1,4 @@
+import Foundation
 import SprinterBackend
 import SprinterContract
 import Testing
@@ -9,6 +10,17 @@ import Testing
 struct MissionControlInboxTests {
   private static let sessionA = SessionId(rawValue: "session-a")
   private static let sessionB = SessionId(rawValue: "session-b")
+
+  /// A deterministic, strictly-increasing clock so wait-time ordering is stable in
+  /// tests (each stamp is a distinct, later `Date`) rather than depending on the
+  /// wall clock's resolution.
+  private final class SteppingClock {
+    private var tick = 0
+    func now() -> Date {
+      tick += 1
+      return Date(timeIntervalSinceReferenceDate: TimeInterval(tick))
+    }
+  }
 
   /// A `UiRequestRaised` surfacing on a tracked session's feed appears in the inbox,
   /// carrying its session id and the prompt/kind/options to render — driven by a
@@ -72,25 +84,94 @@ struct MissionControlInboxTests {
   }
 
   /// Pending requests raised on distinct sessions aggregate into one inbox, each
-  /// entry retaining its own session id (ordered deterministically by session id).
-  @Test("multiple sessions' pending requests aggregate into one inbox")
+  /// entry retaining its own session id, ordered **longest-waiting-first** by the
+  /// client-side arrival stamp — the request seen first sorts first regardless of
+  /// session id.
+  @Test("multiple sessions' pending requests aggregate, ordered by wait time")
   func multipleSessionsAggregate() async throws {
     let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
-    let inbox = MissionControlInbox(backend: backend)
+    let clock = SteppingClock()
+    let inbox = MissionControlInbox(backend: backend, now: clock.now)
     inbox.track(Self.sessionB)
     inbox.track(Self.sessionA)
 
+    // session-B's request is raised (and observed) FIRST, so it has waited longer and
+    // must sort ahead of session-A's — even though A < B by session id.
     backend.emit(
       .uiRequestRaised(id: "req-b", kind: .input, prompt: "Name the branch", options: nil),
       on: Self.sessionB)
+    #expect(await waitUntil(inbox) { $0.count == 1 })
     backend.emit(
       .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "Approve?", options: nil),
       on: Self.sessionA)
 
     #expect(await waitUntil(inbox) { $0.count == 2 })
-    // Deterministic order: session-a before session-b.
-    #expect(inbox.entries.map(\.sessionId) == [Self.sessionA, Self.sessionB])
-    #expect(inbox.entries.map(\.requestId) == ["req-a", "req-b"])
+    // Longest-waiting-first: req-b (seen first) before req-a.
+    #expect(inbox.entries.map(\.sessionId) == [Self.sessionB, Self.sessionA])
+    #expect(inbox.entries.map(\.requestId) == ["req-b", "req-a"])
+    // The stamps reflect arrival order (earlier = longer wait).
+    #expect(inbox.entries[0].waitingSince < inbox.entries[1].waitingSince)
+
+    inbox.stop()
+    await backend.close()
+  }
+
+  /// Two requests on the SAME session order by wait time within the session: the one
+  /// raised first sorts ahead of the one raised later.
+  @Test("same-session requests order by wait time")
+  func sameSessionOrdersByWaitTime() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA])
+    let clock = SteppingClock()
+    let inbox = MissionControlInbox(backend: backend, now: clock.now)
+    inbox.track(Self.sessionA)
+
+    backend.emit(
+      .uiRequestRaised(id: "first", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.count == 1 })
+    backend.emit(
+      .uiRequestRaised(id: "second", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.count == 2 })
+
+    #expect(inbox.entries.map(\.requestId) == ["first", "second"])
+
+    inbox.stop()
+    await backend.close()
+  }
+
+  /// `isOutstanding` is the no-longer-outstanding signal: `true` while a request is
+  /// pending, `false` once it is answered (or otherwise leaves the outstanding set),
+  /// and the client-side arrival stamp is PRUNED so a re-raised request is stamped
+  /// afresh rather than inheriting its old wait.
+  @Test("isOutstanding flips false on resolution and the arrival stamp is pruned")
+  func isOutstandingFlipsAndArrivalResets() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA])
+    let clock = SteppingClock()
+    let inbox = MissionControlInbox(backend: backend, now: clock.now)
+    inbox.track(Self.sessionA)
+
+    backend.emit(
+      .uiRequestRaised(id: "req-1", kind: .confirm, prompt: "Merge?", options: nil),
+      on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.count == 1 })
+    let entry = try #require(inbox.entries.first)
+    let firstStamp = entry.waitingSince
+    #expect(inbox.isOutstanding(entry.id))
+
+    // Answer it — it leaves the outstanding set, the entry clears, and the signal
+    // flips to no-longer-outstanding.
+    try await inbox.answer(entry, with: .confirmed(confirmed: true))
+    #expect(await waitUntil(inbox) { $0.isEmpty })
+    #expect(!inbox.isOutstanding(entry.id))
+
+    // The SAME request id raised again is stamped afresh (a strictly-later stamp),
+    // not the stale wait — the arrival map was pruned on resolution.
+    backend.emit(
+      .uiRequestRaised(id: "req-1", kind: .confirm, prompt: "Merge again?", options: nil),
+      on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.count == 1 })
+    let reraised = try #require(inbox.entries.first)
+    #expect(reraised.id == entry.id)
+    #expect(reraised.waitingSince > firstStamp)
 
     inbox.stop()
     await backend.close()
@@ -163,6 +244,75 @@ struct MissionControlInboxTests {
 
     #expect(inbox.entries.allSatisfy { $0.requestId == "req-1" })
     #expect(Set(inbox.entries.map(\.id)).count == 2)
+
+    inbox.stop()
+    await backend.close()
+  }
+
+  /// The pure active-session extractor pulls each issue's live-agent session out of a
+  /// projected board tree (and only those — a done issue with no agent contributes
+  /// nothing).
+  @Test("activeSessionIds extracts each issue's live-agent session")
+  func activeSessionIdsExtracts() {
+    let board = BoardProjection.project(BoardFixtures.snapshot)
+    #expect(MissionControlInbox.activeSessionIds(in: board) == [SessionId(rawValue: "sess-a")])
+  }
+
+  /// `syncTrackedSessions` is the live-tracking diff: syncing to a new active set
+  /// tracks newly-active sessions and untracks ones no longer active (their entries
+  /// drop) — the CE3.1-F4 behaviour, not a point-in-time snapshot.
+  @Test("syncTrackedSessions tracks newly-active and untracks no-longer-active sessions")
+  func syncTrackedSessionsDiffs() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
+    let inbox = MissionControlInbox(backend: backend)
+
+    inbox.syncTrackedSessions(to: [Self.sessionA])
+    backend.emit(
+      .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.map(\.sessionId) == [Self.sessionA] })
+
+    // Re-sync to {B}: A is untracked (its entry drops) and B is tracked.
+    inbox.syncTrackedSessions(to: [Self.sessionB])
+    backend.emit(
+      .uiRequestRaised(id: "req-b", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionB)
+    #expect(await waitUntil(inbox) { $0.map(\.sessionId) == [Self.sessionB] })
+
+    inbox.stop()
+    await backend.close()
+  }
+
+  /// `trackActiveSessions(of:)` follows the board LIVE (CE3.1-F4): a session that
+  /// becomes active while the inbox is open is tracked, and one that goes inactive is
+  /// untracked — reacting to board changes, not the `onAppear` snapshot.
+  @Test("trackActiveSessions follows the board live as sessions activate/deactivate")
+  func trackActiveSessionsIsLive() async throws {
+    let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
+    let board = MissionControlBoard()
+    board.apply(
+      BoardFixtures.singleEpicSnapshot(
+        issueIds: ["iss"],
+        jobs: [BoardFixtures.job("job", issue: "iss", status: .running, session: "session-a")],
+        sessions: []))
+    let inbox = MissionControlInbox(backend: backend)
+    inbox.trackActiveSessions(of: board)
+
+    // session-a is the board's live agent → tracked; its prompt surfaces.
+    backend.emit(
+      .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
+    #expect(await waitUntil(inbox) { $0.map(\.sessionId) == [Self.sessionA] })
+
+    // The board changes WHILE the inbox is open: session-a goes inactive, session-b
+    // becomes the live agent.
+    board.apply(
+      BoardFixtures.singleEpicSnapshot(
+        issueIds: ["iss"],
+        jobs: [BoardFixtures.job("job2", issue: "iss", status: .running, session: "session-b")],
+        sessions: []))
+
+    // Live re-sync: session-a is untracked (its entry drops) and session-b tracked.
+    backend.emit(
+      .uiRequestRaised(id: "req-b", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionB)
+    #expect(await waitUntil(inbox) { $0.map(\.sessionId) == [Self.sessionB] })
 
     inbox.stop()
     await backend.close()

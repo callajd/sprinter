@@ -151,6 +151,83 @@ struct PlannerViewModelTests {
     #expect(accepting.createdWorkstreamId == created)
   }
 
+  /// The plan-construction FORM (CE3.2): `canMaterialize` gates on a non-empty name
+  /// AND repo (spec optional), and whitespace-only fields don't count — the plan is
+  /// built explicitly from the fields, never extracted from the transcript.
+  @Test("the form gates materialize on a non-empty name and repo")
+  func formValidationGatesMaterialize() {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+
+    // Empty form → cannot materialize.
+    #expect(!planner.canMaterialize)
+
+    // Name only is not enough; a repo is required too.
+    planner.name = "Postgres sink"
+    #expect(!planner.canMaterialize)
+
+    // Whitespace-only repo still doesn't count.
+    planner.repo = "   "
+    #expect(!planner.canMaterialize)
+
+    // Name + repo (spec may stay empty) → ready.
+    planner.repo = "acme/pipe"
+    #expect(planner.canMaterialize)
+  }
+
+  /// `draftPlan` constructs the plan from the explicit fields, trimming surrounding
+  /// whitespace/newlines so a stray trailing space never leaks into the submission.
+  @Test("draftPlan constructs the plan from the trimmed form fields")
+  func draftPlanTrimsFields() {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    planner.name = "  Postgres sink\n"
+    planner.repo = " acme/pipe "
+    planner.spec = "  batch writes  "
+
+    #expect(
+      planner.draftPlan
+        == WorkstreamPlan(name: "Postgres sink", repo: "acme/pipe", spec: "batch writes"))
+  }
+
+  /// `materializeDraft` submits the plan the form describes through the port and
+  /// reflects the created workstream — the explicit, form-driven construction path.
+  @Test("materializeDraft submits the form's plan and reflects the created workstream")
+  func materializeDraftSubmitsFormPlan() async throws {
+    let created = WorkstreamId(rawValue: "ws-form")
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(created))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    var observed = backend.submittedPlans.makeAsyncIterator()
+    planner.name = "Postgres sink"
+    planner.repo = "acme/pipe"
+    planner.spec = "batch writes to Postgres"
+
+    try await planner.materializeDraft()
+
+    #expect(await observed.next() == Self.plan)
+    #expect(planner.outcome == .created(created))
+  }
+
+  /// `materializeDraft` on an incomplete form is a no-op: no `createWorkstreamFromPlan`
+  /// is issued and the outcome stays idle, so an empty name/repo can't be submitted.
+  @Test("materializeDraft on an incomplete form is a no-op")
+  func materializeDraftIncompleteIsNoOp() async throws {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    planner.name = "Postgres sink"  // repo left empty → incomplete
+
+    try await planner.materializeDraft()
+
+    #expect(backend.submissionCount == 0)
+    #expect(planner.outcome == .idle)
+
+    await backend.close()
+  }
+
   /// Polls the main-actor model until `predicate` holds, yielding so the feed task
   /// can run. Returns `false` if the bound is exhausted.
   private func waitUntil(_ predicate: () -> Bool) async -> Bool {

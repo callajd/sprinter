@@ -30,6 +30,11 @@ public final class SessionViewModel {
   public let sessionId: SessionId
 
   private let session: InteractiveSession
+  /// Incremental transcript memo (CE3.2): continues the projection fold from the last
+  /// read instead of re-folding the whole feed each time SwiftUI reads ``transcript``,
+  /// so repeated re-reads don't cost O(events²). Ignored by observation — it is pure
+  /// cache; ``InteractiveSession/events`` is what drives the view.
+  @ObservationIgnored private let transcriptMemo = TranscriptProjection.Memo()
   /// Whether ``start()`` has ever been called — distinguishes a never-started feed
   /// (`.idle`) from one that has ended (`.ended`). Observed like any stored property.
   private var hasStarted = false
@@ -39,11 +44,13 @@ public final class SessionViewModel {
     self.session = InteractiveSession(backend: backend, sessionId: sessionId)
   }
 
-  /// The live feed projected into the view-facing transcript. Recomputed on each
-  /// read from ``InteractiveSession/events`` (a fresh full projection, so no
-  /// incremental bookkeeping), and observation-tracked transitively.
+  /// The live feed projected into the view-facing transcript. Reading
+  /// ``InteractiveSession/events`` establishes observation transitively (so the view
+  /// re-renders as events arrive); the incremental ``TranscriptProjection/Memo``
+  /// continues the fold from the last read rather than re-folding the whole feed, so
+  /// repeated SwiftUI re-reads stay O(events) overall, not O(events²).
   public var transcript: Transcript {
-    TranscriptProjection.project(session.events)
+    transcriptMemo.project(session.events)
   }
 
   /// The `extension_ui_request` prompts raised but not yet answered, in arrival

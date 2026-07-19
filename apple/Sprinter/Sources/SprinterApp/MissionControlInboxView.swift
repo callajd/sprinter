@@ -62,9 +62,12 @@ private struct InboxEntryRow: View {
   }
 }
 
-/// Hosts a `MissionControlInbox` for the shell's inbox sheet: it tracks every active
-/// session the board currently surfaces (idempotent) so their outstanding prompts
-/// aggregate here, and tears the subscriptions down on dismissal.
+/// Hosts a `MissionControlInbox` for the shell's inbox sheet: it LIVE-tracks the
+/// active sessions the board surfaces (CE3.1-F4) so their outstanding prompts
+/// aggregate here — following sessions that activate/deactivate while the sheet is
+/// open, not a point-in-time snapshot — and tears the subscriptions down on dismissal.
+/// The tracking/diff logic lives in the tested `MissionControlInbox`; this only wires
+/// the board to it.
 struct InboxContainer: View {
   let model: AppModel
   @State private var inbox: MissionControlInbox
@@ -76,19 +79,7 @@ struct InboxContainer: View {
 
   var body: some View {
     MissionControlInboxView(inbox: inbox)
-      .onAppear { trackActiveSessions() }
+      .onAppear { inbox.trackActiveSessions(of: model.board) }
       .onDisappear { inbox.stop() }
-  }
-
-  private func trackActiveSessions() {
-    for workstream in model.board.workstreams {
-      for epic in workstream.epics {
-        for issue in epic.issues {
-          if let session = issue.activity?.sessionId {
-            inbox.track(session)
-          }
-        }
-      }
-    }
   }
 }

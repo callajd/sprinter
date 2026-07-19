@@ -8,11 +8,8 @@ import SwiftUI
 /// so this reuses `SessionView` for the conversation and adds the plan form + the
 /// reflected outcome. No planner logic here; it lives in the tested view model.
 struct PlannerView: View {
-  let model: PlannerViewModel
+  @Bindable var model: PlannerViewModel
 
-  @State private var name = ""
-  @State private var repo = ""
-  @State private var spec = ""
   @State private var actionError: String?
 
   var body: some View {
@@ -29,15 +26,15 @@ struct PlannerView: View {
 
   private var planForm: some View {
     VStack(alignment: .leading, spacing: 8) {
-      TextField("Workstream name", text: $name)
+      TextField("Workstream name", text: $model.name)
         .textFieldStyle(.roundedBorder)
-      TextField("Repository (owner/name)", text: $repo)
+      TextField("Repository (owner/name)", text: $model.repo)
         .textFieldStyle(.roundedBorder)
-      TextField("Spec", text: $spec)
+      TextField("Spec", text: $model.spec)
         .textFieldStyle(.roundedBorder)
       HStack {
         Button("Materialize") { materialize() }
-          .disabled(name.isEmpty || repo.isEmpty)
+          .disabled(!model.canMaterialize)
         outcomeLabel
       }
     }
@@ -59,11 +56,12 @@ struct PlannerView: View {
   }
 
   private func materialize() {
-    let plan = WorkstreamPlan(name: name, repo: repo, spec: spec)
-    // A domain rejection reflects into `model.outcome` (.rejected) and is shown by
-    // `outcomeLabel`; a transport-level failure resets `outcome` to `.idle` and rethrows,
-    // so surface that here instead of dropping it.
-    runShellAction(onError: { actionError = $0 }, action: { try await model.materialize(plan) })
+    // The plan is constructed from the explicit form fields in the tested view model
+    // (`draftPlan`); this View only triggers it. A domain rejection reflects into
+    // `model.outcome` (.rejected) and is shown by `outcomeLabel`; a transport-level
+    // failure resets `outcome` to `.idle` and rethrows, so surface that here instead
+    // of dropping it.
+    runShellAction(onError: { actionError = $0 }, action: { try await model.materializeDraft() })
   }
 }
 
