@@ -30,9 +30,30 @@ echo "==> [4/5] swift test --enable-code-coverage"
 swift test --enable-code-coverage
 
 echo "==> [5/5] coverage gate (>= ${COVERAGE_MIN}% line AND function on Sources/)"
-# `--show-codecov-path` only PRINTS the JSON path for the already-built coverage
-# data from stage 4; it does not re-run the suite (the test binary is up to date).
-codecov_path="$(swift test --enable-code-coverage --show-codecov-path)"
-python3 scripts/coverage-gate.py "${codecov_path}" "${COVERAGE_MIN}"
+# The coverage NUMBERS are computed by llvm-cov (LLVM, ships with the Swift
+# toolchain via `xcrun`) — no third-party coverage tooling. This stage only enforces
+# the >= MIN policy on its TOTAL. Stage 4 already produced the profdata + instrumented
+# test binary; `--show-codecov-path` only PRINTS the data path (no re-run). Scope =
+# product sources: the test target (/Tests/) and dependency/generated code (/.build/)
+# are excluded; the app executable target is naturally absent (no test target links it).
+covdir="$(dirname "$(swift test --enable-code-coverage --show-codecov-path)")"
+xctest="$(/bin/ls -d "$(swift build --show-bin-path)"/*.xctest | head -1)"
+testbin="${xctest}/Contents/MacOS/$(basename "${xctest}" .xctest)"
+report="$(xcrun llvm-cov report "${testbin}" \
+  -instr-profile="${covdir}/default.profdata" \
+  -ignore-filename-regex='(/Tests/|/\.build/)')"
+# The TOTAL row's coverage percentages, in llvm-cov's fixed column order:
+# regions, functions, lines, branches. Take function (2nd) and line (3rd).
+read -r func_pct line_pct < <(
+  printf '%s\n' "${report}" |
+    awk '/^TOTAL/ { n=0; for (i=1;i<=NF;i++) if ($i ~ /%$/) { n++; p[n]=$i+0 } print p[2], p[3] }'
+)
+printf 'coverage: line %.2f%%, function %.2f%% (min %s%%)\n' "${line_pct:-0}" "${func_pct:-0}" "${COVERAGE_MIN}"
+awk -v l="${line_pct:-0}" -v f="${func_pct:-0}" -v m="${COVERAGE_MIN}" 'BEGIN {
+  fail = 0
+  if (l + 0 < m + 0) { printf "FAIL: line coverage %.2f%% < %s%%\n", l, m > "/dev/stderr"; fail = 1 }
+  if (f + 0 < m + 0) { printf "FAIL: function coverage %.2f%% < %s%%\n", f, m > "/dev/stderr"; fail = 1 }
+  exit fail
+}'
 
 echo "==> make check: PASS"

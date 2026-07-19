@@ -4,7 +4,7 @@
 #                                         → tsc → vitest run --coverage.
 # Swift side (macOS):  `make check`     — swift format lint → SwiftLint --strict
 #                                         → swift build (warnings-as-errors)
-#                                         → swift test → coverage-gate.py.
+#                                         → swift test → llvm-cov coverage gate.
 #
 # Both gates carry their own coverage thresholds (INV-COV); CI invokes the repo
 # `check` commands unchanged (INV-GATE) and never anything weaker. Every
@@ -81,7 +81,7 @@ jobs:
 
       # The Swift-side gate, verbatim (INV-GATE): swift format lint → SwiftLint
       # --strict (pinned SPM plugin) → swift build (warnings-as-errors) →
-      # swift test → coverage-gate.py (python3, preinstalled). INV-COV inside.
+      # swift test → llvm-cov coverage gate (xcrun, toolchain). INV-COV inside.
       - name: Run check
         working-directory: apple/Sprinter
         run: make check
