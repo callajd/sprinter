@@ -1,0 +1,415 @@
+/**
+ * CE4.1 — Real Issue → PR through the app (deterministic end-to-end acceptance).
+ *
+ * The ACCEPTANCE test that proves the WHOLE loop COMPOSES: the REAL daemon layer
+ * graph (`./main.ts` — file-backed SQLite `StateStore` + journaling, `RpcServer`
+ * over a REAL Unix-domain socket with NDJSON framing) driven from the APP SIDE by a
+ * REAL `effect/unstable/rpc` client over that REAL socket — byte-for-byte the wire
+ * the Swift `UnixSocketTransport`/`RpcBackend` dial. Everything real EXCEPT the two
+ * leaves a deterministic test must not touch, substituted as pure `Layer`s
+ * (INV-EFFECT-DI):
+ *
+ *   - a CONTROLLABLE `pi` stand-in at the `ChildProcessSpawner` seam — a scripted
+ *     process that acks the runner's commands and emits a canned NDJSON transcript
+ *     reaching a terminal settle (NOT the real `pi` binary), and
+ *   - a SANDBOXED in-process `Repository` that deterministically yields a PR-open
+ *     (NOT real GitHub — no `GITHUB_TOKEN`, no network).
+ *
+ * ## Harness choice (justification)
+ *
+ * The issue allows either a Swift-spawns-bun integration test or an in-process TS
+ * harness speaking the same wire. This is the TS harness, chosen for DETERMINISM:
+ * the test drives the scripted pi's stdout timing DIRECTLY, so it can hold a session
+ * LIVE across `sessionSend` + `interrupt` before settling it — a control a spawned,
+ * opaque process cannot give — with no cross-language toolchain (bun on the Swift CI
+ * runner) and no wall-clock races. It stays FAITHFUL to the real wire: the daemon is
+ * its real `main.ts` graph bound to a real Unix socket, and the client is a real
+ * `RpcClient` over `BunSocket.layerNet` + `RpcSerialization.layerNdjson` — exactly
+ * the Swift client's transport. Every wait is bounded by a HARD timeout so a failure
+ * fails fast rather than hanging, and the whole graph (socket + StateStore + tempdir)
+ * is `Scope`-torn-down in teardown — no leaked process/socket/file.
+ *
+ * ## What it proves (the three observation points)
+ *
+ * From the app side, over the real socket, against the real daemon:
+ *   1. **materialize a plan → workstream** — `createWorkstreamFromPlan`, observed as
+ *      a live `WorkstreamChanged` on the `events` feed;
+ *   2. **dispatch a Sprinter Issue** — `control(start)` dispatches the issue's Job;
+ *      the scripted pi drives a session to a terminal settle, observed as live
+ *      `JobChanged` (running → succeeded) + `SessionChanged` deltas — the **Mission
+ *      Control** board updating live;
+ *   3. **session drives + is interruptible** — the **Interactive session** channel:
+ *      `sessionEvents` streams the live transcript, `sessionSend` drives input, and
+ *      `interrupt` aborts the turn — all resolving the SAME live session (the
+ *      registration wire CE4.1 closes);
+ *   4. **transcript paired with the PR** — the **Inspector** pairing: the settled
+ *      Job carries a `transcriptRef` and resolves, session → job → issue, to the
+ *      open PR the sandboxed `Repository` yields.
+ */
+import { it } from "@effect/vitest";
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Layer,
+  Option,
+  Queue,
+  Schedule,
+  Schema,
+  Sink,
+  Stream,
+} from "effect";
+import { FileSystem } from "effect/FileSystem";
+import { Ndjson } from "effect/unstable/encoding";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { RpcClient, RpcSerialization, RpcServer } from "effect/unstable/rpc";
+import { BunFileSystem, BunServices, BunSocket } from "@effect/platform-bun";
+import { expect } from "vitest";
+import {
+  SessionNotFound,
+  type Snapshot,
+  SprinterRpc,
+  type WorkGraphEvent,
+} from "@sprinter/contract";
+import {
+  Epic,
+  Issue,
+  Job,
+  PositiveInt,
+  PullRequestRef,
+  SessionId,
+  Workstream,
+} from "@sprinter/domain";
+import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
+import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
+import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
+
+// ── hard timeout so a hung socket/daemon/event fails fast, never blocks ────────
+const HARD_TIMEOUT = "15 seconds";
+
+const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
+  Schema.decodeUnknownSync(schema)(raw);
+
+// ── the sandboxed GitHub truth: one deterministic OPEN pull request ───────────
+//
+// The seeded work graph AND the fake `Repository` both reflect THIS single fact —
+// the PR the agent opened for issue #68, open (unmerged) and awaiting review. It is
+// the sandbox's stand-in for GitHub; nothing here reads real GitHub or a token.
+const PR_NUMBER = 4210;
+const openPr: (typeof PullRequestRef)["Encoded"] = {
+  number: PR_NUMBER,
+  url: `https://github.com/callajd/sprinter/pull/${PR_NUMBER}`,
+  merged: false,
+};
+
+/**
+ * The sandboxed in-process `Repository` (NOT real GitHub): every read is a canned,
+ * deterministic value consistent with {@link openPr} — the issue is still open, its
+ * closing PR is #4210, and that PR is open (unmerged). Wired into the real daemon
+ * graph exactly where the GitHub adapter would be (a `Layer` substitution).
+ */
+const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
+  Repository,
+  Repository.of({
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(true) },
+    issues: {
+      getIssue: (number) =>
+        Effect.succeed(
+          decode(RepositoryIssue, {
+            number,
+            title: "Real Issue to PR through the app",
+            state: "open",
+          }),
+        ),
+    },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.some(decode(PositiveInt, PR_NUMBER))),
+      getPullRequest: (number) =>
+        number === PR_NUMBER
+          ? Effect.succeed(decode(PullRequestRef, openPr))
+          : Effect.die(
+              new RepositoryError({ operation: "getPullRequest", detail: `unused #${number}` }),
+            ),
+    },
+  }),
+);
+
+// ── the controllable `pi` stand-in (the process-spawner seam) ─────────────────
+
+/** Minimal boundary schema to read a stdin command's `type` + correlation `id`. */
+const AckCommand = Schema.Struct({ type: Schema.String, id: Schema.optionalKey(Schema.String) });
+
+/** The correlated commands the stand-in must ACK so `transport.request` resolves. */
+const RESPONDS_TO = new Set(["prompt", "steer", "follow_up", "abort", "get_state"]);
+
+interface ScriptedPi {
+  /** The `ChildProcessSpawner` `Layer` substituting the real spawner (INV-EFFECT-DI). */
+  readonly layer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
+  /** Resolves once the daemon has spawned the (single) session process. */
+  readonly awaitSpawn: Effect.Effect<void>;
+  /** Push one raw NDJSON server message onto the stand-in's stdout. */
+  readonly emit: (message: unknown) => Effect.Effect<void>;
+}
+
+/**
+ * A scripted `pi` process at the `ChildProcessSpawner` seam: it decodes the
+ * runner's stdin commands and ACKs the correlated ones (so `handle.send` /
+ * `handle.interrupt` — hence the `sessionSend` / `interrupt` RPCs — resolve), and
+ * its stdout is a test-driven queue of raw NDJSON server messages. The test emits a
+ * canned transcript (`turn_start` → `entry_appended` → … → `agent_settled`) on its
+ * own schedule, so a session can be held LIVE across the session-channel drive and
+ * only THEN settled — fully deterministic, no `pi` binary, no wall-clock.
+ */
+const makeScriptedPi: Effect.Effect<ScriptedPi> = Effect.gen(function* () {
+  const stdout = yield* Queue.make<unknown, Cause.Done>();
+  const spawned = yield* Deferred.make<void>();
+
+  const spawner = ChildProcessSpawner.make(() =>
+    Effect.gen(function* () {
+      const stdinBytes = yield* Queue.make<Uint8Array, Cause.Done>();
+
+      // The auto-responder: decode each stdin command and ACK the correlated ones
+      // by echoing its id, so the transport's pending-request deferred completes.
+      const respond = Stream.fromQueue(stdinBytes).pipe(
+        Stream.pipeThroughChannel(Ndjson.decodeSchema(AckCommand)({ ignoreEmptyLines: true })),
+        Stream.runForEach((command) =>
+          command.id !== undefined && RESPONDS_TO.has(command.type)
+            ? Queue.offer(stdout, {
+                type: "response",
+                command: command.type,
+                success: true,
+                id: command.id,
+              })
+            : Effect.void,
+        ),
+        Effect.orDie,
+      );
+      yield* Effect.forkScoped(respond);
+      yield* Deferred.succeed(spawned, undefined);
+
+      return ChildProcessSpawner.makeHandle({
+        pid: ChildProcessSpawner.ProcessId(4321),
+        exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(0)),
+        isRunning: Effect.succeed(true),
+        kill: () => Effect.void,
+        stdin: Sink.forEach<Uint8Array, boolean, never, never>((chunk) =>
+          Queue.offer(stdinBytes, chunk),
+        ),
+        stdout: Stream.fromQueue(stdout).pipe(
+          Stream.pipeThroughChannel(Ndjson.encode()),
+          Stream.orDie,
+        ),
+        stderr: Stream.empty,
+        all: Stream.empty,
+        getInputFd: () => Sink.drain,
+        getOutputFd: () => Stream.empty,
+        unref: Effect.succeed(Effect.void),
+      });
+    }),
+  );
+
+  return {
+    layer: Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    awaitSpawn: Deferred.await(spawned),
+    emit: (message) => Queue.offer(stdout, message).pipe(Effect.asVoid),
+  };
+});
+
+// ── canned transcript fragments (raw Pi wire NDJSON) ──────────────────────────
+const turnStart = { type: "turn_start" };
+const settled = { type: "agent_settled" };
+const entryAppended = (id: string, text: string) => ({
+  type: "entry_appended",
+  entry: {
+    type: "message",
+    id,
+    parentId: null,
+    timestamp: "2026-07-18T00:00:00.000Z",
+    message: { role: "user", content: text, timestamp: 0 },
+  },
+});
+
+// ── the seeded "materialized plan" (post-planning, agent-opened-PR state) ─────
+const seedWorkstream = decode(Workstream, {
+  id: "ws-seed",
+  name: "Convergence Seed",
+  repo: "callajd/sprinter",
+  status: "active",
+  epics: ["epic-seed"],
+});
+const seedEpic = decode(Epic, {
+  id: "epic-seed",
+  workstreamId: "ws-seed",
+  name: "CE4 acceptance",
+  status: "active",
+  issues: ["issue-seed"],
+});
+const seedIssue = decode(Issue, {
+  id: "issue-seed",
+  epicId: "epic-seed",
+  number: 68,
+  title: "Real Issue to PR through the app",
+  status: "in_review",
+  dependsOn: [],
+  pr: openPr,
+});
+const seedJob = decode(Job, {
+  id: "job-seed",
+  issueId: "issue-seed",
+  kind: "implement",
+  status: "queued",
+});
+const SESSION_ID = decode(SessionId, "session-job-seed");
+
+// ── the harness daemon graph: the REAL main.ts graph, fake leaves substituted ──
+const harnessDaemon = (config: DaemonConfig, pi: ScriptedPi) =>
+  Layer.mergeAll(RpcServer.layer(SprinterRpc), bootLayer).pipe(
+    Layer.provide(appLayer(config)),
+    Layer.provide(socketProtocolLayer(config)),
+    // Fake leaves win (provided nearest): the sandboxed Repository + the scripted pi
+    // spawner. Real Bun services satisfy the rest (FileSystem/Path/socket platform).
+    Layer.provide(Layer.mergeAll(fakeRepository, pi.layer)),
+    Layer.provide(BunServices.layer),
+  );
+
+const testConfig = (dir: string): DaemonConfig => ({
+  databasePath: `${dir}/state.db`,
+  socketPath: `${dir}/daemon.sock`,
+  workspaceRoot: `${dir}/worktrees`,
+  repository: { owner: "callajd", repo: "sprinter", token: "unused-in-sandbox" },
+});
+
+// ── the real socket client (the app's transport) ──────────────────────────────
+const clientLayer = (socketPath: string) =>
+  RpcClient.layerProtocolSocket().pipe(
+    Layer.provide(BunSocket.layerNet({ path: socketPath })),
+    Layer.provide(RpcSerialization.layerNdjson),
+  );
+
+it.effect(
+  "drives the full Issue → PR loop from the app side over the real socket",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-ce41-" });
+      const config = testConfig(dir);
+      const pi = yield* makeScriptedPi;
+
+      // Seed the "materialized plan" into the durable FILE BEFORE the daemon boots,
+      // so the boot reconcile runs against the sandboxed Repository (which reports the
+      // issue still open → conservatively no-op, keeping the seeded open PR) and the
+      // app hydrates the plan on connect. A separate short-lived StateStore instance
+      // on the same file; its scope closes (the "process exit") before the daemon
+      // opens the file.
+      yield* Effect.gen(function* () {
+        const store = yield* StateStore;
+        yield* store.workGraph.putWorkstream(seedWorkstream);
+        yield* store.workGraph.putEpic(seedEpic);
+        yield* store.workGraph.putIssue(seedIssue);
+        yield* store.jobs.putJob(seedJob);
+      }).pipe(Effect.provide(layerStateSqlite({ filename: config.databasePath })), Effect.orDie);
+
+      // Bring up the REAL daemon (real socket bind, file StateStore, boot reconcile)
+      // then drive it from the app side; the scope tears it all down at the end.
+      yield* Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          const client = yield* RpcClient.make(SprinterRpc);
+
+          const waitForDelta = (
+            predicate: (event: WorkGraphEvent) => boolean,
+          ): Effect.Effect<WorkGraphEvent> =>
+            client.events({}).pipe(
+              Stream.map((offsetEvent) => offsetEvent.event),
+              Stream.filter(predicate),
+              Stream.runHead,
+              Effect.timeout(HARD_TIMEOUT),
+              Effect.map(Option.getOrThrow),
+              Effect.orDie,
+            );
+
+          // ── baseline: the seeded plan hydrates, PR-open already present ──────
+          const base: Snapshot = yield* client.snapshot();
+          expect(base.workstreams.map((w) => w.id)).toContain("ws-seed");
+          const baseIssue = base.issues.find((i) => i.id === "issue-seed");
+          expect(baseIssue?.status).toBe("in_review");
+          expect(baseIssue?.pr?.number).toBe(PR_NUMBER);
+          expect(base.jobs.find((j) => j.id === "job-seed")?.status).toBe("queued");
+
+          // ── (1) materialize a plan → workstream (live board update) ─────────
+          const newId = yield* client.createWorkstreamFromPlan({
+            plan: { name: "CE4 New Plan", repo: "callajd/sprinter", spec: "drive the loop" },
+          });
+          const materialized = yield* waitForDelta(
+            (e) => e._tag === "WorkstreamChanged" && e.workstream.id === newId,
+          );
+          expect(materialized._tag).toBe("WorkstreamChanged");
+
+          // ── (2) dispatch the Issue's Job (Mission Control board updates live) ─
+          yield* client.control({ workstreamId: seedWorkstream.id, action: "start" });
+
+          // The scripted pi spawns; drive a live turn + a transcript entry, held open.
+          yield* pi.awaitSpawn.pipe(Effect.timeout(HARD_TIMEOUT), Effect.orDie);
+          yield* pi.emit(turnStart);
+          yield* pi.emit(entryAppended("entry-1", "Working on #68: opening a PR"));
+
+          const running = yield* waitForDelta(
+            (e) => e._tag === "JobChanged" && e.job.id === "job-seed" && e.job.status === "running",
+          );
+          expect(running._tag).toBe("JobChanged");
+          yield* waitForDelta(
+            (e) => e._tag === "SessionChanged" && e.session.id === "session-job-seed",
+          );
+
+          // ── (3) session drives + is interruptible (Interactive session) ──────
+          // `sessionEvents` resolves the SAME live session (the registration wire
+          // CE4.1 closes) and streams the transcript; retry briefly to absorb the
+          // register-after-persist gap, bounded hard.
+          const transcript = yield* client.sessionEvents({ sessionId: SESSION_ID }).pipe(
+            Stream.filter((event) => event._tag === "EntryAppended"),
+            Stream.runHead,
+            Effect.timeout(HARD_TIMEOUT),
+            Effect.map(Option.getOrThrow),
+            Effect.retry({
+              while: (error) => error instanceof SessionNotFound,
+              schedule: Schedule.spaced("50 millis"),
+            }),
+            Effect.timeout(HARD_TIMEOUT),
+            Effect.orDie,
+          );
+          expect(transcript._tag).toBe("EntryAppended");
+
+          // Drive input and interrupt the turn — both must resolve the live session
+          // (never `SessionNotFound`), proving the channel is wired end-to-end.
+          yield* client
+            .sessionSend({ sessionId: SESSION_ID, input: { text: "keep going", mode: "steer" } })
+            .pipe(Effect.timeout(HARD_TIMEOUT), Effect.orDie);
+          yield* client
+            .interrupt({ sessionId: SESSION_ID })
+            .pipe(Effect.timeout(HARD_TIMEOUT), Effect.orDie);
+
+          // ── settle the session → the Job completes (live board update) ───────
+          yield* pi.emit(settled);
+          const succeeded = yield* waitForDelta(
+            (e) =>
+              e._tag === "JobChanged" && e.job.id === "job-seed" && e.job.status === "succeeded",
+          );
+          expect(succeeded._tag).toBe("JobChanged");
+
+          // ── (4) transcript paired with the PR (Inspector pairing) ───────────
+          const finalSnap: Snapshot = yield* client.snapshot();
+          const finalJob = finalSnap.jobs.find((j) => j.id === "job-seed");
+          expect(finalJob?.status).toBe("succeeded");
+          // The Job carries a durable transcript reference (the "transcript" side)…
+          expect(finalJob?.transcriptRef).toBeDefined();
+          // …and resolves — session → job → issue — to the open PR (the "PR" side),
+          // exactly the Inspector's session↔PR pairing.
+          const session = finalSnap.sessions.find((s) => s.id === "session-job-seed");
+          expect(session?.jobId).toBe("job-seed");
+          const pairedIssue = finalSnap.issues.find((i) => i.id === finalJob?.issueId);
+          expect(pairedIssue?.pr?.number).toBe(PR_NUMBER);
+          expect(pairedIssue?.pr?.merged).toBe(false);
+        }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
+      }).pipe(Effect.provide(harnessDaemon(config, pi)), Effect.scoped);
+    }).pipe(Effect.provide(BunFileSystem.layer)),
+  { timeout: 60_000 },
+);

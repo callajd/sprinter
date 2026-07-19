@@ -40,6 +40,7 @@ import { layer as layerStateSqlite } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
 import { layer as layerSessionRegistry } from "./session-registry.ts";
+import { layerRegisterSessions } from "./session-runner.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 import { layer as layerWorkGraphEvents } from "./work-graph-events.ts";
 
@@ -106,12 +107,18 @@ export const stateStoreLayer = (config: DaemonConfig) =>
 
 /**
  * The real {@link ExecutionRunner}: CE1.1's `LocalPi` adapter over a per-Job
- * worktree router (CE1.1-F2). Requires only the `ChildProcessSpawner` and the
- * `FileSystem`/`Path` the router uses — the daemon edge (`BunServices`) provides
- * them; a test substitutes a fake spawner (INV-EFFECT-DI).
+ * worktree router (CE1.1-F2), DECORATED so every started session is registered in
+ * the {@link SessionRegistry} (CE4.1, `./session-runner.ts`) — the wire that makes a
+ * dispatched session reachable over the contract's session channel. Requires the
+ * `ChildProcessSpawner`, the `FileSystem`/`Path` the router uses (the daemon edge
+ * `BunServices` provides them; a test substitutes a fake spawner), and the
+ * `SessionRegistry` ({@link portsLayer} provides it). Selecting real-vs-fake is a
+ * `Layer` substitution (INV-EFFECT-DI).
  */
 export const executionRunnerLayer = (config: DaemonConfig) =>
-  layerLocalPi.pipe(Layer.provide(layerWorktreeRouter(config.workspaceRoot)));
+  layerRegisterSessions(
+    layerLocalPi.pipe(Layer.provide(layerWorktreeRouter(config.workspaceRoot))),
+  );
 
 /**
  * The full port sub-graph MINUS the leaf adapters (`Repository`, the process
@@ -119,9 +126,16 @@ export const executionRunnerLayer = (config: DaemonConfig) =>
  * `ExecutionRunner`, `SessionRegistry`, `WorkGraphEvents`, `JobRunner`, and
  * `StartupReconcile` services, cross-wired. Requires `Repository` +
  * `ChildProcessSpawner`/`FileSystem`/`Path`.
+ *
+ * The {@link SessionRegistry} is provided BENEATH (`provideMerge`) rather than merged
+ * as a sibling, because the registering {@link executionRunnerLayer} decorator (CE4.1)
+ * now DEPENDS on it — one registry instance feeds both the `ExecutionRunner` (which
+ * registers dispatched handles) and the handlers (which resolve them), so the session
+ * a command dispatches is the very session the session channel drives.
  */
 const portsLayer = (config: DaemonConfig) =>
-  Layer.mergeAll(stateStoreLayer(config), executionRunnerLayer(config), layerSessionRegistry).pipe(
+  Layer.mergeAll(stateStoreLayer(config), executionRunnerLayer(config)).pipe(
+    Layer.provideMerge(layerSessionRegistry),
     Layer.provideMerge(layerWorkGraphEvents),
   );
 
