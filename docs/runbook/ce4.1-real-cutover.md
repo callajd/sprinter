@@ -10,17 +10,52 @@
 > **Do not run this in CI and do not point it at a real product repo.** It fires a
 > real agent that opens a real PR. Use a disposable repository you own.
 
+## ⚠️ Known limitation — an OPEN (unmerged) PR is NOT paired in the Inspector yet
+
+**This is the single most important expectation to set before running the cutover.**
+
+The production daemon has **no path today to pair a transcript/Job with an agent-OPENED,
+unmerged PR.** The only PR-pairing path is the reconcile roll-up
+(`packages/repository/src/reconcile.ts` → `github.ts`), and it pairs a PR onto an Issue
+**only when the Issue is CLOSED and its closing PR is MERGED**:
+
+- `reconcileIssue` returns early unless `hostIssue.state === "closed"` — an **open** Issue
+  is never touched;
+- the closing-PR signal is GitHub's `closedByPullRequestsReferences` (CE1.3) — the PRs
+  that **closed** the Issue, and `closingPrFromResponse` selects only a node with
+  `merged === true`;
+- `reconcileIssue` returns early again unless `pr.merged`.
+
+There is also **no `Repository` operation** that lists *open* PRs referencing an Issue —
+the port only exposes `getIssue`, `closingPullRequest` (merged-closer), and
+`getPullRequest(number)`.
+
+**Consequence for this runbook:** when the real agent OPENS a PR, the daemon will **not**
+surface `Issue.pr` / pair it in the **Inspector** until that PR is **merged** (and the
+Issue thereby closed). So step 6 below (“observe the PR open, paired in the Inspector”)
+**cannot be observed with an open PR on the current daemon.** To see the pairing during
+this cutover you must **merge the sandbox PR** (or hand-close the Issue via a merged PR)
+and let a reconcile run; only then does the Inspector pair the transcript with the PR.
+
+This is a genuine daemon gap, not a test artifact. The deterministic acceptance test
+pairs a **seeded** open PR (injected into the plan + the fake `Repository`), which
+exercises the read-model pairing wire but does **not** prove the daemon can *discover* an
+open PR — because it cannot. Closing this gap (an open-PR discovery path in reconcile, or
+a new `Repository` op) is follow-up work outside CE4.1's scope.
+
 ## What this proves
 
 From the running macOS app, against a real local daemon, you materialize a plan
 into a workstream, dispatch a real Sprinter **Issue**, and watch — live — a real
-**PR open**, with:
+agent run to a real **PR open**, with:
 
 - **Mission Control** — the board updating live as the workstream/epic/issue/job
   transition (`snapshot` + the `events` feed).
 - **Interactive session** — the agent's session driving and remaining
   interruptible (the `sessionEvents` / `sessionSend` / `interrupt` channel).
-- **Inspector** — the agent's transcript paired with the PR it produced.
+- **Inspector** — the agent's transcript, paired with the PR **once that PR is
+  merged** (see the known limitation above: the current daemon does not pair an
+  open/unmerged PR).
 
 ## Prerequisites
 
@@ -103,16 +138,21 @@ in the Job's worktree. Then, live:
   (the agent's real reasoning/tool calls). Try `sessionSend` (steer it) and
   `interrupt` (abort the turn) — both must take effect on the live session.
 - The agent does the work and **opens a real PR** against the sandbox repo via
-  `gh`. Confirm the PR exists on GitHub.
-- **Mission Control** — the Issue/Job transition live (`in_progress` →
-  `in_review`/`done`) as the daemon reconciles the PR against the `Repository`
-  port.
+  `gh`. Confirm the PR exists on GitHub. The **Job** reaches its terminal
+  `succeeded` state and carries a `transcriptRef`.
+- **Mission Control** — the Job transitions live to its terminal state. Note that,
+  per the known limitation above, the daemon does **not** yet pair the OPEN PR onto
+  the Issue: `Issue.pr` stays unset until the PR is merged and a reconcile runs.
 
-### 6. Confirm the Inspector pairing
+### 6. Confirm the Inspector pairing (requires MERGING the PR — see the limitation)
 
-Open the **Inspector** for the session. The agent's complete transcript must be
-paired with the PR it produced (the session → job → PR resolution). This is the
-end-to-end acceptance: **one transcript, one PR, paired**.
+Open the **Inspector** for the session. The agent's complete transcript is available
+(the session → job resolution). **To see the transcript paired with the PR you must
+first MERGE the sandbox PR** (or otherwise close the Issue via a merged PR) and let a
+reconcile run — only then does the daemon set `Issue.pr` and the Inspector shows
+**one transcript, one PR, paired**. With the PR still open, the transcript is present
+but the PR side is not yet paired. This is the daemon limitation documented at the top
+of this runbook, not a bug in the app.
 
 ### 7. Tear down
 

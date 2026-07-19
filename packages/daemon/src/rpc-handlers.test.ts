@@ -26,6 +26,7 @@ import {
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { RpcTest } from "effect/unstable/rpc";
+import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import {
   IssueNotFound,
@@ -52,7 +53,11 @@ import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
-import { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
+import {
+  layer as layerSessionRegistry,
+  SESSION_RESOLVE_TIMEOUT,
+  SessionRegistry,
+} from "./session-registry.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures (owned domain values, decoded — no casts) ────────────────────────
@@ -587,35 +592,78 @@ it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   ),
 );
 
-it.effect("session-channel procedures fail with SessionNotFound for an unknown session", () =>
-  harness(({ client }) =>
+// The register-after-dispatch window: `JobRunner.dispatch` fans out the `running`
+// delta BEFORE `run` registers the session handle, so a client reacting to it can
+// open the session channel before registration. The handlers resolve via
+// `SessionRegistry.resolve`, which bounded-WAITS out that window rather than erroring
+// — so the app needs no retry (CE4.1 server-side fix).
+it.effect("a session-channel handler WAITS out the register-after-dispatch window", () =>
+  harness(({ client, sessions }) =>
     Effect.gen(function* () {
-      const missing: SessionId = Schema.decodeUnknownSync(Session)({
-        id: "ses-x",
-        jobId: "job-1",
-        status: "starting",
-      }).id;
+      const fake = yield* makeFakeSession([]);
+      const input: SessionInput = { text: "go", mode: "prompt" };
 
-      const sendError = yield* client
-        .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
-        .pipe(Effect.flip);
-      expect(sendError).toBeInstanceOf(SessionNotFound);
+      // Open the channel BEFORE the session is registered — the handler must park, not
+      // fail with SessionNotFound. Registration lands next; the parked send then drives
+      // the live session. Event-driven, so no TestClock advance is needed here.
+      const fiber = yield* Effect.forkChild(client.sessionSend({ sessionId, input }), {
+        startImmediately: true,
+      });
+      yield* sessions.register(sessionId, fake.handle);
+      yield* Fiber.join(fiber);
 
-      const interruptError = yield* client.interrupt({ sessionId: missing }).pipe(Effect.flip);
-      expect(interruptError).toBeInstanceOf(SessionNotFound);
-
-      const answerError = yield* client
-        .answerUiRequest({
-          sessionId: missing,
-          response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
-        })
-        .pipe(Effect.flip);
-      expect(answerError).toBeInstanceOf(SessionNotFound);
-
-      const streamError = yield* client
-        .sessionEvents({ sessionId: missing })
-        .pipe(Stream.runHead, Effect.flip);
-      expect(streamError).toBeInstanceOf(SessionNotFound);
+      const driven = yield* Queue.take(fake.sent);
+      expect(driven).toEqual(input);
     }),
   ),
+);
+
+it.effect(
+  "session-channel procedures fail with SessionNotFound after the bound for an unknown session",
+  () =>
+    harness(({ client }) =>
+      Effect.gen(function* () {
+        const missing: SessionId = Schema.decodeUnknownSync(Session)({
+          id: "ses-x",
+          jobId: "job-1",
+          status: "starting",
+        }).id;
+
+        // Genuinely absent — no session ever registers. Each procedure parks up to the
+        // hard bound and THEN fails with `SessionNotFound` (never hangs). Fork each,
+        // advance the TestClock past the bound to fire every parked wait at once, then
+        // collect the failures.
+        const startImmediately = true;
+        const sendFiber = yield* Effect.forkChild(
+          client
+            .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
+            .pipe(Effect.flip),
+          { startImmediately },
+        );
+        const interruptFiber = yield* Effect.forkChild(
+          client.interrupt({ sessionId: missing }).pipe(Effect.flip),
+          { startImmediately },
+        );
+        const answerFiber = yield* Effect.forkChild(
+          client
+            .answerUiRequest({
+              sessionId: missing,
+              response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
+            })
+            .pipe(Effect.flip),
+          { startImmediately },
+        );
+        const streamFiber = yield* Effect.forkChild(
+          client.sessionEvents({ sessionId: missing }).pipe(Stream.runHead, Effect.flip),
+          { startImmediately },
+        );
+
+        yield* TestClock.adjust(SESSION_RESOLVE_TIMEOUT);
+
+        expect(yield* Fiber.join(sendFiber)).toBeInstanceOf(SessionNotFound);
+        expect(yield* Fiber.join(interruptFiber)).toBeInstanceOf(SessionNotFound);
+        expect(yield* Fiber.join(answerFiber)).toBeInstanceOf(SessionNotFound);
+        expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(SessionNotFound);
+      }),
+    ),
 );

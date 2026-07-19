@@ -24,7 +24,12 @@
  * The session-channel procedures (`sessionEvents` / `sessionSend` / `interrupt` /
  * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle},
  * resolved through the {@link SessionRegistry} PORT (AE4.2). All four address the
- * same live session for a `sessionId`; a miss is the contract's `SessionNotFound`.
+ * same live session for a `sessionId` via `SessionRegistry.resolve`, which TOLERATES
+ * the register-after-dispatch window: a `running` delta is fanned out BEFORE
+ * `ExecutionRunner.run` registers the handle, so a client reacting to it can arrive
+ * before registration — `resolve` bounded-waits for it to land rather than returning
+ * a spurious `SessionNotFound` (so the app needs no retry). A genuinely-absent
+ * session still fails with the contract's `SessionNotFound` after the bound.
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
  * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY) — and
  * `sessionEvents` streams live over `SessionHandle.events`, never a poll
@@ -297,7 +302,9 @@ const bridgeEvents = (
   registry: Registry,
   sessionId: SessionId,
 ): Stream.Stream<SessionEvent, SessionNotFound> =>
-  Stream.unwrap(registry.get(sessionId).pipe(Effect.map((handle) => Stream.orDie(handle.events))));
+  Stream.unwrap(
+    registry.resolve(sessionId).pipe(Effect.map((handle) => Stream.orDie(handle.events))),
+  );
 
 /**
  * Drive a {@link SessionInput} into the live session for the `sessionSend` RPC:
@@ -311,7 +318,9 @@ const driveInput = (
   sessionId: SessionId,
   input: SessionInput,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)));
+  registry
+    .resolve(sessionId)
+    .pipe(Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)));
 
 /**
  * Abort the live session's in-flight turn for the `interrupt` RPC: resolve the
@@ -322,7 +331,7 @@ const abortTurn = (
   registry: Registry,
   sessionId: SessionId,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)));
+  registry.resolve(sessionId).pipe(Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)));
 
 /**
  * Answer an outstanding UI request for the `answerUiRequest` RPC, completing the
@@ -335,7 +344,7 @@ const answerUi = (
   sessionId: SessionId,
   response: UiResponse,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.answerUi(response)));
+  registry.resolve(sessionId).pipe(Effect.flatMap((handle) => handle.answerUi(response)));
 
 // ── the handler layer ─────────────────────────────────────────────────────────
 

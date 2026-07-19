@@ -29,48 +29,42 @@
  * fails fast rather than hanging, and the whole graph (socket + StateStore + tempdir)
  * is `Scope`-torn-down in teardown — no leaked process/socket/file.
  *
- * ## What it proves (the three observation points)
+ * ## What it proves — and, precisely, what it does NOT
  *
- * From the app side, over the real socket, against the real daemon:
+ * This is a DETERMINISTIC COMPOSITION test. It proves the pieces are wired and speak
+ * the real wire end-to-end; it does NOT drive a real agent or discover a real PR.
+ * Concretely, from the app side, over the real socket, against the real daemon:
  *   1. **materialize a plan → workstream** — `createWorkstreamFromPlan`, observed as
  *      a live `WorkstreamChanged` on the `events` feed;
  *   2. **dispatch a Sprinter Issue** — `control(start)` dispatches the issue's Job;
  *      the scripted pi drives a session to a terminal settle, observed as live
  *      `JobChanged` (running → succeeded) + `SessionChanged` deltas — the **Mission
- *      Control** board updating live;
- *   3. **session drives + is interruptible** — the **Interactive session** channel:
+ *      Control** board updating live; the boot reconcile survives against the fake
+ *      code host;
+ *   3. **session channel resolves** — the **Interactive session** channel:
  *      `sessionEvents` streams the live transcript, `sessionSend` drives input, and
- *      `interrupt` aborts the turn — all resolving the SAME live session (the
- *      registration wire CE4.1 closes);
- *   4. **transcript paired with the PR** — the **Inspector** pairing: the settled
- *      Job carries a `transcriptRef` and resolves, session → job → issue, to the
- *      open PR the sandboxed `Repository` yields.
+ *      `interrupt` aborts the turn — all resolving the SAME live session with NO
+ *      client retry (the registration wire + the server-side bounded-wait CE4.1 close);
+ *   4. **a SEEDED PR pairs through the real read model** — the **Inspector** pairing:
+ *      the settled Job carries a `transcriptRef` and resolves, session → job → issue,
+ *      to a PR. That PR-open is SEED DATA — injected into the materialized plan
+ *      (`seedIssue.pr`) and the fake `Repository`, NOT produced by the loop and NOT
+ *      discovered by the daemon. So this proves the read-model pairing WIRE carries a
+ *      PR through to the app; it does NOT prove the daemon can discover an
+ *      agent-opened PR. In fact the production daemon has no such path — reconcile
+ *      pairs a PR only once it is MERGED (`reconcile.ts`/`github.ts`; see the runbook's
+ *      "Known limitation"). A real agent OPENING a PR and it being paired is the
+ *      RUNBOOK's real-cutover job, deliberately out of this deterministic test's scope.
  */
 import { it } from "@effect/vitest";
-import {
-  Cause,
-  Deferred,
-  Effect,
-  Layer,
-  Option,
-  Queue,
-  Schedule,
-  Schema,
-  Sink,
-  Stream,
-} from "effect";
+import { Cause, Deferred, Effect, Layer, Option, Queue, Schema, Sink, Stream } from "effect";
 import { FileSystem } from "effect/FileSystem";
 import { Ndjson } from "effect/unstable/encoding";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { RpcClient, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import { BunFileSystem, BunServices, BunSocket } from "@effect/platform-bun";
 import { expect } from "vitest";
-import {
-  SessionNotFound,
-  type Snapshot,
-  SprinterRpc,
-  type WorkGraphEvent,
-} from "@sprinter/contract";
+import { type Snapshot, SprinterRpc, type WorkGraphEvent } from "@sprinter/contract";
 import {
   Epic,
   Issue,
@@ -287,7 +281,7 @@ const clientLayer = (socketPath: string) =>
   );
 
 it.effect(
-  "drives the full Issue → PR loop from the app side over the real socket",
+  "composes the Issue → PR loop from the app side over the real socket (seeded PR pairs through the read model)",
   () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem;
@@ -362,18 +356,17 @@ it.effect(
 
           // ── (3) session drives + is interruptible (Interactive session) ──────
           // `sessionEvents` resolves the SAME live session (the registration wire
-          // CE4.1 closes) and streams the transcript; retry briefly to absorb the
-          // register-after-persist gap, bounded hard.
+          // CE4.1 closes) and streams the transcript. NO client retry: opening the
+          // channel immediately after the `running` delta must resolve, because the
+          // daemon's `SessionRegistry.resolve` bounded-WAITS out the
+          // register-after-dispatch window server-side (the real Swift app carries no
+          // retry — that is exactly what this proves). Bounded hard so a genuine hang
+          // still fails fast.
           const transcript = yield* client.sessionEvents({ sessionId: SESSION_ID }).pipe(
             Stream.filter((event) => event._tag === "EntryAppended"),
             Stream.runHead,
             Effect.timeout(HARD_TIMEOUT),
             Effect.map(Option.getOrThrow),
-            Effect.retry({
-              while: (error) => error instanceof SessionNotFound,
-              schedule: Schedule.spaced("50 millis"),
-            }),
-            Effect.timeout(HARD_TIMEOUT),
             Effect.orDie,
           );
           expect(transcript._tag).toBe("EntryAppended");
@@ -401,8 +394,12 @@ it.effect(
           expect(finalJob?.status).toBe("succeeded");
           // The Job carries a durable transcript reference (the "transcript" side)…
           expect(finalJob?.transcriptRef).toBeDefined();
-          // …and resolves — session → job → issue — to the open PR (the "PR" side),
-          // exactly the Inspector's session↔PR pairing.
+          // …and resolves — session → job → issue — to the PR (the "PR" side), exactly
+          // the Inspector's session↔PR pairing. NB: this open PR is SEED DATA
+          // (`seedIssue.pr` + the fake `Repository`), carried through the real read
+          // model — it is NOT discovered by the daemon (production reconcile pairs a PR
+          // only once MERGED; see the runbook's "Known limitation"). This asserts the
+          // pairing WIRE, not open-PR discovery.
           const session = finalSnap.sessions.find((s) => s.id === "session-job-seed");
           expect(session?.jobId).toBe("job-seed");
           const pairedIssue = finalSnap.issues.find((i) => i.id === finalJob?.issueId);
