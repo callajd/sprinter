@@ -1,18 +1,19 @@
 /**
- * Durable journaling + offset-based resync coverage (CE1.2) — the `./event-journal.ts`
- * seam that makes the `events` feed a deterministic, offset-based catch-up rather
- * than snapshot-on-connect (D17). Exercised against the in-memory `StateStore`
- * (`layerMemory`) behind the journaling + publishing decorators and the real
- * `WorkGraphEvents` `PubSub` — deterministic and offline (INV-PORT).
+ * Durable journaling + offset-based resync coverage (CE1.2 / CE2.0) — the
+ * `./event-journal.ts` seam that makes the `events` feed a deterministic,
+ * offset-based catch-up rather than snapshot-on-connect (D17), with each streamed
+ * item carrying its durable offset. Exercised against the in-memory `StateStore`
+ * (`layerMemory`) behind the journaling decorator (which both journals durably AND
+ * fans out live) and the real `WorkGraphEvents` `PubSub` — deterministic and
+ * offline (INV-PORT).
  */
 import { it } from "@effect/vitest";
-import { Context, Effect, Fiber, Option, Schema, Stream } from "effect";
+import { Context, Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
-import type { WorkGraphEvent } from "@sprinter/contract";
+import type { OffsetEvent } from "@sprinter/contract";
 import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
-import { layerPublishing } from "./store-publishing.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
@@ -63,7 +64,7 @@ const issueWithDeps = Schema.decodeUnknownSync(Issue)({
   dependsOn: ["iss-1"],
 });
 
-// ── harness: publishing over journaling over layerMemory ──────────────────────
+// ── harness: journaling (durable + live fan-out) over layerMemory ─────────────
 
 const seedGraph = (store: Context.Service.Shape<typeof StateStore>) =>
   Effect.gen(function* () {
@@ -95,7 +96,7 @@ it.effect("journals every persisted mutation to the durable offset log, in order
     expect(new Set(offsets).size).toBe(offsets.length);
   }).pipe(
     Effect.scoped,
-    Effect.provide(layerPublishing(layerJournaling(layerMemory))),
+    Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
   ),
 );
@@ -130,7 +131,11 @@ it.effect(
       expect(committed._tag).toBe("Some");
       const journaled = yield* store.events.tail(0);
       expect(journaled.map((e) => e.kind)).toEqual(["WorkstreamChanged"]);
-    }).pipe(Effect.scoped, Effect.provide(layerJournaling(layerMemory))),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerJournaling(layerMemory)),
+      Effect.provide(layerWorkGraphEvents),
+    ),
 );
 
 it.effect(
@@ -166,29 +171,80 @@ it.effect(
       expect(Option.getOrThrow(committed).dependsOn).toEqual(["iss-1"]);
       const journaled = yield* store.events.tail(0);
       expect(journaled.map((e) => e.kind)).toEqual(["IssueChanged"]);
-    }).pipe(Effect.scoped, Effect.provide(layerJournaling(layerMemory))),
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerJournaling(layerMemory)),
+      Effect.provide(layerWorkGraphEvents),
+    ),
 );
 
-it.effect("resyncFrom decodes the durable log back into owned WorkGraphEvents", () =>
+it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     yield* seedGraph(store);
 
     const replay = yield* resyncFrom(store, 0).pipe(Stream.runCollect);
-    expect(replay).toEqual([
+    // Each item pairs the owned delta with its durable offset (contract v3 / CE2.0).
+    expect(replay.map((e) => e.event)).toEqual([
       { _tag: "WorkstreamChanged", workstream },
       { _tag: "EpicChanged", epic },
       { _tag: "IssueChanged", issue },
       { _tag: "JobChanged", job },
       { _tag: "SessionChanged", session },
     ]);
+    // Offsets are strictly increasing (the monotonic tail cursor) and all > 0.
+    const offsets = replay.map((e) => e.offset);
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+    expect(offsets.every((o) => o > 0)).toBe(true);
+    expect(new Set(offsets).size).toBe(offsets.length);
 
-    // A cursor past the first two entries resumes from the third (offset-based).
-    const fromThird = yield* resyncFrom(store, replay.length > 0 ? 2 : 0).pipe(Stream.runCollect);
-    expect(fromThird.map((e) => e._tag)).toEqual(["IssueChanged", "JobChanged", "SessionChanged"]);
+    // A cursor past the first two entries resumes from the third (offset-based):
+    // every replayed offset is STRICTLY GREATER than the cursor and contiguous.
+    const cursor = offsets[1] ?? 0;
+    const fromThird = yield* resyncFrom(store, cursor).pipe(Stream.runCollect);
+    expect(fromThird.map((e) => e.event._tag)).toEqual([
+      "IssueChanged",
+      "JobChanged",
+      "SessionChanged",
+    ]);
+    expect(fromThird.every((e) => e.offset > cursor)).toBe(true);
   }).pipe(
     Effect.scoped,
-    Effect.provide(layerPublishing(layerJournaling(layerMemory))),
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+  ),
+);
+
+it.effect("the live feed stamps every fanned-out delta with its durable offset (CE2.0)", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    // Subscribe BEFORE mutating so the live fan-out is observed in order.
+    const subscription = yield* feed.subscribe;
+
+    yield* seedGraph(store);
+
+    const received: Array<OffsetEvent> = [];
+    for (let i = 0; i < 5; i++) received.push(yield* PubSub.take(subscription));
+
+    // The live tail carries the SAME coordinate space as the durable replay: the
+    // published offsets match the journaled `event_log` offsets exactly.
+    const journaled = yield* store.events.tail(0);
+    expect(received.map((e) => e.offset)).toEqual(journaled.map((j) => j.offset));
+    expect(received.map((e) => e.event._tag)).toEqual([
+      "WorkstreamChanged",
+      "EpicChanged",
+      "IssueChanged",
+      "JobChanged",
+      "SessionChanged",
+    ]);
+    // Monotonic, strictly increasing.
+    const offsets = received.map((e) => e.offset);
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+    expect(new Set(offsets).size).toBe(offsets.length);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
   ),
 );
@@ -216,11 +272,42 @@ it.live("resyncEvents replays durable history, then streams the live tail", () =
     const received = yield* Fiber.join(collecting);
     const first = received[0];
     const second = received[1];
-    expect(first?._tag).toBe("WorkstreamChanged");
-    expect(second?._tag).toBe("EpicChanged");
+    expect(first?.event._tag).toBe("WorkstreamChanged");
+    expect(second?.event._tag).toBe("EpicChanged");
+    // Replay (durable) then live-tail offsets are one strictly-increasing coordinate.
+    expect(first !== undefined && second !== undefined && second.offset > first.offset).toBe(true);
   }).pipe(
     Effect.scoped,
-    Effect.provide(layerPublishing(layerJournaling(layerMemory))),
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+  ),
+);
+
+it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // Two mutations BEFORE any client attaches — journaled at offsets 1 and 2.
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+
+    // Attach with a cursor PAST the first entry (offset 1): the resync must replay
+    // only the second durable delta (strictly-after semantics), not re-send offset 1.
+    const collecting = yield* resyncEvents(store, feed, 1).pipe(
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+
+    const received = yield* Fiber.join(collecting);
+    const only: OffsetEvent | undefined = received[0];
+    expect(only?.event._tag).toBe("EpicChanged");
+    // Strictly-after semantics: the replayed offset is greater than the cursor (1).
+    expect((only?.offset ?? 0) > 1).toBe(true);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
   ),
 );
@@ -239,11 +326,11 @@ it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () 
     yield* store.workGraph.putWorkstream(workstream);
 
     const received = yield* Fiber.join(collecting);
-    const only: WorkGraphEvent | undefined = received[0];
-    expect(only?._tag).toBe("WorkstreamChanged");
+    const only: OffsetEvent | undefined = received[0];
+    expect(only?.event._tag).toBe("WorkstreamChanged");
   }).pipe(
     Effect.scoped,
-    Effect.provide(layerPublishing(layerJournaling(layerMemory))),
+    Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
   ),
 );

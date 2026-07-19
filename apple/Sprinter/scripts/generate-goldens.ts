@@ -43,8 +43,10 @@ import {
   control,
   ControlAction,
   createWorkstreamFromPlan,
+  events,
   interrupt,
   IssueNotFound,
+  OffsetEvent,
   PlanRejected,
   retryIssue,
   sessionEvents,
@@ -153,6 +155,20 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
   { _tag: "IssueChanged", issue: issueWithPr },
   { _tag: "JobChanged", job: jobFull },
   { _tag: "SessionChanged", session },
+]);
+
+// ── OffsetEvent — the streamed `events` success envelope (contract v3 / CE2.0) ──
+//
+// Each streamed item pairs a WorkGraphEvent with its DURABLE offset, so a client
+// can feed the offset back as the request's `sinceOffset` cursor. Real `event_log`
+// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3,4,5)
+// rather than the origin — the strict `> sinceOffset` ordering is the durable-replay
+// slice a reconnect resumes from.
+
+write("offset-events", Schema.Array(OffsetEvent), [
+  { offset: 3, event: { _tag: "WorkstreamChanged", workstream } },
+  { offset: 4, event: { _tag: "IssueChanged", issue: issueWithPr } },
+  { offset: 5, event: { _tag: "SessionChanged", session } },
 ]);
 
 // ── SessionEvent — every variant (+ optional present/absent) ─────────────────
@@ -265,6 +281,11 @@ writeFileSync(
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
 
+// The `events` request cursor is OPTIONAL (contract v3 / CE2.0): both wire forms
+// are captured — present (`sinceOffset` key set) and absent (key omitted, the
+// backward-compatible origin replay) — so the Swift mirror decodes each.
+write("payload-events", events.payloadSchema, { sinceOffset: 12 });
+write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
   plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
 });

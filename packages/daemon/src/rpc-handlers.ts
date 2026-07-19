@@ -11,9 +11,10 @@
  * (INV-BOUNDARY). They are:
  *
  * - `snapshot` — full-state hydration, built by traversing the `StateStore`.
- * - `events` — the streaming work-graph delta feed, returned straight off the
- *   real `PubSub` (D17 / INV-REACTIVE); mutations publish via the publishing
- *   `StateStore` decorator (`./store-publishing.ts`), never a poll loop.
+ * - `events` — the streaming work-graph delta feed of offset-stamped
+ *   {@link OffsetEvent}s, returned straight off the real `PubSub` (D17 /
+ *   INV-REACTIVE); mutations journal-and-publish via the journaling `StateStore`
+ *   decorator (`./event-journal.ts`), never a poll loop.
  * - `createWorkstreamFromPlan` — materialize a plan into a new `Workstream`
  *   (child-lists kept consistent with FK parentage on upsert; a fresh plan has no
  *   children yet, so this is trivially satisfied — planning fills them later).
@@ -354,15 +355,20 @@ export const handlers = SprinterRpc.toLayer(
     return {
       snapshot: () => buildSnapshot(store),
       // Live work-graph deltas with DURABLE offset-based resync (CE1.2 / D17): the
-      // feed eagerly subscribes live, replays the durable event log from the origin
-      // (`EventLogStore.tail`, journaled by the store decorator), then streams the
-      // live tail — so a reconnecting client catches up on the whole persisted
-      // history deterministically, not only the deltas after it attaches. Subscribe-
-      // before-replay closes the gap; upsert-idempotent deltas (D8) absorb the
-      // boundary overlap. (The frozen `events` payload carries no cursor, so the
-      // served endpoint replays from origin; per-offset resume is CE2.2's, over the
-      // same `resyncFrom` primitive.)
-      events: () => resyncEvents(store, feed),
+      // feed eagerly subscribes live, replays the durable event log from the client's
+      // `sinceOffset` cursor (`EventLogStore.tail`, journaled by the store decorator),
+      // then streams the live tail — so a reconnecting client catches up on the whole
+      // persisted history deterministically, not only the deltas after it attaches.
+      // Subscribe-before-replay closes the gap; upsert-idempotent deltas (D8) absorb
+      // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
+      // durable offset (contract v3 / CE2.0), and replay + live offsets share one
+      // coordinate space, so the client can feed a streamed item's offset back as
+      // `sinceOffset`. The cursor is OPTIONAL: a request with NO `sinceOffset` (a
+      // present but empty `{}` payload) replays from origin, present resumes strictly
+      // after that offset, over the same `resyncFrom` primitive. The strict
+      // `> sinceOffset` ordering is scoped to that resume; within one stream the
+      // subscribe-before-replay boundary can overlap (harmless under upsert).
+      events: ({ sinceOffset }) => resyncEvents(store, feed, sinceOffset),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),

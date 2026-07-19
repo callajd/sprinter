@@ -1,8 +1,9 @@
 /**
  * `SprinterRpc` handler coverage (AE4.1) — the real query / events / command
  * handlers exercised end-to-end through an in-memory RPC client (`RpcTest`)
- * against FAKES: the in-memory `StateStore` (`layerMemory`) behind the publishing
- * decorator, the real `WorkGraphEvents` `PubSub`, and a fake `JobRunner` that
+ * against FAKES: the in-memory `StateStore` (`layerMemory`) behind the journaling
+ * decorator (durable offset log + live fan-out), the real `WorkGraphEvents`
+ * `PubSub`, and a fake `JobRunner` that
  * records the jobs it is asked to dispatch. Deterministic and offline — no `pi`
  * process, no SQLite file (INV-PORT). The frozen contract is untouched, so its own
  * tests stay green (INV-CONTRACT).
@@ -49,9 +50,9 @@ import {
 import { JobRunner } from "@sprinter/job";
 import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
+import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
 import { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
-import { layerPublishing } from "./store-publishing.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures (owned domain values, decoded — no casts) ────────────────────────
@@ -118,7 +119,7 @@ const harness = <A, E>(
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(layerPublishing(layerMemory), runner, layerSessionRegistry).pipe(
+        Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
         ),
       ),
@@ -191,7 +192,9 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
       expect(persisted.epics).toEqual([]);
 
       const delta = yield* PubSub.take(subscription);
-      expect(delta._tag).toBe("WorkstreamChanged");
+      expect(delta.event._tag).toBe("WorkstreamChanged");
+      // The live fan-out carries the durable offset it was journaled at (CE2.0).
+      expect(delta.offset).toBeGreaterThan(0);
     }),
   ),
 );
@@ -398,8 +401,11 @@ it.effect("events streams a work-graph delta produced by a command", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
       yield* seedGraph(store);
+      // Subscribe PAST the seeded durable history so `take(1)` observes a LIVE delta,
+      // not a replayed one: `events` replays `event_log.tail(sinceOffset)` first.
+      const seeded = yield* store.events.read;
       const collector = yield* client
-        .events()
+        .events({ sinceOffset: seeded.length })
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
       // Drive a REPEATABLE command until the (lazily-subscribing) events stream
       // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
@@ -409,10 +415,41 @@ it.effect("events streams a work-graph delta produced by a command", () =>
         .control({ workstreamId: workstream.id, action: "start" })
         .pipe(Effect.andThen(Effect.yieldNow), Effect.forever, Effect.forkChild);
 
-      const delta = Option.getOrThrow(yield* Fiber.join(collector));
-      expect(delta._tag).toBe("WorkstreamChanged");
-      if (delta._tag !== "WorkstreamChanged") throw new Error("expected WorkstreamChanged");
-      expect(delta.workstream.id).toBe("ws-1");
+      const item = Option.getOrThrow(yield* Fiber.join(collector));
+      expect(item.event._tag).toBe("WorkstreamChanged");
+      if (item.event._tag !== "WorkstreamChanged") throw new Error("expected WorkstreamChanged");
+      expect(item.event.workstream.id).toBe("ws-1");
+      // The streamed item carries its durable offset, past the seeded cursor.
+      expect(item.offset).toBeGreaterThan(seeded.length);
+    }),
+  ),
+);
+
+it.effect("events resumes durable replay after a client-supplied sinceOffset cursor (CE2.0)", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      // Seed durable history: five journaled deltas at offsets 1..5.
+      yield* seedGraph(store);
+      yield* store.jobs.putJob(queuedJob);
+      yield* store.jobs.putSession(session);
+
+      // Subscribe with a cursor PAST the first two entries (offset 2): the served
+      // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
+      // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
+      const replay = yield* client
+        .events({ sinceOffset: 2 })
+        .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
+        .pipe(Effect.flatMap(Fiber.join));
+
+      expect(replay.map((item) => item.event._tag)).toEqual([
+        "IssueChanged",
+        "JobChanged",
+        "SessionChanged",
+      ]);
+      // The response envelope carries the durable offsets: all STRICTLY GREATER than
+      // the supplied cursor (2) and contiguous (3, 4, 5) — the coordinate the client
+      // feeds back as its next `sinceOffset`, so a resume is gap-free and dup-free.
+      expect(replay.map((item) => item.offset)).toEqual([3, 4, 5]);
     }),
   ),
 );

@@ -28,8 +28,8 @@ struct StreamTests {
       Wire.chunk(
         requestId: id,
         values: [
-          try Wire.encoded(Fixtures.issueEvent),
-          try Wire.encoded(Fixtures.workstreamEvent)
+          try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: 3)),
+          try Wire.encoded(Fixtures.offsetEvent(Fixtures.workstreamEvent, at: 4))
         ]))
 
     let ack = try await nextSent(&outbound)
@@ -41,7 +41,37 @@ struct StreamTests {
     transport.close()
   }
 
-  @Test("an unknown event _tag is a decode failure, never a silent drop")
+  /// Regression for the v3 end-to-end decode bug (CE2.0 re-review): the daemon's
+  /// `events` payload schema is a `Struct` under v3, so an OMITTED `payload` key
+  /// decodes to `undefined` and the stream errors on connect. The canonical Effect
+  /// client sends `{}` for `.events({})`; the Swift client must match by sending a
+  /// PRESENT empty ``EventsPayload`` (INV-CONTRACT). Asserted on the REAL outbound
+  /// wire bytes (Backend → envelope encode → transport), not the RpcTest shortcut.
+  @Test("events() encodes a present empty payload object, not an omitted key")
+  func eventsRequestSendsPresentEmptyPayload() async throws {
+    let transport = FakeTransport()
+    let backend = RpcBackend(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let collector = Task {
+      for try await _ in backend.events() {}
+    }
+
+    let request = try await nextSent(&outbound)
+    #expect(request.rpcTag == "events")
+    // A present empty object (`"payload": {}`) — no `sinceOffset` → origin replay —
+    // NOT an absent key (which would decode to `nil` here and to `undefined` on the
+    // wire, breaking the v3 `Struct` decode).
+    #expect(request.payload == .object([:]))
+    #expect(request.payload != nil)
+
+    let id = try #require(request.id)
+    transport.emit(Wire.exitSuccessVoid(requestId: id))
+    collector.cancel()
+    transport.close()
+  }
+
+  @Test("an unknown event _tag inside the envelope is a decode failure, never a silent drop")
   func unknownEventTagFails() async throws {
     let transport = FakeTransport()
     let backend = RpcBackend(transport: transport)
@@ -51,7 +81,9 @@ struct StreamTests {
       for try await _ in backend.events() {}
     }
     let id = try #require(try await nextSent(&outbound).id)
-    transport.emit(Wire.chunk(requestId: id, values: [#"{"_tag":"MysteryChanged"}"#]))
+    // A well-formed OffsetEvent envelope whose INNER event carries an unknown `_tag`.
+    transport.emit(
+      Wire.chunk(requestId: id, values: [#"{"offset":5,"event":{"_tag":"MysteryChanged"}}"#]))
 
     await #expect(throws: (any Error).self) { try await collector.value }
     transport.close()

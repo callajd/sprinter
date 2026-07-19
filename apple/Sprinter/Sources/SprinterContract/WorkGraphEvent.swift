@@ -64,3 +64,23 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     }
   }
 }
+
+/// A single streamed `events` item: a ``WorkGraphEvent`` paired with its DURABLE
+/// `offset` — the daemon's `event_log` position the delta was journaled at (contract
+/// v3 / CE2.0). The stream carries the offset so a reconnecting client can remember
+/// its last-seen position and hand it back as the request's `sinceOffset` cursor to
+/// resume STRICTLY AFTER it (no gap, no duplicate). Wire shape:
+/// `{ "offset": 12, "event": { "_tag": "IssueChanged", "issue": { … } } }`.
+///
+/// The offset is the contract's `NonNegativeInt`, which encodes as a bare JSON
+/// integer, so the mirror maps it to `Int`. Consumers that only need the delta
+/// unwrap ``event``; tracking the offset for resume is CE2.2's job.
+public struct OffsetEvent: Codable, Equatable, Sendable {
+  public let offset: Int
+  public let event: WorkGraphEvent
+
+  public init(offset: Int, event: WorkGraphEvent) {
+    self.offset = offset
+    self.event = event
+  }
+}

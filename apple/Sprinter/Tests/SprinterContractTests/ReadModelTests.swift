@@ -111,4 +111,20 @@ struct ReadModelTests {
       #expect(try Golden.roundTrip(event) == event)
     }
   }
+
+  @Test("decodes the offset-stamped events-stream envelope (contract v3 / CE2.0)")
+  func decodesOffsetEvents() throws {
+    let items = try Golden.decode([OffsetEvent].self, from: "offset-events")
+    #expect(items.count == 3)
+    // Each item pairs a delta with its durable offset; unwrapping `.event` gives the
+    // bare delta the existing consumers use (RpcBackend / WorkGraphResync).
+    let workstream = try Golden.decode(Workstream.self, from: "workstream")
+    #expect(items[0].event == .workstreamChanged(workstream))
+    // Real `event_log` offsets are 1-based (> 0); the sample resumes from a mid-log
+    // position — the durable-replay coordinate the client feeds back as `sinceOffset`.
+    #expect(items.map(\.offset) == [3, 4, 5])
+    for item in items {
+      #expect(try Golden.roundTrip(item) == item)
+    }
+  }
 }

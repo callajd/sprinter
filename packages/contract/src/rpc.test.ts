@@ -75,12 +75,12 @@ it("carries every model of contract v1 as a procedure", () => {
 });
 
 it("marks the group with an explicit contract version (INV-CONTRACT)", () => {
-  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(2);
+  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(3);
   // The version key is a `Context.Reference`, so it resolves to CONTRACT_VERSION
   // from an empty context via its default.
   expect(Context.get(Context.empty(), ContractVersion)).toBe(CONTRACT_VERSION);
-  expect(CONTRACT_VERSION).toBe(2);
-  expect(contractTag()).toBe("v2");
+  expect(CONTRACT_VERSION).toBe(3);
+  expect(contractTag()).toBe("v3");
   expect(contractTag(1)).toBe("v1");
 });
 
@@ -110,12 +110,56 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   expect(decoded.issues[0]?.number).toBe(10);
 });
 
-it("streams owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
+it("streams offset-stamped owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
+  // The streamed success is the OffsetEvent envelope (contract v3 / CE2.0): the
+  // owned delta PLUS the durable offset the client feeds back as `sinceOffset`.
   const delta = { _tag: "IssueChanged", issue };
-  const decoded = Schema.decodeUnknownSync(events.successSchema.success)(delta);
-  expect(decoded).toEqual(Schema.decodeUnknownSync(WorkGraphEvent)(delta));
-  if (decoded._tag !== "IssueChanged") throw new Error("expected IssueChanged");
-  expect(decoded.issue.id).toBe("iss-1");
+  const item = { offset: 7, event: delta };
+  const decoded = Schema.decodeUnknownSync(events.successSchema.success)(item);
+  expect(decoded.event).toEqual(Schema.decodeUnknownSync(WorkGraphEvent)(delta));
+  expect(decoded.offset).toBe(7);
+  if (decoded.event._tag !== "IssueChanged") throw new Error("expected IssueChanged");
+  expect(decoded.event.issue.id).toBe("iss-1");
+  // The offset is a NON-NEGATIVE int: a negative offset is rejected.
+  expect(() =>
+    Schema.decodeUnknownSync(events.successSchema.success)({ offset: -1, event: delta }),
+  ).toThrow();
+});
+
+it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)", () => {
+  // Present: a non-negative offset resumes strictly after that point.
+  const withCursor = Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: 12 });
+  expect(withCursor.sinceOffset).toBe(12);
+
+  // Absent: the key is optional, so an empty payload decodes (origin replay,
+  // backward-compatible with the pre-v3 no-field request).
+  const noCursor = Schema.decodeUnknownSync(events.payloadSchema)({});
+  expect(noCursor.sinceOffset).toBeUndefined();
+
+  // A negative offset is not a non-negative int and is rejected.
+  expect(() => Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: -1 })).toThrow();
+});
+
+it("decodes the events request through the wire JSON codec — {} replays from origin (CE2.0 B1)", () => {
+  // Regression for the v3 end-to-end decode bug (CE2.0 re-review): the daemon decodes
+  // each request payload through `Schema.toCodecJson(payloadSchema)` — the exact seam
+  // `RpcServer` drives over the NDJSON serializer, NOT the `RpcTest` shortcut that
+  // bypasses serialization. Under v3 the events payload is a `Struct`, so what the
+  // client puts on the wire for the `payload` key matters end-to-end.
+  const codec = Schema.toCodecJson(events.payloadSchema);
+
+  // The canonical Effect client (and the fixed Swift client) send a PRESENT empty
+  // object `{}` for `.events({})`; it MUST decode to the origin-replay case (no
+  // `sinceOffset`). This is the assertion that would have caught the Swift client
+  // omitting the `payload` key.
+  expect(Schema.decodeUnknownSync(codec)({}).sinceOffset).toBeUndefined();
+
+  // Documents the boundary the omitted-payload bug tripped: an ABSENT payload
+  // (`undefined`, an omitted `payload` key on the wire) is NOT a valid events
+  // request under the v3 `Struct` schema and fails to decode ("Expected object, got
+  // undefined"). The fix is to send a present `{}`, not to widen the schema to accept
+  // `undefined`.
+  expect(() => Schema.decodeUnknownSync(codec)(undefined)).toThrow();
 });
 
 it("accepts a workstream plan and answers with a WorkstreamId", () => {

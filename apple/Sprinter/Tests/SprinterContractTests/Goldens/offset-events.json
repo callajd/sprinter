@@ -1,0 +1,49 @@
+[
+  {
+    "offset": 3,
+    "event": {
+      "_tag": "WorkstreamChanged",
+      "workstream": {
+        "id": "ws-1",
+        "name": "Foundation",
+        "repo": "callajd/sprinter",
+        "status": "active",
+        "epics": [
+          "ep-1"
+        ]
+      }
+    }
+  },
+  {
+    "offset": 4,
+    "event": {
+      "_tag": "IssueChanged",
+      "issue": {
+        "id": "iss-1",
+        "epicId": "ep-1",
+        "number": 10,
+        "title": "RPC contract v1",
+        "status": "in_review",
+        "dependsOn": [
+          "iss-0"
+        ],
+        "pr": {
+          "number": 16,
+          "url": "https://github.com/callajd/sprinter/pull/16",
+          "merged": false
+        }
+      }
+    }
+  },
+  {
+    "offset": 5,
+    "event": {
+      "_tag": "SessionChanged",
+      "session": {
+        "id": "ses-1",
+        "jobId": "job-1",
+        "status": "active"
+      }
+    }
+  }
+]

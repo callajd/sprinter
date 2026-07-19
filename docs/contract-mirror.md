@@ -44,8 +44,14 @@ Notes threaded to the contract's own decisions:
 - Wire field `pr` maps to the Swift property `pullRequest` via `CodingKeys`.
 - `WorkGraphEvent` is **upsert-only** — there is no `*Removed` variant (contract
   §events); a terminal status is an ordinary change.
+- The streamed `events` **success is the `OffsetEvent` envelope** — `{ "offset":
+  12, "event": { "_tag": "IssueChanged", … } }` — not the bare `WorkGraphEvent`
+  (contract v3 / CE2.0). Each item pairs the delta with its durable `event_log`
+  offset (a `NonNegativeInt`, so a bare JSON integer → Swift `Int`), so a client can
+  hand a streamed item's offset back as the request's `sinceOffset` cursor to resume
+  strictly after it. Existing consumers that only need the delta unwrap `.event`.
 - The contract version is a compile-time marker, not a wire field; the mirror
-  tracks it as `SprinterContract.version` (currently `1`).
+  tracks it as `SprinterContract.version` (currently `3`).
 
 ## What the gate checks
 
