@@ -31,15 +31,23 @@ import Foundation
 /// process-wide `signal(SIGPIPE, SIG_IGN)`.
 ///
 /// It is the fd's *lifetime* — not just the `descriptor` variable — that makes a
-/// `close()` racing a `send` safe. The lock alone does NOT protect the fd across the
-/// blocking `write(2)`: were `close()` to `close(2)` the descriptor while a queued
-/// write is mid-flight, that fd number could be reused by a concurrent dial (a
-/// reconnect, or a second backend) and the write would land RPC bytes on an
-/// unrelated connection. So the real `close(2)` is serialized onto the SAME
-/// `writeQueue` as writes, running strictly after the last queued write on that fd,
-/// and `send` re-checks `isClosed` on that queue and skips a closed fd. The lock
-/// guards the `descriptor`/`isClosed` *variables*; `writeQueue` guards the fd's
-/// *lifetime* (`@unchecked Sendable` is discharged by both together).
+/// `close()` racing an in-flight `send` OR the parked read loop safe, on BOTH the write
+/// and read paths. The lock alone does NOT protect the fd across a blocking
+/// `write(2)`/`read(2)`: were `close()` to `close(2)` the descriptor while a queued write
+/// is mid-flight OR the read loop is parked in `read(2)`, that fd number could be reused
+/// by a concurrent dial (a reconnect, or a second backend) and the write would land RPC
+/// bytes on — or the read loop would drain bytes off, then silently drop them from — an
+/// unrelated connection. So the real `close(2)` is deferred until BOTH conditions hold:
+///   - it is enqueued behind the last queued write on the SAME `writeQueue`, and
+///   - the read thread has provably left `read(2)` — it signals ``readLoopExited`` when it
+///     returns, and the deferred close waits on that semaphore.
+/// `close()` first `shutdown(2)`s the fd, which unblocks the parked `read(2)` (EOF) so the
+/// read loop exits and signals promptly; the wait happens on the `writeQueue` thread, never
+/// the caller, so it is deadlock-free. Only once NEITHER a queued write NOR the read thread
+/// can still touch the fd is its number released for reuse. `send` also re-checks
+/// `isClosed` on the write queue and skips a closed fd. The lock guards the
+/// `descriptor`/`isClosed` *variables*; the `writeQueue` ordering plus the read-loop-exit
+/// gate guard the fd's *lifetime* (`@unchecked Sendable` is discharged by all three).
 ///
 /// `close()` is LOAD-BEARING for this conformer: it owns a real OS thread (the read
 /// loop, parked in `read(2)`) and a file descriptor. The parked read thread retains
@@ -62,6 +70,13 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   /// The connected socket file descriptor; `-1` once closed.
   private var descriptor: Int32
   private var isClosed = false
+
+  /// Signalled exactly once by ``readLoop`` when it returns — i.e. when the read thread
+  /// has provably stopped touching the fd. ``close()``'s deferred `close(2)` waits on this
+  /// (on the `writeQueue` thread) so the fd number can never be released while the read
+  /// loop might still `read(2)` from it. `close()` first `shutdown(2)`s the fd to force the
+  /// parked read to return, so the signal always arrives — the wait is deadlock-free.
+  private let readLoopExited = DispatchSemaphore(value: 0)
 
   /// Wraps an already-connected socket descriptor and starts pumping inbound bytes.
   /// Internal so tests can drive the framing seam over a `socketpair(2)` peer without
@@ -166,13 +181,19 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     guard descriptor >= 0 else { return }  // already closed — idempotent no-op.
 
     // `shutdown` immediately unblocks a read parked in the read loop (it returns EOF),
-    // so the loop exits promptly. The real `close(2)` is DEFERRED onto `writeQueue`, so
-    // it runs strictly AFTER any writes already enqueued on this fd — the fd number can
-    // never be released (and reused by a concurrent dial) while a queued write is
-    // mid-flight. `send` re-checks `isClosed` on the same queue, so a write enqueued
-    // after this point is skipped rather than landing on the closed fd.
+    // so the loop exits promptly and signals `readLoopExited`. The real `close(2)` is
+    // DEFERRED onto `writeQueue`, so it runs strictly AFTER any writes already enqueued
+    // on this fd; the deferred block then waits for `readLoopExited` before `close(2)`, so
+    // the fd number can never be released (and reused by a concurrent dial) while EITHER a
+    // queued write OR the read thread might still touch it. The wait runs on the
+    // `writeQueue` thread — never the caller — and `shutdown` has already forced the read
+    // loop to exit, so it is deadlock-free. `send` re-checks `isClosed` on the same queue,
+    // so a write enqueued after this point is skipped rather than landing on the closed fd.
     shutdownDescriptor(descriptor)
-    writeQueue.async { closeDescriptor(descriptor) }
+    writeQueue.async { [readLoopExited] in
+      readLoopExited.wait()
+      closeDescriptor(descriptor)
+    }
     continuation.finish()
   }
 
@@ -187,6 +208,11 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   }
 
   private func readLoop() {
+    // Signal the instant the read thread stops touching the fd (however it exits), so
+    // `close()`'s deferred `close(2)` — which waits on this — can only run once we are
+    // provably out of `read(2)`. The fd number is thus never released while this thread
+    // might still `read(2)` from it.
+    defer { readLoopExited.signal() }
     let bufferSize = 64 * 1024
     var buffer = [UInt8](repeating: 0, count: bufferSize)
     while true {

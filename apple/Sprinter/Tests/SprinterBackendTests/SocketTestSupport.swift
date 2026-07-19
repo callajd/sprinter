@@ -127,10 +127,19 @@ final class LoopbackSocketServer: @unchecked Sendable {
   private let lock = NSLock()
   private var acceptedDescriptor: Int32 = -1
 
+  /// A SHORT absolute socket path derived under `NSTemporaryDirectory()` — so the fixture
+  /// is not `/tmp`-only and works on hosts (incl. CI) with a relocated temp dir. Guarded
+  /// against the `sockaddr_un.sun_path` limit (~104 bytes, NUL included): if the derived
+  /// path would not fit, fall back to a short `/tmp` name so the bind always stays valid.
+  static func makeSocketPath() -> String {
+    let name = "sprinter-\(UUID().uuidString.prefix(8)).sock"
+    let candidate = (NSTemporaryDirectory() as NSString).appendingPathComponent(name)
+    // `unixSocketPathCapacity` includes the terminating NUL, so require a strict `<`.
+    return candidate.utf8.count < unixSocketPathCapacity ? candidate : "/tmp/\(name)"
+  }
+
   init() throws {
-    // A SHORT absolute path: `sockaddr_un.sun_path` is only ~104 bytes, and the
-    // system temp dir alone can exceed that, so a `/tmp` name keeps the bind valid.
-    path = "/tmp/sprinter-\(UUID().uuidString.prefix(8)).sock"
+    path = Self.makeSocketPath()
     let listenDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
     guard listenDescriptor >= 0 else { throw LoopbackError.setupFailed("socket errno \(errno)") }
     self.listenDescriptor = listenDescriptor

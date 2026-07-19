@@ -110,14 +110,25 @@ actor RpcConnection {
     } catch let error as BackendError {
       // Already a terminal Backend failure (e.g. `connectionClosed` from a closed fd).
       failAll(with: error)
+    } catch let error as UnixSocketTransportError {
+      // ASSUMPTION: the real transport's `send` only ever throws
+      // ``UnixSocketTransportError/writeFailed`` (its only fallible op here is the write; the
+      // typed dial errors stay on the DIAL path in ``DaemonTransports``). A failed `write(2)`
+      // on a stream socket means a dead connection, so map it to
+      // ``BackendError/connectionClosed`` — like every other terminal Backend failure — so
+      // feature view models switching on ``BackendError`` see it, not a transport-specific
+      // error. Any OTHER transport case is unexpected on the write path; surface it as-is
+      // rather than silently collapsing it into `connectionClosed`.
+      if case .writeFailed = error {
+        failAll(with: BackendError.connectionClosed)
+      } else {
+        failAll(with: error)
+      }
     } catch {
-      // A transport-level WRITE failure (e.g. ``UnixSocketTransportError/writeFailed`` on
-      // a broken pipe when the daemon drops mid-write) means a dead connection. Surface it
-      // as ``BackendError/connectionClosed`` — like every other terminal Backend failure —
-      // so feature view models switching on ``BackendError`` see it, not a transport-
-      // specific error. The typed ``UnixSocketTransportError`` stays on the DIAL path
-      // (``DaemonTransports``); transmit's only fallible transport op is the write.
-      failAll(with: BackendError.connectionClosed)
+      // An injected/unexpected transport threw a type we do not model on the write path. Do
+      // NOT masquerade it as `connectionClosed` — surface the original so the real failure
+      // is never silently lost.
+      failAll(with: error)
     }
   }
 

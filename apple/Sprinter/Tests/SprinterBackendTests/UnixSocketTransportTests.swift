@@ -179,6 +179,31 @@ struct UnixSocketTransportTests {
     }
   }
 
+  @Test("close() racing the read loop tears down cleanly and gates the fd close on read exit")
+  func closeRacingReadLoop() async throws {
+    // FIX1 (READ side): close() shutdown(2)s to unblock the parked read(2), then defers the
+    // real close(2) behind BOTH the write-queue drain AND the read thread's exit (it waits on
+    // `readLoopExited`) — so the fd number is never released while the read loop might still
+    // read from it. Whether that gate actually PREVENTS an fd reuse can't be observed
+    // deterministically, so this stresses the teardown path instead: the peer keeps the read
+    // loop actively reading, then close() races it. The guarantee we CAN assert is
+    // deadlock-freedom + a clean finish — if the deferred close ever deadlocked on the read
+    // exit (or the read loop never signalled), the drain below would hang and the test time out.
+    for _ in 0..<32 {
+      let (transport, peer) = try RawSocketPeer.pair()
+      // Drain the shared inbound stream so the read loop is actively pumping bytes; the loop
+      // finishes (or throws) on teardown, either of which ends this task cleanly.
+      let drain = Task {
+        do { for try await _ in transport.receive() {} } catch {}
+      }
+      try await peer.write(Data("{\"k\":\"v\"}\n".utf8))
+      transport.close()
+      transport.close()  // idempotent — a second close is a no-op.
+      await drain.value  // must return: the read loop exits on shutdown-EOF, no deadlock.
+      peer.close()
+    }
+  }
+
   @Test("connect to a path with no listener throws connectionFailed")
   func connectWithNoListenerThrows() async throws {
     let path = "/tmp/sprinter-absent-\(UUID().uuidString.prefix(8)).sock"
