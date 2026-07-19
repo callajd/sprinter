@@ -8,9 +8,9 @@
  * The graph, bottom-up:
  *
  * - {@link StateStore} — the SQLite adapter opened on a real FILE (durable across
- *   restarts, AE5), decorated with durable journaling (`./event-journal.ts`) then
- *   live publishing (`./store-publishing.ts`), so every mutation is persisted,
- *   journaled to the offset log, AND fanned out to the reactive feed.
+ *   restarts, AE5), decorated with durable journaling (`./event-journal.ts`), so
+ *   every mutation is persisted, journaled to the offset log, AND fanned out to the
+ *   reactive feed stamped with its durable offset (one decorator, one coordinate).
  * - {@link ExecutionRunner} — CE1.1's real `LocalPi` adapter (`@sprinter/job`
  *   `layerLocalPi`) over a per-Job worktree router (`layerWorktreeRouter`, CE1.1-F2),
  *   spawning `pi` through the Bun `ChildProcessSpawner`.
@@ -41,7 +41,6 @@ import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
 import { layer as layerSessionRegistry } from "./session-registry.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
-import { layerPublishing } from "./store-publishing.ts";
 import { layer as layerWorkGraphEvents } from "./work-graph-events.ts";
 
 // ── configuration ─────────────────────────────────────────────────────────────
@@ -95,12 +94,15 @@ export const configFromEnv = (env: Readonly<Record<string, string | undefined>>)
 
 /**
  * The durable {@link StateStore}: the SQLite adapter on the configured FILE,
- * decorated with durable journaling (beneath) then live publishing (above). The
- * order matters — a mutation is journaled to the offset log BEFORE it is fanned out
- * live, so the offset-based resync (`./event-journal.ts`) is gap-free.
+ * decorated with durable journaling (`./event-journal.ts`). One decorator both
+ * journals each mutation to the offset log AND fans it out live on the
+ * {@link WorkGraphEvents} feed stamped with the durable offset it committed at — so
+ * the live tail and the durable replay share one coordinate space and the
+ * offset-based resync is gap-free. Requires `WorkGraphEvents` (provided by
+ * {@link portsLayer}).
  */
 export const stateStoreLayer = (config: DaemonConfig) =>
-  layerPublishing(layerJournaling(layerStateSqlite({ filename: config.databasePath })));
+  layerJournaling(layerStateSqlite({ filename: config.databasePath }));
 
 /**
  * The real {@link ExecutionRunner}: CE1.1's `LocalPi` adapter over a per-Job

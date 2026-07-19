@@ -28,8 +28,8 @@ struct StreamTests {
       Wire.chunk(
         requestId: id,
         values: [
-          try Wire.encoded(Fixtures.issueEvent),
-          try Wire.encoded(Fixtures.workstreamEvent)
+          try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: 3)),
+          try Wire.encoded(Fixtures.offsetEvent(Fixtures.workstreamEvent, at: 4))
         ]))
 
     let ack = try await nextSent(&outbound)
@@ -41,7 +41,7 @@ struct StreamTests {
     transport.close()
   }
 
-  @Test("an unknown event _tag is a decode failure, never a silent drop")
+  @Test("an unknown event _tag inside the envelope is a decode failure, never a silent drop")
   func unknownEventTagFails() async throws {
     let transport = FakeTransport()
     let backend = RpcBackend(transport: transport)
@@ -51,7 +51,9 @@ struct StreamTests {
       for try await _ in backend.events() {}
     }
     let id = try #require(try await nextSent(&outbound).id)
-    transport.emit(Wire.chunk(requestId: id, values: [#"{"_tag":"MysteryChanged"}"#]))
+    // A well-formed OffsetEvent envelope whose INNER event carries an unknown `_tag`.
+    transport.emit(
+      Wire.chunk(requestId: id, values: [#"{"offset":5,"event":{"_tag":"MysteryChanged"}}"#]))
 
     await #expect(throws: (any Error).self) { try await collector.value }
     transport.close()

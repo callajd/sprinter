@@ -163,11 +163,13 @@ it.effect("the events feed does DURABLE offset-based resync for a late-attaching
         plan: { name: "Convergence", repo: "callajd/sprinter", spec: "wire the daemon" },
       });
 
-      // Attaching now REPLAYS the journaled history: the pre-subscribe delta arrives.
+      // Attaching now REPLAYS the journaled history: the pre-subscribe delta arrives,
+      // stamped with its durable offset (contract v3 / CE2.0).
       const first = Option.getOrThrow(
         yield* client.events({}).pipe(Stream.take(1), Stream.runHead),
       );
-      expect(first._tag).toBe("WorkstreamChanged");
+      expect(first.event._tag).toBe("WorkstreamChanged");
+      expect(first.offset).toBeGreaterThan(0);
     }).pipe(Effect.scoped, Effect.provide(served(testConfig(dir))));
   }).pipe(Effect.provide(BunFileSystem.layer)),
 );

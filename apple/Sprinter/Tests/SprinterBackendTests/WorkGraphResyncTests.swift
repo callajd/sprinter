@@ -37,7 +37,10 @@ struct WorkGraphResyncTests {
     first.emit(
       Wire.chunk(
         requestId: try #require(eventsRequest.id),
-        values: [try Wire.encoded(WorkGraphEvent.issueChanged(Fixtures.issueInReview))]))
+        values: [
+          try Wire.encoded(
+            Fixtures.offsetEvent(WorkGraphEvent.issueChanged(Fixtures.issueInReview), at: 1))
+        ]))
     let reconciled = try #require(await states.next())
     #expect(reconciled.issues == [Fixtures.issueInReview])
 
@@ -105,7 +108,7 @@ struct WorkGraphResyncTests {
         requestId: try #require(byTag1["snapshot"]?.id),
         value: try Wire.encoded(Fixtures.snapshot)))
     let eventsId = try #require(byTag1["events"]?.id)
-    let delta = try Wire.encoded(Fixtures.issueEvent)
+    let delta = try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: 1))
     first.emit(Wire.chunk(requestId: eventsId, values: [delta, delta, delta]))
 
     // The overflow tears the attempt down and the engine reconnects, re-fetching

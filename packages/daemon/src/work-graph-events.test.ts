@@ -7,7 +7,7 @@
 import { it } from "@effect/vitest";
 import { Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
-import type { WorkGraphEvent } from "@sprinter/contract";
+import type { OffsetEvent } from "@sprinter/contract";
 import { Workstream } from "@sprinter/domain";
 import { layer, WorkGraphEvents } from "./work-graph-events.ts";
 
@@ -18,7 +18,8 @@ const workstream = Schema.decodeUnknownSync(Workstream)({
   status: "pending",
   epics: [],
 });
-const delta: WorkGraphEvent = { _tag: "WorkstreamChanged", workstream };
+// The feed carries offset-stamped envelopes (contract v3 / CE2.0).
+const delta: OffsetEvent = { offset: 7, event: { _tag: "WorkstreamChanged", workstream } };
 
 it.effect("delivers a published delta to a prior subscriber", () =>
   Effect.gen(function* () {

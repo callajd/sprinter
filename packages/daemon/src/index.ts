@@ -8,9 +8,10 @@
  *   `@sprinter/contract`'s `SprinterRpc` (snapshot / events / command handlers),
  *   depending only on the `StateStore`, `JobRunner` and `WorkGraphEvents` PORTS.
  * - {@link WorkGraphEvents} / {@link layerWorkGraphEvents} — the real `PubSub`
- *   feed behind the streaming `events` RPC (D17).
- * - {@link layerPublishing} — the `StateStore` decorator that fans every persisted
- *   mutation out onto that feed, so the daemon is reactive end-to-end.
+ *   feed behind the streaming `events` RPC (D17), carrying offset-stamped deltas.
+ * - {@link layerJournaling} — the `StateStore` decorator that both journals every
+ *   persisted mutation durably AND fans it out onto that feed stamped with its
+ *   durable offset, so the daemon is reactive-plus-durable end-to-end.
  *
  * Task AE4.2 adds the session channel behind the same frozen contract: the
  * {@link SessionRegistry} PORT (`sessionId → live SessionHandle`) the four
@@ -47,7 +48,6 @@ export { handlers } from "./rpc-handlers.ts";
 export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";
 export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
-export { layerPublishing } from "./store-publishing.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 /** Human-readable daemon identity banner, keyed to the active contract version. */

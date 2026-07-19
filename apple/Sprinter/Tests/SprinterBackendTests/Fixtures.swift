@@ -39,6 +39,12 @@ enum Fixtures {
   static let issueEvent = WorkGraphEvent.issueChanged(issue)
   static let workstreamEvent = WorkGraphEvent.workstreamChanged(workstream)
 
+  /// Wrap a delta in the streamed ``OffsetEvent`` envelope (contract v3 / CE2.0) —
+  /// what the daemon puts on the `events` wire; ``RpcBackend`` unwraps to `.event`.
+  static func offsetEvent(_ event: WorkGraphEvent, at offset: Int) -> OffsetEvent {
+    OffsetEvent(offset: offset, event: event)
+  }
+
   // ── Reconnect / resync ──────────────────────────────────────────────────────
 
   /// The same issue, advanced to `in_review` — an UPSERT delta over `snapshot`.

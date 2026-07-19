@@ -48,10 +48,15 @@ import {
  * (CE5.2). Both rippled to the Swift mirror + Track A handlers and re-froze the
  * FE2.4 goldens in one bump (INV-CONTRACT: version once, re-freeze once).
  *
- * `v3` (CE2.0) adds an OPTIONAL `sinceOffset` cursor to the `events` RPC request:
- * absent replays from the log origin (backward-compatible — the pre-v3 wire had no
- * request field), present resumes strictly after that offset. It rippled to the
- * Swift mirror + the daemon `events` handler and re-froze the FE2.4 goldens.
+ * `v3` (CE2.0) makes the `events` cursor usable end-to-end, as ONE change: the
+ * REQUEST gains an OPTIONAL `sinceOffset` cursor (absent replays from the log
+ * origin — backward-compatible, the pre-v3 wire had no request field; present
+ * resumes strictly after that offset), AND the streamed RESPONSE becomes the
+ * {@link OffsetEvent} envelope so each item carries the durable offset the client
+ * feeds back as that cursor. (A cold review caught that the bare-`WorkGraphEvent`
+ * response gave the client no offset to resume from, leaving the cursor inert; the
+ * envelope is batched into the SAME v3 bump.) It rippled to the Swift mirror + the
+ * daemon `events` handler/journal and re-froze the FE2.4 goldens.
  */
 export const CONTRACT_VERSION = 3 as const;
 
@@ -135,6 +140,25 @@ export const WorkGraphEvent = Schema.TaggedUnion({
 export type WorkGraphEvent = (typeof WorkGraphEvent)["Type"];
 
 /**
+ * One streamed `events` item: a {@link WorkGraphEvent} paired with its DURABLE
+ * `offset` — the `event_log` row position the delta was journaled at (contract v3 /
+ * CE2.0). The stream carries the offset so a reconnecting client can remember its
+ * last-seen position and hand it back as the request's `sinceOffset` cursor to
+ * resume STRICTLY AFTER it (no gap, no duplicate). Without this envelope the bare
+ * `WorkGraphEvent` gave the client no coordinate to resume from, so the cursor was
+ * inert; the offset closes that loop end-to-end.
+ *
+ * The offsets are MONOTONIC and share ONE coordinate space with both the durable
+ * replay (`EventLogStore.tail`) and the live tail — a replay from `sinceOffset = N`
+ * yields items whose offsets are all `> N` and contiguous with the live feed.
+ */
+export const OffsetEvent = Schema.Struct({
+  offset: NonNegativeInt,
+  event: WorkGraphEvent,
+});
+export type OffsetEvent = (typeof OffsetEvent)["Type"];
+
+/**
  * The plan the `createWorkstreamFromPlan` command turns into a new workstream:
  * a human-readable name, the bound repository (repo-scoped per D14), and the
  * free-form spec text driving planning.
@@ -161,14 +185,18 @@ export type ControlAction = (typeof ControlAction)["Type"];
 // (1) snapshot — request/response full-state hydration on connect.
 export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 
-// (2) events — streaming work-graph deltas (INV-REACTIVE), with an OPTIONAL
-// `sinceOffset` resume cursor (contract v3 / CE2.0). Absent → replay from the log
+// (2) events — streaming work-graph deltas (INV-REACTIVE). Each streamed item is
+// an {@link OffsetEvent} — the delta PLUS its durable `event_log` offset — so the
+// client can track its last-seen position (contract v3 / CE2.0). The request
+// carries an OPTIONAL `sinceOffset` resume cursor: absent → replay from the log
 // ORIGIN (backward-compatible: the pre-v3 request carried no field, so an omitted
 // key decodes to the same origin replay); present → resume STRICTLY AFTER that
-// offset, over the daemon's existing `resyncFrom(offset)` primitive (CE1.2).
+// offset, over the daemon's existing `resyncFrom(offset)` primitive (CE1.2). The
+// success offset and the request cursor are the SAME coordinate: a client feeds a
+// streamed item's `offset` straight back as the next `sinceOffset`.
 export const events = Rpc.make("events", {
   payload: { sinceOffset: Schema.optionalKey(NonNegativeInt) },
-  success: WorkGraphEvent,
+  success: OffsetEvent,
   stream: true,
 });
 

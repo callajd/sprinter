@@ -110,12 +110,20 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   expect(decoded.issues[0]?.number).toBe(10);
 });
 
-it("streams owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
+it("streams offset-stamped owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
+  // The streamed success is the OffsetEvent envelope (contract v3 / CE2.0): the
+  // owned delta PLUS the durable offset the client feeds back as `sinceOffset`.
   const delta = { _tag: "IssueChanged", issue };
-  const decoded = Schema.decodeUnknownSync(events.successSchema.success)(delta);
-  expect(decoded).toEqual(Schema.decodeUnknownSync(WorkGraphEvent)(delta));
-  if (decoded._tag !== "IssueChanged") throw new Error("expected IssueChanged");
-  expect(decoded.issue.id).toBe("iss-1");
+  const item = { offset: 7, event: delta };
+  const decoded = Schema.decodeUnknownSync(events.successSchema.success)(item);
+  expect(decoded.event).toEqual(Schema.decodeUnknownSync(WorkGraphEvent)(delta));
+  expect(decoded.offset).toBe(7);
+  if (decoded.event._tag !== "IssueChanged") throw new Error("expected IssueChanged");
+  expect(decoded.event.issue.id).toBe("iss-1");
+  // The offset is a NON-NEGATIVE int: a negative offset is rejected.
+  expect(() =>
+    Schema.decodeUnknownSync(events.successSchema.success)({ offset: -1, event: delta }),
+  ).toThrow();
 });
 
 it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)", () => {

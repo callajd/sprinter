@@ -11,9 +11,10 @@
  * (INV-BOUNDARY). They are:
  *
  * - `snapshot` — full-state hydration, built by traversing the `StateStore`.
- * - `events` — the streaming work-graph delta feed, returned straight off the
- *   real `PubSub` (D17 / INV-REACTIVE); mutations publish via the publishing
- *   `StateStore` decorator (`./store-publishing.ts`), never a poll loop.
+ * - `events` — the streaming work-graph delta feed of offset-stamped
+ *   {@link OffsetEvent}s, returned straight off the real `PubSub` (D17 /
+ *   INV-REACTIVE); mutations journal-and-publish via the journaling `StateStore`
+ *   decorator (`./event-journal.ts`), never a poll loop.
  * - `createWorkstreamFromPlan` — materialize a plan into a new `Workstream`
  *   (child-lists kept consistent with FK parentage on upsert; a fresh plan has no
  *   children yet, so this is trivially satisfied — planning fills them later).
@@ -359,9 +360,12 @@ export const handlers = SprinterRpc.toLayer(
       // then streams the live tail — so a reconnecting client catches up on the whole
       // persisted history deterministically, not only the deltas after it attaches.
       // Subscribe-before-replay closes the gap; upsert-idempotent deltas (D8) absorb
-      // the boundary overlap. The `sinceOffset` cursor is OPTIONAL (contract v3 /
-      // CE2.0): absent → replay from origin (backward-compatible), present → resume
-      // strictly after that offset, over the same `resyncFrom` primitive.
+      // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
+      // durable offset (contract v3 / CE2.0), and replay + live offsets share one
+      // coordinate space, so the client can feed a streamed item's offset back as
+      // `sinceOffset`. The cursor is OPTIONAL: absent → replay from origin
+      // (backward-compatible), present → resume strictly after that offset, over the
+      // same `resyncFrom` primitive.
       events: ({ sinceOffset }) => resyncEvents(store, feed, sinceOffset),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>

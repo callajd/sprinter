@@ -2,9 +2,9 @@
 /// types — mirrored from `@sprinter/contract`'s procedure surface.
 ///
 /// Each `payload` struct mirrors one procedure's request shape; the streamed and
-/// request/response success values are owned domain types (``Snapshot``,
-/// ``WorkGraphEvent``, ``SessionEvent``, a bare ``WorkstreamId``) already mirrored
-/// elsewhere in this module.
+/// request/response success values are owned types (``Snapshot``, the
+/// ``OffsetEvent`` envelope over ``WorkGraphEvent``, ``SessionEvent``, a bare
+/// ``WorkstreamId``) already mirrored elsewhere in this module.
 
 /// The lifecycle action a `control` command applies to a workstream.
 public enum ControlAction: String, Codable, CaseIterable, Sendable {
@@ -27,8 +27,8 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
   }
 }
 
-/// Payload of `events` (streams ``WorkGraphEvent``) — the OPTIONAL `sinceOffset`
-/// resume cursor (contract v3 / CE2.0). Absent (`nil`) replays from the log ORIGIN
+/// Payload of `events` (streams the ``OffsetEvent`` envelope) — the OPTIONAL
+/// `sinceOffset` resume cursor (contract v3 / CE2.0). Absent (`nil`) replays from the log ORIGIN
 /// (backward-compatible); present resumes STRICTLY AFTER that offset. The wire is
 /// `Schema.optionalKey(NonNegativeInt)`, so the key is OMITTED when `nil` (never
 /// `null`) — Swift synthesized `Codable` matches this exactly.
@@ -161,8 +161,10 @@ public enum SprinterContract {
   ///
   /// `v2` (CE5) batched the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
   /// and the reconciliation-key `id` on ``SessionEvent``.`notice` /
-  /// ``TranscriptEntry``.`noticeEntry` (CE5.2). `v3` (CE2.0) adds the OPTIONAL
-  /// `sinceOffset` resume cursor on ``EventsPayload`` — rippled here and to the
-  /// goldens.
+  /// ``TranscriptEntry``.`noticeEntry` (CE5.2). `v3` (CE2.0) makes the `events`
+  /// cursor usable end-to-end as ONE change: the OPTIONAL `sinceOffset` resume
+  /// cursor on ``EventsPayload`` (request) AND the ``OffsetEvent`` envelope on the
+  /// streamed response, so each item carries the durable offset the client feeds
+  /// back as that cursor — rippled here and to the goldens.
   public static let version = 3
 }

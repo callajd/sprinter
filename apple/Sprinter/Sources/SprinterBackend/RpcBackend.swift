@@ -6,8 +6,9 @@ import SprinterContract
 /// It maps each port method onto the transport-generic ``RpcConnection``: a query
 /// awaits the correlated `Exit` and decodes its success value (or throws the
 /// mirrored ``ContractError``); `events` wraps the raw chunk stream, decoding each
-/// value into a ``WorkGraphEvent`` — an unknown `_tag` surfaces as a decode
-/// failure, never a silent drop. All request bodies reuse the frozen
+/// value into an ``OffsetEvent`` envelope and yielding its ``WorkGraphEvent`` — an
+/// unknown inner `_tag` surfaces as a decode failure, never a silent drop. All
+/// request bodies reuse the frozen
 /// `SprinterContract` payload DTOs (INV-CONTRACT); this type adds no new wire
 /// shapes beyond the envelope.
 ///
@@ -46,8 +47,12 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
+          // The wire carries the ``OffsetEvent`` envelope (contract v3 / CE2.0); the
+          // ``Backend`` port still yields the bare delta, so unwrap to ``event``.
+          // Tracking the offset for resume (`sinceOffset`) is CE2.2's job — an
+          // unknown inner `_tag` still surfaces as a decode failure, never a drop.
           for try await value in await connection.stream(tag: "events", payload: nil) {
-            continuation.yield(try fromJSONValue(WorkGraphEvent.self, value))
+            continuation.yield(try fromJSONValue(OffsetEvent.self, value).event)
           }
           continuation.finish()
         } catch {

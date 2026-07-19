@@ -12,76 +12,97 @@
  *   monotonic `offset`) inside a SINGLE {@link StateStore.withTransaction} — so the
  *   two commit together or neither does. A crash can never leave the node persisted
  *   with its delta un-journaled (which would make the offset feed an incomplete
- *   history — INV-RESTART). Because it is itself a `StateStore` (same port), every
- *   writer through the port — the command handlers AND the `JobRunner` — journals
- *   atomically for free, with no consumer knowing (INV-PORT). It is composed BENEATH
- *   the publishing decorator (`./store-publishing.ts`), so a mutation is journaled
- *   durably BEFORE it is fanned out live — the ordering the gap-free resync relies on.
+ *   history — INV-RESTART). Because it mints the durable offset, it is ALSO the layer
+ *   that fans the delta out live on the {@link WorkGraphEvents} feed, stamped with
+ *   that same offset — the durable write commits BEFORE the live publish, and the
+ *   live and replay offsets are one coordinate space by construction (the property
+ *   the gap-free resume relies on). Being itself a `StateStore` (same port), every
+ *   writer through the port — the command handlers AND the `JobRunner` — journals and
+ *   fans out atomically for free, with no consumer knowing (INV-PORT).
  *
  * - {@link resyncEvents} — the stream the `events` RPC returns: it EAGERLY subscribes
  *   to the live feed, THEN replays the durable log from a starting offset via
- *   {@link EventLogStore.tail}, then hands over to the live tail. Subscribing before
- *   reading closes the replay/live gap; `WorkGraphEvent` is upsert-idempotent (D8 —
- *   the carried node replaces any prior of the same id), so the small overlap at the
+ *   {@link EventLogStore.tail}, then hands over to the live tail. Each streamed item
+ *   is an {@link OffsetEvent} carrying its durable offset. Subscribing before reading
+ *   closes the replay/live gap; `WorkGraphEvent` is upsert-idempotent (D8 — the
+ *   carried node replaces any prior of the same id), so the small overlap at the
  *   boundary is harmless. A reconnecting client thus catches up on the whole durable
  *   history deterministically, not just the deltas that happen after it attaches.
  *
- * The wire `events` procedure now carries an OPTIONAL `sinceOffset` cursor
- * (contract v3 / CE2.0, INV-CONTRACT): absent replays from the log ORIGIN
- * (`tail(0)`, backward-compatible), present resumes STRICTLY AFTER that offset.
- * {@link resyncFrom} is the offset-parameterized primitive both cases drive
- * (CE2.2 layers reconnect/backpressure on top) without re-deriving a snapshot.
+ * The wire `events` procedure carries an OPTIONAL `sinceOffset` REQUEST cursor and an
+ * {@link OffsetEvent} RESPONSE envelope (contract v3 / CE2.0, INV-CONTRACT): absent
+ * cursor replays from the log ORIGIN (`tail(0)`, backward-compatible), present
+ * resumes STRICTLY AFTER that offset, and each streamed item exposes the durable
+ * offset the client feeds back as its next cursor. {@link resyncFrom} is the
+ * offset-parameterized primitive both cases drive (CE2.2 layers reconnect/
+ * backpressure on top) without re-deriving a snapshot.
  */
 import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "effect";
-import { WorkGraphEvent } from "@sprinter/contract";
+import { type OffsetEvent, WorkGraphEvent } from "@sprinter/contract";
+import type { NonNegativeInt } from "@sprinter/domain";
 import { type PersistedEvent, StateStore, type StateStoreError } from "@sprinter/state";
 import { WorkGraphEvents } from "./work-graph-events.ts";
 
 type Store = Context.Service.Shape<typeof StateStore>;
 type Feed = Context.Service.Shape<typeof WorkGraphEvents>;
 
-// ── journaling decorator ──────────────────────────────────────────────────────
+// ── journaling + publishing decorator ─────────────────────────────────────────
 
 /**
  * Append one owned {@link WorkGraphEvent} to the durable log, keyed by its `_tag`
- * (a producer-owned discriminator, D6) with the encoded event as payload. Encoding
- * an owned schema value cannot fail (`orDie`); an {@link EventLogStore} write can,
- * so — like the `put*` it follows — the effect surfaces {@link StateStoreError}.
+ * (a producer-owned discriminator, D6) with the encoded event as payload, and
+ * return the DURABLE `offset` it was stamped with. Encoding an owned schema value
+ * cannot fail (`orDie`); an {@link EventLogStore} write can, so — like the `put*` it
+ * follows — the effect surfaces {@link StateStoreError}. The returned offset is the
+ * SAME coordinate {@link EventLogStore.tail} / {@link resyncFrom} read, so the live
+ * fan-out and the durable replay agree on one offset per delta (contract v3 / CE2.0).
  */
-const journalDelta = (base: Store, event: WorkGraphEvent): Effect.Effect<void, StateStoreError> =>
+const journalDelta = (
+  base: Store,
+  event: WorkGraphEvent,
+): Effect.Effect<NonNegativeInt, StateStoreError> =>
   Schema.encodeEffect(WorkGraphEvent)(event).pipe(
     Effect.orDie,
     Effect.flatMap((payload) => base.events.append({ kind: event._tag, payload })),
-    Effect.asVoid,
+    Effect.map((persisted) => persisted.offset),
   );
 
 /**
- * Persist a node write AND its offset-log delta ATOMICALLY (INV-RESTART): both run
- * inside a single {@link StateStore.withTransaction}, so a crash can never leave the
- * node persisted with its delta un-journaled (which would make the offset feed an
- * incomplete history). Without the transaction these are two separate commits with a
- * crash window between them; with it, they commit together or neither does.
+ * Persist a node write AND its offset-log delta ATOMICALLY (INV-RESTART), THEN fan
+ * the delta out live stamped with the durable offset it committed at. The put and
+ * the journal append run inside a single {@link StateStore.withTransaction}, so a
+ * crash can never leave the node persisted with its delta un-journaled (which would
+ * make the offset feed an incomplete history); the live {@link WorkGraphEvents}
+ * publish happens AFTER that transaction commits (never on a rolled-back write) and
+ * carries the same offset, so the live tail and the durable replay share ONE
+ * coordinate space — the property the gap-free `sinceOffset` resume relies on.
  */
 const putAndJournal = (
   base: Store,
+  feed: Feed,
   put: Effect.Effect<void, StateStoreError>,
   event: WorkGraphEvent,
 ): Effect.Effect<void, StateStoreError> =>
-  base.withTransaction(put.pipe(Effect.andThen(journalDelta(base, event))));
+  base
+    .withTransaction(put.pipe(Effect.andThen(journalDelta(base, event))))
+    .pipe(Effect.flatMap((offset) => feed.publish({ offset, event })));
 
-/** Build the journaling store shape: delegate to `base`, then journal each `put*`'s delta. */
-const journaling = (base: Store): Store =>
+/**
+ * Build the journaling store shape: delegate to `base`, then for each `put*` journal
+ * its delta durably AND publish it live stamped with the durable offset.
+ */
+const journaling = (base: Store, feed: Feed): Store =>
   StateStore.of({
     workGraph: {
       putWorkstream: (workstream) =>
-        putAndJournal(base, base.workGraph.putWorkstream(workstream), {
+        putAndJournal(base, feed, base.workGraph.putWorkstream(workstream), {
           _tag: "WorkstreamChanged",
           workstream,
         }),
       putEpic: (epic) =>
-        putAndJournal(base, base.workGraph.putEpic(epic), { _tag: "EpicChanged", epic }),
+        putAndJournal(base, feed, base.workGraph.putEpic(epic), { _tag: "EpicChanged", epic }),
       putIssue: (issue) =>
-        putAndJournal(base, base.workGraph.putIssue(issue), { _tag: "IssueChanged", issue }),
+        putAndJournal(base, feed, base.workGraph.putIssue(issue), { _tag: "IssueChanged", issue }),
       getWorkstream: base.workGraph.getWorkstream,
       getEpic: base.workGraph.getEpic,
       getIssue: base.workGraph.getIssue,
@@ -90,11 +111,15 @@ const journaling = (base: Store): Store =>
       listIssues: base.workGraph.listIssues,
     },
     jobs: {
-      putJob: (job) => putAndJournal(base, base.jobs.putJob(job), { _tag: "JobChanged", job }),
+      putJob: (job) =>
+        putAndJournal(base, feed, base.jobs.putJob(job), { _tag: "JobChanged", job }),
       getJob: base.jobs.getJob,
       listJobsForIssue: base.jobs.listJobsForIssue,
       putSession: (session) =>
-        putAndJournal(base, base.jobs.putSession(session), { _tag: "SessionChanged", session }),
+        putAndJournal(base, feed, base.jobs.putSession(session), {
+          _tag: "SessionChanged",
+          session,
+        }),
       getSession: base.jobs.getSession,
       getSessionForJob: base.jobs.getSessionForJob,
     },
@@ -104,42 +129,49 @@ const journaling = (base: Store): Store =>
 
 /**
  * Decorate `baseLayer` so every persisted mutation is journaled to the durable
- * {@link EventLogStore}. The base store is wired in via `Layer.provide`, so
- * consumers see only the decorated port (INV-PORT). Compose it BENEATH the
- * publishing decorator so journaling (durable) precedes live fan-out.
+ * {@link EventLogStore} AND fanned out live on the {@link WorkGraphEvents} feed with
+ * its durable offset. The base store is wired in via `Layer.provide`, so consumers
+ * see only the decorated port (INV-PORT); the feed stays in the requirements (the
+ * composition root provides it). Because the layer that mints the offset is also the
+ * one that publishes, the live and replay offsets are identical by construction —
+ * this decorator is the daemon's SINGLE reactive-plus-durable seam.
  */
 export const layerJournaling = <RIn>(
   baseLayer: Layer.Layer<StateStore, StateStoreError, RIn>,
-): Layer.Layer<StateStore, StateStoreError, RIn> =>
+): Layer.Layer<StateStore, StateStoreError, RIn | WorkGraphEvents> =>
   Layer.effect(
     StateStore,
     Effect.gen(function* () {
       const base = yield* StateStore;
-      return journaling(base);
+      const feed = yield* WorkGraphEvents;
+      return journaling(base, feed);
     }),
   ).pipe(Layer.provide(baseLayer));
 
 // ── offset-based resync ───────────────────────────────────────────────────────
 
 /**
- * Decode one durable entry back to its owned {@link WorkGraphEvent}. An entry that
- * does not decode as a work-graph delta (a foreign `kind` a future producer may
- * append) is skipped, not a failure — the resync replays only work-graph history.
+ * Decode one durable entry back to its owned {@link OffsetEvent} — the delta paired
+ * with the entry's durable `offset`. An entry that does not decode as a work-graph
+ * delta (a foreign `kind` a future producer may append) is skipped, not a failure —
+ * the resync replays only work-graph history.
  */
-const decodeDelta = (entry: PersistedEvent): Effect.Effect<Option.Option<WorkGraphEvent>> =>
+const decodeDelta = (entry: PersistedEvent): Effect.Effect<Option.Option<OffsetEvent>> =>
   Schema.decodeUnknownEffect(WorkGraphEvent)(entry.payload).pipe(
-    Effect.map(Option.some),
+    Effect.map((event) => Option.some<OffsetEvent>({ offset: entry.offset, event })),
     Effect.catch(() => Effect.succeedNone),
   );
 
 /**
- * The durable replay stream: every persisted {@link WorkGraphEvent} with an offset
+ * The durable replay stream: every persisted {@link OffsetEvent} with an offset
  * strictly greater than `offset`, in order — the AE1 {@link EventLogStore.tail}
- * primitive a client resumes from its last-seen cursor. A store read failure is a
- * defect (`orDie`) rather than a stream error, keeping the feed's error channel
- * empty (matching the frozen contract's `events` success/never shape).
+ * primitive a client resumes from its last-seen cursor. Each item carries its
+ * durable offset, so the offsets are strictly greater than `offset` and contiguous
+ * with the live tail. A store read failure is a defect (`orDie`) rather than a
+ * stream error, keeping the feed's error channel empty (matching the frozen
+ * contract's `events` success/never shape).
  */
-export const resyncFrom = (store: Store, offset: number): Stream.Stream<WorkGraphEvent> =>
+export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEvent> =>
   Stream.unwrap(
     store.events.tail(offset).pipe(
       Effect.orDie,
@@ -151,16 +183,20 @@ export const resyncFrom = (store: Store, offset: number): Stream.Stream<WorkGrap
 /**
  * The `events` RPC feed: EAGERLY subscribe to the live work-graph feed, THEN replay
  * the durable log from `sinceOffset` (the client's resume cursor — contract v3 /
- * CE2.0; absent → `0`, replay from the ORIGIN), THEN stream the live tail.
- * Subscribing before the durable read closes the replay/live gap; upsert-idempotent
- * deltas make the small boundary overlap harmless. The result is a deterministic
- * catch-up from durable history, not merely snapshot-on-connect (D17).
+ * CE2.0; absent → `0`, replay from the ORIGIN), THEN stream the live tail. Every
+ * streamed item is an {@link OffsetEvent} carrying its durable offset; replay and
+ * live offsets share one coordinate space (the journaling decorator mints and
+ * publishes the same offset it appended), so a resume from `sinceOffset = N` yields
+ * offsets all `> N`, contiguous, with no gap or duplicate. Subscribing before the
+ * durable read closes the replay/live gap; upsert-idempotent deltas make the small
+ * boundary overlap harmless. The result is a deterministic catch-up from durable
+ * history, not merely snapshot-on-connect (D17).
  */
 export const resyncEvents = (
   store: Store,
   feed: Feed,
   sinceOffset?: number,
-): Stream.Stream<WorkGraphEvent> =>
+): Stream.Stream<OffsetEvent> =>
   Stream.unwrap(
     feed.subscribe.pipe(
       Effect.map((subscription) =>
