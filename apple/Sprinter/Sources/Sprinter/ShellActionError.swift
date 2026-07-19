@@ -6,7 +6,7 @@ import SwiftUI
 /// into an `@State String?` and attaches ``SwiftUI/View/shellActionErrorAlert(_:)``, which
 /// presents the reason.
 ///
-/// This is pure View-layer presentation (`SprinterApp` is the coverage-exempt platform
+/// This is pure View-layer presentation (the executable target `Sprinter` is the coverage-exempt platform
 /// edge); it changes no view-model logic. Where a view model already reflects failure in
 /// its own state (e.g. `PlannerViewModel.outcome` → `.rejected`), the View surfaces that
 /// state directly and only uses this affordance for the errors a call re-throws.
