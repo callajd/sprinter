@@ -17,6 +17,10 @@ struct SessionView: View {
 
   @State private var draft = ""
   @State private var actionError: String?
+  /// The per-view memo for edit/write diff refinement: the LCS pass is O(removed×added),
+  /// so it is computed once per distinct diff content and read from the cache on every
+  /// re-render rather than re-run — held here so it survives the View's re-creation.
+  @State private var diffCache = RefinedDiffCache()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -31,7 +35,7 @@ struct SessionView: View {
     ScrollView {
       LazyVStack(alignment: .leading, spacing: 8) {
         ForEach(model.transcript.items) { item in
-          TranscriptItemView(item: item)
+          TranscriptItemView(item: item, diffCache: diffCache)
         }
         ForEach(model.outstandingRequests) { request in
           promptRow(request)
@@ -93,6 +97,9 @@ struct SessionView: View {
 /// (message, tool call, notice, status, retry, compaction).
 private struct TranscriptItemView: View {
   let item: TranscriptItem
+  /// The shared refinement memo the tool row reads its diff from, so a large Edit's LCS
+  /// pass runs once per distinct content, not once per re-render.
+  let diffCache: RefinedDiffCache
 
   var body: some View {
     switch item {
@@ -120,14 +127,16 @@ private struct TranscriptItemView: View {
   }
 
   /// A tool call: its name, plus — for a recognized edit/write — the intraline-refined
-  /// diff (`TranscriptDiff.refined`) so unchanged lines read as context, not churn.
+  /// diff so unchanged lines read as context, not churn. The refinement is read through
+  /// the shared ``RefinedDiffCache`` so the O(removed×added) LCS pass runs once per
+  /// distinct diff content rather than on every re-render.
   @ViewBuilder
   private func toolRow(_ call: TranscriptToolCall) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       Label(call.name.isEmpty ? "tool" : call.name, systemImage: "wrench.and.screwdriver")
         .font(.callout)
-      if let diff = call.fileDiff {
-        TranscriptDiffView(diff: diff.refined)
+      if let refined = diffCache.refined(for: call) {
+        TranscriptDiffView(diff: refined)
       }
     }
   }

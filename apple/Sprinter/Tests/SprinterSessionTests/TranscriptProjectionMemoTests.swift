@@ -70,4 +70,28 @@ struct TranscriptProjectionMemoTests {
     #expect(memo.project(shorter) == TranscriptProjection.project(shorter))
     #expect(memo.project(full) == TranscriptProjection.project(full))
   }
+
+  /// The equal-count fast path is self-checking: a feed whose COUNT is unchanged but
+  /// whose tail event was mutated in place (which the append-only session feed never
+  /// does, but a future feed might) re-folds instead of silently returning the stale
+  /// cached transcript — the cheap tail fingerprint guards the memo's core assumption.
+  @Test("an equal-count feed with a changed tail re-folds rather than serving stale")
+  func memoRefoldsOnChangedTailAtEqualCount() {
+    let base: [SessionEvent] = [
+      .messageStarted(messageId: "m1"),
+      .messageDelta(messageId: "m1", text: "hi", reasoning: nil)
+    ]
+    let memo = TranscriptProjection.Memo()
+    let first = memo.project(base)
+
+    // Same count (2), different tail event — an in-place mutation of the last event.
+    let mutated: [SessionEvent] = [
+      .messageStarted(messageId: "m1"),
+      .messageDelta(messageId: "m1", text: "bye", reasoning: nil)
+    ]
+    let refolded = memo.project(mutated)
+    // The memo must return the mutated-feed projection, not the stale `first`.
+    #expect(refolded == TranscriptProjection.project(mutated))
+    #expect(refolded != first)
+  }
 }

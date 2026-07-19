@@ -45,15 +45,29 @@ public enum TranscriptProjection {
     private var builder = Builder()
     private var foldedCount = 0
     private var cached: Transcript = .empty
+    /// The last event folded into ``cached`` — a cheap O(1) fingerprint of the feed's
+    /// tail. The equal-count fast path is only sound if the feed is append-only (equal
+    /// count ⟹ unchanged feed); confirming the tail is unchanged makes that assumption
+    /// self-checking, so a future in-place-mutating feed that swaps the tail at equal
+    /// count re-folds instead of silently serving a stale transcript.
+    private var foldedTail: SessionEvent?
 
     public init() {}
 
     /// The transcript for `events`, continuing the fold from the last call. `events`
     /// must be an append-only growth of the prior call's feed (the session feed's
-    /// invariant); a shorter feed resets the memo and re-folds from scratch.
+    /// invariant); a shorter feed — OR an equal-count feed whose tail event changed
+    /// (an in-place mutation the append-only invariant forbids) — resets the memo and
+    /// re-folds from scratch rather than returning a stale projection.
     public func project(_ events: [SessionEvent]) -> Transcript {
-      if events.count == foldedCount { return cached }
-      if events.count < foldedCount {
+      // Fast path: unchanged feed. An equal count means an unchanged feed ONLY for the
+      // append-only session feed; the tail check confirms it and fails SAFE (falls
+      // through to a re-fold) if the tail was mutated in place at equal count — O(1) per
+      // read (one tail compare), never a per-read full scan.
+      if events.count == foldedCount, events.last == foldedTail { return cached }
+      // Reset when the feed shrank OR its tail changed at equal count — both violate the
+      // append-only continuation, so the prior fold is not a prefix of `events`.
+      if events.count <= foldedCount {
         builder = Builder()
         foldedCount = 0
       }
@@ -61,6 +75,7 @@ public enum TranscriptProjection {
         builder.ingest(events[index])
       }
       foldedCount = events.count
+      foldedTail = events.last
       cached = builder.transcript()
       return cached
     }

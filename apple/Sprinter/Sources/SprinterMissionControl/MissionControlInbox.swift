@@ -46,6 +46,15 @@ public final class MissionControlInbox {
   /// stale wait). Internal bookkeeping, not observed directly.
   @ObservationIgnored private var arrivals: [String: Date] = [:]
 
+  /// Whether ``stop()`` has torn the inbox down. Once set, BOTH self-re-arming
+  /// Observation loops (``reconcile()`` and ``trackActiveSessions(of:)``) short-circuit,
+  /// so a board/feed mutation that fires an already-armed one-shot `onChange` in the
+  /// window before the `@State` inbox is released does NOT re-arm the loop or re-track a
+  /// session — which would re-`start()` a feed `stop()` just tore down on a dismissed
+  /// sheet. It is one-way (a stopped inbox stays stopped), making ``stop()`` idempotent
+  /// and its teardown final.
+  @ObservationIgnored private var isStopped = false
+
   /// The flat, cross-session inbox, ordered **longest-waiting-first** by client-side
   /// arrival time (ties broken by the composite entry id, so the rendering is
   /// deterministic). Rebuilt by ``reconcile()`` whenever any tracked session's
@@ -117,11 +126,15 @@ public final class MissionControlInbox {
   /// drops it) — not the one-shot `onAppear` snapshot CE3.1 shipped. Reading the board
   /// under `withObservationTracking` re-arms the sync on each board update.
   public func trackActiveSessions(of board: MissionControlBoard) {
+    // Short-circuit once stopped: neither re-arm the board observation nor re-sync
+    // tracking, so an armed one-shot `onChange` firing after `stop()` re-subscribes
+    // nothing (see ``isStopped``).
+    guard !isStopped else { return }
     let active = withObservationTracking {
       Self.activeSessionIds(in: board.workstreams)
     } onChange: { [weak self, weak board] in
       Task { @MainActor in
-        guard let self, let board else { return }
+        guard let self, let board, !self.isStopped else { return }
         self.trackActiveSessions(of: board)
       }
     }
@@ -154,8 +167,12 @@ public final class MissionControlInbox {
     try await sessions[entry.sessionId]?.answer(requestId: entry.requestId, answer)
   }
 
-  /// Stops every tracked session's feed and empties the inbox. Idempotent.
+  /// Stops every tracked session's feed and empties the inbox. Idempotent: sets
+  /// ``isStopped`` so both self-re-arming Observation loops short-circuit, then tears
+  /// every session down — after it returns no `onChange` can re-arm the projection or
+  /// re-subscribe a feed, so a board/feed mutation racing the inbox's release is inert.
   public func stop() {
+    isStopped = true
     for session in sessions.values {
       session.stop()
     }
@@ -179,6 +196,10 @@ public final class MissionControlInbox {
   /// prompt or an answer/withdrawal — with no polling. Armed once at init; each new
   /// session tracked chains in through the observed `sessions` mutation.
   private func reconcile() {
+    // Short-circuit once stopped: do NOT re-arm the outstanding-feed observation, so an
+    // armed one-shot `onChange` firing after `stop()` re-subscribes nothing and the
+    // observation chain dies rather than re-establishing tracking (see ``isStopped``).
+    guard !isStopped else { return }
     let raw = withObservationTracking {
       currentOutstanding()
     } onChange: { [weak self] in
