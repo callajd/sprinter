@@ -59,8 +59,9 @@ interactive-session surface, not a bespoke planner.
 ### D10 — Native macOS client in SwiftUI
 Truly native, and no Rust backend (ruled out Tauri). Consequence: the Mac client
 is a **foreign consumer** of the RPC contract — it mirrors the message schemas in
-Swift and cannot share Effect types. This puts a premium on a small, stable,
-explicitly-versioned RPC surface. An Effect/TS **web** client comes later
+Swift and cannot share Effect types. This puts a premium on a small, stable RPC
+surface, kept in lockstep by goldens frozen from the TS contract (no version
+number: both sides live in one repo and land together). An Effect/TS **web** client comes later
 (inexpensive, shares types); both eventually.
 
 ### D11 — REVERSED: do **not** build on `pi-orchestrator`

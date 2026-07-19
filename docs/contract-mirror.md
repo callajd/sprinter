@@ -1,7 +1,7 @@
 # Swift contract mirror (FE2.4) — mapping & regeneration
 
 The Swift `SprinterContract` module (`apple/Sprinter/Sources/SprinterContract/`)
-is a **hand-written mirror** of the merged RPC contract v1
+is a **hand-written mirror** of the merged RPC contract
 (`packages/contract` over `packages/domain`). It is a **foreign consumer** (D10):
 it cannot share the Effect `Schema` types, so it re-declares the wire message
 shapes as Swift `Codable` DTOs and is decode-tested against **golden JSON emitted
@@ -9,8 +9,10 @@ by the TypeScript contract itself** (INV-CONTRACT). The module is
 **platform-neutral** — Foundation only, no `AppKit`/`UIKit` — so the macOS (and
 later iOS) client shells consume it as a plain SwiftPM library.
 
-This is the **divergence gate**: once this mirror decodes contract v1, Track A
-(daemon) and Track B (UI) proceed against the frozen contract.
+This is the **divergence gate**: once this mirror decodes the contract, Track A
+(daemon) and Track B (UI) proceed against the frozen contract. The goldens are the
+only lockstep mechanism — there is no contract-version number and no wire handshake;
+change the wire shape without re-freezing them and the decode tests fail.
 
 **Scope — message DTOs, not the transport envelope.** The mirror and its goldens
 cover the contract's *message bodies* (`Schema.encode` output of each payload),
@@ -46,12 +48,10 @@ Notes threaded to the contract's own decisions:
   §events); a terminal status is an ordinary change.
 - The streamed `events` **success is the `OffsetEvent` envelope** — `{ "offset":
   12, "event": { "_tag": "IssueChanged", … } }` — not the bare `WorkGraphEvent`
-  (contract v3 / CE2.0). Each item pairs the delta with its durable `event_log`
+  (CE2.0). Each item pairs the delta with its durable `event_log`
   offset (a `NonNegativeInt`, so a bare JSON integer → Swift `Int`), so a client can
   hand a streamed item's offset back as the request's `sinceOffset` cursor to resume
   strictly after it. Existing consumers that only need the delta unwrap `.event`.
-- The contract version is a compile-time marker, not a wire field; the mirror
-  tracks it as `SprinterContract.version` (currently `3`).
 
 ## What the gate checks
 
@@ -83,9 +83,7 @@ composes) changes, the Swift mirror and its goldens must ripple:
    shape, and add representative values to the generator for any new message type
    or variant.
 
-3. **Bump** `SprinterContract.version` if the contract's `CONTRACT_VERSION` bumped.
-
-4. **Run the gate** and drive it green:
+3. **Run the gate** and drive it green:
 
    ```sh
    cd apple/Sprinter && make check

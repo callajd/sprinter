@@ -1,5 +1,5 @@
 import { it } from "@effect/vitest";
-import { Context, Option, Schema } from "effect";
+import { Schema } from "effect";
 import { RpcSchema } from "effect/unstable/rpc";
 import { expect } from "vitest";
 import {
@@ -16,10 +16,7 @@ import {
 } from "@sprinter/domain";
 import {
   answerUiRequest,
-  ContractVersion,
-  CONTRACT_VERSION,
   ControlAction,
-  contractTag,
   control,
   createWorkstreamFromPlan,
   events,
@@ -72,16 +69,6 @@ const session = { id: "ses-1", jobId: "job-1", status: "active" };
 
 it("carries every model of contract v1 as a procedure", () => {
   expect([...SprinterRpc.requests.keys()].sort()).toEqual([...ALL_TAGS].sort());
-});
-
-it("marks the group with an explicit contract version (INV-CONTRACT)", () => {
-  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(3);
-  // The version key is a `Context.Reference`, so it resolves to CONTRACT_VERSION
-  // from an empty context via its default.
-  expect(Context.get(Context.empty(), ContractVersion)).toBe(CONTRACT_VERSION);
-  expect(CONTRACT_VERSION).toBe(3);
-  expect(contractTag()).toBe("v3");
-  expect(contractTag(1)).toBe("v1");
 });
 
 it("streams the reactive feeds and not the request/response models (INV-REACTIVE)", () => {

@@ -153,22 +153,3 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     }
   }
 }
-
-/// The contract version this mirror tracks (INV-CONTRACT).
-///
-/// The TS contract carries `CONTRACT_VERSION` as a compile-time group annotation
-/// (not an in-band wire field); the Swift mirror tracks it as its own constant.
-/// A contract bump ripples here and to the goldens + decode tests — see the
-/// regeneration procedure in `docs/contract-mirror.md`.
-public enum SprinterContract {
-  /// The mirrored contract version (`v3`).
-  ///
-  /// `v2` (CE5) batched the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
-  /// and the reconciliation-key `id` on ``SessionEvent``.`notice` /
-  /// ``TranscriptEntry``.`noticeEntry` (CE5.2). `v3` (CE2.0) makes the `events`
-  /// cursor usable end-to-end as ONE change: the OPTIONAL `sinceOffset` resume
-  /// cursor on ``EventsPayload`` (request) AND the ``OffsetEvent`` envelope on the
-  /// streamed response, so each item carries the durable offset the client feeds
-  /// back as that cursor — rippled here and to the goldens.
-  public static let version = 3
-}

@@ -80,8 +80,8 @@ public struct RpcBackend: Backend {
           //
           // Send a PRESENT ``EventsPayload`` (the `sinceOffset` KEY is omitted when `nil`
           // → origin replay; present → incremental resume) so the request encodes a
-          // payload object, matching the canonical Effect client (INV-CONTRACT). Under v3
-          // the payload schema is a `Struct`, so an OMITTED payload key would decode to
+          // payload object, matching the canonical Effect client (INV-CONTRACT). The
+          // payload schema is a `Struct`, so an OMITTED payload key would decode to
           // `undefined` and fail — a present object decodes correctly.
           let payload = try toJSONValue(EventsPayload(sinceOffset: sinceOffset))
           for try await value in await connection.stream(tag: "events", payload: payload) {

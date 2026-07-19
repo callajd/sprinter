@@ -91,8 +91,7 @@ BT2 (harness fixture) ──┴─► BT3, BT4, BT5, BT6  ─► BT8 (gated cros
   **fails** if any lacks a golden vector under
   `apple/Sprinter/Tests/SprinterContractTests/Goldens/`. Goldens are produced only by
   `apple/Sprinter/scripts/generate-goldens.ts` (regeneration is drift-free); both the TS
-  decode test and the Swift `SprinterContractTests` decode every golden. Records the
-  contract version (`CONTRACT_VERSION`/`SprinterContract.version`) each golden targets.
+  decode test and the Swift `SprinterContractTests` decode every golden.
 - **Depends on:** —
 
 ### BT1.2 — Negative / boundary decode vectors
