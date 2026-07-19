@@ -22,14 +22,22 @@
  * - `retryIssue` — re-dispatch an issue's Job, reusing its SAME session id.
  *
  * The session-channel procedures (`sessionEvents` / `sessionSend` / `interrupt` /
- * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle},
- * resolved through the {@link SessionRegistry} PORT (AE4.2). All four address the
- * same live session for a `sessionId` via `SessionRegistry.resolve`, which TOLERATES
- * the register-after-dispatch window: a `running` delta is fanned out BEFORE
- * `ExecutionRunner.run` registers the handle, so a client reacting to it can arrive
- * before registration — `resolve` bounded-waits for it to land rather than returning
- * a spurious `SessionNotFound` (so the app needs no retry). A genuinely-absent
- * session still fails with the contract's `SessionNotFound` after the bound.
+ * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle}, resolved
+ * through the {@link SessionRegistry} PORT (AE4.2) via the shared {@link resolveLive}
+ * helper. A registry entry only lives for its session's run scope, so the helper gates
+ * on DURABLE state (`StateStore`) to pick wait-vs-fail-fast:
+ *
+ * - a session whose durable `Session` row is still NON-TERMINAL (`starting`/`active`/
+ *   `idle`) is genuinely MID-DISPATCH: the `running` delta is fanned out BEFORE
+ *   `ExecutionRunner.run` registers the handle, so a client reacting to it can arrive
+ *   before registration. The helper routes it to `SessionRegistry.resolve`, which
+ *   bounded-waits for the handle to land rather than returning a spurious
+ *   `SessionNotFound` (so the app needs no retry);
+ * - a session whose durable row is TERMINAL (completed/failed/interrupted; the
+ *   Inspector opens channels for SETTLED jobs by design, BE4.1) OR does not exist at
+ *   all is routed to `SessionRegistry.get`, which FAILS FAST with `SessionNotFound` —
+ *   no multi-second stall waiting for a registration that will never come.
+ *
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
  * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY) — and
  * `sessionEvents` streams live over `SessionHandle.events`, never a poll
@@ -68,6 +76,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import type { SessionHandle } from "@sprinter/runner";
 import { StateStore } from "@sprinter/state";
 import { resyncEvents } from "./event-journal.ts";
 import { SessionRegistry } from "./session-registry.ts";
@@ -291,60 +300,117 @@ const retry = (
 // ── session channel (bridge a live SessionHandle) ────────────────────────────
 
 /**
+ * True while a durable {@link Session} row is still MID-DISPATCH — i.e. genuinely
+ * running (or about to), so its live {@link SessionHandle} either is registered now
+ * or is about to be within the register-after-dispatch window. The complement is a
+ * TERMINAL session (settled: `completed`/`failed`/`interrupted`), whose registry entry
+ * has already been torn down and will never reappear. Expressed as a POSITIVE
+ * allow-list of the non-terminal statuses so any future status defaults to fail-fast
+ * (never re-introducing a spurious multi-second stall on a settled/unknown state).
+ */
+const isMidDispatchSession = (status: Session["status"]): boolean =>
+  status === "starting" || status === "active" || status === "idle";
+
+/**
+ * Resolve the live {@link SessionHandle} for a `sessionId`, choosing wait-vs-fail-fast
+ * on DURABLE state (the shared gate behind all four session-channel procedures):
+ *
+ * - read the durable `Session` row from the {@link StateStore};
+ * - a row that is present AND still {@link isMidDispatchSession mid-dispatch} is bridged
+ *   through `SessionRegistry.resolve`, which bounded-WAITS out the register-after-dispatch
+ *   window so a client reacting to the `running` delta needs no retry;
+ * - a row that is TERMINAL (settled) OR ABSENT (never existed) is resolved through
+ *   `SessionRegistry.get`, which FAILS FAST with {@link SessionNotFound} — no
+ *   multi-second stall on a registration that will never land (the regression this
+ *   gate closes: the Inspector opens channels for SETTLED jobs by design, BE4.1).
+ *
+ * The `StateStore` read cannot surface a contract error, so its own `StateStoreError`
+ * becomes a defect (`orDie`) — the resolved error channel stays exactly `SessionNotFound`.
+ */
+const resolveLive = (
+  store: Store,
+  registry: Registry,
+  sessionId: SessionId,
+): Effect.Effect<SessionHandle, SessionNotFound> =>
+  store.jobs.getSession(sessionId).pipe(
+    Effect.orDie,
+    Effect.flatMap((session) =>
+      Option.match(session, {
+        // Never existed → nothing is or will be registered; fail fast.
+        onNone: () => registry.get(sessionId),
+        onSome: (row) =>
+          // Mid-dispatch → bridge the window (bounded wait); settled → fail fast.
+          isMidDispatchSession(row.status) ? registry.resolve(sessionId) : registry.get(sessionId),
+      }),
+    ),
+  );
+
+/**
  * Stream a live session's owned {@link SessionEvent} feed for the contract's
  * `sessionEvents` RPC (INV-REACTIVE): resolve the {@link SessionHandle} through
- * the registry and hand back its live `events` stream. A `SessionNotFound` from
+ * {@link resolveLive} and hand back its live `events` stream. A `SessionNotFound` from
  * the lookup surfaces as the stream's failure; the handle's `PiTransportError`
  * (transport teardown — not a contract error) becomes a defect via `Stream.orDie`,
  * so the stream's error channel is exactly `SessionNotFound`.
  */
 const bridgeEvents = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
 ): Stream.Stream<SessionEvent, SessionNotFound> =>
   Stream.unwrap(
-    registry.resolve(sessionId).pipe(Effect.map((handle) => Stream.orDie(handle.events))),
+    resolveLive(store, registry, sessionId).pipe(
+      Effect.map((handle) => Stream.orDie(handle.events)),
+    ),
   );
 
 /**
  * Drive a {@link SessionInput} into the live session for the `sessionSend` RPC:
- * resolve the {@link SessionHandle} ({@link SessionNotFound} on a miss) and call
- * `send`. The handle's `PiRpcError`/`PiTransportError` are infrastructure failures,
- * not contract errors, so they become defects — the error channel is exactly
- * `SessionNotFound`.
+ * resolve the {@link SessionHandle} through {@link resolveLive} ({@link SessionNotFound}
+ * on a miss) and call `send`. The handle's `PiRpcError`/`PiTransportError` are
+ * infrastructure failures, not contract errors, so they become defects — the error
+ * channel is exactly `SessionNotFound`.
  */
 const driveInput = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
   input: SessionInput,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry
-    .resolve(sessionId)
-    .pipe(Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)),
+  );
 
 /**
  * Abort the live session's in-flight turn for the `interrupt` RPC: resolve the
- * {@link SessionHandle} ({@link SessionNotFound} on a miss) and call `interrupt`;
- * the handle's transport failures become defects, not contract errors.
+ * {@link SessionHandle} through {@link resolveLive} ({@link SessionNotFound} on a miss)
+ * and call `interrupt`; the handle's transport failures become defects, not contract
+ * errors.
  */
 const abortTurn = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.resolve(sessionId).pipe(Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)),
+  );
 
 /**
  * Answer an outstanding UI request for the `answerUiRequest` RPC, completing the
- * `extension_ui_request` round-trip: resolve the {@link SessionHandle}
- * ({@link SessionNotFound} on a miss) and hand the neutral {@link UiResponse} to
- * the live session via `answerUi` (which is total — it cannot fail).
+ * `extension_ui_request` round-trip: resolve the {@link SessionHandle} through
+ * {@link resolveLive} ({@link SessionNotFound} on a miss) and hand the neutral
+ * {@link UiResponse} to the live session via `answerUi` (which is total — it cannot fail).
  */
 const answerUi = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
   response: UiResponse,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.resolve(sessionId).pipe(Effect.flatMap((handle) => handle.answerUi(response)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.answerUi(response)),
+  );
 
 // ── the handler layer ─────────────────────────────────────────────────────────
 
@@ -383,13 +449,14 @@ export const handlers = SprinterRpc.toLayer(
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),
       // Session channel — AE4.2. Each procedure resolves the SAME live session
-      // through the `SessionRegistry` port and bridges its neutral `SessionHandle`
-      // surface; a miss is the contract's `SessionNotFound`. `sessionEvents`
-      // streams live over `SessionHandle.events` (INV-REACTIVE).
-      sessionEvents: ({ sessionId }) => bridgeEvents(sessions, sessionId),
-      sessionSend: ({ sessionId, input }) => driveInput(sessions, sessionId, input),
-      interrupt: ({ sessionId }) => abortTurn(sessions, sessionId),
-      answerUiRequest: ({ sessionId, response }) => answerUi(sessions, sessionId, response),
+      // through `resolveLive` (the durable-state gate: mid-dispatch → bounded wait,
+      // settled/absent → fail fast) and bridges its neutral `SessionHandle` surface;
+      // a miss is the contract's `SessionNotFound`. `sessionEvents` streams live over
+      // `SessionHandle.events` (INV-REACTIVE).
+      sessionEvents: ({ sessionId }) => bridgeEvents(store, sessions, sessionId),
+      sessionSend: ({ sessionId, input }) => driveInput(store, sessions, sessionId, input),
+      interrupt: ({ sessionId }) => abortTurn(store, sessions, sessionId),
+      answerUiRequest: ({ sessionId, response }) => answerUi(store, sessions, sessionId, response),
     };
   }),
 );

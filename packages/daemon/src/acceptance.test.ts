@@ -77,6 +77,7 @@ import {
 import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
 import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
+import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
 
 // ── hard timeout so a hung socket/daemon/event fails fast, never blocks ────────
 const HARD_TIMEOUT = "15 seconds";
@@ -271,6 +272,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
   repository: { owner: "callajd", repo: "sprinter", token: "unused-in-sandbox" },
+  sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
 });
 
 // ── the real socket client (the app's transport) ──────────────────────────────

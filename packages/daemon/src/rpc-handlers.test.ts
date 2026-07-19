@@ -11,6 +11,7 @@
 import { it } from "@effect/vitest";
 import {
   Cause,
+  Clock,
   Context,
   Deferred,
   Effect,
@@ -592,78 +593,133 @@ it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   ),
 );
 
+// A durable NON-TERMINAL session row (`starting`) — the register-after-dispatch window
+// state: `JobRunner.dispatch` persists this BEFORE `run` registers the handle, so a
+// client reacting to the `running` delta arrives with the row already durable but the
+// handle not yet registered.
+const startingSession = Schema.decodeUnknownSync(Session)({
+  id: "ses-1",
+  jobId: "job-1",
+  status: "starting",
+});
+
 // The register-after-dispatch window: `JobRunner.dispatch` fans out the `running`
 // delta BEFORE `run` registers the session handle, so a client reacting to it can
-// open the session channel before registration. The handlers resolve via
-// `SessionRegistry.resolve`, which bounded-WAITS out that window rather than erroring
-// — so the app needs no retry (CE4.1 server-side fix).
-it.effect("a session-channel handler WAITS out the register-after-dispatch window", () =>
-  harness(({ client, sessions }) =>
+// open the session channel before registration. Because the durable `Session` row is
+// already `starting` (NON-TERMINAL) at that point, the handler's durable-state gate
+// routes to `SessionRegistry.resolve`, which bounded-WAITS out that window rather than
+// erroring — so the app needs no retry (CE4.1 FIX A: gate the wait on durable state).
+it.effect(
+  "a session-channel handler WAITS out the register-after-dispatch window (mid-dispatch row)",
+  () =>
+    harness(({ client, store, sessions }) =>
+      Effect.gen(function* () {
+        // Seed the durable mid-dispatch row: present + NON-TERMINAL → the gate waits.
+        yield* store.jobs.putSession(startingSession);
+        const fake = yield* makeFakeSession([]);
+        const input: SessionInput = { text: "go", mode: "prompt" };
+
+        // Open the channel BEFORE the session is registered — the handler must park, not
+        // fail with SessionNotFound. Registration lands next; the parked send then drives
+        // the live session. Event-driven, so no TestClock advance is needed here.
+        const fiber = yield* Effect.forkChild(client.sessionSend({ sessionId, input }), {
+          startImmediately: true,
+        });
+        yield* sessions.register(sessionId, fake.handle);
+        yield* Fiber.join(fiber);
+
+        const driven = yield* Queue.take(fake.sent);
+        expect(driven).toEqual(input);
+      }),
+    ),
+);
+
+// FIX A — a SETTLED session's durable row is TERMINAL, so its registry entry is gone
+// and will never come back. The gate must route to `get` and FAIL FAST — NOT wait out
+// the 5s bound (the Inspector opens channels for SETTLED jobs by design, BE4.1). Proven
+// by driving the send INLINE with NO clock advance and asserting virtual time is
+// unchanged: had it entered the bounded wait, the TestClock would deadlock (no advance
+// ever comes) — completing at all, at time zero, proves the fail-fast.
+it.effect("a SETTLED session's channel fails FAST — no 5s stall (durable row terminal)", () =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      const input: SessionInput = { text: "go", mode: "prompt" };
+      // `session` fixture is `completed` (terminal); it is NOT registered.
+      yield* store.jobs.putSession(session);
 
-      // Open the channel BEFORE the session is registered — the handler must park, not
-      // fail with SessionNotFound. Registration lands next; the parked send then drives
-      // the live session. Event-driven, so no TestClock advance is needed here.
-      const fiber = yield* Effect.forkChild(client.sessionSend({ sessionId, input }), {
-        startImmediately: true,
-      });
-      yield* sessions.register(sessionId, fake.handle);
-      yield* Fiber.join(fiber);
+      const before = yield* Clock.currentTimeMillis;
+      const error = yield* client
+        .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+        .pipe(Effect.flip);
+      const after = yield* Clock.currentTimeMillis;
 
-      const driven = yield* Queue.take(fake.sent);
-      expect(driven).toEqual(input);
+      expect(error).toBeInstanceOf(SessionNotFound);
+      // No virtual time consumed → the bounded wait was never entered.
+      expect(after).toBe(before);
     }),
   ),
 );
 
-it.effect(
-  "session-channel procedures fail with SessionNotFound after the bound for an unknown session",
-  () =>
-    harness(({ client }) =>
-      Effect.gen(function* () {
-        const missing: SessionId = Schema.decodeUnknownSync(Session)({
-          id: "ses-x",
-          jobId: "job-1",
-          status: "starting",
-        }).id;
+// FIX A — a NEVER-EXISTED session has NO durable row at all. The gate must route to
+// `get` and FAIL FAST across all four procedures, again with no clock advance.
+it.effect("session-channel procedures fail FAST for a never-existed session (no durable row)", () =>
+  harness(({ client }) =>
+    Effect.gen(function* () {
+      const missing: SessionId = Schema.decodeUnknownSync(Session)({
+        id: "ses-x",
+        jobId: "job-1",
+        status: "starting",
+      }).id;
 
-        // Genuinely absent — no session ever registers. Each procedure parks up to the
-        // hard bound and THEN fails with `SessionNotFound` (never hangs). Fork each,
-        // advance the TestClock past the bound to fire every parked wait at once, then
-        // collect the failures.
-        const startImmediately = true;
-        const sendFiber = yield* Effect.forkChild(
-          client
-            .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
-            .pipe(Effect.flip),
-          { startImmediately },
-        );
-        const interruptFiber = yield* Effect.forkChild(
-          client.interrupt({ sessionId: missing }).pipe(Effect.flip),
-          { startImmediately },
-        );
-        const answerFiber = yield* Effect.forkChild(
-          client
-            .answerUiRequest({
-              sessionId: missing,
-              response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
-            })
-            .pipe(Effect.flip),
-          { startImmediately },
-        );
-        const streamFiber = yield* Effect.forkChild(
-          client.sessionEvents({ sessionId: missing }).pipe(Stream.runHead, Effect.flip),
-          { startImmediately },
-        );
+      // No durable row and nothing registered → each procedure fails immediately (no
+      // TestClock advance): the durable-state gate never enters the bounded wait.
+      const before = yield* Clock.currentTimeMillis;
+      const sendError = yield* client
+        .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
+        .pipe(Effect.flip);
+      const interruptError = yield* client.interrupt({ sessionId: missing }).pipe(Effect.flip);
+      const answerError = yield* client
+        .answerUiRequest({
+          sessionId: missing,
+          response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
+        })
+        .pipe(Effect.flip);
+      const streamError = yield* client
+        .sessionEvents({ sessionId: missing })
+        .pipe(Stream.runHead, Effect.flip);
+      const after = yield* Clock.currentTimeMillis;
 
-        yield* TestClock.adjust(SESSION_RESOLVE_TIMEOUT);
+      expect(sendError).toBeInstanceOf(SessionNotFound);
+      expect(interruptError).toBeInstanceOf(SessionNotFound);
+      expect(answerError).toBeInstanceOf(SessionNotFound);
+      expect(streamError).toBeInstanceOf(SessionNotFound);
+      expect(after).toBe(before);
+    }),
+  ),
+);
 
-        expect(yield* Fiber.join(sendFiber)).toBeInstanceOf(SessionNotFound);
-        expect(yield* Fiber.join(interruptFiber)).toBeInstanceOf(SessionNotFound);
-        expect(yield* Fiber.join(answerFiber)).toBeInstanceOf(SessionNotFound);
-        expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(SessionNotFound);
-      }),
-    ),
+// FIX A — a genuinely mid-dispatch session (durable row NON-TERMINAL) whose handle
+// NEVER registers: the gate routes to the bounded wait, which must fail with
+// `SessionNotFound` AFTER the bound (never hang). Advancing the TestClock past the bound
+// fires the parked wait exactly.
+it.effect("a mid-dispatch session whose handle never registers fails AFTER the bound", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      // Durable row is `starting` (NON-TERMINAL) → the gate waits; nothing ever registers.
+      yield* store.jobs.putSession(startingSession);
+
+      const sendFiber = yield* Effect.forkChild(
+        client.sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } }).pipe(Effect.flip),
+        { startImmediately: true },
+      );
+      const streamFiber = yield* Effect.forkChild(
+        client.sessionEvents({ sessionId }).pipe(Stream.runHead, Effect.flip),
+        { startImmediately: true },
+      );
+
+      yield* TestClock.adjust(SESSION_RESOLVE_TIMEOUT);
+
+      expect(yield* Fiber.join(sendFiber)).toBeInstanceOf(SessionNotFound);
+      expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(SessionNotFound);
+    }),
+  ),
 );

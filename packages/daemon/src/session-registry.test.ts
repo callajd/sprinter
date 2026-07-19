@@ -7,14 +7,14 @@
  * cross this surface).
  */
 import { it } from "@effect/vitest";
-import { Effect, Exit, Fiber, Schema, Scope, Stream } from "effect";
+import { Duration, Effect, Exit, Fiber, Schema, Scope, Stream } from "effect";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import { SessionNotFound } from "@sprinter/contract";
 import { SessionId } from "@sprinter/domain";
 import type { SessionHandle } from "@sprinter/runner";
-import { layer, SESSION_RESOLVE_TIMEOUT, SessionRegistry } from "./session-registry.ts";
+import { layer, layerWith, SESSION_RESOLVE_TIMEOUT, SessionRegistry } from "./session-registry.ts";
 
 const sessionId = Schema.decodeUnknownSync(SessionId)("ses-1");
 
@@ -87,6 +87,22 @@ it.effect("resolve fails with SessionNotFound after the bound for a genuinely-ab
     expect(error).toBeInstanceOf(SessionNotFound);
     expect(error.id).toBe("ses-1");
   }).pipe(Effect.scoped, Effect.provide(layer)),
+);
+
+it.effect("layerWith honors a CONFIGURED resolve bound (FIX B — operational knob)", () =>
+  Effect.gen(function* () {
+    const registry = yield* SessionRegistry;
+    // A custom, shorter bound than the default: `resolve` must fire the timeout at
+    // exactly the configured duration, proving the bound is threaded through the layer
+    // (DaemonConfig.sessionResolveTimeout) and not the hardcoded default.
+    const customBound = Duration.seconds(1);
+    const fiber = yield* Effect.forkChild(registry.resolve(sessionId).pipe(Effect.flip), {
+      startImmediately: true,
+    });
+    yield* TestClock.adjust(customBound);
+    const error = yield* Fiber.join(fiber);
+    expect(error).toBeInstanceOf(SessionNotFound);
+  }).pipe(Effect.scoped, Effect.provide(layerWith(Duration.seconds(1)))),
 );
 
 it.effect("register is Scope-managed: the entry is removed when its scope closes", () =>

@@ -28,7 +28,7 @@
  * entrypoint (env → config → `runMain`) lives in the sibling `./run.ts`; this module
  * is the pure, tested graph.
  */
-import { Effect, Layer, Schema } from "effect";
+import { Duration, Effect, Layer, Schema } from "effect";
 import { FileSystem } from "effect/FileSystem";
 import type { PlatformError } from "effect/PlatformError";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
@@ -39,7 +39,7 @@ import { layerFetch as layerRepository, type RepositoryConfig } from "@sprinter/
 import { layer as layerStateSqlite } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
-import { layer as layerSessionRegistry } from "./session-registry.ts";
+import { layerWith as layerSessionRegistry, SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
 import { layerRegisterSessions } from "./session-runner.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 import { layer as layerWorkGraphEvents } from "./work-graph-events.ts";
@@ -60,6 +60,14 @@ export interface DaemonConfig {
   readonly workspaceRoot: string;
   /** The single bound repository the daemon reconciles against (repo-scoped, D14). */
   readonly repository: RepositoryConfig;
+  /**
+   * The hard bound the session-channel handlers wait for a genuinely mid-dispatch
+   * session's handle to register before failing `SessionNotFound` (the
+   * register-after-dispatch window — a `pi` spawn + RPC handshake). Defaults to
+   * {@link SESSION_RESOLVE_TIMEOUT} (5s); the operational knob to RAISE if a real `pi`
+   * cold-start exceeds it (a spurious `SessionNotFound` with no other lever otherwise).
+   */
+  readonly sessionResolveTimeout: Duration.Duration;
 }
 
 /**
@@ -88,7 +96,21 @@ export const configFromEnv = (env: Readonly<Record<string, string | undefined>>)
       repo: env["SPRINTER_REPO_NAME"] ?? "sprinter",
       token,
     },
+    sessionResolveTimeout: sessionResolveTimeoutFrom(env["SPRINTER_SESSION_RESOLVE_TIMEOUT_MS"]),
   };
+};
+
+/**
+ * Resolve the session-resolve bound from an optional millisecond env override,
+ * defaulting to {@link SESSION_RESOLVE_TIMEOUT}. A missing, blank, non-numeric, or
+ * non-positive value falls back to the default rather than a nonsensical bound — the
+ * knob only ever RAISES a sane cold-start allowance, never breaks it (INV-NOCAST: the
+ * parse is a total `Number` check, no assertion).
+ */
+const sessionResolveTimeoutFrom = (raw: string | undefined): Duration.Duration => {
+  if (raw === undefined || raw.trim() === "") return SESSION_RESOLVE_TIMEOUT;
+  const ms = Number(raw);
+  return Number.isInteger(ms) && ms > 0 ? Duration.millis(ms) : SESSION_RESOLVE_TIMEOUT;
 };
 
 // ── port sub-graphs ───────────────────────────────────────────────────────────
@@ -135,7 +157,7 @@ export const executionRunnerLayer = (config: DaemonConfig) =>
  */
 const portsLayer = (config: DaemonConfig) =>
   Layer.mergeAll(stateStoreLayer(config), executionRunnerLayer(config)).pipe(
-    Layer.provideMerge(layerSessionRegistry),
+    Layer.provideMerge(layerSessionRegistry(config.sessionResolveTimeout)),
     Layer.provideMerge(layerWorkGraphEvents),
   );
 
