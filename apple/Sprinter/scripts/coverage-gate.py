@@ -39,6 +39,25 @@ EXEMPT_SOURCES: set[str] = {
     "/Sources/SprinterBackend/Backend.swift",
 }
 
+# Whole-directory exemptions (policy.md §Coverage: app entry points + pure view layout
+# with no logic). Each prefix needs a written justification.
+EXEMPT_PREFIXES: tuple[str, ...] = (
+    # The executable target (CE3.1): the `@main` SwiftUI `App`, the `#if os(...)` /
+    # AppKit platform shell, and the thin feature Views. It is the D10 platform edge —
+    # all logic lives in the (already-tested) view models and the covered
+    # `SprinterAppSupport` composition layer, and the Views hold none. SwiftUI View
+    # layout is not linked into any test target and is impractical to unit-test, so the
+    # whole target is exempt from the presence requirement (INV-COV covers the real
+    # logic modules, which stay >= 75%). Non-View glue lives in SprinterAppSupport,
+    # which is NOT exempt and is tested.
+    "/Sources/SprinterApp/",
+)
+
+
+def is_exempt(path: str) -> bool:
+    """Whether a shipped source is exempt from the presence requirement."""
+    return path in EXEMPT_SOURCES or path.startswith(EXEMPT_PREFIXES)
+
 
 def sources_on_disk() -> set[str]:
     """Canonical `/Sources/...` suffix for every shipped Swift source on disk."""
@@ -75,7 +94,7 @@ def main() -> int:
 
     # Every shipped source must appear in the report; an absent one is un-linked /
     # un-exercised and its 0% coverage would otherwise be invisible to the aggregate.
-    missing = sorted(sources_on_disk() - reported - EXEMPT_SOURCES)
+    missing = sorted(path for path in sources_on_disk() - reported if not is_exempt(path))
     if missing:
         print("coverage gate: shipped source(s) absent from report (no test exercises them):", file=sys.stderr)
         for path in missing:
