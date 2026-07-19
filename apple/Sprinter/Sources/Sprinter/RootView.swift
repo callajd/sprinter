@@ -61,10 +61,14 @@ private struct ConnectedShell: View {
     }
     .toolbar { toolbarContent }
     .sheet(isPresented: $showInbox) {
-      InboxContainer(model: model, backend: backend)
+      SheetFrame(title: "Inbox") {
+        InboxContainer(model: model, backend: backend)
+      }
     }
     .sheet(isPresented: $showPlanner) {
-      PlannerContainer(backend: backend)
+      SheetFrame(title: "New plan") {
+        PlannerContainer(backend: backend)
+      }
     }
   }
 
@@ -93,6 +97,29 @@ private struct ConnectedShell: View {
       } label: {
         Label("New plan", systemImage: "plus")
       }
+    }
+  }
+}
+
+/// Wraps sheet content with a title bar and a `Done` button. macOS sheets have no
+/// built-in dismissal (no click-outside, no Escape), so every sheet MUST supply its
+/// own close affordance — without this a presented sheet (e.g. the empty inbox) traps
+/// the user. The `Done` button dismisses via the environment, so the wrapped content
+/// stays a thin, dismissal-agnostic View.
+private struct SheetFrame<Content: View>: View {
+  let title: String
+  @ViewBuilder let content: Content
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationStack {
+      content
+        .navigationTitle(title)
+        .toolbar {
+          ToolbarItem(placement: .confirmationAction) {
+            Button("Done") { dismiss() }
+          }
+        }
     }
   }
 }

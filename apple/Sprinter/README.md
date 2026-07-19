@@ -29,8 +29,8 @@ Ordered stages, non-zero exit on any violation (this is what CI runs, FE1.3):
 3. `swift build` — Swift 6 language mode, strict concurrency = complete,
    `-warnings-as-errors`.
 4. `swift test --enable-code-coverage` — `swift-testing`.
-5. Coverage gate — `scripts/coverage-gate.py` parses the `llvm-cov` JSON and
-   fails under **75%** line **and** function over `Sources/`.
+5. Coverage gate — `scripts/check.sh` reads the `llvm-cov` (LLVM, toolchain) TOTAL
+   and fails under **75%** line **and** function over `Sources/` (tests + deps excluded).
 
 ```sh
 make check

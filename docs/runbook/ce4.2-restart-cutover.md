@@ -87,7 +87,7 @@ pgrep -f 'packages/daemon/src/run.ts'
 
 ### 3. Connect the app and dispatch the Issue
 
-Open the app (`swift run SprinterApp` from `apple/Sprinter`, or from Xcode) with the same
+Open the app (`swift run Sprinter` from `apple/Sprinter`, or from Xcode) with the same
 `SPRINTER_SOCKET`. Materialize a plan, then start the workstream (or retry the Issue) so
 the daemon dispatches the Job through the real `LocalPi` runner. In **Interactive session**
 you should see the transcript stream. **Leave the agent mid-run** — before it settles.

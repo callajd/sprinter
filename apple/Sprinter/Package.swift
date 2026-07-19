@@ -175,9 +175,10 @@ let package = Package(
     // AppKit/UIKit glue lives HERE ONLY (D10 / INV-PORT) — the ONE platform edge;
     // the feature libraries stay platform-neutral. Views hold no logic (it all lives
     // in the already-tested view models), so this target is the coverage-exempt
-    // platform edge (app entry point + pure view layout, see scripts/coverage-gate.py).
+    // platform edge (app entry point + pure view layout; naturally absent from the
+    // coverage report since no test target links it — see scripts/check.sh).
     .executableTarget(
-      name: "SprinterApp",
+      name: "Sprinter",
       dependencies: [
         "SprinterAppSupport", "SprinterBackend", "SprinterContract",
         "SprinterMissionControl", "SprinterSession", "SprinterInspector",

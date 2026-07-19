@@ -86,7 +86,7 @@ bun run check                      # gates green before you start
 cd apple/Sprinter && make check && cd -
 ```
 
-Open the macOS app from Xcode (or `swift run SprinterApp` from `apple/Sprinter`).
+Open the macOS app from Xcode (or `swift run Sprinter` from `apple/Sprinter`).
 
 ### 2. Start the real daemon against the sandbox repo
 
