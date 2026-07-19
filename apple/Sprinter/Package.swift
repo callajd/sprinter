@@ -149,5 +149,40 @@ let package = Package(
       dependencies: ["SprinterInspector"],
       swiftSettings: swiftSettings
     ),
+    // App composition layer (CE3.1): daemon-endpoint resolution and the live-backend
+    // wiring (`BackendConnector` → `WorkGraphResync`) plus the top-level `AppModel`
+    // the SwiftUI shell renders. Platform-neutral (Foundation + Observation, no
+    // AppKit/UIKit, no `#if os(...)`, D10 / INV-PORT), so this — the testable non-View
+    // glue — is verified by `make check` (INV-COV); the thin SwiftUI Views live in the
+    // executable target, the one platform edge.
+    .target(
+      name: "SprinterAppSupport",
+      dependencies: [
+        "SprinterBackend", "SprinterContract", "SprinterMissionControl",
+      ],
+      swiftSettings: swiftSettings
+    ),
+    // Endpoint resolution + `AppModel` lifecycle tested against a FAKE `Backend`
+    // (a fake `DaemonTransportProvider` for the live connect seam) — deterministic
+    // and offline, no live daemon/network/socket in the gate.
+    .testTarget(
+      name: "SprinterAppSupportTests",
+      dependencies: ["SprinterAppSupport"],
+      swiftSettings: swiftSettings
+    ),
+    // The running macOS app (CE3.1): the `@main` SwiftUI `App` + the thin feature
+    // Views rendering the existing view models. The `#if os(...)` shell + any
+    // AppKit/UIKit glue lives HERE ONLY (D10 / INV-PORT) — the ONE platform edge;
+    // the feature libraries stay platform-neutral. Views hold no logic (it all lives
+    // in the already-tested view models), so this target is the coverage-exempt
+    // platform edge (app entry point + pure view layout, see scripts/coverage-gate.py).
+    .executableTarget(
+      name: "SprinterApp",
+      dependencies: [
+        "SprinterAppSupport", "SprinterBackend", "SprinterContract",
+        "SprinterMissionControl", "SprinterSession", "SprinterInspector",
+      ],
+      swiftSettings: swiftSettings
+    ),
   ]
 )
