@@ -498,6 +498,16 @@ const entryAppended2: SessionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
 };
+// EPHEMERAL live deltas — the live driving modality the ONE channel must also carry: they
+// ride the feed offset-less, are never persisted, and never advance the resume cursor.
+const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+const messageDelta: SessionEvent = { _tag: "MessageDelta", messageId: "a2", text: "do" };
+const uiRequest: SessionEvent = {
+  _tag: "UiRequestRaised",
+  id: "u1",
+  kind: "confirm",
+  prompt: "proceed?",
+};
 
 /**
  * A fake live {@link SessionHandle}: a caller-supplied owned `SessionEvent` stream
@@ -543,8 +553,10 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
 
       const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
       expect(received.map((i) => i.event)).toEqual([entryAppended, noticeEvent, entryAppended2]);
-      // Offsets are monotonic (the durable per-session coordinate).
-      const offsets = received.map((i) => i.offset);
+      // A settled replay is DURABLE-ONLY: every item is offset-BEARING and monotonic (the
+      // durable per-session coordinate).
+      const offsets = received.flatMap((i) => (i.offset === undefined ? [] : [i.offset]));
+      expect(offsets.length).toBe(received.length);
       expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
 
       // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
@@ -553,7 +565,7 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
         .sessionEvents({ sessionId, sinceOffset: cursor })
         .pipe(Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
-      expect(resumed.every((i) => i.offset > cursor)).toBe(true);
+      expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
     }),
   ),
 );
@@ -603,6 +615,60 @@ it.effect("sessionEvents completes when a live session settles (no hang on the d
 
       const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
       expect(received.map((i) => i.event)).toEqual([entryAppended]);
+    }),
+  ),
+);
+
+// The ONE channel serves BOTH modalities: a LIVE driving session must receive its EPHEMERAL
+// deltas (turn lifecycle, message partials, `UiRequestRaised`) AND its DURABLE entries,
+// interleaved in emission order — ephemerals offset-LESS, durables offset-STAMPED. This is
+// the exact regression the correction fixes (the prior pass dropped every ephemeral).
+it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable entries", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      // A STILL-RUNNING session: `result` stays pending so the live tail keeps forwarding.
+      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+      yield* sessions.register(sessionId, liveHandle);
+
+      // Collect the full interleaved flow off the live tail (nothing durable pre-attach).
+      const collecting = yield* client
+        .sessionEvents({ sessionId })
+        .pipe(Stream.take(5), Stream.runCollect, Effect.forkChild);
+      yield* Effect.sleep("20 millis"); // let the subscription settle before emitting
+
+      // Tee a mix through the decorated store exactly as the JobRunner fold does: ephemeral
+      // deltas via `publishEphemeral` (offset-less), durable entries via `append` (offset).
+      yield* store.sessionLog.publishEphemeral(sessionId, turnStarted);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.publishEphemeral(sessionId, messageDelta);
+      yield* store.sessionLog.publishEphemeral(sessionId, uiRequest);
+      yield* store.sessionLog.append(sessionId, entryAppended2);
+
+      const received = yield* Fiber.join(collecting);
+      // ALL five arrive, in emission order (no ephemeral dropped — the design regression fixed).
+      expect(received.map((i) => i.event)).toEqual([
+        turnStarted,
+        entryAppended,
+        messageDelta,
+        uiRequest,
+        entryAppended2,
+      ]);
+      // Ephemeral deltas are offset-LESS; durable entries are offset-STAMPED and monotonic.
+      const presence = received.map((i) => i.offset !== undefined);
+      expect(presence).toEqual([false, true, false, false, true]);
+      const durableOffsets = received.flatMap((i) => (i.offset === undefined ? [] : [i.offset]));
+      expect(durableOffsets).toEqual([...durableOffsets].sort((a, b) => a - b));
+
+      // Resume IGNORES ephemerals: because they were never persisted, a cursor at the first
+      // durable offset replays ONLY the durable suffix (the second entry). The handle is still
+      // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
+      const cursor = durableOffsets[0] ?? 0;
+      const resumed = yield* client
+        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .pipe(Stream.take(1), Stream.runCollect);
+      expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
+      expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
     }),
   ),
 );

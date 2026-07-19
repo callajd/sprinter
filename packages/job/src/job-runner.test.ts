@@ -14,9 +14,9 @@ import { Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
-import { Issue, Job, type SessionEvent, type SessionInput } from "@sprinter/domain";
+import { Issue, Job, type SessionEvent, SessionId, type SessionInput } from "@sprinter/domain";
 import { PiTransportError, type SessionHandle, type SessionResult } from "@sprinter/runner";
-import { layerMemory, StateStore } from "@sprinter/state";
+import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
 import { ExecutionRunner, ExecutionRunnerError, JobRunner, layer } from "./index.ts";
 
 // ============================================================================
@@ -34,6 +34,41 @@ const entryEvent: SessionEvent = {
   entry: { _tag: "UserMessage", id: "u1", text: "hi" },
 };
 const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+// A durable, transcript-grade `Notice` (offset-bearing) and an ephemeral `MessageDelta`
+// (offset-less) — used to prove the fold routes BOTH modalities, dropping nothing.
+const noticeEvent: SessionEvent = { _tag: "Notice", id: "n1", level: "info", message: "go" };
+const messageDelta: SessionEvent = { _tag: "MessageDelta", messageId: "u1", text: "h" };
+
+/**
+ * A {@link StateStore} decorator over `layerMemory` that RECORDS every `sessionLog.append`
+ * (durable) and `sessionLog.publishEphemeral` (ephemeral) call while delegating to the base —
+ * so a test can assert the JobRunner fold routes durable entries to `append` and ephemeral
+ * deltas to `publishEphemeral`, teeing the whole flow.
+ */
+const recordingStore = (
+  appended: Ref.Ref<ReadonlyArray<SessionEvent>>,
+  published: Ref.Ref<ReadonlyArray<SessionEvent>>,
+): Layer.Layer<StateStore, StateStoreError> =>
+  Layer.effect(
+    StateStore,
+    Effect.gen(function* () {
+      const base = yield* StateStore;
+      return StateStore.of({
+        ...base,
+        sessionLog: {
+          ...base.sessionLog,
+          append: (sessionId, event) =>
+            Ref.update(appended, (xs) => [...xs, event]).pipe(
+              Effect.andThen(base.sessionLog.append(sessionId, event)),
+            ),
+          publishEphemeral: (sessionId, event) =>
+            Ref.update(published, (xs) => [...xs, event]).pipe(
+              Effect.andThen(base.sessionLog.publishEphemeral(sessionId, event)),
+            ),
+        },
+      });
+    }),
+  ).pipe(Layer.provide(layerMemory));
 
 /** A fake {@link SessionHandle}: a canned event stream and terminal result; the drive/answer verbs are inert. */
 const fakeHandle = (
@@ -121,6 +156,47 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
     const byId = Option.getOrThrow(yield* store.jobs.getSession(forJob.id));
     expect(byId).toStrictEqual(forJob);
   }).pipe(provide(fakeHandle(Stream.make(turnStarted, entryEvent), { _tag: "Completed" }))),
+);
+
+// ============================================================================
+// Dual-modality tee (contract v4) — the fold routes durable vs ephemeral events
+// ============================================================================
+
+it.effect(
+  "tees the whole fold — durable entries via append, ephemeral deltas via publishEphemeral",
+  () =>
+    Effect.gen(function* () {
+      const appended = yield* Ref.make<ReadonlyArray<SessionEvent>>([]);
+      const published = yield* Ref.make<ReadonlyArray<SessionEvent>>([]);
+      // A session emitting a MIX of ephemeral (TurnStarted, MessageDelta) and durable
+      // (EntryAppended, Notice) events, interleaved.
+      const handle = fakeHandle(Stream.make(turnStarted, entryEvent, messageDelta, noticeEvent), {
+        _tag: "Completed",
+      });
+
+      yield* Effect.gen(function* () {
+        const job = yield* makeJob();
+        const runner = yield* JobRunner;
+        yield* runner.dispatch(job);
+
+        // Only the durable events reached the durable transcript log (ephemerals never persist).
+        const store = yield* StateStore;
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+          Effect.orDie,
+        );
+        const persisted = yield* store.sessionLog.read(sessionId);
+        expect(persisted.map((e) => e.event)).toEqual([entryEvent, noticeEvent]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provide(fakeRunner(handle)),
+        Effect.provide(recordingStore(appended, published)),
+      );
+
+      // The fold DROPPED NOTHING: durable events took `append`, ephemeral deltas `publishEphemeral`.
+      expect(yield* Ref.get(appended)).toEqual([entryEvent, noticeEvent]);
+      expect(yield* Ref.get(published)).toEqual([turnStarted, messageDelta]);
+    }),
 );
 
 // ============================================================================

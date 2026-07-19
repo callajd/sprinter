@@ -484,6 +484,10 @@ const make = Effect.gen(function* () {
         const persisted: PersistedSessionEvent = { offset: decoded[0].offset, event };
         return persisted;
       }).pipe(Effect.mapError(fail("sessionLog.append"))),
+    // The base store owns DURABILITY, not the live feed: an ephemeral delta is not persisted
+    // here, so this is a total no-op. The daemon's journaling decorator overrides it to fan
+    // the delta out on the `SessionEvents` feed offset-less (contract v4).
+    publishEphemeral: () => Effect.void,
     read: (sessionId) =>
       sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} ORDER BY "offset"`.pipe(
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),

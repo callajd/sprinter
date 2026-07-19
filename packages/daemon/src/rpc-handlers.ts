@@ -46,7 +46,7 @@
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
  * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY). `sessionSend` /
  * `interrupt` / `answerUiRequest` stay LIVE-only (a settled session is read-only). Only
- * `sessionEvents` gains DURABLE replay: it replays the session's durable
+ * `sessionEvents` gains DURABLE replay (contract v4): it replays the session's durable
  * transcript from the client's `sinceOffset` cursor then live-tails new durable entries if
  * the session is running, or COMPLETES if it has settled — the session-channel mirror of
  * the `events` offset-resync, so a SETTLED session's transcript is viewable in the Inspector
@@ -211,7 +211,7 @@ const dispatchInBackground = (runner: Runner, scope: Scope, job: Job): Effect.Ef
  * scope): `pause`/`cancel` are status-only here — they transition the workstream
  * node but do NOT interrupt an in-flight session (that rides on the session
  * `interrupt` channel, AE4.2) nor roll status down to epics/issues/jobs. `cancel`
- * maps to the distinct terminal `cancelled` (CE5.1) — a cancelled
+ * maps to the distinct terminal `cancelled` (contract v2 / CE5.1) — a cancelled
  * workstream is terminal-but-not-`done`, so it renders and reconciles apart from a
  * completed one ({@link isTerminal}).
  */
@@ -402,17 +402,19 @@ const resolveLive = (
   );
 
 /**
- * Serve the contract's `sessionEvents` RPC as a DURABLE replay-then-tail —
- * the session-channel mirror of {@link resyncEvents}. Each streamed item is an
- * {@link OffsetSessionEvent} carrying the durable per-session offset; replay and live tail
- * share ONE coordinate space (the session fold journals and the decorator publishes the
- * same offset it appended), so a client resumes from any streamed item's offset.
+ * Serve the contract's `sessionEvents` RPC as a UNIFIED replay-then-tail (contract v4) — the
+ * session-channel mirror of {@link resyncEvents}, serving BOTH the settled-transcript replay
+ * AND the live driving modality over ONE channel. Each streamed item is an
+ * {@link OffsetSessionEvent} whose offset is PRESENT for a durable transcript-grade event
+ * (replay and live tail share ONE coordinate space — the session fold journals and the
+ * decorator publishes the same offset it appended — so a client resumes from any offset-bearing
+ * item's offset) and ABSENT for an ephemeral live delta.
  *
  * The flow:
  *
  * - EAGERLY subscribe to the live {@link SessionEvents} feed BEFORE reading the durable log,
  *   so a durable entry committed between the read and the live hand-over is not lost
- *   (subscribe-before-replay). The small boundary overlap it can produce (an offset
+ *   (subscribe-before-replay). The small boundary overlap it can produce (a durable offset
  *   repeating where the durable replay and the live tail meet) is absorbed by the consumer's
  *   id-keyed transcript reconciliation, exactly as the work-graph feed's overlap is absorbed
  *   by upsert idempotency.
@@ -421,9 +423,11 @@ const resolveLive = (
  *   session resolves its handle (bounded wait), a settled/absent session fails fast.
  * - Replay the session's durable transcript from `sinceOffset` (absent → the ORIGIN) via
  *   {@link resyncSessionFrom} (`SessionLogStore.tail`), batched and strictly ordered by
- *   offset.
- * - If the session is LIVE, CONTINUE with the live tail (new durable entries fanned out on
- *   the feed as the fold journals them, filtered to this session). If the session is SETTLED
+ *   offset. Replay is DURABLE-ONLY: only offset-bearing events were persisted, so a reconnect
+ *   never re-delivers (or needs to re-derive) an ephemeral delta.
+ * - If the session is LIVE, CONTINUE with the live tail — BOTH new durable entries
+ *   (offset-stamped) AND ephemeral deltas (offset-less) fanned out on the feed as the fold
+ *   runs, filtered to this session, interleaved in emission order. If the session is SETTLED
  *   (no live handle, but a durable transcript exists), the fold has ended, so the durable log
  *   holds the WHOLE transcript — replay it and the stream COMPLETES (never a spurious
  *   `SessionNotFound` for a settled session, the gap this closes). If the session NEVER
@@ -463,7 +467,15 @@ const resyncSessionEvents = (
       const handle = live.value;
       const liveTail = Stream.fromSubscription(subscription).pipe(
         Stream.filter((item) => item.sessionId === sessionId),
-        Stream.map((item): OffsetSessionEvent => ({ offset: item.offset, event: item.event })),
+        // Forward BOTH modalities interleaved in emission order: a durable entry keeps its
+        // offset (advances the resume cursor), an ephemeral delta stays offset-less (the key
+        // is omitted, not set to `undefined` — `exactOptionalPropertyTypes`).
+        Stream.map(
+          (item): OffsetSessionEvent =>
+            item.offset === undefined
+              ? { event: item.event }
+              : { offset: item.offset, event: item.event },
+        ),
         Stream.interruptWhen(handle.result.pipe(Effect.orDie)),
       );
       return Stream.concat(replay, liveTail);
@@ -543,7 +555,7 @@ export const handlers = SprinterRpc.toLayer(
       // persisted history deterministically, not only the deltas after it attaches.
       // Subscribe-before-replay closes the gap; upsert-idempotent deltas (D8) absorb
       // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
-      // durable offset (CE2.0), and replay + live offsets share one
+      // durable offset (contract v3 / CE2.0), and replay + live offsets share one
       // coordinate space, so the client can feed a streamed item's offset back as
       // `sinceOffset`. The cursor is OPTIONAL: a request with NO `sinceOffset` (a
       // present but empty `{}` payload) replays from origin, present resumes strictly
@@ -555,7 +567,7 @@ export const handlers = SprinterRpc.toLayer(
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),
-      // Session channel — AE4.2. `sessionSend`/`interrupt`/`answerUiRequest`
+      // Session channel — AE4.2 + contract v4. `sessionSend`/`interrupt`/`answerUiRequest`
       // resolve the SAME live session through `resolveLive` (the durable-state gate:
       // mid-dispatch → bounded wait, settled/absent → fail fast) and bridge its neutral
       // `SessionHandle` surface; a miss is the contract's `SessionNotFound` — a settled

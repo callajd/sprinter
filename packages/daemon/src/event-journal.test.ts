@@ -365,6 +365,10 @@ const entryA2: SessionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
 };
+// Ephemeral live deltas — NOT transcript-grade, so `publishEphemeral` fans them out
+// offset-less and never persists them (contract v4).
+const turnStartedA: SessionEvent = { _tag: "TurnStarted" };
+const deltaA: SessionEvent = { _tag: "MessageDelta", messageId: "a1", text: "hel" };
 
 it.effect(
   "resyncSessionFrom replays a session's durable transcript, offset-stamped and scoped",
@@ -381,7 +385,9 @@ it.effect(
       const replay = yield* resyncSessionFrom(store, sessionA, 0).pipe(Stream.runCollect);
       // Only session A's entries, in order — session B is scoped out.
       expect(replay.map((e) => e.event)).toEqual([entryA1, noticeA, entryA2]);
-      const offsets = replay.map((e) => e.offset);
+      // A durable replay is offset-BEARING throughout (every item has a present offset).
+      const offsets = replay.flatMap((e) => (e.offset === undefined ? [] : [e.offset]));
+      expect(offsets.length).toBe(replay.length);
       expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
       expect(offsets.every((o) => o > 0)).toBe(true);
 
@@ -389,7 +395,7 @@ it.effect(
       const cursor = offsets[0] ?? 0;
       const fromSecond = yield* resyncSessionFrom(store, sessionA, cursor).pipe(Stream.runCollect);
       expect(fromSecond.map((e) => e.event)).toEqual([noticeA, entryA2]);
-      expect(fromSecond.every((e) => e.offset > cursor)).toBe(true);
+      expect(fromSecond.every((e) => e.offset !== undefined && e.offset > cursor)).toBe(true);
     }).pipe(
       Effect.scoped,
       Effect.provide(layerJournaling(layerMemory)),
@@ -413,9 +419,43 @@ it.effect("the SessionEvents feed stamps every appended durable entry with its o
     expect([first.event, second.event]).toEqual([entryA1, noticeA]);
     expect(first.sessionId).toBe(sessionA);
     // The live offsets match the durably-journaled ones exactly — one coordinate space.
+    // Both are durable appends, so both feed items are offset-BEARING (present).
     const journaled = yield* store.sessionLog.tail(sessionA, 0);
     expect([first.offset, second.offset]).toEqual(journaled.map((j) => j.offset));
-    expect(second.offset > first.offset).toBe(true);
+    expect(
+      first.offset !== undefined && second.offset !== undefined && second.offset > first.offset,
+    ).toBe(true);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.effect("the SessionEvents feed fans out ephemeral deltas OFFSET-LESS, without persisting", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const sessionFeed = yield* SessionEvents;
+    const subscription = yield* sessionFeed.subscribe;
+
+    // Interleave a durable append and two ephemeral publishes, as the fold's tee does.
+    yield* store.sessionLog.append(sessionA, entryA1);
+    yield* store.sessionLog.publishEphemeral(sessionA, turnStartedA);
+    yield* store.sessionLog.publishEphemeral(sessionA, deltaA);
+
+    const first = yield* PubSub.take(subscription);
+    const second = yield* PubSub.take(subscription);
+    const third = yield* PubSub.take(subscription);
+    // All three reach the live feed, in emission order (the dual modality on ONE channel).
+    expect([first.event, second.event, third.event]).toEqual([entryA1, turnStartedA, deltaA]);
+    // The durable entry is offset-STAMPED; the ephemeral deltas are offset-LESS.
+    expect(first.offset).not.toBeUndefined();
+    expect(second.offset).toBeUndefined();
+    expect(third.offset).toBeUndefined();
+    // Ephemeral deltas are NOT persisted: the durable transcript holds only the one entry.
+    const persisted = yield* store.sessionLog.read(sessionA);
+    expect(persisted.map((e) => e.event)).toEqual([entryA1]);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),

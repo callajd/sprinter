@@ -123,6 +123,19 @@ const appendAndPublish =
       );
 
 /**
+ * Fan one EPHEMERAL live session event out on the {@link SessionEvents} feed OFFSET-LESS,
+ * WITHOUT persisting it — the live-only half of the session channel's dual modality (contract
+ * v4). Where {@link appendAndPublish} persists a durable entry and publishes it stamped with
+ * its minted offset, this publishes with NO offset (the item omits the key), so the event
+ * reaches every live subscriber to drive the reactive flow but never joins the durable
+ * transcript and never advances the `sinceOffset` reconnect cursor. Total (it cannot fail).
+ */
+const publishEphemeralLive =
+  (sessionFeed: SessionFeed) =>
+  (sessionId: SessionId, event: SessionEvent): Effect.Effect<void> =>
+    sessionFeed.publish({ sessionId, event });
+
+/**
  * Build the journaling store shape: delegate to `base`, then for each `put*` journal
  * its delta durably AND publish it live stamped with the durable offset, and for each
  * durable session-transcript `append` publish it live on the {@link SessionEvents} feed
@@ -163,6 +176,7 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
     events: base.events,
     sessionLog: {
       append: appendAndPublish(base, sessionFeed),
+      publishEphemeral: publishEphemeralLive(sessionFeed),
       read: base.sessionLog.read,
       tail: base.sessionLog.tail,
     },

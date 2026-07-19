@@ -174,13 +174,16 @@ write("offset-events", Schema.Array(OffsetEvent), [
 
 // ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────
 //
-// Each streamed item pairs a DURABLE, transcript-grade SessionEvent with its durable
-// per-session offset, so a client can feed the offset back as the request's `sinceOffset`
-// cursor. Only durable transcript-grade events flow here (EntryAppended records + Notices);
-// the sample resumes from a mid-transcript position (2,3,4) — the strict `> sinceOffset`
-// slice a reconnect resumes from.
+// The ONE channel serves BOTH modalities: DURABLE transcript-grade events carry a per-session
+// `offset` (replayable; the client feeds it back as `sinceOffset`), while EPHEMERAL live deltas
+// ride the SAME channel OFFSET-LESS (the `offset` key is omitted). The sample interleaves both:
+// the durable entries resume from a mid-transcript position (2,3,4), and the ephemeral deltas
+// (TurnStarted, MessageDelta, UiRequestRaised) prove the mirror decodes a missing `offset` to
+// `nil` and still surfaces the event.
 
 write("offset-session-events", Schema.Array(OffsetSessionEvent), [
+  // Ephemeral live delta — NO `offset` key (turn lifecycle).
+  { event: { _tag: "TurnStarted" } },
   {
     offset: 2,
     event: {
@@ -188,7 +191,11 @@ write("offset-session-events", Schema.Array(OffsetSessionEvent), [
       entry: { _tag: "AssistantMessage", id: "a1", text: "on it", reasoning: "planning" },
     },
   },
+  // Ephemeral message partial — offset-less.
+  { event: { _tag: "MessageDelta", messageId: "a1", text: "on " } },
   { offset: 3, event: { _tag: "Notice", id: "notice-disk", level: "warn", message: "disk low" } },
+  // Ephemeral interactive request — offset-less.
+  { event: { _tag: "UiRequestRaised", id: "u1", kind: "confirm", prompt: "proceed?" } },
   {
     offset: 4,
     event: {

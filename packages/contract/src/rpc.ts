@@ -123,28 +123,34 @@ export const OffsetEvent = Schema.Struct({
 export type OffsetEvent = (typeof OffsetEvent)["Type"];
 
 /**
- * One streamed `sessionEvents` item: a durable, transcript-grade {@link SessionEvent}
- * paired with its DURABLE per-session `offset` — the position it was journaled at in the
- * session's durable transcript log. It is the session-channel mirror of
- * {@link OffsetEvent}: the stream carries the offset so a reconnecting client can remember
- * its last-seen position and hand it back as the request's `sinceOffset` cursor to resume
- * strictly after it.
+ * One streamed `sessionEvents` item: a {@link SessionEvent} paired with an OPTIONAL DURABLE
+ * per-session `offset`. This ONE channel serves BOTH session modalities —
+ * live driving AND settled-transcript replay — so `offset` is optional, the one deliberate
+ * divergence from the work-graph {@link OffsetEvent} (whose offset is ALWAYS present because
+ * every work-graph event is durable). Sessions carry a SUPERSET: the durable transcript
+ * grade PLUS the ephemeral live deltas. Semantics of `offset`:
  *
- * The offset is a durable per-session transcript coordinate shared by BOTH the replay
- * (the durable log `tail`) and the live tail (new durable entries fanned out as the session
- * runs), so replay and live are one coordinate space and a client CAN resume from any
- * streamed item's offset. Only the DURABLE, transcript-grade events flow here — the
- * `EntryAppended` records the transcript folds and the reconcilable `Notice`s — NOT the
- * ephemeral streaming deltas (message/tool partials, turn lifecycle), which are not
- * journaled and carry no durable offset. The strict `> sinceOffset` guarantee is scoped to
- * the RECONNECT RESUME (the durable `tail`); a single live stream can show a harmless
- * boundary overlap where the durable replay and the live tail meet (an offset repeating),
- * absorbed by the consumer's id-keyed transcript reconciliation (a durable entry replaces
- * the item its live counterpart built) exactly as `OffsetEvent` overlap is absorbed by
- * upsert idempotency.
+ * - **PRESENT** ⇒ the event is DURABLE and transcript-grade (an `EntryAppended` record or a
+ *   reconcilable `Notice`): it was journaled to the session's durable transcript log at this
+ *   offset, it is REPLAYABLE, and it ADVANCES the reconnect resume cursor. The offset is a
+ *   durable per-session coordinate shared by BOTH the replay (the durable log `tail`) and the
+ *   live tail (new durable entries fanned out as the session runs), so replay and live are one
+ *   coordinate space and a client CAN resume from any offset-bearing item's offset.
+ * - **ABSENT** ⇒ the event is an EPHEMERAL live delta (message/tool partials, turn lifecycle,
+ *   `UiRequestRaised`, status/retry/compaction): it is forwarded to the consumer to drive the
+ *   LIVE modality, but it is NEVER persisted, carries no durable coordinate, and NEVER moves
+ *   the resume cursor. A reconnect replays only the durable (offset-bearing) prefix, so an
+ *   offset-less delta cannot be — and need not be — resumed.
+ *
+ * The strict `> sinceOffset` guarantee is scoped to the RECONNECT RESUME (the durable `tail`),
+ * which sees only offset-bearing events; a single live stream can show a harmless boundary
+ * overlap where the durable replay and the live tail meet (a durable offset repeating),
+ * absorbed by the consumer's id-keyed transcript reconciliation (a durable entry replaces the
+ * item its live counterpart built) exactly as `OffsetEvent` overlap is absorbed by upsert
+ * idempotency.
  */
 export const OffsetSessionEvent = Schema.Struct({
-  offset: NonNegativeInt,
+  offset: Schema.optionalKey(NonNegativeInt),
   event: SessionEvent,
 });
 export type OffsetSessionEvent = (typeof OffsetSessionEvent)["Type"];
@@ -211,17 +217,21 @@ export const retryIssue = Rpc.make("retryIssue", {
 // (4) session channel — streaming events + send/interrupt/answer.
 //
 // `sessionEvents` replays a session's DURABLE transcript then live-tails it — the
-// session-channel mirror of `events`. Each streamed item is an
-// {@link OffsetSessionEvent} — a durable transcript-grade {@link SessionEvent} PLUS its
-// durable per-session offset — so the client can track its last-seen position and resume.
-// The request payload carries an OPTIONAL `sinceOffset` resume cursor: a request with NO
-// `sinceOffset` (a PRESENT but empty payload beyond `sessionId`) replays the session's
-// transcript from the ORIGIN, present resumes STRICTLY AFTER that offset. A SETTLED session
-// replays its durable transcript and the stream COMPLETES (no longer `SessionNotFound`); a
-// LIVE session replays then tails new durable entries; a session that never existed (no
-// durable transcript AND no live handle) is `SessionNotFound`. Only `sessionEvents` gains
-// durable replay — `sessionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled
-// session is read-only, so they still fail `SessionNotFound`).
+// session-channel mirror of `events`, but a UNIFIED dual-modality feed. Each
+// streamed item is an {@link OffsetSessionEvent} — a {@link SessionEvent} PLUS an OPTIONAL
+// durable per-session offset. Durable, transcript-grade events (`EntryAppended`/`Notice`)
+// carry the offset the client feeds back to resume; ephemeral live deltas (turn lifecycle,
+// message/tool partials, `UiRequestRaised`, …) ride the SAME channel offset-less so a live
+// driving session still receives its full reactive flow. The request payload carries an
+// OPTIONAL `sinceOffset` resume cursor: a request with NO `sinceOffset` (a PRESENT but empty
+// payload beyond `sessionId`) replays the session's DURABLE transcript from the ORIGIN,
+// present resumes STRICTLY AFTER that offset (only offset-bearing events are replayable). A
+// SETTLED session replays its durable transcript and the stream COMPLETES (no longer
+// `SessionNotFound`); a LIVE session replays the durable prefix then tails both new durable
+// entries and ephemeral deltas; a session that never existed (no durable transcript AND no
+// live handle) is `SessionNotFound`. Only `sessionEvents` gains durable replay —
+// `sessionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled session is read-only,
+// so they still fail `SessionNotFound`).
 export const sessionEvents = Rpc.make("sessionEvents", {
   payload: { sessionId: SessionId, sinceOffset: Schema.optionalKey(NonNegativeInt) },
   success: OffsetSessionEvent,

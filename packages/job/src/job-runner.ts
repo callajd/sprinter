@@ -81,11 +81,13 @@ const promptForJob = (job: Job, issue: Option.Option<Issue>): SessionInput => ({
 /**
  * True for a DURABLE, transcript-grade {@link SessionEvent} — the ones the app folds into
  * the transcript and that must persist to the session's durable transcript log so a SETTLED
- * session stays viewable: the `EntryAppended` durable records and the
- * reconcilable `Notice`s. Ephemeral streaming deltas (message/tool partials, turn lifecycle,
- * status/retry/compaction) are NOT persisted — they carry no durable offset and are absorbed
- * into the durable entries by the consumer's projection. A POSITIVE allow-list, so any future
- * variant defaults to ephemeral (never accidentally bloating the durable transcript).
+ * session stays viewable (contract v4): the `EntryAppended` durable records and the
+ * reconcilable `Notice`s. The complement — ephemeral streaming deltas (message/tool partials,
+ * turn lifecycle, `UiRequestRaised`, status/retry/compaction) — is NOT persisted, but is still
+ * TEED to the reactive feed offset-less so a live driving session receives its whole flow (see
+ * the fold below); it carries no durable offset and is absorbed into the durable entries by the
+ * consumer's projection. A POSITIVE allow-list, so any future variant defaults to ephemeral
+ * (never accidentally bloating the durable transcript).
  */
 const isDurableTranscriptEvent = (event: SessionEvent): boolean =>
   event._tag === "EntryAppended" || event._tag === "Notice";
@@ -187,15 +189,25 @@ const dispatch = (
       yield* handle.events.pipe(
         Stream.interruptWhen(handle.result),
         Stream.runForEach((event) =>
-          // Persist each DURABLE transcript entry to the session's durable transcript log
-          // as it arrives — the store's journaling decorator mints its
-          // per-session offset AND fans it out on the `SessionEvents` feed, so a live
-          // `sessionEvents` subscriber tails it and a SETTLED session replays it later.
-          // 1 Job = 1 session = 1 transcript, so this fold is the sole writer of this
-          // session's transcript; a re-dispatch APPENDS (never resets the offset sequence).
+          // TEE the WHOLE reactive flow to the `SessionEvents` feed (contract v4 — ONE channel
+          // serving BOTH the live driving modality AND settled-transcript replay). Every event
+          // the session emits must reach a live `sessionEvents` subscriber:
+          //   - a DURABLE transcript entry is APPENDED to the session's durable transcript log,
+          //     which the store's journaling decorator persists, mints a per-session offset for,
+          //     AND fans out on the feed offset-STAMPED — so a live subscriber tails it and a
+          //     SETTLED session replays it later;
+          //   - an EPHEMERAL live delta is fanned out OFFSET-LESS via `publishEphemeral` — it
+          //     reaches live subscribers to drive the reactive flow but is never persisted and
+          //     never advances the reconnect cursor.
+          // 1 Job = 1 session = 1 transcript, so this fold is the sole writer of this session's
+          // transcript; a re-dispatch APPENDS (never resets the offset sequence).
           Effect.gen(function* () {
-            if (isDurableTranscriptEvent(event)) yield* store.sessionLog.append(sessionId, event);
-            if (event._tag === "EntryAppended") yield* Ref.update(entriesRef, (n) => n + 1);
+            if (isDurableTranscriptEvent(event)) {
+              yield* store.sessionLog.append(sessionId, event);
+              if (event._tag === "EntryAppended") yield* Ref.update(entriesRef, (n) => n + 1);
+            } else {
+              yield* store.sessionLog.publishEphemeral(sessionId, event);
+            }
           }),
         ),
         // The stream is not the terminal authority (`handle.result` is), so a typed teardown

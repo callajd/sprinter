@@ -1,19 +1,27 @@
 /**
- * `SessionEvents` — the daemon's reactive DURABLE-TRANSCRIPT feed, the
+ * `SessionEvents` — the daemon's reactive UNIFIED session feed (contract v4), the
  * session-channel analogue of {@link WorkGraphEvents}. It is the live half of the
- * `sessionEvents` durable replay-then-tail: as a session's fold journals each durable,
- * transcript-grade {@link SessionEvent} to the per-session transcript log, the journaling
- * `StateStore` decorator (`./event-journal.ts`) fans it out here stamped with the durable
- * offset it committed at, so a subscribed `sessionEvents` handler tails new entries the
- * moment they persist (INV-REACTIVE — no poll loop on this path).
+ * `sessionEvents` durable replay-then-tail AND the carrier of a live driving session's full
+ * reactive flow. As a session's fold runs, the journaling `StateStore` decorator
+ * (`./event-journal.ts`) fans out EVERY {@link SessionEvent} here:
+ *
+ * - DURABLE, transcript-grade events (`EntryAppended`/`Notice`) are journaled to the
+ *   per-session transcript log first, then fanned out stamped WITH the durable offset they
+ *   committed at, so a subscribed `sessionEvents` handler tails new entries the moment they
+ *   persist and a reconnect can resume from that offset;
+ * - EPHEMERAL live deltas (turn lifecycle, message/tool partials, `UiRequestRaised`, …) are
+ *   fanned out offset-LESS — never persisted, never advancing the resume cursor — so a live
+ *   subscriber still receives the fine-grained reactive flow.
+ *
+ * Either way there is no poll loop on this path (INV-REACTIVE).
  *
  * It is a thin, owned wrapper over an Effect `PubSub<SessionFeedItem>`: the feed is
  * GLOBAL across sessions (one PubSub for the daemon), each item carrying the `sessionId`
  * it belongs to so a per-session subscriber filters to its own session. Only owned domain
- * types cross this surface — the branded `SessionId`, the durable `NonNegativeInt` offset,
- * and the owned `SessionEvent` (INV-BOUNDARY / INV-PORT). The single producer is the
+ * types cross this surface — the branded `SessionId`, the OPTIONAL durable `NonNegativeInt`
+ * offset, and the owned `SessionEvent` (INV-BOUNDARY / INV-PORT). The single producer is the
  * journaling decorator — the one layer that mints the durable per-session offset — so the
- * live-tail offset shares ONE coordinate space with the durable replay
+ * live-tail offset (when present) shares ONE coordinate space with the durable replay
  * ({@link SessionLogStore.tail}), the property the `sinceOffset` reconnect resume relies on.
  */
 import { Context, Effect, Layer, PubSub } from "effect";
@@ -21,18 +29,22 @@ import type { Scope } from "effect/Scope";
 import type { NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
 
 /**
- * One item on the {@link SessionEvents} feed: a durable, transcript-grade
- * {@link SessionEvent} paired with the `sessionId` it belongs to and the durable per-session
- * `offset` it was journaled at. The `sessionId` scopes the global feed so a per-session
- * subscriber filters to its own session; `offset` is the same durable coordinate the
- * `sessionEvents` replay reads, so live and replay agree on one offset per entry.
+ * One item on the {@link SessionEvents} feed: a {@link SessionEvent} paired with the
+ * `sessionId` it belongs to and an OPTIONAL durable per-session `offset`. The `sessionId`
+ * scopes the global feed so a per-session subscriber filters to its own session. `offset` is
+ * PRESENT for a durable, transcript-grade event (the same durable coordinate the
+ * `sessionEvents` replay reads, so live and replay agree on one offset per durable entry) and
+ * ABSENT for an ephemeral live delta (never journaled, never resumable).
  */
 export interface SessionFeedItem {
-  /** The session this durable transcript entry belongs to (the feed's per-session scope). */
+  /** The session this event belongs to (the feed's per-session scope). */
   readonly sessionId: SessionId;
-  /** The durable per-session offset the entry was journaled at. */
-  readonly offset: NonNegativeInt;
-  /** The durable, transcript-grade session event. */
+  /**
+   * The durable per-session offset the entry was journaled at (contract v4) — PRESENT for a
+   * durable transcript-grade event, ABSENT for an ephemeral live delta.
+   */
+  readonly offset?: NonNegativeInt;
+  /** The session event — durable transcript-grade (offset present) or ephemeral (offset absent). */
   readonly event: SessionEvent;
 }
 
@@ -49,7 +61,10 @@ export interface SessionFeedItem {
 export class SessionEvents extends Context.Service<
   SessionEvents,
   {
-    /** Publish one offset-stamped durable transcript entry to every current subscriber. */
+    /**
+     * Publish one item to every current subscriber — a durable transcript entry
+     * (offset-stamped) or an ephemeral live delta (offset-less).
+     */
     readonly publish: (item: SessionFeedItem) => Effect.Effect<void>;
     /**
      * A scoped subscription to the feed. Resolving this effect establishes the
