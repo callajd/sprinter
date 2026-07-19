@@ -33,7 +33,17 @@ struct SprinterApp: App {
     WindowGroup {
       RootView(model: model)
         .frame(minWidth: 900, minHeight: 600)
-        .task { model.start() }
+        .task {
+          // Own the model's lifetime for the scene: start it, then hold the task alive
+          // until SwiftUI tears the scene down (which CANCELS this task) and release the
+          // load-bearing transport thread + fd via `stop()` (CE4.2 scene-lifecycle
+          // teardown — the CE4 lifecycle watch-item), rather than only at process exit.
+          model.start()
+          while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3600))
+          }
+          model.stop()
+        }
     }
     #if os(macOS)
       .windowStyle(.titleBar)

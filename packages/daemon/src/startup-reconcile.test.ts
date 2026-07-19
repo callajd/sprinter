@@ -320,6 +320,9 @@ it.effect(
         expect(yield* Queue.size(dispatched)).toBe(0);
         const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
         expect(j1.status).toBe("succeeded");
+        // ROOT FIX (CE4.1-R4): a landed Job's SESSION row is settled to `completed`.
+        const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+        expect(s1.status).toBe("completed");
       }).pipe(
         Effect.provide(
           testLayer(
@@ -362,6 +365,11 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("queued");
+      // ROOT FIX (CE4.1-R4): the SESSION row is settled to a terminal status alongside
+      // the re-queued Job, so no NON-TERMINAL session orphan survives to stall the
+      // session-resolve gate. A later resume re-attaches this same id back to `starting`.
+      const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+      expect(s1.status).toBe("interrupted");
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -393,12 +401,52 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("cancelled");
+      // ROOT FIX (CE4.1-R4): the SESSION row is settled terminal alongside the Job.
+      const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+      expect(s1.status).toBe("interrupted");
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
       ),
     );
   }),
+);
+
+it.effect(
+  "does NOT resume a stray non-landed running Job under a truly-done Workstream (CE5-F4)",
+  () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<Job>();
+      yield* Effect.gen(function* () {
+        const store = yield* StateStore;
+        // A completed workstream/epic, but a stray `running` Job whose Issue did NOT land
+        // (still open on the host, in_progress locally) — the pathological case the
+        // narrowed terminal-resume guard must catch: never resurrect it.
+        yield* store.workGraph.putWorkstream(workstream({ status: "done" }));
+        yield* store.workGraph.putEpic(epic({ status: "done" }));
+        yield* store.workGraph.putIssue(issue(1));
+        yield* store.jobs.putSession(session());
+        yield* store.jobs.putJob(job());
+
+        const startup = yield* StartupReconcile;
+        const summary = yield* startup.run;
+
+        // The stray job is settled (cancelled — abandoned, its work never landed), NEVER
+        // re-dispatched: nothing resumed, nothing dispatched, no durable `running` limbo.
+        expect(summary.resumed).toStrictEqual([]);
+        expect(summary.skipped).toStrictEqual(["job-1"]);
+        expect(yield* Queue.size(dispatched)).toBe(0);
+        const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
+        expect(j1.status).toBe("cancelled");
+        // ROOT FIX (CE4.1-R4): its SESSION row is settled terminal alongside the Job.
+        const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+        expect(s1.status).toBe("interrupted");
+      }).pipe(
+        Effect.provide(
+          testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+        ),
+      );
+    }),
 );
 
 // ============================================================================

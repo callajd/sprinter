@@ -36,7 +36,19 @@
  * - a Job of a Workstream persisted `cancelled` is settled to `cancelled`; one of a
  *   `blocked` (paused) Workstream is settled to `queued` so a later `control resume`
  *   re-dispatches it — a cancelled/paused Workstream stays that way across a restart
- *   (AE4.1 / #30 N1; the distinct terminal `cancelled` status is CE5.1).
+ *   (AE4.1 / #30 N1; the distinct terminal `cancelled` status is CE5.1);
+ * - a stray, non-landed `running` Job under a truly-`done` Workstream is NEVER resumed
+ *   (CE5-F4): the Workstream finished without it, so it is settled to `cancelled` rather
+ *   than resurrected — resume is NARROWED to the genuinely-in-flight (`active`/`pending`)
+ *   Workstreams, so every terminal/paused Workstream status settles instead.
+ *
+ * Every settle path also settles the corresponding SESSION row to a terminal status
+ * alongside the Job row (CE4.1-R4 root fix): a settled Job must never leave a stale
+ * NON-TERMINAL Session behind, or the session-resolve gate ({@link ./rpc-handlers.ts}
+ * `resolveLive`) would mistake that orphan for a mid-dispatch session and stall the full
+ * resolve bound before `SessionNotFound`. `succeeded` → `completed`; `cancelled`/`queued`
+ * → `interrupted` (a later re-dispatch of a `queued` Job re-attaches its session id and
+ * moves it back to `starting`). This is INV-RESTART behavior.
  *
  * A single resume failure is isolated (logged in its background fiber) so one bad Job
  * never disturbs the others; a {@link StateStoreError} reading/writing the durable
@@ -54,8 +66,15 @@
  * `docs/decisions.md` / architecture §10 — NOT part of AE5.1. This module is the
  * persist/reconcile/re-dispatch LOGIC, wired to the ports and tested offline.
  */
-import { Context, Effect, Layer } from "effect";
-import { type Issue, isIssueLanded, type Job, type JobId, type WorkStatus } from "@sprinter/domain";
+import { Context, Effect, Layer, Option } from "effect";
+import {
+  type Issue,
+  isIssueLanded,
+  type Job,
+  type JobId,
+  type SessionStatus,
+  type WorkStatus,
+} from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { reconcileWorkstream, Repository } from "@sprinter/repository";
 import { StateStore, type StateStoreError } from "@sprinter/state";
@@ -88,26 +107,56 @@ export interface StartupSummary {
   readonly skipped: ReadonlyArray<JobId>;
 }
 
+/** The Job statuses a settle path moves a stale `running` Job to (never `running`). */
+type SettleStatus = "succeeded" | "cancelled" | "queued";
+
 /**
  * What restart does with a `running` Job given its (post-roll-up) Issue and its
  * Workstream's control state: resume it in the background, or settle its durable row
  * to a terminal/pending status so it never lingers as a stale `running` across
- * restarts. A landed Issue's work succeeded; a `cancelled` Workstream's Job is
- * cancelled; a `blocked` (paused) Workstream's Job is re-queued to resume on the next
- * `control`.
+ * restarts. A landed Issue's work succeeded; a `cancelled` (or truly-`done`, CE5-F4)
+ * Workstream's Job is cancelled; a `blocked` (paused) Workstream's Job is re-queued to
+ * resume on the next `control`. Resume is reserved for a genuinely-in-flight
+ * (`active`/`pending`) Workstream.
  */
 type ResumeAction =
   | { readonly _tag: "resume" }
-  | { readonly _tag: "settle"; readonly status: "succeeded" | "cancelled" | "queued" };
+  | { readonly _tag: "settle"; readonly status: SettleStatus };
 
-const decideRunning = (issue: Issue, workstreamStatus: WorkStatus): ResumeAction =>
-  isIssueLanded(issue)
-    ? { _tag: "settle", status: "succeeded" }
-    : workstreamStatus === "cancelled"
-      ? { _tag: "settle", status: "cancelled" }
-      : workstreamStatus === "blocked"
-        ? { _tag: "settle", status: "queued" }
-        : { _tag: "resume" };
+/**
+ * The terminal {@link SessionStatus} a settled Job's session row is moved to alongside
+ * the Job row (CE4.1-R4 root fix), so no stale NON-TERMINAL Session outlives a settled
+ * Job. `succeeded` → `completed`; `cancelled`/`queued` → `interrupted` (the pre-restart
+ * turn ended; a later `control resume` of a `queued` Job re-attaches the same session id
+ * and moves it back to `starting`). A total map (INV-NOCAST): every {@link SettleStatus}
+ * has a terminal image.
+ */
+const sessionSettleStatus: Record<SettleStatus, SessionStatus> = {
+  succeeded: "completed",
+  cancelled: "interrupted",
+  queued: "interrupted",
+};
+
+/**
+ * Decide a `running` Job's fate. Resume is NARROWED (CE5-F4) to the genuinely-in-flight
+ * Workstream statuses (`active`/`pending`); every terminal/paused status settles instead,
+ * so a stray non-landed `running` Job under a truly-`done` Workstream is abandoned, never
+ * resurrected. Exhaustive over {@link WorkStatus} — a new status is a compile error here,
+ * never a silent fall-through back to `resume`.
+ */
+const decideRunning = (issue: Issue, workstreamStatus: WorkStatus): ResumeAction => {
+  if (isIssueLanded(issue)) return { _tag: "settle", status: "succeeded" };
+  switch (workstreamStatus) {
+    case "active":
+    case "pending":
+      return { _tag: "resume" };
+    case "blocked":
+      return { _tag: "settle", status: "queued" };
+    case "cancelled":
+    case "done":
+      return { _tag: "settle", status: "cancelled" };
+  }
+};
 
 /**
  * The {@link StartupReconcile} service PORT (INV-NAMING, `sprinter/<area>/<Name>`):
@@ -171,6 +220,26 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
           Effect.asVoid,
         );
 
+      /**
+       * Settle a stale `running` Job to a terminal/pending status AND settle its SESSION
+       * row to a terminal status (CE4.1-R4 root fix) — writing ONLY the Job row would
+       * leave a NON-TERMINAL Session orphan that stalls the session-resolve gate. The
+       * session write is conditional on a row existing (a `running` Job always has one,
+       * but the read stays graceful) and reuses the persisted session id, so a later
+       * re-dispatch of a `queued` Job re-attaches the SAME session (1 Job = 1 session).
+       */
+      const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
+        Effect.gen(function* () {
+          yield* store.jobs.putJob({ ...job, status });
+          const session = yield* store.jobs.getSessionForJob(job.id);
+          if (Option.isSome(session)) {
+            yield* store.jobs.putSession({
+              ...session.value,
+              status: sessionSettleStatus[status],
+            });
+          }
+        });
+
       const run = Effect.gen(function* () {
         // 1. Reconcile + roll up every Workstream (per-issue host errors isolated in
         //    the reconciler). We re-read the rolled-up graph next, but the isolated
@@ -205,9 +274,10 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
                   yield* resume(job);
                   resumed.push(job.id);
                 } else {
-                  // Settle the stale `running` row to a terminal/pending status so it
-                  // never survives as durable limbo across restarts.
-                  yield* store.jobs.putJob({ ...job, status: action.status });
+                  // Settle the stale `running` Job AND its Session row to terminal, so no
+                  // durable `running` limbo — and no orphaned NON-TERMINAL Session — survives
+                  // across restarts (CE4.1-R4).
+                  yield* settle(job, action.status);
                   skipped.push(job.id);
                 }
               }
