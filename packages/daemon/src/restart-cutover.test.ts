@@ -321,53 +321,59 @@ it.effect(
   { timeout: 60_000 },
 );
 
-// ── watch-item CE1.2-RR-Q2 — SQLite WAL replay of a committed mid-write ────────
+// ── watch-item CE1.2-RR-Q2 — cross-connection visibility of a committed mid-write ──
 //
-// The daemon runs SQLite in WAL mode, so a COMMITTED write lands in the write-ahead log
-// and is recovered on the next open even WITHOUT a graceful checkpoint. This proves the
-// deterministic core of the crash-mid-write → recovery watch-item: a second connection
-// opened on the SAME file while the writer is STILL OPEN (no checkpoint/close has run)
-// reads the committed `running` Job back via WAL replay — the mechanism that survives a
-// real crash. The genuinely-real SIGKILL-mid-write is the runbook's job.
-it.effect("recovers a committed mid-write via SQLite WAL replay (no graceful checkpoint)", () =>
-  Effect.gen(function* () {
-    const fs = yield* FileSystem;
-    const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-ce42-wal-" });
-    const filename = `${dir}/state.db`;
+// What this deterministic test ACTUALLY proves: a committed write is visible to a FRESH
+// `StateStore` connection opened on the SAME file. The daemon runs SQLite in WAL mode, so a
+// second connection opened while the writer is STILL OPEN (no checkpoint/close has run)
+// reads the committed `running` Job back intact — cross-connection durability of a committed
+// write. This is the in-process stand-in a deterministic test can assert.
+//
+// What it does NOT prove: survival of a real process crash. It does not SIGKILL a writer
+// mid-write and then reopen the on-disk file, so it exercises neither fsync durability nor
+// on-disk WAL replay after an ungraceful kill. That genuinely-real crash-recovery
+// (SIGKILL mid-write → reboot → WAL replay) is exercised by the runbook, not this test.
+it.effect(
+  "a committed row is visible to a fresh StateStore connection on the same file (cross-connection durability)",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-ce42-wal-" });
+      const filename = `${dir}/state.db`;
 
-    const runningJob = decode(Job, {
-      id: "job-wal",
-      issueId: "issue-seed",
-      kind: "implement",
-      status: "running",
-      sessionId: "session-job-wal",
-    });
-    const startingSession = decode(Session, {
-      id: "session-job-wal",
-      jobId: "job-wal",
-      status: "active",
-    });
+      const runningJob = decode(Job, {
+        id: "job-wal",
+        issueId: "issue-seed",
+        kind: "implement",
+        status: "running",
+        sessionId: "session-job-wal",
+      });
+      const startingSession = decode(Session, {
+        id: "session-job-wal",
+        jobId: "job-wal",
+        status: "active",
+      });
 
-    // Writer store A stays OPEN (its scope is the outer `Effect.gen`) — no close, no
-    // checkpoint. It commits the in-flight rows…
-    yield* Effect.gen(function* () {
-      const writer = yield* StateStore;
-      yield* writer.workGraph.putWorkstream(seedWorkstream);
-      yield* writer.workGraph.putEpic(seedEpic);
-      yield* writer.workGraph.putIssue(seedIssue);
-      yield* writer.jobs.putSession(startingSession);
-      yield* writer.jobs.putJob(runningJob);
-
-      // …and a SEPARATE reader store B, opened on the SAME file while A is still open,
-      // replays the WAL and reads the committed mid-write back intact.
+      // Writer store A stays OPEN (its scope is the outer `Effect.gen`) — no close, no
+      // checkpoint. It commits the in-flight rows…
       yield* Effect.gen(function* () {
-        const reader = yield* StateStore;
-        const reloaded = Option.getOrThrow(yield* reader.jobs.getJob(runningJob.id));
-        expect(reloaded.status).toBe("running");
-        expect(reloaded.sessionId).toBe("session-job-wal");
-        const session = Option.getOrThrow(yield* reader.jobs.getSessionForJob(runningJob.id));
-        expect(session.id).toBe(startingSession.id);
+        const writer = yield* StateStore;
+        yield* writer.workGraph.putWorkstream(seedWorkstream);
+        yield* writer.workGraph.putEpic(seedEpic);
+        yield* writer.workGraph.putIssue(seedIssue);
+        yield* writer.jobs.putSession(startingSession);
+        yield* writer.jobs.putJob(runningJob);
+
+        // …and a SEPARATE reader store B, opened on the SAME file while A is still open,
+        // replays the WAL and reads the committed mid-write back intact.
+        yield* Effect.gen(function* () {
+          const reader = yield* StateStore;
+          const reloaded = Option.getOrThrow(yield* reader.jobs.getJob(runningJob.id));
+          expect(reloaded.status).toBe("running");
+          expect(reloaded.sessionId).toBe("session-job-wal");
+          const session = Option.getOrThrow(yield* reader.jobs.getSessionForJob(runningJob.id));
+          expect(session.id).toBe(startingSession.id);
+        }).pipe(Effect.provide(layerStateSqlite({ filename })), Effect.orDie);
       }).pipe(Effect.provide(layerStateSqlite({ filename })), Effect.orDie);
-    }).pipe(Effect.provide(layerStateSqlite({ filename })), Effect.orDie);
-  }).pipe(Effect.provide(BunFileSystem.layer)),
+    }).pipe(Effect.provide(BunFileSystem.layer)),
 );

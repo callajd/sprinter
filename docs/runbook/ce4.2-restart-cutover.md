@@ -31,10 +31,12 @@ core, hermetic and hard-timeout-bounded:
    delta arrives strictly after the cursor (no duplication) and the terminal `succeeded`
    delta arrives (no loss).
 
-It also proves **SQLite WAL replay of a committed mid-write** without a graceful
-checkpoint (a second connection opened on the same file while the writer is still open
-reads the committed `running` Job back) — the deterministic core of the crash-mid-write →
-recovery watch-item.
+It also proves **cross-connection visibility of a committed mid-write**: a second
+`StateStore` connection opened on the same file while the writer is still open (no graceful
+checkpoint) reads the committed `running` Job back intact. That is the in-process stand-in
+for the crash-mid-write → recovery watch-item — it does NOT SIGKILL a writer and reopen the
+on-disk file, so real fsync durability and on-disk WAL replay after an ungraceful kill are
+this runbook's job (below), not the deterministic test's.
 
 The following are what this **runbook** adds that the deterministic test deliberately
 cannot: a **real `pi` terminal-result** across the restart, and a **real SIGKILL** (not a
