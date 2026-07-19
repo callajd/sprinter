@@ -177,7 +177,7 @@ let package = Package(
     // in the already-tested view models), so this target is the coverage-exempt
     // platform edge (app entry point + pure view layout, see scripts/coverage-gate.py).
     .executableTarget(
-      name: "SprinterApp",
+      name: "Sprinter",
       dependencies: [
         "SprinterAppSupport", "SprinterBackend", "SprinterContract",
         "SprinterMissionControl", "SprinterSession", "SprinterInspector",

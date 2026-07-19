@@ -50,7 +50,7 @@ EXEMPT_PREFIXES: tuple[str, ...] = (
     # whole target is exempt from the presence requirement (INV-COV covers the real
     # logic modules, which stay >= 75%). Non-View glue lives in SprinterAppSupport,
     # which is NOT exempt and is tested.
-    "/Sources/SprinterApp/",
+    "/Sources/Sprinter/",
 )
 
 
