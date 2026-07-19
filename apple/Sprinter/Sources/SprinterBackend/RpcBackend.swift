@@ -73,7 +73,7 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          // The wire carries the ``OffsetEvent`` envelope (contract v3 / CE2.0): each
+          // The wire carries the ``OffsetEvent`` envelope (CE2.0): each
           // item pairs the delta with its DURABLE offset, which ``WorkGraphResync`` tracks
           // to resume STRICTLY AFTER the last-applied offset on reconnect. An unknown
           // inner `_tag` still surfaces as a decode failure, never a silent drop.
@@ -102,7 +102,7 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          // The wire carries the ``OffsetSessionEvent`` envelope (contract v4) — ONE channel
+          // The wire carries the ``OffsetSessionEvent`` envelope — ONE channel
           // serving BOTH modalities: DURABLE transcript-grade events carry a per-session
           // `offset`, EPHEMERAL live deltas ride offset-less. Send a PRESENT
           // ``SessionEventsPayload`` with NO `sinceOffset` key (→ origin replay of the durable

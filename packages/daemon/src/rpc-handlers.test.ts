@@ -673,6 +673,72 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
   ),
 );
 
+// Existence is the Session ROW, not the transcript length. A session that NEVER existed —
+// no live handle AND no row — is the ONLY `sessionEvents` miss.
+it.effect(
+  "sessionEvents fails SessionNotFound only when the session never existed (no row, no handle)",
+  () =>
+    harness(({ client }) =>
+      Effect.gen(function* () {
+        const exit = yield* client
+          .sessionEvents({ sessionId })
+          .pipe(Stream.runCollect, Effect.exit);
+        expect(Exit.isFailure(exit)).toBe(true);
+      }),
+    ),
+);
+
+// A SETTLED session that emitted ZERO durable events still EXISTS (its Session row is
+// terminal): `sessionEvents` replays an EMPTY transcript and COMPLETES — NOT the old
+// `SessionNotFound`, which would make the Inspector error on a legitimate empty session.
+it.effect(
+  "sessionEvents completes with an empty transcript for a settled session that emitted nothing",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        yield* store.jobs.putSession(session); // terminal row, NO durable entries, no live handle
+        yield* store.jobs.putJob(orphanedJob);
+
+        const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+        expect(received.length).toBe(0);
+      }),
+    ),
+);
+
+// The subscribe→read overlap must NOT double-deliver a durable event: an entry whose offset is
+// already covered by the replay (≤ the replay high-water) and is ALSO fanned out on the live
+// feed is DROPPED by the live tail — the id-keyed projection cannot dedup an id-LESS `Notice`,
+// so the daemon must not emit it twice. A genuinely-newer entry (offset above the high-water)
+// still passes, proving the tail keeps running.
+it.live(
+  "sessionEvents does not re-deliver a durable event already covered by replay (no id-less Notice dup)",
+  () =>
+    harness(({ client, store, sessions, sessionFeed }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeSession([]);
+        const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+        yield* sessions.register(sessionId, liveHandle);
+        const idlessNotice: SessionEvent = { _tag: "Notice", level: "info", message: "started" };
+        // The id-less notice is in the durable transcript before attach → covered by REPLAY.
+        const persisted = yield* store.sessionLog.append(sessionId, idlessNotice);
+
+        const collecting = yield* client
+          .sessionEvents({ sessionId })
+          .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+        yield* Effect.sleep("20 millis"); // replay drains + subscription settles
+
+        // The overlap: the SAME durable item (offset ≤ high-water) is ALSO on the live feed.
+        yield* sessionFeed.publish({ sessionId, offset: persisted.offset, event: idlessNotice });
+        // A genuinely-new durable entry (offset > high-water) DOES pass.
+        yield* store.sessionLog.append(sessionId, entryAppended2);
+
+        const received = yield* Fiber.join(collecting);
+        // Only the replayed notice + the new entry — the re-published duplicate was filtered out.
+        expect(received.map((i) => i.event)).toEqual([idlessNotice, entryAppended2]);
+      }),
+    ),
+);
+
 it.effect("sessionSend drives the input into the live session", () =>
   harness(({ client, sessions }) =>
     Effect.gen(function* () {

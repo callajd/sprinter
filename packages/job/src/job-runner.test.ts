@@ -16,7 +16,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import { Issue, Job, type SessionEvent, SessionId, type SessionInput } from "@sprinter/domain";
 import { PiTransportError, type SessionHandle, type SessionResult } from "@sprinter/runner";
-import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
+import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { ExecutionRunner, ExecutionRunnerError, JobRunner, layer } from "./index.ts";
 
 // ============================================================================
@@ -159,7 +159,7 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
 );
 
 // ============================================================================
-// Dual-modality tee (contract v4) — the fold routes durable vs ephemeral events
+// Dual-modality tee — the fold routes durable vs ephemeral events
 // ============================================================================
 
 it.effect(
@@ -196,6 +196,64 @@ it.effect(
       // The fold DROPPED NOTHING: durable events took `append`, ephemeral deltas `publishEphemeral`.
       expect(yield* Ref.get(appended)).toEqual([entryEvent, noticeEvent]);
       expect(yield* Ref.get(published)).toEqual([turnStarted, messageDelta]);
+    }),
+);
+
+// A TRANSIENT `sessionLog.append` failure must drop ONLY that entry and keep folding — never
+// tear down the whole writer and silently truncate every SUBSEQUENT durable entry (a data-loss
+// path for a durability feature). A store whose append fails ONCE (on the middle entry) still
+// persists the entries BEFORE and AFTER it.
+it.effect(
+  "a transient sessionLog.append failure drops one entry but keeps folding (no truncation)",
+  () =>
+    Effect.gen(function* () {
+      const first = entryEvent;
+      const poison: SessionEvent = {
+        _tag: "EntryAppended",
+        entry: { _tag: "AssistantMessage", id: "poison", text: "x" },
+      };
+      const third: SessionEvent = {
+        _tag: "EntryAppended",
+        entry: { _tag: "AssistantMessage", id: "third", text: "z" },
+      };
+      // A StateStore whose `sessionLog.append` fails transiently for the poison entry only.
+      const failAppendOnPoison: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+        StateStore,
+        Effect.gen(function* () {
+          const base = yield* StateStore;
+          return StateStore.of({
+            ...base,
+            sessionLog: {
+              ...base.sessionLog,
+              append: (sessionId, event) =>
+                event === poison
+                  ? Effect.fail(new StateStoreError({ operation: "append", detail: "transient" }))
+                  : base.sessionLog.append(sessionId, event),
+            },
+          });
+        }),
+      ).pipe(Layer.provide(layerMemory));
+
+      yield* Effect.gen(function* () {
+        const job = yield* makeJob();
+        const runner = yield* JobRunner;
+        yield* runner.dispatch(job);
+
+        const store = yield* StateStore;
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+          Effect.orDie,
+        );
+        const persisted = yield* store.sessionLog.read(sessionId);
+        // The poison entry was dropped, but folding CONTINUED — `first` and `third` both persisted.
+        expect(persisted.map((e) => e.event)).toEqual([first, third]);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provide(
+          fakeRunner(fakeHandle(Stream.make(first, poison, third), { _tag: "Completed" })),
+        ),
+        Effect.provide(failAppendOnPoison),
+      );
     }),
 );
 

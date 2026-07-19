@@ -225,7 +225,7 @@ export interface EventLogStore {
  * The EPHEMERAL live deltas (turn lifecycle, message/tool partials, `UiRequestRaised`, …)
  * are NOT persisted — they take {@link publishEphemeral}, the offset-less live-only path that
  * lets the session fold tee its WHOLE reactive flow to the reactive feed without bloating the
- * durable transcript (contract v4). The base store no-ops it (it owns durability, not the
+ * durable transcript. The base store no-ops it (it owns durability, not the
  * live feed); the daemon's journaling decorator overrides it to fan the delta out on the
  * `SessionEvents` feed offset-less, exactly as its `append` override fans a durable entry out
  * offset-stamped.
@@ -241,7 +241,7 @@ export interface SessionLogStore {
   ) => Effect.Effect<PersistedSessionEvent, StateStoreError>;
   /**
    * Fan out one EPHEMERAL, non-durable live session event WITHOUT persisting it — the
-   * offset-less live-delta path (contract v4). Total (it cannot fail): the base store no-ops
+   * offset-less live-delta path. Total (it cannot fail): the base store no-ops
    * it, and the decorator's feed publish cannot fail. It NEVER mints an offset and NEVER
    * touches the durable transcript, so it does not perturb the `sinceOffset` reconnect resume.
    */

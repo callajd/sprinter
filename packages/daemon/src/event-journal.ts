@@ -124,8 +124,8 @@ const appendAndPublish =
 
 /**
  * Fan one EPHEMERAL live session event out on the {@link SessionEvents} feed OFFSET-LESS,
- * WITHOUT persisting it — the live-only half of the session channel's dual modality (contract
- * v4). Where {@link appendAndPublish} persists a durable entry and publishes it stamped with
+ * WITHOUT persisting it — the live-only half of the session channel's dual modality.
+ * Where {@link appendAndPublish} persists a durable entry and publishes it stamped with
  * its minted offset, this publishes with NO offset (the item omits the key), so the event
  * reaches every live subscriber to drive the reactive flow but never joins the durable
  * transcript and never advances the `sinceOffset` reconnect cursor. Total (it cannot fail).

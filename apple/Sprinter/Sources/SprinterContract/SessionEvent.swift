@@ -262,7 +262,7 @@ extension SessionEvent {
 }
 
 /// A single streamed `sessionEvents` item: a ``SessionEvent`` paired with an OPTIONAL DURABLE
-/// per-session `offset` (contract v4). This ONE channel serves BOTH session modalities — live
+/// per-session `offset`. This ONE channel serves BOTH session modalities — live
 /// driving AND settled-transcript replay — so `offset` is optional, the sole divergence from
 /// the always-present ``OffsetEvent``:
 ///

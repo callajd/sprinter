@@ -366,7 +366,7 @@ const entryA2: SessionEvent = {
   entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
 };
 // Ephemeral live deltas — NOT transcript-grade, so `publishEphemeral` fans them out
-// offset-less and never persists them (contract v4).
+// offset-less and never persists them.
 const turnStartedA: SessionEvent = { _tag: "TurnStarted" };
 const deltaA: SessionEvent = { _tag: "MessageDelta", messageId: "a1", text: "hel" };
 

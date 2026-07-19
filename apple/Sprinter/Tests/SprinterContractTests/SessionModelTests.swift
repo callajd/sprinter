@@ -77,7 +77,7 @@ struct SessionModelTests {
         ))
   }
 
-  @Test("decodes the dual-modality sessionEvents-stream envelope (contract v4)")
+  @Test("decodes the dual-modality sessionEvents-stream envelope")
   func decodesOffsetSessionEvents() throws {
     let items = try Golden.decode([OffsetSessionEvent].self, from: "offset-session-events")
     #expect(items.count == 6)

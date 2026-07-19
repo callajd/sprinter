@@ -1,5 +1,5 @@
 /**
- * `SessionEvents` — the daemon's reactive UNIFIED session feed (contract v4), the
+ * `SessionEvents` — the daemon's reactive UNIFIED session feed, the
  * session-channel analogue of {@link WorkGraphEvents}. It is the live half of the
  * `sessionEvents` durable replay-then-tail AND the carrier of a live driving session's full
  * reactive flow. As a session's fold runs, the journaling `StateStore` decorator
@@ -40,7 +40,7 @@ export interface SessionFeedItem {
   /** The session this event belongs to (the feed's per-session scope). */
   readonly sessionId: SessionId;
   /**
-   * The durable per-session offset the entry was journaled at (contract v4) — PRESENT for a
+   * The durable per-session offset the entry was journaled at — PRESENT for a
    * durable transcript-grade event, ABSENT for an ephemeral live delta.
    */
   readonly offset?: NonNegativeInt;

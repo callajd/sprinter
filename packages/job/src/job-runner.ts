@@ -81,7 +81,7 @@ const promptForJob = (job: Job, issue: Option.Option<Issue>): SessionInput => ({
 /**
  * True for a DURABLE, transcript-grade {@link SessionEvent} — the ones the app folds into
  * the transcript and that must persist to the session's durable transcript log so a SETTLED
- * session stays viewable (contract v4): the `EntryAppended` durable records and the
+ * session stays viewable: the `EntryAppended` durable records and the
  * reconcilable `Notice`s. The complement — ephemeral streaming deltas (message/tool partials,
  * turn lifecycle, `UiRequestRaised`, status/retry/compaction) — is NOT persisted, but is still
  * TEED to the reactive feed offset-less so a live driving session receives its whole flow (see
@@ -189,7 +189,7 @@ const dispatch = (
       yield* handle.events.pipe(
         Stream.interruptWhen(handle.result),
         Stream.runForEach((event) =>
-          // TEE the WHOLE reactive flow to the `SessionEvents` feed (contract v4 — ONE channel
+          // TEE the WHOLE reactive flow to the `SessionEvents` feed (ONE channel
           // serving BOTH the live driving modality AND settled-transcript replay). Every event
           // the session emits must reach a live `sessionEvents` subscriber:
           //   - a DURABLE transcript entry is APPENDED to the session's durable transcript log,
@@ -203,16 +203,25 @@ const dispatch = (
           // transcript; a re-dispatch APPENDS (never resets the offset sequence).
           Effect.gen(function* () {
             if (isDurableTranscriptEvent(event)) {
-              yield* store.sessionLog.append(sessionId, event);
-              if (event._tag === "EntryAppended") yield* Ref.update(entriesRef, (n) => n + 1);
+              // Tolerate a transient `append` failure PER EVENT — drop THIS one entry and keep
+              // folding — rather than letting one hiccup tear down the whole writer and silently
+              // truncate every SUBSEQUENT durable entry. The count advances only on a real append.
+              yield* store.sessionLog.append(sessionId, event).pipe(
+                Effect.flatMap(() =>
+                  event._tag === "EntryAppended"
+                    ? Ref.update(entriesRef, (n) => n + 1)
+                    : Effect.void,
+                ),
+                Effect.catchTag("StateStoreError", () => Effect.void),
+              );
             } else {
               yield* store.sessionLog.publishEphemeral(sessionId, event);
             }
           }),
         ),
-        // The stream is not the terminal authority (`handle.result` is), so a typed teardown
-        // of the fold — OR a transient durable-append failure — is tolerated while preserving
-        // the count so far; the durable transcript is best-effort during the live fold.
+        // The stream is not the terminal authority (`handle.result` is), so a typed teardown of
+        // the fold is tolerated while preserving the count so far (transient per-append failures
+        // are already absorbed above, so one hiccup no longer truncates the rest of the fold).
         Effect.orElseSucceed(() => undefined),
       );
       const entries = yield* Ref.get(entriesRef);

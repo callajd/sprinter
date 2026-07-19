@@ -28,7 +28,7 @@ struct SessionChannelTests {
     #expect(request.payload == expectedPayload)
     let id = try #require(request.id)
 
-    // The wire carries the OffsetSessionEvent envelope (contract v4) — ONE channel with BOTH
+    // The wire carries the OffsetSessionEvent envelope — ONE channel with BOTH
     // modalities: a DURABLE entry offset-STAMPED, EPHEMERAL deltas offset-LESS. The backend
     // UNWRAPS `.event` and yields EVERY event (offset dropped) to the SessionEvent consumer.
     let durableEntry: SessionEvent = .entryAppended(
