@@ -1,3 +1,4 @@
+import Foundation
 import Observation
 import SprinterBackend
 import SprinterContract
@@ -45,6 +46,16 @@ public final class PlannerViewModel {
   /// and the ``SessionViewModel/lifecycle``.
   public let session: SessionViewModel
 
+  /// The plan-construction **form** (CE3.2): the explicit name/repo/spec the user
+  /// fills in from the planning conversation. There is deliberately NO
+  /// transcript→plan auto-extractor — the contract carries no structured "plan
+  /// produced" event, so the shell constructs the plan from these explicit fields.
+  /// The view binds `TextField`s to them; ``canMaterialize`` and ``draftPlan`` are
+  /// derived, so the construction/validation stays here (tested), not in the View.
+  public var name = ""
+  public var repo = ""
+  public var spec = ""
+
   /// The reflected materialize result: `.idle` until the first ``materialize(_:)``,
   /// then `.materializing`, then `.created(id)` or `.rejected(reason:)`.
   public private(set) var outcome: PlanningOutcome = .idle
@@ -56,6 +67,32 @@ public final class PlannerViewModel {
   public init(backend: any Backend, planningSessionId: SessionId) {
     self.backend = backend
     self.session = SessionViewModel(backend: backend, sessionId: planningSessionId)
+  }
+
+  /// The plan the form currently describes — the explicit name/repo/spec, each
+  /// trimmed of surrounding whitespace/newlines so a stray trailing space never
+  /// leaks into the submitted ``WorkstreamPlan``.
+  public var draftPlan: WorkstreamPlan {
+    WorkstreamPlan(
+      name: name.trimmed, repo: repo.trimmed, spec: spec.trimmed)
+  }
+
+  /// Whether the form is complete enough to materialize: a plan needs a non-empty
+  /// name AND repository (the spec may be empty — a bare workstream is valid). The
+  /// view disables the materialize control off this, and ``materializeDraft()``
+  /// guards on it too.
+  public var canMaterialize: Bool {
+    !name.trimmed.isEmpty && !repo.trimmed.isEmpty
+  }
+
+  /// Materializes the plan the FORM currently describes — the explicit,
+  /// shell-constructed ``draftPlan``. A no-op when the form is incomplete
+  /// (``canMaterialize`` is `false`), so an empty name/repo can never be submitted.
+  /// Delegates to ``materialize(_:)`` for the reflected-outcome + re-entrancy
+  /// semantics.
+  public func materializeDraft() async throws {
+    guard canMaterialize else { return }
+    try await materialize(draftPlan)
   }
 
   /// The created workstream's id once the plan has materialized, else `nil` — the
@@ -99,5 +136,13 @@ public final class PlannerViewModel {
       outcome = .idle
       throw error
     }
+  }
+}
+
+extension String {
+  /// The string with surrounding whitespace and newlines removed — the form's
+  /// field-normalisation, so a trailing space never leaks into a submitted plan.
+  fileprivate var trimmed: String {
+    trimmingCharacters(in: .whitespacesAndNewlines)
   }
 }
