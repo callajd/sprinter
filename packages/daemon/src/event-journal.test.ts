@@ -225,6 +225,33 @@ it.live("resyncEvents replays durable history, then streams the live tail", () =
   ),
 );
 
+it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // Two mutations BEFORE any client attaches — journaled at offsets 1 and 2.
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+
+    // Attach with a cursor PAST the first entry (offset 1): the resync must replay
+    // only the second durable delta (strictly-after semantics), not re-send offset 1.
+    const collecting = yield* resyncEvents(store, feed, 1).pipe(
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+
+    const received = yield* Fiber.join(collecting);
+    const only: WorkGraphEvent | undefined = received[0];
+    expect(only?._tag).toBe("EpicChanged");
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerPublishing(layerJournaling(layerMemory))),
+    Effect.provide(layerWorkGraphEvents),
+  ),
+);
+
 it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

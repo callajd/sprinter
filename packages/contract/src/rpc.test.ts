@@ -75,12 +75,12 @@ it("carries every model of contract v1 as a procedure", () => {
 });
 
 it("marks the group with an explicit contract version (INV-CONTRACT)", () => {
-  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(2);
+  expect(Option.getOrThrow(Context.getOption(SprinterRpc.annotations, ContractVersion))).toBe(3);
   // The version key is a `Context.Reference`, so it resolves to CONTRACT_VERSION
   // from an empty context via its default.
   expect(Context.get(Context.empty(), ContractVersion)).toBe(CONTRACT_VERSION);
-  expect(CONTRACT_VERSION).toBe(2);
-  expect(contractTag()).toBe("v2");
+  expect(CONTRACT_VERSION).toBe(3);
+  expect(contractTag()).toBe("v3");
   expect(contractTag(1)).toBe("v1");
 });
 
@@ -116,6 +116,20 @@ it("streams owned work-graph deltas over the events feed (INV-REACTIVE)", () => 
   expect(decoded).toEqual(Schema.decodeUnknownSync(WorkGraphEvent)(delta));
   if (decoded._tag !== "IssueChanged") throw new Error("expected IssueChanged");
   expect(decoded.issue.id).toBe("iss-1");
+});
+
+it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)", () => {
+  // Present: a non-negative offset resumes strictly after that point.
+  const withCursor = Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: 12 });
+  expect(withCursor.sinceOffset).toBe(12);
+
+  // Absent: the key is optional, so an empty payload decodes (origin replay,
+  // backward-compatible with the pre-v3 no-field request).
+  const noCursor = Schema.decodeUnknownSync(events.payloadSchema)({});
+  expect(noCursor.sinceOffset).toBeUndefined();
+
+  // A negative offset is not a non-negative int and is rejected.
+  expect(() => Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: -1 })).toThrow();
 });
 
 it("accepts a workstream plan and answers with a WorkstreamId", () => {

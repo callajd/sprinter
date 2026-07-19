@@ -164,7 +164,9 @@ it.effect("the events feed does DURABLE offset-based resync for a late-attaching
       });
 
       // Attaching now REPLAYS the journaled history: the pre-subscribe delta arrives.
-      const first = Option.getOrThrow(yield* client.events().pipe(Stream.take(1), Stream.runHead));
+      const first = Option.getOrThrow(
+        yield* client.events({}).pipe(Stream.take(1), Stream.runHead),
+      );
       expect(first._tag).toBe("WorkstreamChanged");
     }).pipe(Effect.scoped, Effect.provide(served(testConfig(dir))));
   }).pipe(Effect.provide(BunFileSystem.layer)),

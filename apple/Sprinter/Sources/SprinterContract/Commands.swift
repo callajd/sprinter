@@ -27,6 +27,16 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
   }
 }
 
+/// Payload of `events` (streams ``WorkGraphEvent``) — the OPTIONAL `sinceOffset`
+/// resume cursor (contract v3 / CE2.0). Absent (`nil`) replays from the log ORIGIN
+/// (backward-compatible); present resumes STRICTLY AFTER that offset. The wire is
+/// `Schema.optionalKey(NonNegativeInt)`, so the key is OMITTED when `nil` (never
+/// `null`) — Swift synthesized `Codable` matches this exactly.
+public struct EventsPayload: Codable, Equatable, Sendable {
+  public let sinceOffset: Int?
+  public init(sinceOffset: Int? = nil) { self.sinceOffset = sinceOffset }
+}
+
 /// Payload of `createWorkstreamFromPlan` (success: ``WorkstreamId``; error:
 /// ``ContractError/planRejected(reason:)``).
 public struct CreateWorkstreamFromPlanPayload: Codable, Equatable, Sendable {
@@ -147,10 +157,12 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
 /// A contract bump ripples here and to the goldens + decode tests — see the
 /// regeneration procedure in `docs/contract-mirror.md`.
 public enum SprinterContract {
-  /// The mirrored contract version (`v2`).
+  /// The mirrored contract version (`v3`).
   ///
-  /// `v2` (CE5) batches the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
+  /// `v2` (CE5) batched the distinct terminal `cancelled` ``WorkStatus`` (CE5.1)
   /// and the reconciliation-key `id` on ``SessionEvent``.`notice` /
-  /// ``TranscriptEntry``.`noticeEntry` (CE5.2) — rippled here and to the goldens.
-  public static let version = 2
+  /// ``TranscriptEntry``.`noticeEntry` (CE5.2). `v3` (CE2.0) adds the OPTIONAL
+  /// `sinceOffset` resume cursor on ``EventsPayload`` — rippled here and to the
+  /// goldens.
+  public static let version = 3
 }

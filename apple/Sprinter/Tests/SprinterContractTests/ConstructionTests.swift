@@ -164,6 +164,14 @@ struct ConstructionTests {
 
     let interrupt = InterruptPayload(sessionId: SessionId(rawValue: "ses-1"))
     #expect(interrupt == (try Golden.decode(InterruptPayload.self, from: "payload-interrupt")))
+
+    // The `events` resume cursor — both wire forms (present + absent origin replay).
+    let events = EventsPayload(sinceOffset: 12)
+    #expect(events == (try Golden.decode(EventsPayload.self, from: "payload-events")))
+    let eventsFromOrigin = EventsPayload()
+    #expect(
+      eventsFromOrigin
+        == (try Golden.decode(EventsPayload.self, from: "payload-events-no-offset")))
   }
 
   @Test("builds the send/answer payloads equal to their goldens")

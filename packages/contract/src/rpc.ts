@@ -1,5 +1,5 @@
 /**
- * The versioned daemon↔client **RPC contract** (currently `v2`, see
+ * The versioned daemon↔client **RPC contract** (currently `v3`, see
  * {@link CONTRACT_VERSION}) — an `RpcGroup` (`effect/unstable/rpc`) over the FE2.1
  * owned domain schemas (architecture §7, D8/D10/D16/D17).
  *
@@ -27,6 +27,7 @@ import {
   Issue,
   IssueId,
   Job,
+  NonNegativeInt,
   Session,
   SessionEvent,
   SessionId,
@@ -42,12 +43,17 @@ import {
  * Current contract version. Bumped whenever the RPC surface changes; the Swift
  * mirror (FE2.4) and its decode tests track this bump (INV-CONTRACT).
  *
- * `v2` (CE5) batches two frozen-contract changes: a distinct terminal `cancelled`
+ * `v2` (CE5) batched two frozen-contract changes: a distinct terminal `cancelled`
  * `WorkStatus` (CE5.1) and a reconciliation-key `id` on `Notice`/`NoticeEntry`
  * (CE5.2). Both rippled to the Swift mirror + Track A handlers and re-froze the
  * FE2.4 goldens in one bump (INV-CONTRACT: version once, re-freeze once).
+ *
+ * `v3` (CE2.0) adds an OPTIONAL `sinceOffset` cursor to the `events` RPC request:
+ * absent replays from the log origin (backward-compatible — the pre-v3 wire had no
+ * request field), present resumes strictly after that offset. It rippled to the
+ * Swift mirror + the daemon `events` handler and re-froze the FE2.4 goldens.
  */
-export const CONTRACT_VERSION = 2 as const;
+export const CONTRACT_VERSION = 3 as const;
 
 /** Format the contract version as a `v`-prefixed tag, e.g. `v1`. */
 export const contractTag = (version: number = CONTRACT_VERSION): string => `v${version}`;
@@ -155,8 +161,16 @@ export type ControlAction = (typeof ControlAction)["Type"];
 // (1) snapshot — request/response full-state hydration on connect.
 export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 
-// (2) events — streaming work-graph deltas (INV-REACTIVE).
-export const events = Rpc.make("events", { success: WorkGraphEvent, stream: true });
+// (2) events — streaming work-graph deltas (INV-REACTIVE), with an OPTIONAL
+// `sinceOffset` resume cursor (contract v3 / CE2.0). Absent → replay from the log
+// ORIGIN (backward-compatible: the pre-v3 request carried no field, so an omitted
+// key decodes to the same origin replay); present → resume STRICTLY AFTER that
+// offset, over the daemon's existing `resyncFrom(offset)` primitive (CE1.2).
+export const events = Rpc.make("events", {
+  payload: { sinceOffset: Schema.optionalKey(NonNegativeInt) },
+  success: WorkGraphEvent,
+  stream: true,
+});
 
 // (3) commands — create-workstream-from-plan, control, retry-issue.
 export const createWorkstreamFromPlan = Rpc.make("createWorkstreamFromPlan", {

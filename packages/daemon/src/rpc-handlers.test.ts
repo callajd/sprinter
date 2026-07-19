@@ -399,7 +399,7 @@ it.effect("events streams a work-graph delta produced by a command", () =>
     Effect.gen(function* () {
       yield* seedGraph(store);
       const collector = yield* client
-        .events()
+        .events({})
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
       // Drive a REPEATABLE command until the (lazily-subscribing) events stream
       // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
@@ -416,6 +416,30 @@ it.effect("events streams a work-graph delta produced by a command", () =>
     }),
   ),
 );
+
+it("events resumes durable replay after a client-supplied sinceOffset cursor (CE2.0)", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      // Seed durable history: five journaled deltas at offsets 1..5.
+      yield* seedGraph(store);
+      yield* store.jobs.putJob(queuedJob);
+      yield* store.jobs.putSession(session);
+
+      // Subscribe with a cursor PAST the first two entries (offset 2): the served
+      // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
+      // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
+      const replay = yield* client
+        .events({ sinceOffset: 2 })
+        .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
+        .pipe(Effect.flatMap(Fiber.join));
+
+      expect(replay.map((delta) => delta._tag)).toEqual([
+        "IssueChanged",
+        "JobChanged",
+        "SessionChanged",
+      ]);
+    }),
+  ));
 
 // ── session channel (AE4.2 — bridge a live SessionHandle) ─────────────────────
 

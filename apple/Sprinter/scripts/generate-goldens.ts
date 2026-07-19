@@ -43,6 +43,7 @@ import {
   control,
   ControlAction,
   createWorkstreamFromPlan,
+  events,
   interrupt,
   IssueNotFound,
   PlanRejected,
@@ -265,6 +266,11 @@ writeFileSync(
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
 
+// The `events` request cursor is OPTIONAL (contract v3 / CE2.0): both wire forms
+// are captured — present (`sinceOffset` key set) and absent (key omitted, the
+// backward-compatible origin replay) — so the Swift mirror decodes each.
+write("payload-events", events.payloadSchema, { sinceOffset: 12 });
+write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
   plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
 });

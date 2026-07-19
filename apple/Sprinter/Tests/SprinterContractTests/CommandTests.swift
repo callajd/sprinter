@@ -42,6 +42,20 @@ struct CommandTests {
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
+  @Test("decodes the events payload with a sinceOffset cursor")
+  func decodesEventsPayload() throws {
+    let payload = try Golden.decode(EventsPayload.self, from: "payload-events")
+    #expect(payload.sinceOffset == 12)
+    #expect(try Golden.roundTrip(payload) == payload)
+  }
+
+  @Test("decodes the events payload with the cursor absent (origin replay)")
+  func decodesEventsPayloadNoOffset() throws {
+    let payload = try Golden.decode(EventsPayload.self, from: "payload-events-no-offset")
+    #expect(payload.sinceOffset == nil)
+    #expect(try Golden.roundTrip(payload) == payload)
+  }
+
   @Test("decodes the sessionEvents payload")
   func decodesSessionEventsPayload() throws {
     let payload = try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")
@@ -94,6 +108,6 @@ struct CommandTests {
 
   @Test("tracks the frozen contract version")
   func tracksContractVersion() {
-    #expect(SprinterContract.version == 2)
+    #expect(SprinterContract.version == 3)
   }
 }

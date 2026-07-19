@@ -45,7 +45,7 @@ Notes threaded to the contract's own decisions:
 - `WorkGraphEvent` is **upsert-only** — there is no `*Removed` variant (contract
   §events); a terminal status is an ordinary change.
 - The contract version is a compile-time marker, not a wire field; the mirror
-  tracks it as `SprinterContract.version` (currently `1`).
+  tracks it as `SprinterContract.version` (currently `3`).
 
 ## What the gate checks
 

@@ -26,10 +26,11 @@
  *   boundary is harmless. A reconnecting client thus catches up on the whole durable
  *   history deterministically, not just the deltas that happen after it attaches.
  *
- * The wire `events` procedure carries no cursor (the contract is FROZEN,
- * INV-CONTRACT), so the served endpoint replays from the log ORIGIN (`tail(0)`);
- * {@link resyncFrom} is the offset-parameterized primitive a future
- * cursor-carrying transport (CE2.2) resumes from without re-deriving a snapshot.
+ * The wire `events` procedure now carries an OPTIONAL `sinceOffset` cursor
+ * (contract v3 / CE2.0, INV-CONTRACT): absent replays from the log ORIGIN
+ * (`tail(0)`, backward-compatible), present resumes STRICTLY AFTER that offset.
+ * {@link resyncFrom} is the offset-parameterized primitive both cases drive
+ * (CE2.2 layers reconnect/backpressure on top) without re-deriving a snapshot.
  */
 import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import { WorkGraphEvent } from "@sprinter/contract";
@@ -149,16 +150,21 @@ export const resyncFrom = (store: Store, offset: number): Stream.Stream<WorkGrap
 
 /**
  * The `events` RPC feed: EAGERLY subscribe to the live work-graph feed, THEN replay
- * the whole durable log from the origin, THEN stream the live tail. Subscribing
- * before the durable read closes the replay/live gap; upsert-idempotent deltas make
- * the small boundary overlap harmless. The result is a deterministic catch-up from
- * durable history, not merely snapshot-on-connect (D17).
+ * the durable log from `sinceOffset` (the client's resume cursor — contract v3 /
+ * CE2.0; absent → `0`, replay from the ORIGIN), THEN stream the live tail.
+ * Subscribing before the durable read closes the replay/live gap; upsert-idempotent
+ * deltas make the small boundary overlap harmless. The result is a deterministic
+ * catch-up from durable history, not merely snapshot-on-connect (D17).
  */
-export const resyncEvents = (store: Store, feed: Feed): Stream.Stream<WorkGraphEvent> =>
+export const resyncEvents = (
+  store: Store,
+  feed: Feed,
+  sinceOffset?: number,
+): Stream.Stream<WorkGraphEvent> =>
   Stream.unwrap(
     feed.subscribe.pipe(
       Effect.map((subscription) =>
-        Stream.concat(resyncFrom(store, 0), Stream.fromSubscription(subscription)),
+        Stream.concat(resyncFrom(store, sinceOffset ?? 0), Stream.fromSubscription(subscription)),
       ),
     ),
   );

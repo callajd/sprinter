@@ -354,15 +354,15 @@ export const handlers = SprinterRpc.toLayer(
     return {
       snapshot: () => buildSnapshot(store),
       // Live work-graph deltas with DURABLE offset-based resync (CE1.2 / D17): the
-      // feed eagerly subscribes live, replays the durable event log from the origin
-      // (`EventLogStore.tail`, journaled by the store decorator), then streams the
-      // live tail — so a reconnecting client catches up on the whole persisted
-      // history deterministically, not only the deltas after it attaches. Subscribe-
-      // before-replay closes the gap; upsert-idempotent deltas (D8) absorb the
-      // boundary overlap. (The frozen `events` payload carries no cursor, so the
-      // served endpoint replays from origin; per-offset resume is CE2.2's, over the
-      // same `resyncFrom` primitive.)
-      events: () => resyncEvents(store, feed),
+      // feed eagerly subscribes live, replays the durable event log from the client's
+      // `sinceOffset` cursor (`EventLogStore.tail`, journaled by the store decorator),
+      // then streams the live tail — so a reconnecting client catches up on the whole
+      // persisted history deterministically, not only the deltas after it attaches.
+      // Subscribe-before-replay closes the gap; upsert-idempotent deltas (D8) absorb
+      // the boundary overlap. The `sinceOffset` cursor is OPTIONAL (contract v3 /
+      // CE2.0): absent → replay from origin (backward-compatible), present → resume
+      // strictly after that offset, over the same `resyncFrom` primitive.
+      events: ({ sinceOffset }) => resyncEvents(store, feed, sinceOffset),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
