@@ -92,7 +92,7 @@ const GhPull = Schema.Struct({
  * closing-PR path is unsupported there; there is no runtime guard because Sprinter
  * targets github.com (D14).
  */
-const CLOSING_PR_QUERY = `query ($owner: String!, $repo: String!, $number: Int!) {
+export const CLOSING_PR_QUERY = `query ($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     issue(number: $number) {
       closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
@@ -194,11 +194,11 @@ export interface RepositoryConfig {
    * access is NOT a supported mode: GitHub's GraphQL API rejects ALL unauthenticated
    * requests with 401 (even on public repos), so the authoritative closing-PR
    * signal ({@link CLOSING_PR_QUERY}) cannot work anonymously, and the daemon drives
-   * authenticated Issue→PR work regardless. Sent as a `Bearer` credential; never
+   * authenticated Issue→PR work regardless. Sent as a `Bearer` credential on every request; never
    * logged. Must be non-empty — the composition root fails fast at boot when
-   * `GITHUB_TOKEN` is absent, and {@link closingPullRequest} raises a distinct,
-   * loud error if ever invoked with an empty token rather than silently reporting
-   * "no closing PR".
+   * `GITHUB_TOKEN` is absent, and {@link make} refuses to construct the adapter with
+   * an empty/blank token (a single, universal guard covering EVERY operation) rather
+   * than ever sending an empty `Bearer` or silently reporting "no closing PR".
    */
   readonly token: string;
   /**
@@ -224,11 +224,25 @@ const DEFAULT_BASE_URL = "https://api.github.com";
  */
 const make = (config: RepositoryConfig) =>
   Effect.gen(function* () {
+    // The token is REQUIRED for EVERY operation (B1, NB3). GitHub's GraphQL endpoint
+    // 401s every unauthenticated request, and the REST ops must never carry an empty
+    // `Bearer`. So refuse to construct the adapter with an empty/blank token: a single,
+    // universal fail-fast with a distinct, loud RepositoryError (never a silent empty
+    // credential or `Option.none`), backing up the boot-time fail-fast in the daemon
+    // composition root. The token itself is never logged.
+    if (config.token.trim() === "") {
+      return yield* Effect.fail(
+        new RepositoryError({
+          operation: "make",
+          detail:
+            "a GitHub token is required (set GITHUB_TOKEN); GitHub's GraphQL API rejects unauthenticated requests with 401",
+        }),
+      );
+    }
     const base = yield* HttpClient.HttpClient;
     const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
-    // The token is REQUIRED (B1) — always authenticate. GitHub's GraphQL endpoint
-    // 401s every unauthenticated request, so a token-less adapter can never observe a
-    // closing PR; token-less is not a supported mode.
+    // Token verified non-empty above — always authenticate; token-less is not a
+    // supported mode.
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
@@ -287,36 +301,26 @@ const make = (config: RepositoryConfig) =>
 
     const pullRequests: PullRequestOps = {
       closingPullRequest: (issueNumber) =>
-        // Belt-and-suspenders (B1): a token-less GraphQL POST 401s, and the reconcile
-        // isolation would fold that into `failures` — indistinguishable from "no
-        // closing PR", silently starving the roll-up. So an empty token is refused
-        // here with a DISTINCT, loud error (never `Option.none`), backing up the
-        // boot-time fail-fast in the daemon composition root.
-        config.token.trim() === ""
-          ? Effect.fail(
-              new RepositoryError({
-                operation: "closingPullRequest",
-                detail:
-                  "a GitHub token is required (set GITHUB_TOKEN); GitHub's GraphQL API rejects unauthenticated requests with 401",
+        // The token is guaranteed non-empty (universal guard in `make`, NB3), so the
+        // authenticated GraphQL POST always carries a real `Bearer`; a token-less
+        // adapter can never be constructed to reach here.
+        base
+          .execute(
+            HttpClientRequest.post(graphqlUrl).pipe(
+              HttpClientRequest.setHeaders(headers),
+              HttpClientRequest.bodyJsonUnsafe({
+                query: CLOSING_PR_QUERY,
+                variables: { owner: config.owner, repo: config.repo, number: issueNumber },
               }),
-            )
-          : base
-              .execute(
-                HttpClientRequest.post(graphqlUrl).pipe(
-                  HttpClientRequest.setHeaders(headers),
-                  HttpClientRequest.bodyJsonUnsafe({
-                    query: CLOSING_PR_QUERY,
-                    variables: { owner: config.owner, repo: config.repo, number: issueNumber },
-                  }),
-                ),
-              )
-              .pipe(
-                Effect.flatMap(HttpClientResponse.filterStatusOk),
-                Effect.flatMap((response) => response.json),
-                Effect.flatMap(Schema.decodeUnknownEffect(GhClosingPrResponse)),
-                Effect.flatMap(closingPrFromResponse),
-                Effect.mapError(fail("closingPullRequest")),
-              ),
+            ),
+          )
+          .pipe(
+            Effect.flatMap(HttpClientResponse.filterStatusOk),
+            Effect.flatMap((response) => response.json),
+            Effect.flatMap(Schema.decodeUnknownEffect(GhClosingPrResponse)),
+            Effect.flatMap(closingPrFromResponse),
+            Effect.mapError(fail("closingPullRequest")),
+          ),
       getPullRequest: (number) =>
         client.execute(HttpClientRequest.get(`${repoPath}/pulls/${number}`)).pipe(
           Effect.flatMap(HttpClientResponse.filterStatusOk),
@@ -349,7 +353,8 @@ const make = (config: RepositoryConfig) =>
  */
 export const layer = (
   config: RepositoryConfig,
-): Layer.Layer<Repository, never, HttpClient.HttpClient> => Layer.effect(Repository, make(config));
+): Layer.Layer<Repository, RepositoryError, HttpClient.HttpClient> =>
+  Layer.effect(Repository, make(config));
 
 /**
  * The self-contained GitHub adapter: {@link layer} with the Bun-native fetch
@@ -357,5 +362,5 @@ export const layer = (
  * the production wiring — a `Layer<Repository>` with the transport sealed inside,
  * exposing no HTTP type (INV-PORT).
  */
-export const layerFetch = (config: RepositoryConfig): Layer.Layer<Repository> =>
+export const layerFetch = (config: RepositoryConfig): Layer.Layer<Repository, RepositoryError> =>
   layer(config).pipe(Layer.provide(FetchHttpClient.layer));

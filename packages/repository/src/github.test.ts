@@ -17,6 +17,7 @@ import { Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
 import { PositiveInt } from "@sprinter/domain";
+import { CLOSING_PR_QUERY } from "./github.ts";
 import { layer, layerFetch, Repository, RepositoryError } from "./index.ts";
 
 // ============================================================================
@@ -43,7 +44,7 @@ const makeFetch = (routes: Record<string, Route>): typeof globalThis.fetch =>
 
 const config = { owner: "callajd", repo: "sprinter", token: "test-token" };
 
-const backend = (routes: Record<string, Route>): Layer.Layer<Repository> =>
+const backend = (routes: Record<string, Route>): Layer.Layer<Repository, RepositoryError> =>
   layer(config).pipe(
     Layer.provide(
       FetchHttpClient.layer.pipe(
@@ -175,6 +176,83 @@ it.effect("detects the PR that CLOSED an Issue via GraphQL closedByPullRequestsR
   }).pipe(Effect.provide(backend({ "/graphql": gqlClosing(42) }))),
 );
 
+/**
+ * The GraphQL request body the adapter must send for {@link CLOSING_PR_QUERY} —
+ * decoded straight from the captured JSON string (no cast, INV-NOCAST): the query
+ * text plus the owner/repo/issue-number variables.
+ */
+const GraphqlRequestBody = Schema.fromJsonString(
+  Schema.Struct({
+    query: Schema.String,
+    variables: Schema.Struct({
+      owner: Schema.String,
+      repo: Schema.String,
+      number: Schema.Number,
+    }),
+  }),
+);
+
+/** What a single captured outbound `fetch` call carried (method / auth / body). */
+interface CapturedRequest {
+  readonly method: string;
+  readonly authorization: string | null;
+  readonly body: string | undefined;
+}
+
+/**
+ * Normalize a `fetch` body to its JSON text. The transport encodes a JSON body as a
+ * UTF-8 `Uint8Array`; a raw string is decoded as-is. Anything else yields `undefined`
+ * (a missing body) — no cast, INV-NOCAST.
+ */
+const bodyText = (body: RequestInit["body"]): string | undefined =>
+  typeof body === "string"
+    ? body
+    : body instanceof Uint8Array
+      ? new TextDecoder().decode(body)
+      : undefined;
+
+it.effect(
+  "sends the closing-PR query as an authenticated POST with the expected variables (NB2)",
+  () =>
+    // Locks the HEADLINE security behavior: the GraphQL closing-PR request must be a
+    // POST that carries `Authorization: Bearer <token>` and the exact CLOSING_PR_QUERY
+    // with the owner/repo/issue variables. Assert method + header + body — not merely
+    // the pathname — so a regression that drops the token or garbles the query is caught.
+    Effect.gen(function* () {
+      let seen: CapturedRequest | undefined;
+      const capturingFetch: typeof globalThis.fetch = Object.assign(
+        (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+          seen = {
+            method: init?.method ?? "GET",
+            authorization: new Headers(init?.headers).get("authorization"),
+            body: bodyText(init?.body),
+          };
+          return Promise.resolve(gqlClosing(42)());
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      );
+      const repo = yield* Repository.pipe(
+        Effect.provide(
+          layer(config).pipe(
+            Layer.provide(
+              FetchHttpClient.layer.pipe(
+                Layer.provide(Layer.succeed(FetchHttpClient.Fetch, capturingFetch)),
+              ),
+            ),
+          ),
+        ),
+      );
+      const found = yield* repo.pullRequests.closingPullRequest(num(25));
+      expect(found).toStrictEqual(Option.some(42));
+      expect(seen).toBeDefined();
+      expect(seen?.method).toBe("POST");
+      expect(seen?.authorization).toBe("Bearer test-token");
+      const decoded = Schema.decodeUnknownSync(GraphqlRequestBody)(seen?.body);
+      expect(decoded.query).toBe(CLOSING_PR_QUERY);
+      expect(decoded.variables).toStrictEqual({ owner: "callajd", repo: "sprinter", number: 25 });
+    }),
+);
+
 it.effect(
   "does NOT attribute an unrelated PR that merely mentions a hand-closed Issue as the closer",
   () =>
@@ -302,26 +380,27 @@ it.effect(
     ),
 );
 
-it.effect("rejects a token-less adapter with a distinct, loud error, not Option.none (B1)", () =>
-  // Belt-and-suspenders: an empty token can never observe a closing PR (GitHub 401s
-  // it), so `closingPullRequest` refuses loudly rather than silently reporting none.
+it.effect("refuses to construct a token-less adapter with a distinct, loud error (NB3)", () =>
+  // Universal guard (NB3): an empty/blank token can never authenticate ANY operation
+  // (GitHub 401s it), and the REST ops must never carry an empty `Bearer`. So the
+  // adapter refuses to build at all — one construction-time fail-fast covering every
+  // op — rather than a per-op guard, and never silently reports "no closing PR".
   Effect.gen(function* () {
-    const repo = yield* Repository;
-    const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
-    expect(error.operation).toBe("closingPullRequest");
-    expect(error.detail).toContain("token is required");
-  }).pipe(
-    Effect.provide(
-      layer({ ...config, token: "" }).pipe(
-        Layer.provide(
-          FetchHttpClient.layer.pipe(
-            Layer.provide(Layer.succeed(FetchHttpClient.Fetch, makeFetch({}))),
+    const error = yield* Repository.pipe(
+      Effect.provide(
+        layer({ ...config, token: "" }).pipe(
+          Layer.provide(
+            FetchHttpClient.layer.pipe(
+              Layer.provide(Layer.succeed(FetchHttpClient.Fetch, makeFetch({}))),
+            ),
           ),
         ),
       ),
-    ),
-  ),
+      Effect.flip,
+    );
+    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error.detail).toContain("token is required");
+  }),
 );
 
 // ============================================================================
