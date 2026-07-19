@@ -25,18 +25,23 @@
  * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle}, resolved
  * through the {@link SessionRegistry} PORT (AE4.2) via the shared {@link resolveLive}
  * helper. A registry entry only lives for its session's run scope, so the helper gates
- * on DURABLE state (`StateStore`) to pick wait-vs-fail-fast:
+ * on DURABLE state (`StateStore`) to pick wait-vs-fail-fast — keying on the durable
+ * JOB status (session → job → job-status), the dispatch unit `startup-reconcile`
+ * maintains (CE4.1 FIX A):
  *
- * - a session whose durable `Session` row is still NON-TERMINAL (`starting`/`active`/
- *   `idle`) is genuinely MID-DISPATCH: the `running` delta is fanned out BEFORE
+ * - a session whose durable `Job` is still NON-TERMINAL (`queued`/`running`) is
+ *   genuinely MID-DISPATCH: the `running` delta is fanned out BEFORE
  *   `ExecutionRunner.run` registers the handle, so a client reacting to it can arrive
  *   before registration. The helper routes it to `SessionRegistry.resolve`, which
  *   bounded-waits for the handle to land rather than returning a spurious
  *   `SessionNotFound` (so the app needs no retry);
- * - a session whose durable row is TERMINAL (completed/failed/interrupted; the
- *   Inspector opens channels for SETTLED jobs by design, BE4.1) OR does not exist at
- *   all is routed to `SessionRegistry.get`, which FAILS FAST with `SessionNotFound` —
- *   no multi-second stall waiting for a registration that will never come.
+ * - a session whose durable Job is TERMINAL (`succeeded`/`failed`/`cancelled`; the
+ *   Inspector opens channels for SETTLED jobs by design, BE4.1) OR whose Job/Session
+ *   row does not exist is routed to `SessionRegistry.get`, which FAILS FAST with
+ *   `SessionNotFound` — no multi-second stall waiting for a registration that will
+ *   never come. Keying on the Job (not the Session row) closes the crash-orphaned case:
+ *   `startup-reconcile` settles a stale Job it cannot resume by writing ONLY the Job
+ *   row, leaving its Session row NON-TERMINAL — a Session-row gate would stall on it.
  *
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
  * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY) — and
@@ -300,49 +305,70 @@ const retry = (
 // ── session channel (bridge a live SessionHandle) ────────────────────────────
 
 /**
- * True while a durable {@link Session} row is still MID-DISPATCH — i.e. genuinely
- * running (or about to), so its live {@link SessionHandle} either is registered now
- * or is about to be within the register-after-dispatch window. The complement is a
- * TERMINAL session (settled: `completed`/`failed`/`interrupted`), whose registry entry
- * has already been torn down and will never reappear. Expressed as a POSITIVE
- * allow-list of the non-terminal statuses so any future status defaults to fail-fast
- * (never re-introducing a spurious multi-second stall on a settled/unknown state).
+ * True while a durable {@link Job} row is still MID-DISPATCH — i.e. genuinely queued
+ * or running, so its live {@link SessionHandle} either is registered now or is about
+ * to be within the register-after-dispatch window. The complement is a TERMINAL job
+ * (settled: `succeeded`/`failed`/`cancelled`), whose registry entry has already been
+ * torn down and will never reappear. Expressed as a POSITIVE allow-list of the
+ * non-terminal statuses so any future status defaults to fail-fast (never
+ * re-introducing a spurious multi-second stall on a settled/unknown state).
+ *
+ * The gate keys on the JOB, not the durable `Session` row, ON PURPOSE (CE4.1 FIX A):
+ * `startup-reconcile` settles a stale `running` Job it cannot resume by writing ONLY
+ * the Job row (its `putJob` → terminal), and NEVER settles the Session row. So after a
+ * crash + restart a settled-not-resumed job leaves its Session row NON-TERMINAL
+ * (`starting`/`active`) while its Job is terminal. Gating on the Session row would
+ * mistake that crash-orphaned state for mid-dispatch and stall the full resolve bound;
+ * the Job — the dispatch unit reconcile maintains — is the authoritative signal.
  */
-const isMidDispatchSession = (status: Session["status"]): boolean =>
-  status === "starting" || status === "active" || status === "idle";
+const isMidDispatchJob = (status: Job["status"]): boolean =>
+  status === "queued" || status === "running";
 
 /**
  * Resolve the live {@link SessionHandle} for a `sessionId`, choosing wait-vs-fail-fast
- * on DURABLE state (the shared gate behind all four session-channel procedures):
+ * on DURABLE state (the shared gate behind all four session-channel procedures). It
+ * resolves session → job → job-status and gates on the JOB:
  *
- * - read the durable `Session` row from the {@link StateStore};
- * - a row that is present AND still {@link isMidDispatchSession mid-dispatch} is bridged
- *   through `SessionRegistry.resolve`, which bounded-WAITS out the register-after-dispatch
- *   window so a client reacting to the `running` delta needs no retry;
- * - a row that is TERMINAL (settled) OR ABSENT (never existed) is resolved through
+ * - read the durable `Session` row from the {@link StateStore} to recover the `jobId`
+ *   it belongs to (1 Job = 1 session); ABSENT → nothing is or will be registered, fail
+ *   fast through `SessionRegistry.get`;
+ * - read that {@link Job} row; a job that is present AND still {@link isMidDispatchJob
+ *   mid-dispatch} (`queued`/`running`) is bridged through `SessionRegistry.resolve`,
+ *   which bounded-WAITS out the register-after-dispatch window so a client reacting to
+ *   the `running` delta needs no retry;
+ * - a job that is TERMINAL (settled) OR ABSENT is resolved through
  *   `SessionRegistry.get`, which FAILS FAST with {@link SessionNotFound} — no
- *   multi-second stall on a registration that will never land (the regression this
- *   gate closes: the Inspector opens channels for SETTLED jobs by design, BE4.1).
+ *   multi-second stall on a registration that will never land. This covers both the
+ *   Inspector opening channels for SETTLED jobs (BE4.1) AND the crash-orphaned case a
+ *   Session-row gate would miss: a terminal Job whose Session row `startup-reconcile`
+ *   left NON-TERMINAL (see {@link isMidDispatchJob}).
  *
- * The `StateStore` read cannot surface a contract error, so its own `StateStoreError`
- * becomes a defect (`orDie`) — the resolved error channel stays exactly `SessionNotFound`.
+ * FIX B (CE4.1): a transient `StateStoreError` from either durable read is mapped to a
+ * graceful {@link SessionNotFound} rather than `orDie`'d into an unrecoverable defect —
+ * a store hiccup on this hot path treats the session as (momentarily) unresolvable
+ * instead of killing the long-lived `sessionEvents` stream/handler fiber. The resolved
+ * error channel stays exactly `SessionNotFound`.
  */
 const resolveLive = (
   store: Store,
   registry: Registry,
   sessionId: SessionId,
 ): Effect.Effect<SessionHandle, SessionNotFound> =>
-  store.jobs.getSession(sessionId).pipe(
-    Effect.orDie,
-    Effect.flatMap((session) =>
-      Option.match(session, {
-        // Never existed → nothing is or will be registered; fail fast.
-        onNone: () => registry.get(sessionId),
-        onSome: (row) =>
-          // Mid-dispatch → bridge the window (bounded wait); settled → fail fast.
-          isMidDispatchSession(row.status) ? registry.resolve(sessionId) : registry.get(sessionId),
-      }),
-    ),
+  Effect.gen(function* () {
+    const session = yield* store.jobs.getSession(sessionId);
+    // No Session row → never existed / already torn down; fail fast.
+    if (Option.isNone(session)) return yield* registry.get(sessionId);
+    const job = yield* store.jobs.getJob(session.value.jobId);
+    // Job absent, or terminal → registry entry gone for good; fail fast.
+    // Job mid-dispatch (queued/running) → bridge the register-after-dispatch window.
+    if (Option.isNone(job) || !isMidDispatchJob(job.value.status)) {
+      return yield* registry.get(sessionId);
+    }
+    return yield* registry.resolve(sessionId);
+  }).pipe(
+    // FIX B: a transient store read failure is surfaced as SessionNotFound (the
+    // handler's existing typed channel), never a defect that crashes the stream fiber.
+    Effect.catchTag("StateStoreError", () => Effect.fail(new SessionNotFound({ id: sessionId }))),
   );
 
 /**

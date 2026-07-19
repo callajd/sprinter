@@ -51,7 +51,7 @@ import {
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { PiTransportError, type SessionHandle } from "@sprinter/runner";
-import { layerMemory, StateStore, type StateStoreError } from "@sprinter/state";
+import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
 import {
@@ -95,6 +95,25 @@ const session = Schema.decodeUnknownSync(Session)({
   id: "ses-1",
   jobId: "job-1",
   status: "completed",
+});
+// A durable RUNNING Job for `job-1` — genuinely mid-dispatch. The session-channel
+// gate keys on the JOB status (CE4.1 FIX A), so a running Job routes to the bounded
+// wait that bridges the register-after-dispatch window.
+const midDispatchJob = Schema.decodeUnknownSync(Job)({
+  id: "job-1",
+  issueId: "iss-1",
+  kind: "implement",
+  status: "running",
+});
+// A CRASH-ORPHANED Job: `startup-reconcile` settled a stale `running` Job it could not
+// resume by writing ONLY the Job row (terminal `cancelled`), and NEVER settled the
+// Session row — so its Session stays NON-TERMINAL. The Job-status gate must fail this
+// FAST despite the live Session row (the exact regression a Session-row gate missed).
+const orphanedJob = Schema.decodeUnknownSync(Job)({
+  id: "job-1",
+  issueId: "iss-1",
+  kind: "implement",
+  status: "cancelled",
 });
 
 const succeededResult: JobResult = { status: "succeeded" };
@@ -602,20 +621,28 @@ const startingSession = Schema.decodeUnknownSync(Session)({
   jobId: "job-1",
   status: "starting",
 });
+// A NON-TERMINAL (`active`) Session row whose Job has since settled — the crash-orphaned
+// limbo `startup-reconcile` leaves (Job-only settle). Pairs with {@link orphanedJob}.
+const activeSession = Schema.decodeUnknownSync(Session)({
+  id: "ses-1",
+  jobId: "job-1",
+  status: "active",
+});
 
-// The register-after-dispatch window: `JobRunner.dispatch` fans out the `running`
-// delta BEFORE `run` registers the session handle, so a client reacting to it can
-// open the session channel before registration. Because the durable `Session` row is
-// already `starting` (NON-TERMINAL) at that point, the handler's durable-state gate
-// routes to `SessionRegistry.resolve`, which bounded-WAITS out that window rather than
-// erroring — so the app needs no retry (CE4.1 FIX A: gate the wait on durable state).
+// The register-after-dispatch window: `JobRunner.dispatch` persists the `starting`
+// Session + `running` Job BEFORE `run` registers the session handle, so a client
+// reacting to the `running` delta can open the session channel before registration.
+// Because the durable JOB is `running` (NON-TERMINAL) at that point, the handler's
+// durable-state gate routes to `SessionRegistry.resolve`, which bounded-WAITS out that
+// window rather than erroring — so the app needs no retry (CE4.1 FIX A: gate on Job).
 it.effect(
-  "a session-channel handler WAITS out the register-after-dispatch window (mid-dispatch row)",
+  "a session-channel handler WAITS out the register-after-dispatch window (mid-dispatch job)",
   () =>
     harness(({ client, store, sessions }) =>
       Effect.gen(function* () {
-        // Seed the durable mid-dispatch row: present + NON-TERMINAL → the gate waits.
+        // Seed the durable mid-dispatch state: Session row + a RUNNING Job → gate waits.
         yield* store.jobs.putSession(startingSession);
+        yield* store.jobs.putJob(midDispatchJob);
         const fake = yield* makeFakeSession([]);
         const input: SessionInput = { text: "go", mode: "prompt" };
 
@@ -634,17 +661,46 @@ it.effect(
     ),
 );
 
-// FIX A — a SETTLED session's durable row is TERMINAL, so its registry entry is gone
-// and will never come back. The gate must route to `get` and FAIL FAST — NOT wait out
-// the 5s bound (the Inspector opens channels for SETTLED jobs by design, BE4.1). Proven
-// by driving the send INLINE with NO clock advance and asserting virtual time is
-// unchanged: had it entered the bounded wait, the TestClock would deadlock (no advance
-// ever comes) — completing at all, at time zero, proves the fail-fast.
-it.effect("a SETTLED session's channel fails FAST — no 5s stall (durable row terminal)", () =>
+// FIX A (the regression this closes) — a CRASH-ORPHANED session: `startup-reconcile`
+// settled its stale `running` Job to a TERMINAL status (`cancelled`) by writing ONLY
+// the Job row, leaving the Session row NON-TERMINAL (`active`). A gate that keyed on the
+// SESSION row would see `active` and stall the full 5s bound; the Job-status gate sees
+// `cancelled` (terminal) and FAILS FAST. Proven by driving the send INLINE with NO clock
+// advance and asserting virtual time is unchanged: had it entered the bounded wait, the
+// TestClock would deadlock (no advance ever comes) — completing at all, at time zero,
+// proves the fail-fast on the exact BE4.1 path FIX A targets.
+it.effect(
+  "a CRASH-ORPHANED session fails FAST — no 5s stall (Job terminal, Session row still active)",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        // Session row NON-TERMINAL (`active`) but its Job terminal (`cancelled`) — the
+        // durable limbo `startup-reconcile` leaves after settling a non-resumable job.
+        yield* store.jobs.putSession(activeSession);
+        yield* store.jobs.putJob(orphanedJob);
+
+        const before = yield* Clock.currentTimeMillis;
+        const error = yield* client
+          .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+          .pipe(Effect.flip);
+        const after = yield* Clock.currentTimeMillis;
+
+        expect(error).toBeInstanceOf(SessionNotFound);
+        // No virtual time consumed → the bounded wait was never entered.
+        expect(after).toBe(before);
+      }),
+    ),
+);
+
+// FIX A — a fully SETTLED session (durable Job AND Session row both terminal): the same
+// `!isMidDispatchJob → get` branch fails fast, the classic BE4.1 Inspector-on-settled-job
+// path. No clock advance; virtual time unchanged.
+it.effect("a SETTLED session's channel fails FAST — no 5s stall (Job terminal)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      // `session` fixture is `completed` (terminal); it is NOT registered.
+      // `session` fixture is `completed` (terminal); its Job is terminal too.
       yield* store.jobs.putSession(session);
+      yield* store.jobs.putJob(orphanedJob);
 
       const before = yield* Clock.currentTimeMillis;
       const error = yield* client
@@ -704,8 +760,9 @@ it.effect("session-channel procedures fail FAST for a never-existed session (no 
 it.effect("a mid-dispatch session whose handle never registers fails AFTER the bound", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      // Durable row is `starting` (NON-TERMINAL) → the gate waits; nothing ever registers.
+      // Durable Job is `running` (NON-TERMINAL) → the gate waits; nothing ever registers.
       yield* store.jobs.putSession(startingSession);
+      yield* store.jobs.putJob(midDispatchJob);
 
       const sendFiber = yield* Effect.forkChild(
         client.sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } }).pipe(Effect.flip),
@@ -722,4 +779,51 @@ it.effect("a mid-dispatch session whose handle never registers fails AFTER the b
       expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(SessionNotFound);
     }),
   ),
+);
+
+// FIX B — a TRANSIENT `StateStoreError` on the resolve-path durable read must NOT
+// become an unrecoverable defect that kills a long-lived `sessionEvents` stream/handler
+// fiber. `resolveLive` maps it to a graceful `SessionNotFound` (the handler's existing
+// typed channel), so the error surfaces in the TYPED failure channel — provably not a
+// die. A StateStore whose `getSession` fails transiently is substituted for the memory
+// store; the send must fail with a typed `SessionNotFound`, never a defect.
+it.effect("a transient store read failure surfaces as SessionNotFound, not a defect", () =>
+  Effect.gen(function* () {
+    const failingStore = Layer.effect(
+      StateStore,
+      Effect.gen(function* () {
+        const base = yield* StateStore;
+        return StateStore.of({
+          ...base,
+          jobs: {
+            ...base.jobs,
+            getSession: () =>
+              Effect.fail(new StateStoreError({ operation: "getSession", detail: "transient" })),
+          },
+        });
+      }),
+    ).pipe(Layer.provide(layerJournaling(layerMemory)));
+    const runner = Layer.succeed(
+      JobRunner,
+      JobRunner.of({ dispatch: () => Effect.succeed(succeededResult) }),
+    );
+    const app = handlers.pipe(
+      Layer.provideMerge(
+        Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
+          Layer.provideMerge(layerWorkGraphEvents),
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const client = yield* clientEffect();
+      const exit = yield* client
+        .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+        .pipe(Effect.exit);
+      expect(Exit.isFailure(exit)).toBe(true);
+      const failure = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
+      // Present in the TYPED channel as SessionNotFound → a graceful fail, not `orDie`.
+      expect(Option.isSome(failure) && failure.value instanceof SessionNotFound).toBe(true);
+    }).pipe(Effect.provide(app), Effect.scoped);
+  }),
 );
