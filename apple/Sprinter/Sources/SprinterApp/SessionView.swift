@@ -75,10 +75,16 @@ struct SessionView: View {
   }
 
   private func send() {
-    let text = draft
-    draft = ""
-    let input = SessionInput(text: text, images: nil, mode: .prompt)
-    runShellAction(onError: { actionError = $0 }, action: { try await model.send(input) })
+    // Clear the composed text only AFTER the send succeeds: on a transient failure the
+    // error alert fires (runShellAction's catch) while `draft` is left intact, so the user
+    // can retry without retyping. INV-NOFORCE: runShellAction's do/catch owns the failure.
+    let input = SessionInput(text: draft, images: nil, mode: .prompt)
+    runShellAction(
+      onError: { actionError = $0 },
+      action: {
+        try await model.send(input)
+        draft = ""
+      })
   }
 }
 

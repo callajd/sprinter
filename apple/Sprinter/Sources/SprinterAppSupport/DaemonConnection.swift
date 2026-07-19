@@ -1,3 +1,4 @@
+import Foundation
 import SprinterBackend
 import SprinterContract
 
@@ -20,11 +21,17 @@ public enum DaemonEndpointResolver {
   /// with no configuration.
   public static let defaultSocketPath = "./sprinter.sock"
 
-  /// Resolves the endpoint from `environment`: the `SPRINTER_SOCKET` path when set,
-  /// else the default. Always a `.localDaemon` (CE1/CE2 serve a local socket only;
-  /// a remote endpoint is later cutover work — see ``DaemonTransports``).
+  /// Resolves the endpoint from `environment`: the `SPRINTER_SOCKET` path when set to a
+  /// non-blank value, else the default. A set-but-empty (or whitespace-only)
+  /// `SPRINTER_SOCKET` is treated as "unset" rather than the literal path `""`, so an
+  /// exported-but-empty variable still rendezvous on the default. Always a `.localDaemon`
+  /// (CE1/CE2 serve a local socket only; a remote endpoint is later cutover work — see
+  /// ``DaemonTransports``).
   public static func resolve(environment: [String: String]) -> DaemonEndpoint {
-    let socketPath = environment[socketEnvVar] ?? defaultSocketPath
+    let socketPath =
+      environment[socketEnvVar]
+      .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+      ?? defaultSocketPath
     return .localDaemon(socketPath: socketPath)
   }
 }

@@ -77,8 +77,11 @@ public final class AppModel {
   }
 
   /// Tears the app down: stops the board feed, cancels an in-flight connect, and closes
-  /// the connected backend (LOAD-BEARING — the live ``UnixSocketTransport`` holds a real
-  /// thread + fd that only `close()` releases). Idempotent.
+  /// the connected backend. The live ``UnixSocketTransport`` holds a real thread + fd that
+  /// `close()` releases, but today this explicit teardown is exercised only by tests: the
+  /// `WindowGroup` scene wires `start()` with no matching lifecycle hook, so the running
+  /// single-process app reclaims the thread + fd at process exit. Wiring `stop()` to the
+  /// scene lifecycle is deferred to CE4. Idempotent.
   public func stop() {
     connectTask?.cancel()
     connectTask = nil

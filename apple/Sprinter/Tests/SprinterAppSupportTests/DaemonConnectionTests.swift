@@ -22,6 +22,30 @@ struct DaemonConnectionTests {
     #expect(endpoint == .localDaemon(socketPath: DaemonEndpointResolver.defaultSocketPath))
   }
 
+  /// A set-but-empty `SPRINTER_SOCKET` is treated as "unset" — an exported-but-empty
+  /// variable must not resolve to the literal path `""`, so it falls back to the default.
+  @Test("resolve treats an empty SPRINTER_SOCKET as unset")
+  func resolveEmptyDefaults() {
+    let endpoint = DaemonEndpointResolver.resolve(environment: ["SPRINTER_SOCKET": ""])
+    #expect(endpoint == .localDaemon(socketPath: DaemonEndpointResolver.defaultSocketPath))
+  }
+
+  /// A whitespace-only `SPRINTER_SOCKET` is likewise blank — it falls back to the default
+  /// rather than dialing a path made of spaces.
+  @Test("resolve treats a whitespace-only SPRINTER_SOCKET as unset")
+  func resolveWhitespaceDefaults() {
+    let endpoint = DaemonEndpointResolver.resolve(environment: ["SPRINTER_SOCKET": "  \t\n"])
+    #expect(endpoint == .localDaemon(socketPath: DaemonEndpointResolver.defaultSocketPath))
+  }
+
+  /// A real (non-blank) `SPRINTER_SOCKET` resolves to exactly that path — the empty-guard
+  /// leaves a genuine value untouched.
+  @Test("resolve keeps a real SPRINTER_SOCKET value")
+  func resolveRealValue() {
+    let endpoint = DaemonEndpointResolver.resolve(environment: ["SPRINTER_SOCKET": "/run/s.sock"])
+    #expect(endpoint == .localDaemon(socketPath: "/run/s.sock"))
+  }
+
   /// The injected-seam initializer hands `connect()` straight through to the closure,
   /// and `makeWorkGraphFeed()` yields a real feed a board consumes end to end.
   @Test("connect() and makeWorkGraphFeed() drive off the injected seam")
