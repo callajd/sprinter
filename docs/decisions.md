@@ -176,14 +176,22 @@ drives real "landed" decisions, we resolve the carried risk (AE3.2 / #27 F1)
   Issue is landed only when the host reports it **closed** AND the referenced PR is
   **merged** (`reconcileIssue`). That gate makes the common case correct offline and
   needs no live GraphQL round-trip.
-- **Residual risk (accepted, documented):** an Issue closed for an unrelated reason
-  while a *different* merged PR merely references it could be mis-landed. The robust
-  signal — GraphQL `closedByPullRequestsReferences`, or gating on the timeline
-  `closed` event's associated PR — is a **live-wiring** concern of the GitHub
-  adapter (it can only be validated against the real host, not the offline suite),
-  so it is tracked as deferred provisioning below, NOT a dropped AE5.1 criterion.
-  Roll-up is one-directional (D13) and idempotent, so a future robust signal
-  supersedes a stale landing on the next reconcile with no migration.
+- **Residual risk (accepted at AE5.1, since RESOLVED — see below):** an Issue closed
+  for an unrelated reason while a *different* merged PR merely references it could be
+  mis-landed. The robust signal — GraphQL `closedByPullRequestsReferences`, or gating
+  on the timeline `closed` event's associated PR — was tracked as deferred
+  provisioning, NOT a dropped AE5.1 criterion. Roll-up is one-directional (D13) and
+  idempotent, so the robust signal supersedes any stale landing on the next reconcile
+  with no migration.
+
+**Update (CE1.3 / #53) — the robust signal now ships; the heuristic is retired.**
+The GitHub adapter's `closingPullRequest` reads GraphQL
+`closedByPullRequestsReferences` (through the same injected transport seam, decoded
+via `Schema`, no cast) — the PRs GitHub itself records as having closed the Issue —
+in place of the timeline `cross-referenced` scan. An unrelated merged PR that merely
+*mentions* a hand-closed Issue is therefore no longer attributed as its closer, so
+the residual mis-landing risk above is eliminated. The closed-AND-merged gate in
+`reconcileIssue` is unchanged; roll-up stays one-directional and idempotent.
 
 ### D19 — A `cancelled` Epic is terminal-but-not-complete for parent roll-up
 `reconcileEpic` returns `isComplete` (done-only), NOT `isTerminal` (done OR
@@ -205,9 +213,10 @@ cancellation owns revisiting the roll-up semantics.
   adapter that spawns a real `pi` process and the boot entrypoint that wires the
   production adapters and calls `StartupReconcile.run` are **provisioning**, not part
   of AE5.1's Done.
-- **Robust closing-PR signal** (D18): GraphQL `closedByPullRequestsReferences` (or
-  the `closed`-event PR) in the GitHub adapter — a live-wiring concern; the offline
-  cross-reference heuristic + closed/merged gate is what ships now.
+- ~~**Robust closing-PR signal** (D18): GraphQL `closedByPullRequestsReferences` (or
+  the `closed`-event PR) in the GitHub adapter.~~ **Resolved in CE1.3 (#53):** the
+  adapter now reads `closedByPullRequestsReferences`; the timeline heuristic is
+  retired.
 - Inspector transcript rendering: native vs. embed `export-html`.
 - StateStore local backing; how much of resume is `WorkflowEngine` vs. custom.
 - Remote adapters: `effect/unstable/cluster` vs. hand-rolled tunnel.

@@ -4,18 +4,20 @@
  * {@link FetchHttpClient}). Deterministic and OFFLINE — no live GitHub call in the
  * gate (INV-GATE): every request is answered by a canned in-memory route table.
  *
- * The suite proves the adapter issues the right GitHub REST paths, decodes each
- * wire response through `Schema` into the OWNED port types (never a cast,
- * INV-NOCAST), and translates every host failure into the owned
- * {@link RepositoryError} (INV-PORT). The tests depend ONLY on the package's public
- * surface plus the standard `FetchHttpClient` transport seam — never a concrete
- * GitHub client.
+ * The suite proves the adapter issues the right GitHub REST paths AND the GraphQL
+ * closing-PR query (`closedByPullRequestsReferences`), decodes each wire response
+ * through `Schema` into the OWNED port types (never a cast, INV-NOCAST), and
+ * translates every host failure — an HTTP error, a decode error, a GraphQL
+ * `errors[]` — into the owned {@link RepositoryError} (INV-PORT). The tests depend
+ * ONLY on the package's public surface plus the standard `FetchHttpClient` transport
+ * seam — never a concrete GitHub client.
  */
 import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
 import { PositiveInt } from "@sprinter/domain";
+import { CLOSING_PR_QUERY } from "./github.ts";
 import { layer, layerFetch, Repository, RepositoryError } from "./index.ts";
 
 // ============================================================================
@@ -40,9 +42,9 @@ const makeFetch = (routes: Record<string, Route>): typeof globalThis.fetch =>
     { preconnect: globalThis.fetch.preconnect },
   );
 
-const config = { owner: "callajd", repo: "sprinter" };
+const config = { owner: "callajd", repo: "sprinter", token: "test-token" };
 
-const backend = (routes: Record<string, Route>): Layer.Layer<Repository> =>
+const backend = (routes: Record<string, Route>): Layer.Layer<Repository, RepositoryError> =>
   layer(config).pipe(
     Layer.provide(
       FetchHttpClient.layer.pipe(
@@ -144,78 +146,261 @@ it.effect("reads a PR and reports whether it merged", () =>
   ),
 );
 
-it.effect("detects the PR that closes an Issue from its timeline", () =>
+/** One `closedByPullRequestsReferences` node — a closing PR and whether it merged. */
+interface ClosingNode {
+  readonly number: number;
+  readonly merged: boolean;
+}
+
+/** A GraphQL `closedByPullRequestsReferences` response with the given nodes (in order). */
+const gqlNodes =
+  (...nodes: ReadonlyArray<ClosingNode>): Route =>
+  () =>
+    json({
+      data: {
+        repository: { issue: { closedByPullRequestsReferences: { nodes } } },
+      },
+    });
+
+/** A GraphQL response whose (single) closing PR is MERGED — the common landed case. */
+const gqlClosing =
+  (...numbers: ReadonlyArray<number>): Route =>
+  () =>
+    gqlNodes(...numbers.map((number) => ({ number, merged: true })))();
+
+it.effect("detects the PR that CLOSED an Issue via GraphQL closedByPullRequestsReferences", () =>
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.some(42));
+  }).pipe(Effect.provide(backend({ "/graphql": gqlClosing(42) }))),
+);
+
+/**
+ * The GraphQL request body the adapter must send for {@link CLOSING_PR_QUERY} —
+ * decoded straight from the captured JSON string (no cast, INV-NOCAST): the query
+ * text plus the owner/repo/issue-number variables.
+ */
+const GraphqlRequestBody = Schema.fromJsonString(
+  Schema.Struct({
+    query: Schema.String,
+    variables: Schema.Struct({
+      owner: Schema.String,
+      repo: Schema.String,
+      number: Schema.Number,
+    }),
+  }),
+);
+
+/** What a single captured outbound `fetch` call carried (method / auth / body). */
+interface CapturedRequest {
+  readonly method: string;
+  readonly authorization: string | null;
+  readonly body: string | undefined;
+}
+
+/**
+ * Normalize a `fetch` body to its JSON text. The transport encodes a JSON body as a
+ * UTF-8 `Uint8Array`; a raw string is decoded as-is. Anything else yields `undefined`
+ * (a missing body) — no cast, INV-NOCAST.
+ */
+const bodyText = (body: RequestInit["body"]): string | undefined =>
+  typeof body === "string"
+    ? body
+    : body instanceof Uint8Array
+      ? new TextDecoder().decode(body)
+      : undefined;
+
+it.effect(
+  "sends the closing-PR query as an authenticated POST with the expected variables (NB2)",
+  () =>
+    // Locks the HEADLINE security behavior: the GraphQL closing-PR request must be a
+    // POST that carries `Authorization: Bearer <token>` and the exact CLOSING_PR_QUERY
+    // with the owner/repo/issue variables. Assert method + header + body — not merely
+    // the pathname — so a regression that drops the token or garbles the query is caught.
+    Effect.gen(function* () {
+      let seen: CapturedRequest | undefined;
+      const capturingFetch: typeof globalThis.fetch = Object.assign(
+        (_input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+          seen = {
+            method: init?.method ?? "GET",
+            authorization: new Headers(init?.headers).get("authorization"),
+            body: bodyText(init?.body),
+          };
+          return Promise.resolve(gqlClosing(42)());
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      );
+      const repo = yield* Repository.pipe(
+        Effect.provide(
+          layer(config).pipe(
+            Layer.provide(
+              FetchHttpClient.layer.pipe(
+                Layer.provide(Layer.succeed(FetchHttpClient.Fetch, capturingFetch)),
+              ),
+            ),
+          ),
+        ),
+      );
+      const found = yield* repo.pullRequests.closingPullRequest(num(25));
+      expect(found).toStrictEqual(Option.some(42));
+      expect(seen).toBeDefined();
+      expect(seen?.method).toBe("POST");
+      expect(seen?.authorization).toBe("Bearer test-token");
+      const decoded = Schema.decodeUnknownSync(GraphqlRequestBody)(seen?.body);
+      expect(decoded.query).toBe(CLOSING_PR_QUERY);
+      expect(decoded.variables).toStrictEqual({ owner: "callajd", repo: "sprinter", number: 25 });
+    }),
+);
+
+it.effect(
+  "does NOT attribute an unrelated PR that merely mentions a hand-closed Issue as the closer",
+  () =>
+    // The authoritative signal (`closedByPullRequestsReferences`) reports NO closing
+    // PR for an Issue that was hand-closed while a different merged PR only mentions
+    // it — where the retired timeline `cross-referenced` heuristic false-positived,
+    // GraphQL returns an empty node set, so the reconciler never mis-lands (D18/CE1.3).
+    Effect.gen(function* () {
+      const repo = yield* Repository;
+      const found = yield* repo.pullRequests.closingPullRequest(num(25));
+      expect(found).toStrictEqual(Option.none());
+    }).pipe(Effect.provide(backend({ "/graphql": gqlClosing() }))),
+);
+
+it.effect("reports no closing PR when the host has no record of the Issue (null issue)", () =>
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.none());
+  }).pipe(
+    Effect.provide(backend({ "/graphql": () => json({ data: { repository: { issue: null } } }) })),
+  ),
+);
+
+it.effect("surfaces a GraphQL errors[] response as RepositoryError", () =>
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error.operation).toBe("closingPullRequest");
+    expect(error.detail).toContain("rate limited");
+  }).pipe(
+    Effect.provide(backend({ "/graphql": () => json({ errors: [{ message: "rate limited" }] }) })),
+  ),
+);
+
+it.effect("addresses the GraphQL endpoint for a GitHub Enterprise base URL", () =>
+  // GHE exposes REST at `/api/v3` and GraphQL at `/api/graphql`; the adapter must
+  // POST the closing-PR query to the latter, not `baseUrl + /graphql`.
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.some(7));
+  }).pipe(
+    Effect.provide(
+      layer({ ...config, baseUrl: "https://ghe.example/api/v3" }).pipe(
+        Layer.provide(
+          FetchHttpClient.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FetchHttpClient.Fetch, makeFetch({ "/api/graphql": gqlClosing(7) })),
+            ),
+          ),
+        ),
+      ),
+    ),
+  ),
+);
+
+it.effect(
+  "selects the MERGED closing PR when a closed-but-unmerged reference precedes it (NB2)",
+  () =>
+    // An Issue closed by an unmerged PR, reopened, then closed/merged by a later PR:
+    // the connection holds the UNMERGED reference ahead of the MERGED one. Taking
+    // `nodes[0]` + a merged-gate would wrongly report not-landed; the adapter must
+    // select the merged reference among the page.
+    Effect.gen(function* () {
+      const repo = yield* Repository;
+      const found = yield* repo.pullRequests.closingPullRequest(num(25));
+      expect(found).toStrictEqual(Option.some(99));
+    }).pipe(
+      Effect.provide(
+        backend({
+          "/graphql": gqlNodes({ number: 41, merged: false }, { number: 99, merged: true }),
+        }),
+      ),
+    ),
+);
+
+it.effect("reports no closing PR when every closing reference is unmerged (NB2)", () =>
+  // Only closed-but-unmerged references exist — nothing landed, so `Option.none`.
+  Effect.gen(function* () {
+    const repo = yield* Repository;
+    const found = yield* repo.pullRequests.closingPullRequest(num(25));
+    expect(found).toStrictEqual(Option.none());
+  }).pipe(Effect.provide(backend({ "/graphql": gqlNodes({ number: 41, merged: false }) }))),
+);
+
+it.effect("normalizes a trailing slash on the base URL so the endpoint is /graphql (NB3)", () =>
+  // A base URL ending in `/` must yield `.../graphql`, never `...//graphql`.
   Effect.gen(function* () {
     const repo = yield* Repository;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
   }).pipe(
     Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": () =>
-          json([
-            { event: "labeled" },
-            { event: "cross-referenced", source: { issue: { number: 7 } } },
-            {
-              event: "cross-referenced",
-              source: { issue: { number: 42, pull_request: { url: "x" } } },
-            },
-          ]),
-      }),
+      layer({ ...config, baseUrl: "https://api.github.com/" }).pipe(
+        Layer.provide(
+          FetchHttpClient.layer.pipe(
+            Layer.provide(
+              Layer.succeed(FetchHttpClient.Fetch, makeFetch({ "/graphql": gqlClosing(42) })),
+            ),
+          ),
+        ),
+      ),
     ),
   ),
 );
 
-it.effect("follows timeline pagination — finds a closing PR referenced on a later page", () =>
-  Effect.gen(function* () {
-    const repo = yield* Repository;
-    // The closing PR's cross-reference is on page 2; the adapter must follow the
-    // `Link: rel="next"` header rather than stop at the first page.
-    const found = yield* repo.pullRequests.closingPullRequest(num(25));
-    expect(found).toStrictEqual(Option.some(99));
-  }).pipe(
-    Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": (() => {
-          let call = 0;
-          return () => {
-            call += 1;
-            if (call === 1) {
-              // Page 1: only noise, with a `Link` header advertising page 2.
-              return new Response(JSON.stringify([{ event: "labeled" }, { event: "commented" }]), {
-                status: 200,
-                headers: {
-                  "content-type": "application/json",
-                  link: '<https://api.github.com/repos/callajd/sprinter/issues/25/timeline?per_page=100&page=2>; rel="next"',
-                },
-              });
-            }
-            // Page 2: the closing PR reference, and no further `Link` → stop.
-            return json([
-              {
-                event: "cross-referenced",
-                source: { issue: { number: 99, pull_request: { url: "x" } } },
-              },
-            ]);
-          };
-        })(),
-      }),
+it.effect(
+  "surfaces a 401 from the GraphQL endpoint as a loud RepositoryError, not Option.none (B1)",
+  () =>
+    // GitHub 401s an unauthenticated/invalid-token GraphQL request. That must be a
+    // DISTINCT, loud failure the reconciler can see — never masked as "no closing PR".
+    Effect.gen(function* () {
+      const repo = yield* Repository;
+      const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(RepositoryError);
+      expect(error.operation).toBe("closingPullRequest");
+    }).pipe(
+      Effect.provide(
+        backend({
+          "/graphql": () => json({ message: "Requires authentication" }, 401),
+        }),
+      ),
     ),
-  ),
 );
 
-it.effect("reports no closing PR when nothing references the Issue", () =>
+it.effect("refuses to construct a token-less adapter with a distinct, loud error (NB3)", () =>
+  // Universal guard (NB3): an empty/blank token can never authenticate ANY operation
+  // (GitHub 401s it), and the REST ops must never carry an empty `Bearer`. So the
+  // adapter refuses to build at all — one construction-time fail-fast covering every
+  // op — rather than a per-op guard, and never silently reports "no closing PR".
   Effect.gen(function* () {
-    const repo = yield* Repository;
-    const found = yield* repo.pullRequests.closingPullRequest(num(25));
-    expect(found).toStrictEqual(Option.none());
-  }).pipe(
-    Effect.provide(
-      backend({
-        "/repos/callajd/sprinter/issues/25/timeline": () => json([{ event: "labeled" }]),
-      }),
-    ),
-  ),
+    const error = yield* Repository.pipe(
+      Effect.provide(
+        layer({ ...config, token: "" }).pipe(
+          Layer.provide(
+            FetchHttpClient.layer.pipe(
+              Layer.provide(Layer.succeed(FetchHttpClient.Fetch, makeFetch({}))),
+            ),
+          ),
+        ),
+      ),
+      Effect.flip,
+    );
+    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error.detail).toContain("token is required");
+  }),
 );
 
 // ============================================================================

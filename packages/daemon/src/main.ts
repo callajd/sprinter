@@ -64,11 +64,21 @@ export interface DaemonConfig {
 
 /**
  * Resolve a {@link DaemonConfig} from an environment record — pure, with sensible
- * defaults for a local daemon, so the entrypoint is a thin `process.env` read. The
- * GitHub `token` is included only when present (`exactOptionalPropertyTypes`).
+ * defaults for a local daemon, so the entrypoint is a thin `process.env` read.
+ *
+ * `GITHUB_TOKEN` is REQUIRED (B1, CE1.3): the daemon drives authenticated Issue→PR
+ * work and GitHub's GraphQL closing-PR signal 401s every unauthenticated request, so
+ * a token-less daemon would silently never observe any Issue as landed. This FAILS
+ * FAST AND LOUDLY at boot — throwing a clear, actionable error before the graph is
+ * built — rather than constructing a token-less config that dies quietly per-call.
  */
 export const configFromEnv = (env: Readonly<Record<string, string | undefined>>): DaemonConfig => {
   const token = env["GITHUB_TOKEN"];
+  if (token === undefined || token.trim() === "") {
+    throw new Error(
+      "GITHUB_TOKEN is required: the daemon needs an authenticated GitHub token (GitHub's GraphQL API rejects unauthenticated requests with 401). Set GITHUB_TOKEN and restart.",
+    );
+  }
   return {
     databasePath: env["SPRINTER_DB"] ?? "./sprinter.db",
     socketPath: env["SPRINTER_SOCKET"] ?? "./sprinter.sock",
@@ -76,7 +86,7 @@ export const configFromEnv = (env: Readonly<Record<string, string | undefined>>)
     repository: {
       owner: env["SPRINTER_REPO_OWNER"] ?? "callajd",
       repo: env["SPRINTER_REPO_NAME"] ?? "sprinter",
-      ...(token !== undefined ? { token } : {}),
+      token,
     },
   };
 };
