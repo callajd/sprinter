@@ -35,7 +35,7 @@ import {
   WorkstreamPlan,
 } from "./rpc.ts";
 
-/** The full procedure surface of contract v1 (architecture §7). */
+/** The full procedure surface of the contract (architecture §7). */
 const ALL_TAGS = [
   "snapshot",
   "events",
@@ -67,7 +67,7 @@ const issue = {
 const job = { id: "job-1", issueId: "iss-1", kind: "implement", status: "running" };
 const session = { id: "ses-1", jobId: "job-1", status: "active" };
 
-it("carries every model of contract v1 as a procedure", () => {
+it("carries every model of the contract as a procedure", () => {
   expect([...SprinterRpc.requests.keys()].sort()).toEqual([...ALL_TAGS].sort());
 });
 
@@ -98,7 +98,7 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
 });
 
 it("streams offset-stamped owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
-  // The streamed success is the OffsetEvent envelope (contract v3 / CE2.0): the
+  // The streamed success is the OffsetEvent envelope (CE2.0): the
   // owned delta PLUS the durable offset the client feeds back as `sinceOffset`.
   const delta = { _tag: "IssueChanged", issue };
   const item = { offset: 7, event: delta };
@@ -119,7 +119,7 @@ it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)"
   expect(withCursor.sinceOffset).toBe(12);
 
   // Absent: the key is optional, so an empty payload decodes (origin replay,
-  // backward-compatible with the pre-v3 no-field request).
+  // backward-compatible with the earlier (pre-cursor) no-field request).
   const noCursor = Schema.decodeUnknownSync(events.payloadSchema)({});
   expect(noCursor.sinceOffset).toBeUndefined();
 
@@ -128,10 +128,10 @@ it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)"
 });
 
 it("decodes the events request through the wire JSON codec — {} replays from origin (CE2.0 B1)", () => {
-  // Regression for the v3 end-to-end decode bug (CE2.0 re-review): the daemon decodes
+  // Regression for the events-payload end-to-end decode bug (CE2.0 re-review): the daemon decodes
   // each request payload through `Schema.toCodecJson(payloadSchema)` — the exact seam
   // `RpcServer` drives over the NDJSON serializer, NOT the `RpcTest` shortcut that
-  // bypasses serialization. Under v3 the events payload is a `Struct`, so what the
+  // bypasses serialization. The events payload is a `Struct`, so what the
   // client puts on the wire for the `payload` key matters end-to-end.
   const codec = Schema.toCodecJson(events.payloadSchema);
 
@@ -143,7 +143,7 @@ it("decodes the events request through the wire JSON codec — {} replays from o
 
   // Documents the boundary the omitted-payload bug tripped: an ABSENT payload
   // (`undefined`, an omitted `payload` key on the wire) is NOT a valid events
-  // request under the v3 `Struct` schema and fails to decode ("Expected object, got
+  // request under the events `Struct` schema and fails to decode ("Expected object, got
   // undefined"). The fix is to send a present `{}`, not to widen the schema to accept
   // `undefined`.
   expect(() => Schema.decodeUnknownSync(codec)(undefined)).toThrow();

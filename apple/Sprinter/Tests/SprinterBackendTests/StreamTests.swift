@@ -41,8 +41,8 @@ struct StreamTests {
     transport.close()
   }
 
-  /// Regression for the v3 end-to-end decode bug (CE2.0 re-review): the daemon's
-  /// `events` payload schema is a `Struct` under v3, so an OMITTED `payload` key
+  /// Regression for the events-payload end-to-end decode bug (CE2.0 re-review): the daemon's
+  /// `events` payload schema is a `Struct`, so an OMITTED `payload` key
   /// decodes to `undefined` and the stream errors on connect. The canonical Effect
   /// client sends `{}` for `.events({})`; the Swift client must match by sending a
   /// PRESENT empty ``EventsPayload`` (INV-CONTRACT). Asserted on the REAL outbound
@@ -61,7 +61,7 @@ struct StreamTests {
     #expect(request.rpcTag == "events")
     // A present empty object (`"payload": {}`) — no `sinceOffset` → origin replay —
     // NOT an absent key (which would decode to `nil` here and to `undefined` on the
-    // wire, breaking the v3 `Struct` decode).
+    // wire, breaking the `Struct` decode).
     #expect(request.payload == .object([:]))
     #expect(request.payload != nil)
 

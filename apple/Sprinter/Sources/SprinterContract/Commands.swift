@@ -28,13 +28,13 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
 }
 
 /// Payload of `events` (streams the ``OffsetEvent`` envelope) — the OPTIONAL
-/// `sinceOffset` resume cursor (contract v3 / CE2.0). A request with no `sinceOffset`
+/// `sinceOffset` resume cursor (CE2.0). A request with no `sinceOffset`
 /// (`nil`) replays from the log ORIGIN; present resumes STRICTLY AFTER that offset.
 /// The wire is `Schema.optionalKey(NonNegativeInt)`, so the KEY is OMITTED when `nil`
 /// (never `null`) — Swift synthesized `Codable` matches this exactly. The payload
 /// OBJECT itself is still sent PRESENT (an empty `{}` when there is no cursor):
 /// ``RpcBackend/events()`` encodes an empty ``EventsPayload`` so the request carries
-/// `"payload": {}`, matching the canonical Effect client — under v3 the payload
+/// `"payload": {}`, matching the canonical Effect client — the payload
 /// schema is a `Struct`, so an omitted `payload` key would fail to decode.
 public struct EventsPayload: Codable, Equatable, Sendable {
   public let sinceOffset: Int?

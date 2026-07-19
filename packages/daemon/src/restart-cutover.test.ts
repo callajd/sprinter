@@ -21,8 +21,8 @@
  *      session id (`UNIQUE(session.jobId)`), never a new session, so the work is not
  *      DUPLICATED;
  *   3. the app **resyncs** on reconnect — a fresh client (the app re-dialing the restarted
- *      daemon) resumes the `events` feed from its last-applied durable **offset** (the v3
- *      cursor) and observes the post-restart deltas STRICTLY AFTER it: no delta re-delivered
+ *      daemon) resumes the `events` feed from its last-applied durable **offset** (the
+ *      resume cursor) and observes the post-restart deltas STRICTLY AFTER it: no delta re-delivered
  *      (no duplication) and the terminal `succeeded` delta delivered (no loss).
  *
  * Every wait is HARD-timeout-bounded so a hung socket/reconnect/event fails fast rather

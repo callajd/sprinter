@@ -18,7 +18,7 @@ const workstream = Schema.decodeUnknownSync(Workstream)({
   status: "pending",
   epics: [],
 });
-// The feed carries offset-stamped envelopes (contract v3 / CE2.0).
+// The feed carries offset-stamped envelopes (CE2.0).
 const delta: OffsetEvent = { offset: 7, event: { _tag: "WorkstreamChanged", workstream } };
 
 it.effect("delivers a published delta to a prior subscriber", () =>

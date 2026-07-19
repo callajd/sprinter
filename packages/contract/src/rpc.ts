@@ -98,8 +98,8 @@ export type WorkGraphEvent = (typeof WorkGraphEvent)["Type"];
 
 /**
  * One streamed `events` item: a {@link WorkGraphEvent} paired with its DURABLE
- * `offset` — the `event_log` row position the delta was journaled at (contract v3 /
- * CE2.0). The stream carries the offset so a reconnecting client can remember its
+ * `offset` — the `event_log` row position the delta was journaled at (CE2.0). The
+ * stream carries the offset so a reconnecting client can remember its
  * last-seen position and hand it back as the request's `sinceOffset` cursor. Without
  * this envelope the bare `WorkGraphEvent` gave the client no coordinate to resume
  * from, so the cursor was inert; the offset closes that loop end-to-end.
@@ -138,7 +138,7 @@ export type WorkstreamPlan = (typeof WorkstreamPlan)["Type"];
 export const ControlAction = Schema.Literals(["start", "pause", "resume", "cancel"]);
 export type ControlAction = (typeof ControlAction)["Type"];
 
-// ── Procedures (contract v1) ────────────────────────────────────────────────
+// ── Procedures ──────────────────────────────────────────────────────────────
 //
 // Each procedure is a named `Rpc` so its per-procedure payload/success/error
 // types are preserved (the group's `requests` map erases them to a union). The
@@ -151,12 +151,12 @@ export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 
 // (2) events — streaming work-graph deltas (INV-REACTIVE). Each streamed item is
 // an {@link OffsetEvent} — the delta PLUS its durable `event_log` offset — so the
-// client can track its last-seen position (contract v3 / CE2.0). The request payload
+// client can track its last-seen position (CE2.0). The request payload
 // carries an OPTIONAL `sinceOffset` resume cursor: an events request with NO
 // `sinceOffset` (a PRESENT but empty `{}` payload) replays from the log ORIGIN,
 // present resumes STRICTLY AFTER that offset, over the daemon's existing
 // `resyncFrom(offset)` primitive (CE1.2). Note the payload OBJECT itself is required
-// (the v3 schema is a `Struct`): the canonical client sends `{}` for `.events({})` —
+// (the events payload schema is a `Struct`): the canonical client sends `{}` for `.events({})` —
 // an omitted `payload` key on the wire (decoding to `undefined`) is NOT a valid v3
 // request. The success offset and the request cursor are the SAME coordinate: a
 // client feeds a streamed item's `offset` straight back as the next `sinceOffset`.
