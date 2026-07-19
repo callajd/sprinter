@@ -80,8 +80,8 @@ public struct RpcBackend: Backend {
           //
           // Send a PRESENT ``EventsPayload`` (the `sinceOffset` KEY is omitted when `nil`
           // → origin replay; present → incremental resume) so the request encodes a
-          // payload object, matching the canonical Effect client (INV-CONTRACT). The
-          // payload schema is a `Struct`, so an OMITTED payload key would decode to
+          // payload object, matching the canonical Effect client (INV-CONTRACT). Under v3
+          // the payload schema is a `Struct`, so an OMITTED payload key would decode to
           // `undefined` and fail — a present object decodes correctly.
           let payload = try toJSONValue(EventsPayload(sinceOffset: sinceOffset))
           for try await value in await connection.stream(tag: "events", payload: payload) {
@@ -102,9 +102,20 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
+          // The wire carries the ``OffsetSessionEvent`` envelope — ONE channel
+          // serving BOTH modalities: DURABLE transcript-grade events carry a per-session
+          // `offset`, EPHEMERAL live deltas ride offset-less. Send a PRESENT
+          // ``SessionEventsPayload`` with NO `sinceOffset` key (→ origin replay of the durable
+          // transcript, then live tail), then UNWRAP `.event` and yield EVERY event — durable
+          // and ephemeral alike — to the existing ``SessionEvent`` fold (unchanged), which folds
+          // durable entries into the transcript and applies ephemeral deltas live. Tracking the
+          // offset for a reconnect resume is deferred — ``InteractiveSession`` is a single,
+          // non-reconnecting subscription — so only the wire is made offset-aware here (the
+          // optional `offset` is unwrapped away); resume via `sinceOffset` layers on later,
+          // exactly as ``WorkGraphResync`` did for the `events` feed.
           let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
           for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {
-            continuation.yield(try fromJSONValue(SessionEvent.self, value))
+            continuation.yield(try fromJSONValue(OffsetSessionEvent.self, value).event)
           }
           continuation.finish()
         } catch {

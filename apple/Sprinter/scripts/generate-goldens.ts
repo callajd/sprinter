@@ -47,6 +47,7 @@ import {
   interrupt,
   IssueNotFound,
   OffsetEvent,
+  OffsetSessionEvent,
   PlanRejected,
   retryIssue,
   sessionEvents,
@@ -171,6 +172,39 @@ write("offset-events", Schema.Array(OffsetEvent), [
   { offset: 5, event: { _tag: "SessionChanged", session } },
 ]);
 
+// ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────
+//
+// The ONE channel serves BOTH modalities: DURABLE transcript-grade events carry a per-session
+// `offset` (replayable; the client feeds it back as `sinceOffset`), while EPHEMERAL live deltas
+// ride the SAME channel OFFSET-LESS (the `offset` key is omitted). The sample interleaves both:
+// the durable entries resume from a mid-transcript position (2,3,4), and the ephemeral deltas
+// (TurnStarted, MessageDelta, UiRequestRaised) prove the mirror decodes a missing `offset` to
+// `nil` and still surfaces the event.
+
+write("offset-session-events", Schema.Array(OffsetSessionEvent), [
+  // Ephemeral live delta — NO `offset` key (turn lifecycle).
+  { event: { _tag: "TurnStarted" } },
+  {
+    offset: 2,
+    event: {
+      _tag: "EntryAppended",
+      entry: { _tag: "AssistantMessage", id: "a1", text: "on it", reasoning: "planning" },
+    },
+  },
+  // Ephemeral message partial — offset-less.
+  { event: { _tag: "MessageDelta", messageId: "a1", text: "on " } },
+  { offset: 3, event: { _tag: "Notice", id: "notice-disk", level: "warn", message: "disk low" } },
+  // Ephemeral interactive request — offset-less.
+  { event: { _tag: "UiRequestRaised", id: "u1", kind: "confirm", prompt: "proceed?" } },
+  {
+    offset: 4,
+    event: {
+      _tag: "EntryAppended",
+      entry: { _tag: "ToolResult", id: "c1", output: 3, isError: false },
+    },
+  },
+]);
+
 // ── SessionEvent — every variant (+ optional present/absent) ─────────────────
 
 const usageFull = {
@@ -291,7 +325,14 @@ write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSch
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
-write("payload-session-events", sessionEvents.payloadSchema, { sessionId: "ses-1" });
+// The `sessionEvents` request cursor is OPTIONAL, exactly like `events`:
+// both wire forms are captured — present (`sinceOffset` key set) and absent (key omitted,
+// the origin-replay case) — so the Swift mirror decodes each.
+write("payload-session-events", sessionEvents.payloadSchema, {
+  sessionId: "ses-1",
+  sinceOffset: 12,
+});
+write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
 write("payload-session-send", sessionSend.payloadSchema, {
   sessionId: "ses-1",
   input: { text: "go", mode: "prompt" },

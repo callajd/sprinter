@@ -364,14 +364,16 @@ it.effect(
           // register-after-dispatch window server-side (the real Swift app carries no
           // retry — that is exactly what this proves). Bounded hard so a genuine hang
           // still fails fast.
+          // Each streamed item is an `OffsetSessionEvent`: unwrap `.event` to
+          // the durable transcript entry the daemon journaled as the live session ran.
           const transcript = yield* client.sessionEvents({ sessionId: SESSION_ID }).pipe(
-            Stream.filter((event) => event._tag === "EntryAppended"),
+            Stream.filter((item) => item.event._tag === "EntryAppended"),
             Stream.runHead,
             Effect.timeout(HARD_TIMEOUT),
             Effect.map(Option.getOrThrow),
             Effect.orDie,
           );
-          expect(transcript._tag).toBe("EntryAppended");
+          expect(transcript.event._tag).toBe("EntryAppended");
 
           // Drive input and interrupt the turn — both must resolve the live session
           // (never `SessionNotFound`), proving the channel is wired end-to-end.

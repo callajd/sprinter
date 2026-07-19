@@ -260,3 +260,29 @@ extension SessionEvent {
     }
   }
 }
+
+/// A single streamed `sessionEvents` item: a ``SessionEvent`` paired with an OPTIONAL DURABLE
+/// per-session `offset`. This ONE channel serves BOTH session modalities — live
+/// driving AND settled-transcript replay — so `offset` is optional, the sole divergence from
+/// the always-present ``OffsetEvent``:
+///
+/// - `offset` PRESENT ⇒ a DURABLE, transcript-grade event (`EntryAppended`/`Notice`) journaled
+///   at that position; it is replayable and advances a reconnect's `sinceOffset` cursor. Wire:
+///   `{ "offset": 7, "event": { "_tag": "EntryAppended", "entry": { … } } }`.
+/// - `offset` ABSENT ⇒ an EPHEMERAL live delta (turn lifecycle, message/tool partials,
+///   `UiRequestRaised`, …): forwarded to drive the live modality but never persisted, so the
+///   `offset` key is simply omitted. Wire: `{ "event": { "_tag": "TurnStarted" } }`.
+///
+/// The offset is the contract's `NonNegativeInt`, which encodes as a bare JSON integer, so the
+/// mirror maps it to `Int?` (a missing key decodes to `nil`; a `nil` never re-encodes a key).
+/// A SETTLED session's durable transcript replays and the stream completes rather than the old
+/// `SessionNotFound`. Consumers that only need the event unwrap ``event``.
+public struct OffsetSessionEvent: Codable, Equatable, Sendable {
+  public let offset: Int?
+  public let event: SessionEvent
+
+  public init(offset: Int? = nil, event: SessionEvent) {
+    self.offset = offset
+    self.event = event
+  }
+}

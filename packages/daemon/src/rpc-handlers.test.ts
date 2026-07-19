@@ -54,6 +54,7 @@ import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
+import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
 import {
   layer as layerSessionRegistry,
   SESSION_RESOLVE_TIMEOUT,
@@ -127,6 +128,7 @@ interface Ctx {
   readonly client: Client;
   readonly store: Context.Service.Shape<typeof StateStore>;
   readonly feed: Context.Service.Shape<typeof WorkGraphEvents>;
+  readonly sessionFeed: Context.Service.Shape<typeof SessionEvents>;
   readonly sessions: Context.Service.Shape<typeof SessionRegistry>;
   readonly dispatched: Queue.Dequeue<Job>;
 }
@@ -146,6 +148,7 @@ const harness = <A, E>(
       Layer.provideMerge(
         Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
+          Layer.provideMerge(layerSessionEvents),
         ),
       ),
     );
@@ -153,8 +156,9 @@ const harness = <A, E>(
       const client = yield* clientEffect();
       const store = yield* StateStore;
       const feed = yield* WorkGraphEvents;
+      const sessionFeed = yield* SessionEvents;
       const sessions = yield* SessionRegistry;
-      return yield* body({ client, store, feed, sessions, dispatched });
+      return yield* body({ client, store, feed, sessionFeed, sessions, dispatched });
     }).pipe(Effect.provide(app));
   }).pipe(Effect.scoped);
 
@@ -483,13 +487,27 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
 
 const sessionId = session.id;
 
+// DURABLE, transcript-grade session events — the only ones the durable `sessionEvents`
+// channel carries: `EntryAppended` records and reconcilable `Notice`s.
+const entryAppended: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a1", text: "on it" },
+};
+const noticeEvent: SessionEvent = { _tag: "Notice", id: "n1", level: "info", message: "started" };
+const entryAppended2: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
+};
+// EPHEMERAL live deltas — the live driving modality the ONE channel must also carry: they
+// ride the feed offset-less, are never persisted, and never advance the resume cursor.
+const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+const messageDelta: SessionEvent = { _tag: "MessageDelta", messageId: "a2", text: "do" };
 const uiRequest: SessionEvent = {
   _tag: "UiRequestRaised",
-  id: "req-1",
+  id: "u1",
   kind: "confirm",
-  prompt: "Proceed?",
+  prompt: "proceed?",
 };
-const turnStarted: SessionEvent = { _tag: "TurnStarted" };
 
 /**
  * A fake live {@link SessionHandle}: a caller-supplied owned `SessionEvent` stream
@@ -520,16 +538,205 @@ const makeFakeSession = (events: ReadonlyArray<SessionEvent>): Effect.Effect<Fak
     return { handle, sent, answered, interrupted };
   });
 
-it.effect("sessionEvents bridges the live session's owned event stream", () =>
-  harness(({ client, sessions }) =>
+// A SETTLED session (durable Job + Session rows terminal, NO live handle): the Inspector
+// opens its channel to VIEW the transcript. `sessionEvents` replays the whole durable
+// transcript as `OffsetSessionEvent`s and COMPLETES — never the old `SessionNotFound` for a
+// settled session (the gap this closes) — and a `sinceOffset` cursor resumes strictly after.
+it.effect("sessionEvents replays a SETTLED session's durable transcript and completes", () =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([turnStarted, uiRequest]);
-      yield* sessions.register(sessionId, fake.handle);
+      yield* store.jobs.putSession(session); // `completed` (terminal)
+      yield* store.jobs.putJob(orphanedJob); // terminal Job, no live handle
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.append(sessionId, noticeEvent);
+      yield* store.sessionLog.append(sessionId, entryAppended2);
 
       const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
-      expect(received).toEqual([turnStarted, uiRequest]);
+      expect(received.map((i) => i.event)).toEqual([entryAppended, noticeEvent, entryAppended2]);
+      // A settled replay is DURABLE-ONLY: every item is offset-BEARING and monotonic (the
+      // durable per-session coordinate).
+      const offsets = received.flatMap((i) => (i.offset === undefined ? [] : [i.offset]));
+      expect(offsets.length).toBe(received.length);
+      expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+
+      // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
+      const cursor = offsets[0] ?? 0;
+      const resumed = yield* client
+        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .pipe(Stream.runCollect);
+      expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
+      expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
     }),
   ),
+);
+
+// A LIVE session (a registered handle → `resolveLive` resolves it): `sessionEvents` replays
+// the durable transcript so far, THEN tails new durable entries as the fold journals them —
+// replay and live tail one offset coordinate. Uses `it.live` + a settle so the live append
+// lands after the subscription (no TestClock: the registered handle resolves without waiting).
+it.live("sessionEvents replays a LIVE session's transcript, then tails new durable entries", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      // A STILL-RUNNING session: its terminal `result` stays pending, so the live tail keeps
+      // tailing new durable entries (it completes only once the session settles).
+      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+      yield* sessions.register(sessionId, liveHandle);
+      // One durable entry already in the transcript before the client attaches.
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      const collecting = yield* client
+        .sessionEvents({ sessionId })
+        .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+      // Let the replay drain and the live subscription settle before the live append.
+      yield* Effect.sleep("20 millis");
+      // A durable entry appended AFTER attach arrives on the live tail (one coordinate).
+      yield* store.sessionLog.append(sessionId, entryAppended2);
+
+      const received = yield* Fiber.join(collecting);
+      expect(received.map((i) => i.event)).toEqual([entryAppended, entryAppended2]);
+      const [first, second] = received.map((i) => i.offset);
+      expect(first !== undefined && second !== undefined && second > first).toBe(true);
+    }),
+  ),
+);
+
+// The live tail must COMPLETE when the session settles (mirroring the old `handle.events`,
+// which closed on session end) rather than hang open on the durable feed. The fake handle's
+// terminal `result` is already settled, so the live tail interrupts right after replay — the
+// stream replays the durable transcript and completes (a `runCollect` that never returns
+// would hang the test, so completing at all proves the bound).
+it.effect("sessionEvents completes when a live session settles (no hang on the durable feed)", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]); // result is already `Completed` → settled
+      yield* sessions.register(sessionId, fake.handle);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      expect(received.map((i) => i.event)).toEqual([entryAppended]);
+    }),
+  ),
+);
+
+// The ONE channel serves BOTH modalities: a LIVE driving session must receive its EPHEMERAL
+// deltas (turn lifecycle, message partials, `UiRequestRaised`) AND its DURABLE entries,
+// interleaved in emission order — ephemerals offset-LESS, durables offset-STAMPED. This is
+// the exact regression the correction fixes (the prior pass dropped every ephemeral).
+it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable entries", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      // A STILL-RUNNING session: `result` stays pending so the live tail keeps forwarding.
+      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+      yield* sessions.register(sessionId, liveHandle);
+
+      // Collect the full interleaved flow off the live tail (nothing durable pre-attach).
+      const collecting = yield* client
+        .sessionEvents({ sessionId })
+        .pipe(Stream.take(5), Stream.runCollect, Effect.forkChild);
+      yield* Effect.sleep("20 millis"); // let the subscription settle before emitting
+
+      // Tee a mix through the decorated store exactly as the JobRunner fold does: ephemeral
+      // deltas via `publishEphemeral` (offset-less), durable entries via `append` (offset).
+      yield* store.sessionLog.publishEphemeral(sessionId, turnStarted);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.publishEphemeral(sessionId, messageDelta);
+      yield* store.sessionLog.publishEphemeral(sessionId, uiRequest);
+      yield* store.sessionLog.append(sessionId, entryAppended2);
+
+      const received = yield* Fiber.join(collecting);
+      // ALL five arrive, in emission order (no ephemeral dropped — the design regression fixed).
+      expect(received.map((i) => i.event)).toEqual([
+        turnStarted,
+        entryAppended,
+        messageDelta,
+        uiRequest,
+        entryAppended2,
+      ]);
+      // Ephemeral deltas are offset-LESS; durable entries are offset-STAMPED and monotonic.
+      const presence = received.map((i) => i.offset !== undefined);
+      expect(presence).toEqual([false, true, false, false, true]);
+      const durableOffsets = received.flatMap((i) => (i.offset === undefined ? [] : [i.offset]));
+      expect(durableOffsets).toEqual([...durableOffsets].sort((a, b) => a - b));
+
+      // Resume IGNORES ephemerals: because they were never persisted, a cursor at the first
+      // durable offset replays ONLY the durable suffix (the second entry). The handle is still
+      // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
+      const cursor = durableOffsets[0] ?? 0;
+      const resumed = yield* client
+        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .pipe(Stream.take(1), Stream.runCollect);
+      expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
+      expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
+    }),
+  ),
+);
+
+// Existence is the Session ROW, not the transcript length. A session that NEVER existed —
+// no live handle AND no row — is the ONLY `sessionEvents` miss.
+it.effect(
+  "sessionEvents fails SessionNotFound only when the session never existed (no row, no handle)",
+  () =>
+    harness(({ client }) =>
+      Effect.gen(function* () {
+        const exit = yield* client
+          .sessionEvents({ sessionId })
+          .pipe(Stream.runCollect, Effect.exit);
+        expect(Exit.isFailure(exit)).toBe(true);
+      }),
+    ),
+);
+
+// A SETTLED session that emitted ZERO durable events still EXISTS (its Session row is
+// terminal): `sessionEvents` replays an EMPTY transcript and COMPLETES — NOT the old
+// `SessionNotFound`, which would make the Inspector error on a legitimate empty session.
+it.effect(
+  "sessionEvents completes with an empty transcript for a settled session that emitted nothing",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        yield* store.jobs.putSession(session); // terminal row, NO durable entries, no live handle
+        yield* store.jobs.putJob(orphanedJob);
+
+        const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+        expect(received.length).toBe(0);
+      }),
+    ),
+);
+
+// The subscribe→read overlap must NOT double-deliver a durable event: an entry whose offset is
+// already covered by the replay (≤ the replay high-water) and is ALSO fanned out on the live
+// feed is DROPPED by the live tail — the id-keyed projection cannot dedup an id-LESS `Notice`,
+// so the daemon must not emit it twice. A genuinely-newer entry (offset above the high-water)
+// still passes, proving the tail keeps running.
+it.live(
+  "sessionEvents does not re-deliver a durable event already covered by replay (no id-less Notice dup)",
+  () =>
+    harness(({ client, store, sessions, sessionFeed }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeSession([]);
+        const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+        yield* sessions.register(sessionId, liveHandle);
+        const idlessNotice: SessionEvent = { _tag: "Notice", level: "info", message: "started" };
+        // The id-less notice is in the durable transcript before attach → covered by REPLAY.
+        const persisted = yield* store.sessionLog.append(sessionId, idlessNotice);
+
+        const collecting = yield* client
+          .sessionEvents({ sessionId })
+          .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+        yield* Effect.sleep("20 millis"); // replay drains + subscription settles
+
+        // The overlap: the SAME durable item (offset ≤ high-water) is ALSO on the live feed.
+        yield* sessionFeed.publish({ sessionId, offset: persisted.offset, event: idlessNotice });
+        // A genuinely-new durable entry (offset > high-water) DOES pass.
+        yield* store.sessionLog.append(sessionId, entryAppended2);
+
+        const received = yield* Fiber.join(collecting);
+        // Only the replayed notice + the new entry — the re-published duplicate was filtered out.
+        expect(received.map((i) => i.event)).toEqual([idlessNotice, entryAppended2]);
+      }),
+    ),
 );
 
 it.effect("sessionSend drives the input into the live session", () =>
@@ -588,19 +795,12 @@ it.effect("interrupt aborts the live session's in-flight turn", () =>
 it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   harness(({ client, sessions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([uiRequest]);
+      const fake = yield* makeFakeSession([]);
       yield* sessions.register(sessionId, fake.handle);
 
-      // A `UiRequestRaised` surfaces on the live sessionEvents feed…
-      const raised = Option.getOrThrow(
-        yield* client.sessionEvents({ sessionId }).pipe(Stream.runHead),
-      );
-      expect(raised._tag).toBe("UiRequestRaised");
-      if (raised._tag !== "UiRequestRaised") throw new Error("expected UiRequestRaised");
-
-      // …the client answers it, keyed by the raised request id…
+      // The client answers an outstanding UI request, keyed by the request id it echoes…
       const response: UiResponse = {
-        requestId: raised.id,
+        requestId: "req-1",
         answer: { _tag: "Confirmed", confirmed: true },
       };
       yield* client.answerUiRequest({ sessionId, response });
@@ -851,6 +1051,7 @@ it.effect("a transient store read failure surfaces as SessionNotFound, not a def
       Layer.provideMerge(
         Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
+          Layer.provideMerge(layerSessionEvents),
         ),
       ),
     );

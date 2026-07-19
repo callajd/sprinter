@@ -158,9 +158,15 @@ struct ConstructionTests {
     let retry = RetryIssuePayload(issueId: IssueId(rawValue: "iss-1"))
     #expect(retry == (try Golden.decode(RetryIssuePayload.self, from: "payload-retry-issue")))
 
-    let subscribe = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"))
+    // The `sessionEvents` resume cursor — both wire forms (present + absent origin replay).
+    let subscribe = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"), sinceOffset: 12)
     #expect(
       subscribe == (try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")))
+    let subscribeFromOrigin = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"))
+    #expect(
+      subscribeFromOrigin
+        == (try Golden.decode(
+          SessionEventsPayload.self, from: "payload-session-events-no-offset")))
 
     let interrupt = InterruptPayload(sessionId: SessionId(rawValue: "ses-1"))
     #expect(interrupt == (try Golden.decode(InterruptPayload.self, from: "payload-interrupt")))

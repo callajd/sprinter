@@ -65,10 +65,19 @@ public struct RetryIssuePayload: Codable, Equatable, Sendable {
   public init(issueId: IssueId) { self.issueId = issueId }
 }
 
-/// Payload of `sessionEvents` (streams ``SessionEvent``).
+/// Payload of `sessionEvents` (streams the ``OffsetSessionEvent`` envelope) — the session
+/// id plus the OPTIONAL `sinceOffset` resume cursor. A request with no
+/// `sinceOffset` (`nil`) replays the session's durable transcript from the ORIGIN; present
+/// resumes STRICTLY AFTER that durable per-session offset. The wire is
+/// `Schema.optionalKey(NonNegativeInt)`, so the KEY is OMITTED when `nil` (never `null`) —
+/// Swift synthesized `Codable` matches this exactly (mirrors ``EventsPayload``).
 public struct SessionEventsPayload: Codable, Equatable, Sendable {
   public let sessionId: SessionId
-  public init(sessionId: SessionId) { self.sessionId = sessionId }
+  public let sinceOffset: Int?
+  public init(sessionId: SessionId, sinceOffset: Int? = nil) {
+    self.sessionId = sessionId
+    self.sinceOffset = sinceOffset
+  }
 }
 
 /// Payload of `sessionSend`.

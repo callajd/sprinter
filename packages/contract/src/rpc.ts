@@ -123,6 +123,39 @@ export const OffsetEvent = Schema.Struct({
 export type OffsetEvent = (typeof OffsetEvent)["Type"];
 
 /**
+ * One streamed `sessionEvents` item: a {@link SessionEvent} paired with an OPTIONAL DURABLE
+ * per-session `offset`. This ONE channel serves BOTH session modalities —
+ * live driving AND settled-transcript replay — so `offset` is optional, the one deliberate
+ * divergence from the work-graph {@link OffsetEvent} (whose offset is ALWAYS present because
+ * every work-graph event is durable). Sessions carry a SUPERSET: the durable transcript
+ * grade PLUS the ephemeral live deltas. Semantics of `offset`:
+ *
+ * - **PRESENT** ⇒ the event is DURABLE and transcript-grade (an `EntryAppended` record or a
+ *   reconcilable `Notice`): it was journaled to the session's durable transcript log at this
+ *   offset, it is REPLAYABLE, and it ADVANCES the reconnect resume cursor. The offset is a
+ *   durable per-session coordinate shared by BOTH the replay (the durable log `tail`) and the
+ *   live tail (new durable entries fanned out as the session runs), so replay and live are one
+ *   coordinate space and a client CAN resume from any offset-bearing item's offset.
+ * - **ABSENT** ⇒ the event is an EPHEMERAL live delta (message/tool partials, turn lifecycle,
+ *   `UiRequestRaised`, status/retry/compaction): it is forwarded to the consumer to drive the
+ *   LIVE modality, but it is NEVER persisted, carries no durable coordinate, and NEVER moves
+ *   the resume cursor. A reconnect replays only the durable (offset-bearing) prefix, so an
+ *   offset-less delta cannot be — and need not be — resumed.
+ *
+ * The strict `> sinceOffset` guarantee is scoped to the RECONNECT RESUME (the durable `tail`),
+ * which sees only offset-bearing events; a single live stream can show a harmless boundary
+ * overlap where the durable replay and the live tail meet (a durable offset repeating),
+ * absorbed by the consumer's id-keyed transcript reconciliation (a durable entry replaces the
+ * item its live counterpart built) exactly as `OffsetEvent` overlap is absorbed by upsert
+ * idempotency.
+ */
+export const OffsetSessionEvent = Schema.Struct({
+  offset: Schema.optionalKey(NonNegativeInt),
+  event: SessionEvent,
+});
+export type OffsetSessionEvent = (typeof OffsetSessionEvent)["Type"];
+
+/**
  * The plan the `createWorkstreamFromPlan` command turns into a new workstream:
  * a human-readable name, the bound repository (repo-scoped per D14), and the
  * free-form spec text driving planning.
@@ -182,9 +215,26 @@ export const retryIssue = Rpc.make("retryIssue", {
 });
 
 // (4) session channel — streaming events + send/interrupt/answer.
+//
+// `sessionEvents` replays a session's DURABLE transcript then live-tails it — the
+// session-channel mirror of `events`, but a UNIFIED dual-modality feed. Each
+// streamed item is an {@link OffsetSessionEvent} — a {@link SessionEvent} PLUS an OPTIONAL
+// durable per-session offset. Durable, transcript-grade events (`EntryAppended`/`Notice`)
+// carry the offset the client feeds back to resume; ephemeral live deltas (turn lifecycle,
+// message/tool partials, `UiRequestRaised`, …) ride the SAME channel offset-less so a live
+// driving session still receives its full reactive flow. The request payload carries an
+// OPTIONAL `sinceOffset` resume cursor: a request with NO `sinceOffset` (a PRESENT but empty
+// payload beyond `sessionId`) replays the session's DURABLE transcript from the ORIGIN,
+// present resumes STRICTLY AFTER that offset (only offset-bearing events are replayable). A
+// SETTLED session replays its durable transcript and the stream COMPLETES (no longer
+// `SessionNotFound`); a LIVE session replays the durable prefix then tails both new durable
+// entries and ephemeral deltas; a session that never existed (no durable transcript AND no
+// live handle) is `SessionNotFound`. Only `sessionEvents` gains durable replay —
+// `sessionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled session is read-only,
+// so they still fail `SessionNotFound`).
 export const sessionEvents = Rpc.make("sessionEvents", {
-  payload: { sessionId: SessionId },
-  success: SessionEvent,
+  payload: { sessionId: SessionId, sinceOffset: Schema.optionalKey(NonNegativeInt) },
+  success: OffsetSessionEvent,
   error: SessionNotFound,
   stream: true,
 });

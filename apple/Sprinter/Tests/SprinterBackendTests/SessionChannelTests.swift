@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Session channel verbs")
 struct SessionChannelTests {
-  @Test("sessionEvents streams owned SessionEvents until Exit")
+  @Test("sessionEvents unwraps the dual-modality envelope (durable + ephemeral) until Exit")
   func sessionEventsStream() async throws {
     let transport = FakeTransport()
     let backend = RpcBackend(transport: transport)
@@ -22,19 +22,27 @@ struct SessionChannelTests {
 
     let request = try await nextSent(&outbound)
     #expect(request.rpcTag == "sessionEvents")
+    // The request sends a PRESENT payload with the `sinceOffset` key OMITTED (→ origin
+    // replay of the durable transcript), matching the canonical Effect client.
     let expectedPayload = try toJSONValue(SessionEventsPayload(sessionId: Fixtures.sessionId))
     #expect(request.payload == expectedPayload)
     let id = try #require(request.id)
 
+    // The wire carries the OffsetSessionEvent envelope — ONE channel with BOTH
+    // modalities: a DURABLE entry offset-STAMPED, EPHEMERAL deltas offset-LESS. The backend
+    // UNWRAPS `.event` and yields EVERY event (offset dropped) to the SessionEvent consumer.
+    let durableEntry: SessionEvent = .entryAppended(
+      entry: .assistantMessage(id: "a1", text: "on it", reasoning: nil))
     transport.emit(
       Wire.chunk(
         requestId: id,
         values: [
-          try Wire.encoded(SessionEvent.turnStarted),
-          try Wire.encoded(Fixtures.uiRequestEvent)
+          try Wire.encoded(OffsetSessionEvent(event: .turnStarted)),  // ephemeral, offset-less
+          try Wire.encoded(OffsetSessionEvent(offset: 2, event: durableEntry)),  // durable
+          try Wire.encoded(OffsetSessionEvent(event: Fixtures.uiRequestEvent))  // ephemeral
         ]))
     transport.emit(Wire.exitSuccessVoid(requestId: id))
-    #expect(try await collector.value == [.turnStarted, Fixtures.uiRequestEvent])
+    #expect(try await collector.value == [.turnStarted, durableEntry, Fixtures.uiRequestEvent])
     transport.close()
   }
 

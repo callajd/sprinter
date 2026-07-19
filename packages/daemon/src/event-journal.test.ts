@@ -11,9 +11,18 @@ import { it } from "@effect/vitest";
 import { Context, Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
 import type { OffsetEvent } from "@sprinter/contract";
-import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
+import {
+  Epic,
+  Issue,
+  Job,
+  type SessionEvent,
+  SessionId,
+  Session,
+  Workstream,
+} from "@sprinter/domain";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
-import { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
+import { layerJournaling, resyncEvents, resyncFrom, resyncSessionFrom } from "./event-journal.ts";
+import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
@@ -98,6 +107,7 @@ it.effect("journals every persisted mutation to the durable offset log, in order
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );
 
@@ -135,6 +145,7 @@ it.effect(
       Effect.scoped,
       Effect.provide(layerJournaling(layerMemory)),
       Effect.provide(layerWorkGraphEvents),
+      Effect.provide(layerSessionEvents),
     ),
 );
 
@@ -175,6 +186,7 @@ it.effect(
       Effect.scoped,
       Effect.provide(layerJournaling(layerMemory)),
       Effect.provide(layerWorkGraphEvents),
+      Effect.provide(layerSessionEvents),
     ),
 );
 
@@ -212,6 +224,7 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );
 
@@ -246,6 +259,7 @@ it.effect("the live feed stamps every fanned-out delta with its durable offset (
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );
 
@@ -280,6 +294,7 @@ it.live("resyncEvents replays durable history, then streams the live tail", () =
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );
 
@@ -309,6 +324,7 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );
 
@@ -332,5 +348,144 @@ it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () 
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
     Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+// ── session-transcript journaling + durable replay ───────────────
+
+const sessionA: SessionId = session.id; // "ses-1"
+const sessionB: SessionId = Schema.decodeUnknownSync(SessionId)("ses-2");
+const entryA1: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a1", text: "hello" },
+};
+const noticeA: SessionEvent = { _tag: "Notice", id: "n1", level: "warn", message: "heads up" };
+const entryA2: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
+};
+// Ephemeral live deltas — NOT transcript-grade, so `publishEphemeral` fans them out
+// offset-less and never persists them.
+const turnStartedA: SessionEvent = { _tag: "TurnStarted" };
+const deltaA: SessionEvent = { _tag: "MessageDelta", messageId: "a1", text: "hel" };
+
+it.effect(
+  "resyncSessionFrom replays a session's durable transcript, offset-stamped and scoped",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+      // Interleave two sessions to prove per-session scoping AND that the shared global
+      // offset counter keeps each session's replay strictly increasing (not contiguous).
+      yield* store.sessionLog.append(sessionA, entryA1);
+      yield* store.sessionLog.append(sessionB, entryA1);
+      yield* store.sessionLog.append(sessionA, noticeA);
+      yield* store.sessionLog.append(sessionA, entryA2);
+
+      const replay = yield* resyncSessionFrom(store, sessionA, 0).pipe(Stream.runCollect);
+      // Only session A's entries, in order — session B is scoped out.
+      expect(replay.map((e) => e.event)).toEqual([entryA1, noticeA, entryA2]);
+      // A durable replay is offset-BEARING throughout (every item has a present offset).
+      const offsets = replay.flatMap((e) => (e.offset === undefined ? [] : [e.offset]));
+      expect(offsets.length).toBe(replay.length);
+      expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+      expect(offsets.every((o) => o > 0)).toBe(true);
+
+      // A cursor past the first entry resumes STRICTLY AFTER it (offset-based resume).
+      const cursor = offsets[0] ?? 0;
+      const fromSecond = yield* resyncSessionFrom(store, sessionA, cursor).pipe(Stream.runCollect);
+      expect(fromSecond.map((e) => e.event)).toEqual([noticeA, entryA2]);
+      expect(fromSecond.every((e) => e.offset !== undefined && e.offset > cursor)).toBe(true);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layerJournaling(layerMemory)),
+      Effect.provide(layerWorkGraphEvents),
+      Effect.provide(layerSessionEvents),
+    ),
+);
+
+it.effect("the SessionEvents feed stamps every appended durable entry with its offset", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const sessionFeed = yield* SessionEvents;
+    // Subscribe BEFORE appending so the live fan-out is observed in order.
+    const subscription = yield* sessionFeed.subscribe;
+
+    yield* store.sessionLog.append(sessionA, entryA1);
+    yield* store.sessionLog.append(sessionA, noticeA);
+
+    const first = yield* PubSub.take(subscription);
+    const second = yield* PubSub.take(subscription);
+    expect([first.event, second.event]).toEqual([entryA1, noticeA]);
+    expect(first.sessionId).toBe(sessionA);
+    // The live offsets match the durably-journaled ones exactly — one coordinate space.
+    // Both are durable appends, so both feed items are offset-BEARING (present).
+    const journaled = yield* store.sessionLog.tail(sessionA, 0);
+    expect([first.offset, second.offset]).toEqual(journaled.map((j) => j.offset));
+    expect(
+      first.offset !== undefined && second.offset !== undefined && second.offset > first.offset,
+    ).toBe(true);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.effect("the SessionEvents feed fans out ephemeral deltas OFFSET-LESS, without persisting", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const sessionFeed = yield* SessionEvents;
+    const subscription = yield* sessionFeed.subscribe;
+
+    // Interleave a durable append and two ephemeral publishes, as the fold's tee does.
+    yield* store.sessionLog.append(sessionA, entryA1);
+    yield* store.sessionLog.publishEphemeral(sessionA, turnStartedA);
+    yield* store.sessionLog.publishEphemeral(sessionA, deltaA);
+
+    const first = yield* PubSub.take(subscription);
+    const second = yield* PubSub.take(subscription);
+    const third = yield* PubSub.take(subscription);
+    // All three reach the live feed, in emission order (the dual modality on ONE channel).
+    expect([first.event, second.event, third.event]).toEqual([entryA1, turnStartedA, deltaA]);
+    // The durable entry is offset-STAMPED; the ephemeral deltas are offset-LESS.
+    expect(first.offset).not.toBeUndefined();
+    expect(second.offset).toBeUndefined();
+    expect(third.offset).toBeUndefined();
+    // Ephemeral deltas are NOT persisted: the durable transcript holds only the one entry.
+    const persisted = yield* store.sessionLog.read(sessionA);
+    expect(persisted.map((e) => e.event)).toEqual([entryA1]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.effect("a re-dispatch of the same session APPENDS without resetting the offset sequence", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // First run persists two entries…
+    yield* store.sessionLog.append(sessionA, entryA1);
+    yield* store.sessionLog.append(sessionA, noticeA);
+    const afterFirst = yield* store.sessionLog.read(sessionA);
+    // …a re-dispatch (same session id) appends a third at a STRICTLY HIGHER offset — the
+    // sequence is never reset or duplicated (offsets stay monotonic and unique).
+    yield* store.sessionLog.append(sessionA, entryA2);
+    const afterSecond = yield* store.sessionLog.read(sessionA);
+
+    expect(afterSecond.map((e) => e.event)).toEqual([entryA1, noticeA, entryA2]);
+    const offsets = afterSecond.map((e) => e.offset);
+    expect(new Set(offsets).size).toBe(offsets.length);
+    expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+    const last = afterFirst.at(-1)?.offset ?? 0;
+    expect((afterSecond.at(-1)?.offset ?? 0) > last).toBe(true);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
   ),
 );

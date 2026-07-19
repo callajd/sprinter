@@ -77,6 +77,37 @@ struct SessionModelTests {
         ))
   }
 
+  @Test("decodes the dual-modality sessionEvents-stream envelope")
+  func decodesOffsetSessionEvents() throws {
+    let items = try Golden.decode([OffsetSessionEvent].self, from: "offset-session-events")
+    #expect(items.count == 6)
+    // The ONE channel interleaves DURABLE transcript-grade events (offset-BEARING) and
+    // EPHEMERAL live deltas (offset-LESS); unwrapping `.event` gives the bare event the
+    // existing SessionEvent fold consumes, regardless of whether an offset was present.
+    // Items 0/2/4 are ephemeral (offset-less); items 1/3/5 are durable (offset-bearing).
+    #expect(items[0].event == .turnStarted)
+    #expect(
+      items[1].event
+        == .entryAppended(
+          entry: .assistantMessage(id: "a1", text: "on it", reasoning: "planning")))
+    #expect(items[2].event == .messageDelta(messageId: "a1", text: "on ", reasoning: nil))
+    #expect(items[3].event == .notice(id: "notice-disk", level: .warn, message: "disk low"))
+    #expect(
+      items[4].event
+        == .uiRequestRaised(id: "u1", kind: .confirm, prompt: "proceed?", options: nil))
+    #expect(
+      items[5].event
+        == .entryAppended(entry: .toolResult(id: "c1", output: .number(3), isError: false)))
+
+    // A missing `offset` key decodes to `nil` (ephemeral); a present one to the durable
+    // per-session coordinate. The durable offsets are monotonic — the value a client feeds
+    // back as `sinceOffset` (ephemerals never advance it).
+    #expect(items.map(\.offset) == [nil, 2, nil, 3, nil, 4])
+    for item in items {
+      #expect(try Golden.roundTrip(item) == item)
+    }
+  }
+
   @Test("decodes every TranscriptEntry variant")
   func decodesTranscriptEntries() throws {
     let entries = try Golden.decode([TranscriptEntry].self, from: "transcript-entries")
