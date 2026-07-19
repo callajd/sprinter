@@ -1,3 +1,4 @@
+import SprinterAppSupport
 import SprinterBackend
 import SprinterContract
 import SprinterSession
@@ -14,6 +15,7 @@ struct SessionView: View {
   let model: SessionViewModel
 
   @State private var draft = ""
+  @State private var actionError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -21,6 +23,7 @@ struct SessionView: View {
       Divider()
       composer
     }
+    .shellActionErrorAlert($actionError)
   }
 
   private var transcript: some View {
@@ -45,7 +48,7 @@ struct SessionView: View {
       Button("Send") { send() }
         .disabled(draft.isEmpty)
       Button("Interrupt") {
-        Task { try? await model.interrupt() }
+        runShellAction(onError: { actionError = $0 }, action: { try await model.interrupt() })
       }
     }
     .padding()
@@ -54,19 +57,28 @@ struct SessionView: View {
   private func promptRow(_ request: OutstandingUiRequest) -> some View {
     VStack(alignment: .leading, spacing: 4) {
       Text(request.prompt).font(.headline)
-      Button("Confirm") {
-        Task { try? await model.answer(requestId: request.id, .confirmed(confirmed: true)) }
+      UiRequestAnswerControls(kind: request.kind, options: request.options) { reply in
+        answer(request, reply)
       }
     }
     .padding(8)
     .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
   }
 
+  private func answer(_ request: OutstandingUiRequest, _ reply: UiRequestReply) {
+    runShellAction(
+      onError: { actionError = $0 },
+      action: {
+        let answer = try makeUiAnswer(forKind: request.kind, reply: reply)
+        try await model.answer(requestId: request.id, answer)
+      })
+  }
+
   private func send() {
     let text = draft
     draft = ""
     let input = SessionInput(text: text, images: nil, mode: .prompt)
-    Task { try? await model.send(input) }
+    runShellAction(onError: { actionError = $0 }, action: { try await model.send(input) })
   }
 }
 

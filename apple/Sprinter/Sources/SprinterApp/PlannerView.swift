@@ -13,6 +13,7 @@ struct PlannerView: View {
   @State private var name = ""
   @State private var repo = ""
   @State private var spec = ""
+  @State private var actionError: String?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -23,6 +24,7 @@ struct PlannerView: View {
     .frame(minWidth: 480, minHeight: 420)
     .task { model.session.start() }
     .onDisappear { model.session.stop() }
+    .shellActionErrorAlert($actionError)
   }
 
   private var planForm: some View {
@@ -58,7 +60,10 @@ struct PlannerView: View {
 
   private func materialize() {
     let plan = WorkstreamPlan(name: name, repo: repo, spec: spec)
-    Task { try? await model.materialize(plan) }
+    // A domain rejection reflects into `model.outcome` (.rejected) and is shown by
+    // `outcomeLabel`; a transport-level failure resets `outcome` to `.idle` and rethrows,
+    // so surface that here instead of dropping it.
+    runShellAction(onError: { actionError = $0 }, action: { try await model.materialize(plan) })
   }
 }
 
