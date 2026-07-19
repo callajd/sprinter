@@ -44,9 +44,14 @@
  *   row, leaving its Session row NON-TERMINAL — a Session-row gate would stall on it.
  *
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
- * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY) — and
- * `sessionEvents` streams live over `SessionHandle.events`, never a poll
- * (INV-REACTIVE). The handle's infrastructure failures (`PiTransportError` /
+ * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY). `sessionSend` /
+ * `interrupt` / `answerUiRequest` stay LIVE-only (a settled session is read-only). Only
+ * `sessionEvents` gains DURABLE replay: it replays the session's durable
+ * transcript from the client's `sinceOffset` cursor then live-tails new durable entries if
+ * the session is running, or COMPLETES if it has settled — the session-channel mirror of
+ * the `events` offset-resync, so a SETTLED session's transcript is viewable in the Inspector
+ * rather than a `SessionNotFound`. It streams off the durable log + `SessionEvents` feed,
+ * never a poll (INV-REACTIVE). The handle's infrastructure failures (`PiTransportError` /
  * `PiRpcError`) are NOT contract errors, so they are turned into defects: the
  * contract's error channel is exactly `SessionNotFound`.
  *
@@ -59,6 +64,7 @@ import type { Scope } from "effect/Scope";
 import {
   type ControlAction,
   IssueNotFound,
+  type OffsetSessionEvent,
   PlanRejected,
   SessionNotFound,
   type Snapshot,
@@ -72,7 +78,6 @@ import {
   type IssueId,
   Job,
   type Session,
-  type SessionEvent,
   type SessionId,
   type SessionInput,
   type UiResponse,
@@ -83,13 +88,15 @@ import {
 import { JobRunner } from "@sprinter/job";
 import type { SessionHandle } from "@sprinter/runner";
 import { StateStore } from "@sprinter/state";
-import { resyncEvents } from "./event-journal.ts";
+import { resyncEvents, resyncSessionFrom } from "./event-journal.ts";
+import { SessionEvents } from "./session-events.ts";
 import { SessionRegistry } from "./session-registry.ts";
 import { WorkGraphEvents } from "./work-graph-events.ts";
 
 type Store = Context.Service.Shape<typeof StateStore>;
 type Runner = Context.Service.Shape<typeof JobRunner>;
 type Registry = Context.Service.Shape<typeof SessionRegistry>;
+type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
 
 // ── snapshot ────────────────────────────────────────────────────────────────
 
@@ -395,22 +402,72 @@ const resolveLive = (
   );
 
 /**
- * Stream a live session's owned {@link SessionEvent} feed for the contract's
- * `sessionEvents` RPC (INV-REACTIVE): resolve the {@link SessionHandle} through
- * {@link resolveLive} and hand back its live `events` stream. A `SessionNotFound` from
- * the lookup surfaces as the stream's failure; the handle's `PiTransportError`
- * (transport teardown — not a contract error) becomes a defect via `Stream.orDie`,
- * so the stream's error channel is exactly `SessionNotFound`.
+ * Serve the contract's `sessionEvents` RPC as a DURABLE replay-then-tail —
+ * the session-channel mirror of {@link resyncEvents}. Each streamed item is an
+ * {@link OffsetSessionEvent} carrying the durable per-session offset; replay and live tail
+ * share ONE coordinate space (the session fold journals and the decorator publishes the
+ * same offset it appended), so a client resumes from any streamed item's offset.
+ *
+ * The flow:
+ *
+ * - EAGERLY subscribe to the live {@link SessionEvents} feed BEFORE reading the durable log,
+ *   so a durable entry committed between the read and the live hand-over is not lost
+ *   (subscribe-before-replay). The small boundary overlap it can produce (an offset
+ *   repeating where the durable replay and the live tail meet) is absorbed by the consumer's
+ *   id-keyed transcript reconciliation, exactly as the work-graph feed's overlap is absorbed
+ *   by upsert idempotency.
+ * - Gate liveness through the SHARED {@link resolveLive} durable-state gate (used ONLY to
+ *   pick live-tail-vs-complete — the durable replay is independent of it): a mid-dispatch
+ *   session resolves its handle (bounded wait), a settled/absent session fails fast.
+ * - Replay the session's durable transcript from `sinceOffset` (absent → the ORIGIN) via
+ *   {@link resyncSessionFrom} (`SessionLogStore.tail`), batched and strictly ordered by
+ *   offset.
+ * - If the session is LIVE, CONTINUE with the live tail (new durable entries fanned out on
+ *   the feed as the fold journals them, filtered to this session). If the session is SETTLED
+ *   (no live handle, but a durable transcript exists), the fold has ended, so the durable log
+ *   holds the WHOLE transcript — replay it and the stream COMPLETES (never a spurious
+ *   `SessionNotFound` for a settled session, the gap this closes). If the session NEVER
+ *   existed (no durable transcript AND no live handle) → `SessionNotFound`.
+ *
+ * The stream's error channel is exactly `SessionNotFound`: the durable read is `orDie`'d and
+ * the liveness gate maps its transient failures to `SessionNotFound`, so no store hiccup
+ * leaks past the frozen contract.
  */
-const bridgeEvents = (
+const resyncSessionEvents = (
   store: Store,
+  sessionFeed: SessionFeed,
   registry: Registry,
   sessionId: SessionId,
-): Stream.Stream<SessionEvent, SessionNotFound> =>
+  sinceOffset?: number,
+): Stream.Stream<OffsetSessionEvent, SessionNotFound> =>
   Stream.unwrap(
-    resolveLive(store, registry, sessionId).pipe(
-      Effect.map((handle) => Stream.orDie(handle.events)),
-    ),
+    Effect.gen(function* () {
+      const subscription = yield* sessionFeed.subscribe;
+      const live = yield* resolveLive(store, registry, sessionId).pipe(
+        Effect.asSome,
+        Effect.catchTag("SessionNotFound", () => Effect.succeedNone),
+      );
+      const durable = yield* store.sessionLog.read(sessionId).pipe(Effect.orDie);
+      if (Option.isNone(live) && durable.length === 0) {
+        return Stream.fail(new SessionNotFound({ id: sessionId }));
+      }
+      const replay = resyncSessionFrom(store, sessionId, sinceOffset ?? 0);
+      // Settled: the durable log is the whole transcript — replay and complete.
+      if (Option.isNone(live)) return replay;
+      // Live: replay, then tail new durable entries for THIS session (one coordinate space).
+      // Bound the live tail by the handle's terminal `result`, so the stream COMPLETES when
+      // the session settles (mirroring the old `handle.events`, which closed on session end)
+      // rather than hanging open on the durable feed forever — the last durable entries are
+      // already persisted, so a re-open replays them. The result's transport failure becomes
+      // a defect (`orDie`), keeping the error channel exactly `SessionNotFound`.
+      const handle = live.value;
+      const liveTail = Stream.fromSubscription(subscription).pipe(
+        Stream.filter((item) => item.sessionId === sessionId),
+        Stream.map((item): OffsetSessionEvent => ({ offset: item.offset, event: item.event })),
+        Stream.interruptWhen(handle.result.pipe(Effect.orDie)),
+      );
+      return Stream.concat(replay, liveTail);
+    }),
   );
 
 /**
@@ -474,6 +531,7 @@ export const handlers = SprinterRpc.toLayer(
     const store = yield* StateStore;
     const runner = yield* JobRunner;
     const feed = yield* WorkGraphEvents;
+    const sessionFeed = yield* SessionEvents;
     const sessions = yield* SessionRegistry;
     const scope = yield* Effect.scope;
     return {
@@ -497,12 +555,19 @@ export const handlers = SprinterRpc.toLayer(
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),
-      // Session channel — AE4.2. Each procedure resolves the SAME live session
-      // through `resolveLive` (the durable-state gate: mid-dispatch → bounded wait,
-      // settled/absent → fail fast) and bridges its neutral `SessionHandle` surface;
-      // a miss is the contract's `SessionNotFound`. `sessionEvents` streams live over
-      // `SessionHandle.events` (INV-REACTIVE).
-      sessionEvents: ({ sessionId }) => bridgeEvents(store, sessions, sessionId),
+      // Session channel — AE4.2. `sessionSend`/`interrupt`/`answerUiRequest`
+      // resolve the SAME live session through `resolveLive` (the durable-state gate:
+      // mid-dispatch → bounded wait, settled/absent → fail fast) and bridge its neutral
+      // `SessionHandle` surface; a miss is the contract's `SessionNotFound` — a settled
+      // session is read-only. `sessionEvents` gains DURABLE replay: it replays the session's
+      // durable transcript from the client's `sinceOffset` cursor (`SessionLogStore.tail`,
+      // journaled by the store decorator as the fold runs), then — if the session is LIVE —
+      // tails new durable entries off the `SessionEvents` feed; a SETTLED session's replay
+      // COMPLETES (viewable transcript, no `SessionNotFound`), an absent one is
+      // `SessionNotFound`. Each item is an `OffsetSessionEvent` carrying its durable offset
+      // (INV-REACTIVE — no poll loop).
+      sessionEvents: ({ sessionId, sinceOffset }) =>
+        resyncSessionEvents(store, sessionFeed, sessions, sessionId, sinceOffset),
       sessionSend: ({ sessionId, input }) => driveInput(store, sessions, sessionId, input),
       interrupt: ({ sessionId }) => abortTurn(store, sessions, sessionId),
       answerUiRequest: ({ sessionId, response }) => answerUi(store, sessions, sessionId, response),

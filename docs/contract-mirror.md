@@ -52,6 +52,16 @@ Notes threaded to the contract's own decisions:
   offset (a `NonNegativeInt`, so a bare JSON integer → Swift `Int`), so a client can
   hand a streamed item's offset back as the request's `sinceOffset` cursor to resume
   strictly after it. Existing consumers that only need the delta unwrap `.event`.
+- The streamed `sessionEvents` **success is the `OffsetSessionEvent` envelope** — `{
+  "offset": 7, "event": { "_tag": "EntryAppended", … } }` — not the bare `SessionEvent`,
+  the session-channel mirror of `OffsetEvent`. Each durable, transcript-grade session event
+  pairs with its durable per-session offset, so a client can hand it back as the request's
+  `sinceOffset` cursor. A SETTLED session's durable transcript replays and the stream
+  completes (viewable in the Inspector) rather than the old `SessionNotFound`; the
+  `sessionEvents` request gains the same OPTIONAL `sinceOffset` cursor as `events`.
+  `RpcBackend` unwraps `.event` to the existing `SessionEvent` consumer. Ephemeral live
+  deltas ride the same channel offset-less (offset present ⇒ durable/replayable, absent ⇒
+  ephemeral).
 
 ## What the gate checks
 

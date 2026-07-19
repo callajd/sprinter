@@ -24,6 +24,7 @@ import {
   type Job,
   type JobResult,
   type Session,
+  type SessionEvent,
   SessionId,
   type SessionInput,
   type SessionStatus,
@@ -76,6 +77,18 @@ const promptForJob = (job: Job, issue: Option.Option<Issue>): SessionInput => ({
   }),
   mode: "prompt",
 });
+
+/**
+ * True for a DURABLE, transcript-grade {@link SessionEvent} — the ones the app folds into
+ * the transcript and that must persist to the session's durable transcript log so a SETTLED
+ * session stays viewable: the `EntryAppended` durable records and the
+ * reconcilable `Notice`s. Ephemeral streaming deltas (message/tool partials, turn lifecycle,
+ * status/retry/compaction) are NOT persisted — they carry no durable offset and are absorbed
+ * into the durable entries by the consumer's projection. A POSITIVE allow-list, so any future
+ * variant defaults to ephemeral (never accidentally bloating the durable transcript).
+ */
+const isDurableTranscriptEvent = (event: SessionEvent): boolean =>
+  event._tag === "EntryAppended" || event._tag === "Notice";
 
 /**
  * Map a settled session's {@link SessionResult} onto the terminal {@link Session}
@@ -174,8 +187,20 @@ const dispatch = (
       yield* handle.events.pipe(
         Stream.interruptWhen(handle.result),
         Stream.runForEach((event) =>
-          event._tag === "EntryAppended" ? Ref.update(entriesRef, (n) => n + 1) : Effect.void,
+          // Persist each DURABLE transcript entry to the session's durable transcript log
+          // as it arrives — the store's journaling decorator mints its
+          // per-session offset AND fans it out on the `SessionEvents` feed, so a live
+          // `sessionEvents` subscriber tails it and a SETTLED session replays it later.
+          // 1 Job = 1 session = 1 transcript, so this fold is the sole writer of this
+          // session's transcript; a re-dispatch APPENDS (never resets the offset sequence).
+          Effect.gen(function* () {
+            if (isDurableTranscriptEvent(event)) yield* store.sessionLog.append(sessionId, event);
+            if (event._tag === "EntryAppended") yield* Ref.update(entriesRef, (n) => n + 1);
+          }),
         ),
+        // The stream is not the terminal authority (`handle.result` is), so a typed teardown
+        // of the fold — OR a transient durable-append failure — is tolerated while preserving
+        // the count so far; the durable transcript is best-effort during the live fold.
         Effect.orElseSucceed(() => undefined),
       );
       const entries = yield* Ref.get(entriesRef);

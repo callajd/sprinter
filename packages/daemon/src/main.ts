@@ -39,6 +39,7 @@ import { layerFetch as layerRepository, type RepositoryConfig } from "@sprinter/
 import { layer as layerStateSqlite } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
+import { layer as layerSessionEvents } from "./session-events.ts";
 import { layerWith as layerSessionRegistry, SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
 import { layerRegisterSessions } from "./session-runner.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
@@ -121,8 +122,9 @@ const sessionResolveTimeoutFrom = (raw: string | undefined): Duration.Duration =
  * journals each mutation to the offset log AND fans it out live on the
  * {@link WorkGraphEvents} feed stamped with the durable offset it committed at — so
  * the live tail and the durable replay share one coordinate space and the
- * offset-based resync is gap-free. Requires `WorkGraphEvents` (provided by
- * {@link portsLayer}).
+ * offset-based resync is gap-free. The SAME decorator fans each durable session-transcript
+ * append out on the {@link SessionEvents} feed stamped with its per-session offset.
+ * Requires `WorkGraphEvents` + `SessionEvents` (both provided by {@link portsLayer}).
  */
 export const stateStoreLayer = (config: DaemonConfig) =>
   layerJournaling(layerStateSqlite({ filename: config.databasePath }));
@@ -159,6 +161,7 @@ const portsLayer = (config: DaemonConfig) =>
   Layer.mergeAll(stateStoreLayer(config), executionRunnerLayer(config)).pipe(
     Layer.provideMerge(layerSessionRegistry(config.sessionResolveTimeout)),
     Layer.provideMerge(layerWorkGraphEvents),
+    Layer.provideMerge(layerSessionEvents),
   );
 
 /**

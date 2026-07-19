@@ -260,3 +260,26 @@ extension SessionEvent {
     }
   }
 }
+
+/// A single streamed `sessionEvents` item: a DURABLE, transcript-grade ``SessionEvent``
+/// paired with its DURABLE per-session `offset` — the position it was journaled at in the
+/// session's durable transcript log. The session-channel mirror of
+/// ``OffsetEvent``: the stream carries the offset so a reconnecting client can remember its
+/// last-seen position and hand it back as the request's `sinceOffset` cursor to resume
+/// STRICTLY AFTER it. Wire shape:
+/// `{ "offset": 7, "event": { "_tag": "EntryAppended", "entry": { … } } }`.
+///
+/// The offset is the contract's `NonNegativeInt`, which encodes as a bare JSON integer, so
+/// the mirror maps it to `Int`. Only durable transcript-grade events flow here (the
+/// `EntryAppended` records and reconcilable `Notice`s), so a SETTLED session's transcript
+/// replays and the stream completes rather than the old `SessionNotFound`. Consumers that
+/// only need the event unwrap ``event``.
+public struct OffsetSessionEvent: Codable, Equatable, Sendable {
+  public let offset: Int
+  public let event: SessionEvent
+
+  public init(offset: Int, event: SessionEvent) {
+    self.offset = offset
+    self.event = event
+  }
+}

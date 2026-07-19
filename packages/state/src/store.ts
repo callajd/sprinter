@@ -35,6 +35,7 @@ import {
   JobId,
   NonNegativeInt,
   type Session,
+  SessionEvent,
   SessionId,
   type Workstream,
   WorkstreamId,
@@ -93,6 +94,24 @@ export const PersistedEvent = Schema.Struct({
   payload: Schema.Unknown,
 });
 export type PersistedEvent = (typeof PersistedEvent)["Type"];
+
+/**
+ * A persisted DURABLE session-transcript entry: an owned, transcript-grade
+ * {@link SessionEvent} stamped with its monotonic per-session `offset` — the
+ * session-channel analogue of {@link PersistedEvent}. The `offset` is the durable
+ * cursor a consumer reads the session's transcript in order by and tails from a known
+ * position (the `sessionEvents` durable replay). Unlike the open
+ * {@link PersistedEvent} envelope, the transcript log is TYPED to the owned
+ * `SessionEvent` — its only producer is the session fold, so it persists the owned value
+ * directly rather than an opaque `kind`/`payload` pair.
+ */
+export const PersistedSessionEvent = Schema.Struct({
+  /** The entry's monotonic position in the session's transcript; the tail cursor. */
+  offset: NonNegativeInt,
+  /** The durable, transcript-grade session event persisted at this offset. */
+  event: SessionEvent,
+});
+export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
 
 // ============================================================================
 // Capability groups
@@ -187,6 +206,42 @@ export interface EventLogStore {
   readonly tail: (offset: number) => Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
 }
 
+/**
+ * The append-only durable SESSION-TRANSCRIPT log, keyed per session (1 Job = 1 session
+ * = 1 transcript). It is the session-channel analogue of {@link EventLogStore}: `append`
+ * stamps a session's next transcript entry with a monotonic `offset` and returns the
+ * persisted entry; `read` returns a session's whole transcript in order; `tail` returns a
+ * session's entries strictly after a given offset — the primitive the `sessionEvents`
+ * durable replay resumes from. It makes a SETTLED session's transcript
+ * viewable: the entries persist independently of any live handle, so they replay after the
+ * session ends.
+ *
+ * Only DURABLE, transcript-grade {@link SessionEvent}s are appended here (the
+ * `EntryAppended` records and reconcilable `Notice`s the transcript folds), NEVER the
+ * ephemeral streaming deltas. Offsets are monotonic per session; a re-dispatch of the same
+ * session id APPENDS (never resets the sequence), so the offset sequence is never
+ * duplicated or corrupted.
+ */
+export interface SessionLogStore {
+  /**
+   * Append one durable transcript entry for `sessionId`, returning it stamped with its
+   * assigned {@link PersistedSessionEvent.offset}.
+   */
+  readonly append: (
+    sessionId: SessionId,
+    event: SessionEvent,
+  ) => Effect.Effect<PersistedSessionEvent, StateStoreError>;
+  /** A session's entire transcript in memory, ordered by ascending offset. */
+  readonly read: (
+    sessionId: SessionId,
+  ) => Effect.Effect<ReadonlyArray<PersistedSessionEvent>, StateStoreError>;
+  /** A session's entries with an offset strictly greater than `offset`, ordered ascending. */
+  readonly tail: (
+    sessionId: SessionId,
+    offset: number,
+  ) => Effect.Effect<ReadonlyArray<PersistedSessionEvent>, StateStoreError>;
+}
+
 // ============================================================================
 // Port
 // ============================================================================
@@ -207,6 +262,8 @@ export class StateStore extends Context.Service<
     readonly jobs: JobStore;
     /** The durable event-feed capability group. */
     readonly events: EventLogStore;
+    /** The durable per-session transcript-log capability group. */
+    readonly sessionLog: SessionLogStore;
     /**
      * Run `effect` in a SINGLE durable transaction: every `put*`/`append` write
      * it performs commits together or rolls back together (nested transactions

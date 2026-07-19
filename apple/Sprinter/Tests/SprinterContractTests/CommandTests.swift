@@ -56,10 +56,20 @@ struct CommandTests {
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionEvents payload")
+  @Test("decodes the sessionEvents payload with a sinceOffset cursor")
   func decodesSessionEventsPayload() throws {
     let payload = try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")
     #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+    #expect(payload.sinceOffset == 12)
+    #expect(try Golden.roundTrip(payload) == payload)
+  }
+
+  @Test("decodes the sessionEvents payload with the cursor absent (origin replay)")
+  func decodesSessionEventsPayloadNoOffset() throws {
+    let payload = try Golden.decode(
+      SessionEventsPayload.self, from: "payload-session-events-no-offset")
+    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+    #expect(payload.sinceOffset == nil)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 

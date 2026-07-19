@@ -47,6 +47,7 @@ import {
   interrupt,
   IssueNotFound,
   OffsetEvent,
+  OffsetSessionEvent,
   PlanRejected,
   retryIssue,
   sessionEvents,
@@ -171,6 +172,32 @@ write("offset-events", Schema.Array(OffsetEvent), [
   { offset: 5, event: { _tag: "SessionChanged", session } },
 ]);
 
+// ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────
+//
+// Each streamed item pairs a DURABLE, transcript-grade SessionEvent with its durable
+// per-session offset, so a client can feed the offset back as the request's `sinceOffset`
+// cursor. Only durable transcript-grade events flow here (EntryAppended records + Notices);
+// the sample resumes from a mid-transcript position (2,3,4) — the strict `> sinceOffset`
+// slice a reconnect resumes from.
+
+write("offset-session-events", Schema.Array(OffsetSessionEvent), [
+  {
+    offset: 2,
+    event: {
+      _tag: "EntryAppended",
+      entry: { _tag: "AssistantMessage", id: "a1", text: "on it", reasoning: "planning" },
+    },
+  },
+  { offset: 3, event: { _tag: "Notice", id: "notice-disk", level: "warn", message: "disk low" } },
+  {
+    offset: 4,
+    event: {
+      _tag: "EntryAppended",
+      entry: { _tag: "ToolResult", id: "c1", output: 3, isError: false },
+    },
+  },
+]);
+
 // ── SessionEvent — every variant (+ optional present/absent) ─────────────────
 
 const usageFull = {
@@ -291,7 +318,14 @@ write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSch
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
-write("payload-session-events", sessionEvents.payloadSchema, { sessionId: "ses-1" });
+// The `sessionEvents` request cursor is OPTIONAL, exactly like `events`:
+// both wire forms are captured — present (`sinceOffset` key set) and absent (key omitted,
+// the origin-replay case) — so the Swift mirror decodes each.
+write("payload-session-events", sessionEvents.payloadSchema, {
+  sessionId: "ses-1",
+  sinceOffset: 12,
+});
+write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
 write("payload-session-send", sessionSend.payloadSchema, {
   sessionId: "ses-1",
   input: { text: "go", mode: "prompt" },

@@ -31,7 +31,7 @@
  * {@link bootLayer} — the boot-time `StartupReconcile` run. The runnable process
  * entrypoint is the sibling `run.ts` (`sprinter-daemon` bin).
  */
-export { layerJournaling, resyncEvents, resyncFrom } from "./event-journal.ts";
+export { layerJournaling, resyncEvents, resyncFrom, resyncSessionFrom } from "./event-journal.ts";
 export type { DaemonConfig } from "./main.ts";
 export {
   appLayer,
@@ -43,6 +43,8 @@ export {
   stateStoreLayer,
 } from "./main.ts";
 export { handlers } from "./rpc-handlers.ts";
+export type { SessionFeedItem } from "./session-events.ts";
+export { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
 export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
 export { layerRegisterSessions } from "./session-runner.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";

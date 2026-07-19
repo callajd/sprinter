@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Session channel verbs")
 struct SessionChannelTests {
-  @Test("sessionEvents streams owned SessionEvents until Exit")
+  @Test("sessionEvents unwraps the OffsetSessionEvent envelope and streams events until Exit")
   func sessionEventsStream() async throws {
     let transport = FakeTransport()
     let backend = RpcBackend(transport: transport)
@@ -22,16 +22,20 @@ struct SessionChannelTests {
 
     let request = try await nextSent(&outbound)
     #expect(request.rpcTag == "sessionEvents")
+    // The request sends a PRESENT payload with the `sinceOffset` key OMITTED (→ origin
+    // replay of the durable transcript), matching the canonical Effect client.
     let expectedPayload = try toJSONValue(SessionEventsPayload(sessionId: Fixtures.sessionId))
     #expect(request.payload == expectedPayload)
     let id = try #require(request.id)
 
+    // The wire carries the OffsetSessionEvent envelope: the backend UNWRAPS
+    // `.event` and yields it to the existing SessionEvent consumer.
     transport.emit(
       Wire.chunk(
         requestId: id,
         values: [
-          try Wire.encoded(SessionEvent.turnStarted),
-          try Wire.encoded(Fixtures.uiRequestEvent)
+          try Wire.encoded(OffsetSessionEvent(offset: 1, event: .turnStarted)),
+          try Wire.encoded(OffsetSessionEvent(offset: 2, event: Fixtures.uiRequestEvent))
         ]))
     transport.emit(Wire.exitSuccessVoid(requestId: id))
     #expect(try await collector.value == [.turnStarted, Fixtures.uiRequestEvent])

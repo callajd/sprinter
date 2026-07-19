@@ -37,6 +37,35 @@ struct SessionViewModelTests {
     await backend.close()
   }
 
+  /// A SETTLED session: the daemon's durable-transcript replay COMPLETES.
+  /// The fake emits only the durable transcript-grade entries the daemon journaled —
+  /// `EntryAppended` records and a `Notice` — then ENDS the feed (replay done, no live
+  /// tail). The view model folds them into the transcript and the feed lifecycle settles
+  /// to `.ended` (read-only), so the Inspector renders a settled session's replayed
+  /// transcript rather than the old `SessionNotFound`.
+  @Test("renders a settled session's replayed transcript, then ends read-only")
+  func rendersSettledReplayedTranscript() async throws {
+    let backend = SessionFakeBackend(knownSession: Self.session)
+    let model = SessionViewModel(backend: backend, sessionId: Self.session)
+    model.start()
+
+    backend.emit(.entryAppended(entry: .userMessage(id: "u1", text: "please fix the bug")))
+    backend.emit(.entryAppended(entry: .assistantMessage(id: "a1", text: "on it", reasoning: nil)))
+    backend.emit(.notice(id: "n1", level: .info, message: "started"))
+    backend.finish()  // settled: the durable replay completes, no live tail
+
+    #expect(await waitUntil(model) { $0.count == 3 })
+    let transcript = model.transcript
+    #expect(transcript.items.map(\.id) == ["message:u1", "message:a1", "notice:key:n1"])
+    #expect(!transcript.isTurnActive)
+
+    // The feed ended cleanly (settled → read-only): `.ended`, not `.dropped`.
+    #expect(await waitUntilLifecycle(model, .ended))
+    #expect(model.terminationError == nil)
+
+    await backend.close()
+  }
+
   /// `send` drives `sessionSend` through the session channel with the exact
   /// `SessionInput` (the fake observes it), and resolves successfully.
   @Test("send drives sessionSend with the exact input")
@@ -123,6 +152,18 @@ struct SessionViewModelTests {
   ) async -> Bool {
     for _ in 0..<100_000 {
       if predicate(model.transcript.items) { return true }
+      await Task.yield()
+    }
+    return false
+  }
+
+  /// Polls the main-actor model until its feed `lifecycle` reaches `expected`.
+  private func waitUntilLifecycle(
+    _ model: SessionViewModel,
+    _ expected: SessionLifecycle
+  ) async -> Bool {
+    for _ in 0..<100_000 {
+      if model.lifecycle == expected { return true }
       await Task.yield()
     }
     return false

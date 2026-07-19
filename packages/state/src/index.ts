@@ -8,7 +8,13 @@
  * sealed inside {@link ./sqlite.ts} and never leaks a type here — {@link layer}
  * is a `Layer<StateStore, StateStoreError>`, backing-free.
  */
-export type { EventLogStore, JobStore, WorkGraphStore } from "./store.ts";
-export { AppendEvent, PersistedEvent, StateStore, StateStoreError } from "./store.ts";
+export type { EventLogStore, JobStore, SessionLogStore, WorkGraphStore } from "./store.ts";
+export {
+  AppendEvent,
+  PersistedEvent,
+  PersistedSessionEvent,
+  StateStore,
+  StateStoreError,
+} from "./store.ts";
 export type { StateStoreConfig } from "./sqlite.ts";
 export { layer, layerMemory } from "./sqlite.ts";

@@ -24,9 +24,12 @@ struct InteractiveSessionTests {
     #expect(subscribe.rpcTag == "sessionEvents")
     let feedId = try #require(subscribe.id)
 
-    // The daemon raises a confirm prompt on the feed.
+    // The daemon raises a confirm prompt on the feed — the wire carries the
+    // OffsetSessionEvent envelope, which RpcBackend unwraps to `.event`.
     transport.emit(
-      Wire.chunk(requestId: feedId, values: [try Wire.encoded(Fixtures.uiRequestEvent)]))
+      Wire.chunk(
+        requestId: feedId,
+        values: [try Wire.encoded(OffsetSessionEvent(offset: 1, event: Fixtures.uiRequestEvent))]))
     try await settle { session.outstandingRequests.count == 1 }
     let outstanding = try #require(session.outstandingRequests.first)
     #expect(outstanding.id == "req-1")

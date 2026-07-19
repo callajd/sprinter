@@ -102,9 +102,17 @@ public struct RpcBackend: Backend {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
+          // The wire carries the ``OffsetSessionEvent`` envelope: each item
+          // pairs a DURABLE transcript-grade event with its per-session offset. Send a
+          // PRESENT ``SessionEventsPayload`` with NO `sinceOffset` key (→ origin replay of
+          // the durable transcript), then UNWRAP `.event` and yield it to the existing
+          // ``SessionEvent`` fold (unchanged). Tracking the offset for a reconnect resume is
+          // deferred — ``InteractiveSession`` is a single, non-reconnecting subscription — so
+          // only the wire is made offset-aware here (unwrap); resume via `sinceOffset` layers
+          // on later, exactly as ``WorkGraphResync`` did for the `events` feed.
           let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
           for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {
-            continuation.yield(try fromJSONValue(SessionEvent.self, value))
+            continuation.yield(try fromJSONValue(OffsetSessionEvent.self, value).event)
           }
           continuation.finish()
         } catch {

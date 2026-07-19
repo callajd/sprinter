@@ -77,6 +77,25 @@ struct SessionModelTests {
         ))
   }
 
+  @Test("decodes the offset-stamped sessionEvents-stream envelope")
+  func decodesOffsetSessionEvents() throws {
+    let items = try Golden.decode([OffsetSessionEvent].self, from: "offset-session-events")
+    #expect(items.count == 3)
+    // Each item pairs a DURABLE transcript-grade event with its per-session offset;
+    // unwrapping `.event` gives the bare event the existing SessionEvent fold consumes.
+    #expect(
+      items[0].event
+        == .entryAppended(
+          entry: .assistantMessage(id: "a1", text: "on it", reasoning: "planning")))
+    #expect(items[1].event == .notice(id: "notice-disk", level: .warn, message: "disk low"))
+    // Durable per-session offsets are monotonic; the sample resumes from a mid-transcript
+    // position — the coordinate the client feeds back as `sinceOffset`.
+    #expect(items.map(\.offset) == [2, 3, 4])
+    for item in items {
+      #expect(try Golden.roundTrip(item) == item)
+    }
+  }
+
   @Test("decodes every TranscriptEntry variant")
   func decodesTranscriptEntries() throws {
     let entries = try Golden.decode([TranscriptEntry].self, from: "transcript-entries")

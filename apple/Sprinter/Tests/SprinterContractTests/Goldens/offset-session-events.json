@@ -1,0 +1,35 @@
+[
+  {
+    "offset": 2,
+    "event": {
+      "_tag": "EntryAppended",
+      "entry": {
+        "_tag": "AssistantMessage",
+        "id": "a1",
+        "text": "on it",
+        "reasoning": "planning"
+      }
+    }
+  },
+  {
+    "offset": 3,
+    "event": {
+      "_tag": "Notice",
+      "id": "notice-disk",
+      "level": "warn",
+      "message": "disk low"
+    }
+  },
+  {
+    "offset": 4,
+    "event": {
+      "_tag": "EntryAppended",
+      "entry": {
+        "_tag": "ToolResult",
+        "id": "c1",
+        "output": 3,
+        "isError": false
+      }
+    }
+  }
+]

@@ -54,6 +54,7 @@ import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
+import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
 import {
   layer as layerSessionRegistry,
   SESSION_RESOLVE_TIMEOUT,
@@ -127,6 +128,7 @@ interface Ctx {
   readonly client: Client;
   readonly store: Context.Service.Shape<typeof StateStore>;
   readonly feed: Context.Service.Shape<typeof WorkGraphEvents>;
+  readonly sessionFeed: Context.Service.Shape<typeof SessionEvents>;
   readonly sessions: Context.Service.Shape<typeof SessionRegistry>;
   readonly dispatched: Queue.Dequeue<Job>;
 }
@@ -146,6 +148,7 @@ const harness = <A, E>(
       Layer.provideMerge(
         Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
+          Layer.provideMerge(layerSessionEvents),
         ),
       ),
     );
@@ -153,8 +156,9 @@ const harness = <A, E>(
       const client = yield* clientEffect();
       const store = yield* StateStore;
       const feed = yield* WorkGraphEvents;
+      const sessionFeed = yield* SessionEvents;
       const sessions = yield* SessionRegistry;
-      return yield* body({ client, store, feed, sessions, dispatched });
+      return yield* body({ client, store, feed, sessionFeed, sessions, dispatched });
     }).pipe(Effect.provide(app));
   }).pipe(Effect.scoped);
 
@@ -483,13 +487,17 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
 
 const sessionId = session.id;
 
-const uiRequest: SessionEvent = {
-  _tag: "UiRequestRaised",
-  id: "req-1",
-  kind: "confirm",
-  prompt: "Proceed?",
+// DURABLE, transcript-grade session events — the only ones the durable `sessionEvents`
+// channel carries: `EntryAppended` records and reconcilable `Notice`s.
+const entryAppended: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a1", text: "on it" },
 };
-const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+const noticeEvent: SessionEvent = { _tag: "Notice", id: "n1", level: "info", message: "started" };
+const entryAppended2: SessionEvent = {
+  _tag: "EntryAppended",
+  entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
+};
 
 /**
  * A fake live {@link SessionHandle}: a caller-supplied owned `SessionEvent` stream
@@ -520,14 +528,81 @@ const makeFakeSession = (events: ReadonlyArray<SessionEvent>): Effect.Effect<Fak
     return { handle, sent, answered, interrupted };
   });
 
-it.effect("sessionEvents bridges the live session's owned event stream", () =>
-  harness(({ client, sessions }) =>
+// A SETTLED session (durable Job + Session rows terminal, NO live handle): the Inspector
+// opens its channel to VIEW the transcript. `sessionEvents` replays the whole durable
+// transcript as `OffsetSessionEvent`s and COMPLETES — never the old `SessionNotFound` for a
+// settled session (the gap this closes) — and a `sinceOffset` cursor resumes strictly after.
+it.effect("sessionEvents replays a SETTLED session's durable transcript and completes", () =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([turnStarted, uiRequest]);
-      yield* sessions.register(sessionId, fake.handle);
+      yield* store.jobs.putSession(session); // `completed` (terminal)
+      yield* store.jobs.putJob(orphanedJob); // terminal Job, no live handle
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.append(sessionId, noticeEvent);
+      yield* store.sessionLog.append(sessionId, entryAppended2);
 
       const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
-      expect(received).toEqual([turnStarted, uiRequest]);
+      expect(received.map((i) => i.event)).toEqual([entryAppended, noticeEvent, entryAppended2]);
+      // Offsets are monotonic (the durable per-session coordinate).
+      const offsets = received.map((i) => i.offset);
+      expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
+
+      // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
+      const cursor = offsets[0] ?? 0;
+      const resumed = yield* client
+        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .pipe(Stream.runCollect);
+      expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
+      expect(resumed.every((i) => i.offset > cursor)).toBe(true);
+    }),
+  ),
+);
+
+// A LIVE session (a registered handle → `resolveLive` resolves it): `sessionEvents` replays
+// the durable transcript so far, THEN tails new durable entries as the fold journals them —
+// replay and live tail one offset coordinate. Uses `it.live` + a settle so the live append
+// lands after the subscription (no TestClock: the registered handle resolves without waiting).
+it.live("sessionEvents replays a LIVE session's transcript, then tails new durable entries", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]);
+      // A STILL-RUNNING session: its terminal `result` stays pending, so the live tail keeps
+      // tailing new durable entries (it completes only once the session settles).
+      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
+      yield* sessions.register(sessionId, liveHandle);
+      // One durable entry already in the transcript before the client attaches.
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      const collecting = yield* client
+        .sessionEvents({ sessionId })
+        .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+      // Let the replay drain and the live subscription settle before the live append.
+      yield* Effect.sleep("20 millis");
+      // A durable entry appended AFTER attach arrives on the live tail (one coordinate).
+      yield* store.sessionLog.append(sessionId, entryAppended2);
+
+      const received = yield* Fiber.join(collecting);
+      expect(received.map((i) => i.event)).toEqual([entryAppended, entryAppended2]);
+      const [first, second] = received.map((i) => i.offset);
+      expect(first !== undefined && second !== undefined && second > first).toBe(true);
+    }),
+  ),
+);
+
+// The live tail must COMPLETE when the session settles (mirroring the old `handle.events`,
+// which closed on session end) rather than hang open on the durable feed. The fake handle's
+// terminal `result` is already settled, so the live tail interrupts right after replay — the
+// stream replays the durable transcript and completes (a `runCollect` that never returns
+// would hang the test, so completing at all proves the bound).
+it.effect("sessionEvents completes when a live session settles (no hang on the durable feed)", () =>
+  harness(({ client, store, sessions }) =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeSession([]); // result is already `Completed` → settled
+      yield* sessions.register(sessionId, fake.handle);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      expect(received.map((i) => i.event)).toEqual([entryAppended]);
     }),
   ),
 );
@@ -588,19 +663,12 @@ it.effect("interrupt aborts the live session's in-flight turn", () =>
 it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   harness(({ client, sessions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([uiRequest]);
+      const fake = yield* makeFakeSession([]);
       yield* sessions.register(sessionId, fake.handle);
 
-      // A `UiRequestRaised` surfaces on the live sessionEvents feed…
-      const raised = Option.getOrThrow(
-        yield* client.sessionEvents({ sessionId }).pipe(Stream.runHead),
-      );
-      expect(raised._tag).toBe("UiRequestRaised");
-      if (raised._tag !== "UiRequestRaised") throw new Error("expected UiRequestRaised");
-
-      // …the client answers it, keyed by the raised request id…
+      // The client answers an outstanding UI request, keyed by the request id it echoes…
       const response: UiResponse = {
-        requestId: raised.id,
+        requestId: "req-1",
         answer: { _tag: "Confirmed", confirmed: true },
       };
       yield* client.answerUiRequest({ sessionId, response });
@@ -851,6 +919,7 @@ it.effect("a transient store read failure surfaces as SessionNotFound, not a def
       Layer.provideMerge(
         Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
+          Layer.provideMerge(layerSessionEvents),
         ),
       ),
     );

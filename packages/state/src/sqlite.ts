@@ -40,6 +40,7 @@ import {
   PositiveInt,
   PullRequestRef,
   Session,
+  SessionEvent,
   SessionId,
   SessionStatus,
   WorkstreamId,
@@ -51,6 +52,8 @@ import {
   type EventLogStore,
   type JobStore,
   type PersistedEvent,
+  type PersistedSessionEvent,
+  type SessionLogStore,
   StateStore,
   StateStoreError,
   type WorkGraphStore,
@@ -141,6 +144,17 @@ const EventRow = Schema.Struct({
   payload: Schema.UnknownFromJsonString,
 });
 
+/**
+ * A session-transcript-log row: `event` is a JSON column holding the owned
+ * {@link SessionEvent}; `offset` is the auto-assigned rowid (monotonic per session by
+ * ascending read, globally unique across sessions). The `sessionId` scoping column is
+ * a query predicate, not part of the reconstructed {@link PersistedSessionEvent}.
+ */
+const SessionEventRow = Schema.Struct({
+  offset: NonNegativeInt,
+  event: Schema.fromJsonString(SessionEvent),
+});
+
 /** The single row returned by an event append's `RETURNING "offset"`. */
 const OffsetRow = Schema.Struct({ offset: NonNegativeInt });
 
@@ -210,6 +224,21 @@ const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClien
       kind TEXT NOT NULL,
       payload TEXT NOT NULL
     )`;
+  }),
+  // The durable per-session transcript log: one append-only row per
+  // durable, transcript-grade session event, scoped by "sessionId". The AUTOINCREMENT
+  // rowid is the monotonic offset — globally unique, so a re-dispatch of the same session
+  // id APPENDS with fresh higher offsets rather than reusing or resetting the sequence
+  // (never a duplicated/corrupted offset). The `session_event_log_session` index keeps a
+  // per-session ordered read/tail cheap.
+  "2_session_event_log": Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`CREATE TABLE session_event_log (
+      "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
+      "sessionId" TEXT NOT NULL,
+      event TEXT NOT NULL
+    )`;
+    yield* sql`CREATE INDEX session_event_log_session ON session_event_log ("sessionId")`;
   }),
 };
 
@@ -443,6 +472,30 @@ const make = Effect.gen(function* () {
       ),
   };
 
+  // ── SessionLogStore ─────────────────────────────────────────────────────────
+
+  const sessionLog: SessionLogStore = {
+    append: (sessionId, event) =>
+      Effect.gen(function* () {
+        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(SessionEvent))(event);
+        const rows =
+          yield* sql`INSERT INTO session_event_log ${sql.insert({ sessionId, event: encoded })} RETURNING "offset"`;
+        const decoded = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(OffsetRow))(rows);
+        const persisted: PersistedSessionEvent = { offset: decoded[0].offset, event };
+        return persisted;
+      }).pipe(Effect.mapError(fail("sessionLog.append"))),
+    read: (sessionId) =>
+      sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} ORDER BY "offset"`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),
+        Effect.mapError(fail("sessionLog.read")),
+      ),
+    tail: (sessionId, offset) =>
+      sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} AND "offset" > ${offset} ORDER BY "offset"`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),
+        Effect.mapError(fail("sessionLog.tail")),
+      ),
+  };
+
   // ── transactions ──────────────────────────────────────────────────────────
 
   /**
@@ -465,7 +518,7 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  return StateStore.of({ workGraph: putWorkGraph, jobs, events, withTransaction });
+  return StateStore.of({ workGraph: putWorkGraph, jobs, events, sessionLog, withTransaction });
 });
 
 // ============================================================================

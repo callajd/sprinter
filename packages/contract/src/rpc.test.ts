@@ -22,6 +22,7 @@ import {
   events,
   interrupt,
   IssueNotFound,
+  OffsetSessionEvent,
   PlanRejected,
   retryIssue,
   SessionNotFound,
@@ -197,13 +198,27 @@ it("retries an issue by id, failing with IssueNotFound", () => {
   expect(err).toBeInstanceOf(IssueNotFound);
 });
 
-it("streams the neutral SessionEvent over sessionEvents, keyed by session id", () => {
+it("streams the offset-stamped durable transcript over sessionEvents, keyed by session id", () => {
+  // The streamed success is the OffsetSessionEvent envelope: a durable,
+  // transcript-grade SessionEvent PLUS the durable per-session offset the client feeds back
+  // as `sinceOffset`. It mirrors the `events` feed's OffsetEvent envelope.
   const payload = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
   expect(payload.sessionId).toBe(Schema.decodeUnknownSync(SessionId)("ses-1"));
 
-  const event = { _tag: "MessageDelta", messageId: "m1", text: "hi" };
-  const decoded = Schema.decodeUnknownSync(sessionEvents.successSchema.success)(event);
-  expect(decoded).toEqual(Schema.decodeUnknownSync(SessionEvent)(event));
+  const event = {
+    _tag: "EntryAppended",
+    entry: { _tag: "AssistantMessage", id: "a1", text: "hi" },
+  };
+  const item = { offset: 7, event };
+  const decoded = Schema.decodeUnknownSync(sessionEvents.successSchema.success)(item);
+  expect(decoded).toEqual(Schema.decodeUnknownSync(OffsetSessionEvent)(item));
+  expect(decoded.offset).toBe(7);
+  expect(decoded.event).toEqual(Schema.decodeUnknownSync(SessionEvent)(event));
+
+  // A negative offset is rejected (NonNegativeInt), matching the `events` envelope.
+  expect(() =>
+    Schema.decodeUnknownSync(sessionEvents.successSchema.success)({ offset: -1, event }),
+  ).toThrow();
 
   // The stream error is the neutral SessionNotFound.
   const err = Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
@@ -211,6 +226,33 @@ it("streams the neutral SessionEvent over sessionEvents, keyed by session id", (
     id: "ses-1",
   });
   expect(err).toBeInstanceOf(SessionNotFound);
+});
+
+it("carries an OPTIONAL sinceOffset resume cursor on the sessionEvents request", () => {
+  // Present cursor: resume STRICTLY AFTER that durable per-session offset.
+  const withCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
+    sessionId: "ses-1",
+    sinceOffset: 12,
+  });
+  expect(withCursor.sinceOffset).toBe(12);
+
+  // Absent cursor: the KEY is omitted (present-but-empty beyond `sessionId`) → replay the
+  // session's durable transcript from the ORIGIN.
+  const noCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
+  expect(noCursor.sinceOffset).toBeUndefined();
+
+  // A negative cursor is rejected (NonNegativeInt).
+  expect(() =>
+    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1", sinceOffset: -1 }),
+  ).toThrow();
+
+  // Through the wire JSON codec: a request with sessionId and NO sinceOffset key decodes to
+  // the origin-replay case (mirrors the `events` B1 seam for the session channel).
+  const codec = Schema.toCodecJson(sessionEvents.payloadSchema);
+  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1" }).sinceOffset).toBeUndefined();
+  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1", sinceOffset: 3 }).sinceOffset).toBe(
+    3,
+  );
 });
 
 it("drives input into a session via sessionSend", () => {
