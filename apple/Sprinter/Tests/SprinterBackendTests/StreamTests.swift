@@ -195,6 +195,26 @@ struct StreamTests {
     transport.close()
   }
 
+  /// FIX D — no trailing ack after a clean terminal Exit. A fully-drained active batch owes a
+  /// deferred "ready for more" ack on the NEXT pull; but if the stream has ALREADY finished
+  /// (the daemon's chunk and its terminal success `Exit` were both processed before the
+  /// consumer pulls again), that ack would be sent for an already-closed request — benign (the
+  /// daemon ignores it) but pointless. The gate suppresses it: draining the batch and then
+  /// pulling past a clean finish returns `nil` WITHOUT the ack firing. Driven directly on the
+  /// ``AckGate`` so the finish-before-pull ordering is exact and deterministic.
+  @Test("a clean Exit after a fully-drained batch sends no trailing ack")
+  func noTrailingAckOnCleanExit() async throws {
+    let acks = CallCounter()
+    let gate = AckGate(limit: 8, ack: { _ = await acks.increment() }, cancelHandler: {})
+
+    gate.push([.string("only")])
+    #expect(try await gate.next() == .string("only"))  // drain the batch fully.
+    gate.finish()  // clean terminal Exit BEFORE the consumer pulls for more.
+
+    #expect(try await gate.next() == nil)  // the stream finishes …
+    #expect(await acks.value == 0)  // … and the trailing ack was suppressed.
+  }
+
   /// The bounded backlog (CE2.2 / the CE2.1-F4 carried constraint): an un-drained
   /// subscription does NOT ack-and-buffer unbounded — the demand-gated buffer is bounded,
   /// and a batch past the bound surfaces an ``AckGate/Overflow`` the consumer sees as a

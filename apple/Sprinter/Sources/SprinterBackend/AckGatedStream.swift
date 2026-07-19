@@ -171,6 +171,14 @@ final class AckGate: @unchecked Sendable {
       }
       if activeNeedsAck {
         activeNeedsAck = false
+        // FIX D — suppress the trailing ack on a clean terminal Exit. A fully-drained active
+        // batch with no successor, on a stream that has ALREADY finished, owes no "ready for
+        // more" signal: the request is closed, so the ack would be a no-op the daemon ignores
+        // (and one trailing `Ack` for an already-closed request). Fall straight through to the
+        // `.finished` terminator below rather than emitting it.
+        if finished && batches.isEmpty {
+          return .finished
+        }
         return .needsAck
       }
       if !batches.isEmpty {

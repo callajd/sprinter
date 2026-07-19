@@ -43,10 +43,17 @@ import SprinterContract
 /// bounded resync is the intended, better-for-a-live-UI mechanism (a live view coalesces to
 /// the latest baseline; it does not need every intermediate delta stalled into it).
 ///
-/// **Reconnect backoff + jitter (CE2.2).** Reconnect delays follow
-/// ``ReconnectBackoff`` — exponential with full jitter, reset on a successful connect —
-/// so a persistently-failing daemon is retried with a widening, de-synchronized delay
-/// rather than a tight constant loop.
+/// **Reconnect backoff + jitter (CE2.2).** Reconnect delays follow ``ReconnectBackoff`` —
+/// exponential with full jitter — so a persistently-failing daemon is retried with a
+/// widening, de-synchronized delay rather than a tight constant loop. The schedule resets on
+/// a demonstrably-HEALTHY connection, assessed at each attempt's teardown: healthy means the
+/// attempt made a successful read (a snapshot or delta) OR stayed established at least a
+/// minimum duration (``minHealthyDuration``, measured on an injected clock). The
+/// established-duration signal is what covers a live-but-IDLE connection that delivered no
+/// deltas — so a healthy connection that drops during a quiet period reconnects promptly from
+/// `base` rather than being mis-scored as a failure and widening the ceiling toward the cap.
+/// An accept-then-immediately-drop flap (no read, dropped before the threshold) is NOT
+/// healthy, so the backoff widens against it as intended.
 public actor WorkGraphResync {
   /// Yields a freshly connected ``Backend`` for one (re)connect attempt.
   public typealias Connect = @Sendable () async throws -> any Backend
@@ -59,6 +66,20 @@ public actor WorkGraphResync {
   private let bufferLimit: Int
   private var backoff: ReconnectBackoff
   private let observer: StateObserver?
+  /// The clock the health assessment measures established-duration on (INJECTED so tests
+  /// drive the health window deterministically — a manual clock the test advances — with no
+  /// wall-clock wait). Only ``runAttempt(_:resume:_:clock:)`` reads ``Clock/now`` from it;
+  /// the reconnect delay is scheduled through ``ReconnectBackoff`` (whose jitter tests
+  /// neutralize to zero), so no bounded await depends on real time.
+  private let clock: any Clock<Duration>
+  /// The minimum established-duration that marks a subscription healthy even if it delivered
+  /// NO deltas (the idle-connection case). A connection that stayed up at least this long
+  /// before dropping is scored healthy → the backoff resets; a connection that drops sooner
+  /// WITHOUT any successful read is a flap → the backoff widens.
+  private let minHealthyDuration: Duration
+  /// The bounded out-of-order gap window handed to each ``ContiguousOffsetTracker``: a gap
+  /// that never fills within it forces a resync instead of freezing the resume cursor.
+  private let gapLimit: Int
 
   private var driver: Task<Void, Never>?
   private var started = false
@@ -69,6 +90,10 @@ public actor WorkGraphResync {
   /// The last-applied contiguous-prefix offset — the `sinceOffset` cursor a reconnect
   /// resumes strictly after.
   private var resumeOffset: Int?
+  /// Whether the CURRENT attempt has seen a successful read yet (a published snapshot on a
+  /// first connect, or an applied delta on a resume). Reset at each attempt's start; part of
+  /// the health assessment at teardown (see ``assessHealth(establishedFor:)``).
+  private var attemptSawRead = false
 
   /// Builds the engine over a `connect` seam (the port-only construction path).
   public init(
@@ -76,12 +101,18 @@ public actor WorkGraphResync {
     reconciler: SnapshotReconciler = SnapshotReconciler(),
     bufferLimit: Int = 256,
     backoff: ReconnectBackoff = ReconnectBackoff(),
+    clock: any Clock<Duration> = ContinuousClock(),
+    minHealthyDuration: Duration = .seconds(3),
+    gapLimit: Int = 1024,
     observer: StateObserver? = nil
   ) {
     self.connect = connect
     self.reconciler = reconciler
     self.bufferLimit = bufferLimit
     self.backoff = backoff
+    self.clock = clock
+    self.minHealthyDuration = minHealthyDuration
+    self.gapLimit = gapLimit
     self.observer = observer
   }
 
@@ -94,6 +125,9 @@ public actor WorkGraphResync {
     reconciler: SnapshotReconciler = SnapshotReconciler(),
     bufferLimit: Int = 256,
     backoff: ReconnectBackoff = ReconnectBackoff(),
+    clock: any Clock<Duration> = ContinuousClock(),
+    minHealthyDuration: Duration = .seconds(3),
+    gapLimit: Int = 1024,
     observer: StateObserver? = nil
   ) {
     self.init(
@@ -101,6 +135,9 @@ public actor WorkGraphResync {
       reconciler: reconciler,
       bufferLimit: bufferLimit,
       backoff: backoff,
+      clock: clock,
+      minHealthyDuration: minHealthyDuration,
+      gapLimit: gapLimit,
       observer: observer)
   }
 
@@ -138,13 +175,14 @@ public actor WorkGraphResync {
     while !Task.isCancelled {
       do {
         let backend = try await connect()
-        // NOTE: the backoff is NOT reset here. A bare `connect()` success is not progress —
-        // a daemon that accepts the socket then immediately drops the subscription would
-        // reset `failures` to 0 every attempt, pinning the delay at `base` and hot-spinning
-        // against a flapping daemon. It is reset only once the connection has DEMONSTRABLY
-        // made progress — the first published snapshot or the first applied delta of the
-        // attempt (see ``markProgress()``) — so an accept-then-immediately-drop flap is
-        // treated as a failure and the backoff widens exponentially as intended.
+        // NOTE: the backoff is NOT reset here. A bare `connect()` success is not health — a
+        // daemon that accepts the socket then immediately drops the subscription would reset
+        // `failures` to 0 every attempt, pinning the delay at `base` and hot-spinning against
+        // a flapping daemon. The attempt instead assesses its CONNECTION HEALTH at teardown
+        // (see ``runAttempt`` / ``assessHealth(establishedFor:)``) and resets the backoff
+        // only when the connection proved healthy — it made a successful read OR stayed
+        // established at least ``minHealthyDuration``. An accept-then-immediately-drop flap
+        // (no read, dropped before the threshold) is scored a failure and the backoff widens.
         let resume = resumePoint()
         await runAttempt(backend, resume: resume, continuation)
         // Fully drain the OLD transport BEFORE the loop dials the next one (the CE2.1
@@ -176,25 +214,65 @@ public actor WorkGraphResync {
     }
   }
 
-  /// Resets the reconnect backoff once the current attempt has DEMONSTRABLY made progress
-  /// — the first published snapshot (first connect) or the first applied delta (resume).
-  /// Reset on real progress, NOT on a bare `connect()`, so a daemon that accepts then
-  /// immediately drops (no snapshot, no delta) keeps widening the backoff instead of
-  /// hot-spinning at `base`. Idempotent, so calling it per delta is harmless.
-  private func markProgress() {
-    backoff.reset()
+  /// Records that the current attempt made a successful read (a published snapshot on a
+  /// first connect, or an applied delta on a resume) — one of the two health signals. On
+  /// the resume path this is the ONLY read-based signal; the other, established-duration, is
+  /// what covers an idle connection that reads nothing. Idempotent (per-delta calls harmless).
+  private func noteRead() {
+    attemptSawRead = true
   }
 
-  /// One attempt. With `resume == nil` it subscribes-around-snapshot (first connect);
-  /// otherwise it resumes the `events` stream from `resume.offset` and folds live deltas
-  /// onto the retained baseline (incremental durable replay). Any failure (snapshot
-  /// error, transport drop, or bounded-buffer overflow) returns so the loop reconnects.
+  /// Resets the current attempt's health accounting at its start.
+  private func beginAttempt() {
+    attemptSawRead = false
+  }
+
+  /// The connection-health assessment run at an attempt's teardown. The just-ended
+  /// subscription is HEALTHY — so the backoff resets, and a later drop reconnects promptly
+  /// from `base` — when EITHER it made a successful read (a snapshot/delta proves the
+  /// connection was live and functioning) OR it stayed established at least
+  /// ``minHealthyDuration`` (proof of a live-but-idle connection that simply had no deltas
+  /// to deliver — the quiet-period case). A connection that dropped sooner WITHOUT any read
+  /// is an accept-then-flap: NOT healthy, so the backoff is left to widen.
+  ///
+  /// Assessing at teardown (rather than resetting mid-attempt) is race-free: the reconnect
+  /// delay is only ever drawn AFTER the attempt returns, so a teardown reset and a
+  /// mid-attempt reset are equivalent for the delay — and the elapsed measurement reads the
+  /// clock synchronously here, so an injected manual clock makes the health window exact.
+  private func assessHealth(establishedFor elapsed: Duration) {
+    if attemptSawRead || elapsed >= minHealthyDuration {
+      backoff.reset()
+    }
+  }
+
+  /// One attempt. Opens the injected existential clock so the health assessment can measure
+  /// established-duration with concrete instant arithmetic (an `any Clock<Duration>` erases
+  /// its `Instant` type), then runs the attempt against the opened clock.
   private func runAttempt(
     _ backend: any Backend,
     resume: (state: Snapshot, offset: Int)?,
     _ continuation: AsyncStream<Snapshot>.Continuation
   ) async {
+    await runAttempt(backend, resume: resume, continuation, clock: clock)
+  }
+
+  /// One attempt against a concrete `clock`. With `resume == nil` it subscribes-around-
+  /// snapshot (first connect); otherwise it resumes the `events` stream from `resume.offset`
+  /// and folds live deltas onto the retained baseline (incremental durable replay). Any
+  /// failure (snapshot error, transport drop, bounded-buffer overflow, or a stalled offset
+  /// gap) returns so the loop reconnects. On the way out it assesses connection health from
+  /// the elapsed established-duration and whether a read occurred, resetting the backoff for
+  /// a healthy connection (see ``assessHealth(establishedFor:)``).
+  private func runAttempt<C: Clock<Duration>>(
+    _ backend: any Backend,
+    resume: (state: Snapshot, offset: Int)?,
+    _ continuation: AsyncStream<Snapshot>.Continuation,
+    clock: C
+  ) async {
+    beginAttempt()
+    let establishedAt = clock.now
     let queue = BoundedDeltaQueue<OffsetEvent>(limit: bufferLimit)
+    let gapLimit = gapLimit
     // Establish the subscription BEFORE the snapshot request (on a first connect) — on
     // the connection's serialized send path this issues the `events` Request ahead of
     // `snapshot`. On a reconnect there is no snapshot: the daemon replays strictly after
@@ -218,35 +296,9 @@ public actor WorkGraphResync {
         }
         // Folder: publish/retain the baseline, then fold buffered + live deltas, tracking
         // the contiguous-prefix offset for the next resume.
-        group.addTask { [reconciler, observer] in
-          var state: Snapshot
-          var tracker: ContiguousOffsetTracker
-          if let resume {
-            // Incremental resume: fold onto the retained baseline — no fresh snapshot.
-            state = resume.state
-            tracker = ContiguousOffsetTracker(resumingAfter: resume.offset)
-          } else {
-            // First connect: fetch and publish the baseline (subscribe-around-snapshot).
-            let base = try await backend.snapshot()
-            state = base
-            tracker = ContiguousOffsetTracker()
-            await self.record(state: base, contiguous: nil)
-            await observer?(base)
-            continuation.yield(base)
-            // A published snapshot IS demonstrated progress — reset the backoff so a later
-            // clean drop reconnects promptly from `base`.
-            await self.markProgress()
-          }
-          while let offsetEvent = await queue.next() {
-            state = reconciler.reconcile(state, applying: offsetEvent.event)
-            tracker.observe(offsetEvent.offset)
-            await self.record(state: state, contiguous: tracker.contiguous)
-            await observer?(state)
-            continuation.yield(state)
-            // An applied delta IS demonstrated progress (the only progress signal on the
-            // resume path, which has no snapshot) — reset the backoff.
-            await self.markProgress()
-          }
+        group.addTask { [self] in
+          try await fold(
+            from: queue, backend: backend, resume: resume, gapLimit: gapLimit, continuation)
         }
         do {
           try await group.next()
@@ -258,6 +310,53 @@ public actor WorkGraphResync {
       }
     } catch {
       // Reconnect: the next attempt re-dials and resumes incrementally from the cursor.
+    }
+    // Assess connection health for THIS attempt before the loop draws the next reconnect
+    // delay: reset the backoff if the connection made a read or stayed established long
+    // enough (healthy), else leave it to widen (a flap). Elapsed is measured on the injected
+    // clock, read synchronously here so the window is exact under a manual test clock.
+    assessHealth(establishedFor: establishedAt.duration(to: clock.now))
+  }
+
+  /// The folder half of an attempt: on a first connect fetch and publish the baseline
+  /// (subscribe-around-snapshot); then fold each buffered/live delta onto the retained
+  /// baseline, tracking the contiguous-prefix offset for the next resume and recording each
+  /// read as a health signal. A permanently-missing offset trips ``ContiguousOffsetTracker``'s
+  /// bounded-gap guard (``ContiguousOffsetTracker/StalledGap``), which throws here to collapse
+  /// the attempt into a resync from the frozen cursor rather than freezing progress and growing
+  /// the ahead-set unbounded (FIX B).
+  private func fold(
+    from queue: BoundedDeltaQueue<OffsetEvent>,
+    backend: any Backend,
+    resume: (state: Snapshot, offset: Int)?,
+    gapLimit: Int,
+    _ continuation: AsyncStream<Snapshot>.Continuation
+  ) async throws {
+    var state: Snapshot
+    var tracker: ContiguousOffsetTracker
+    if let resume {
+      // Incremental resume: fold onto the retained baseline — no fresh snapshot.
+      state = resume.state
+      tracker = ContiguousOffsetTracker(resumingAfter: resume.offset, gapLimit: gapLimit)
+    } else {
+      // First connect: fetch and publish the baseline (subscribe-around-snapshot).
+      let base = try await backend.snapshot()
+      state = base
+      tracker = ContiguousOffsetTracker(gapLimit: gapLimit)
+      record(state: base, contiguous: nil)
+      await observer?(base)
+      continuation.yield(base)
+      // A published snapshot IS a successful read — one of the two health signals.
+      noteRead()
+    }
+    while let offsetEvent = await queue.next() {
+      state = reconciler.reconcile(state, applying: offsetEvent.event)
+      try tracker.observe(offsetEvent.offset)
+      record(state: state, contiguous: tracker.contiguous)
+      await observer?(state)
+      continuation.yield(state)
+      // An applied delta IS a successful read (the only read signal on the resume path).
+      noteRead()
     }
   }
 }

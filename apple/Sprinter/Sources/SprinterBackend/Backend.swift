@@ -78,11 +78,19 @@ extension Backend {
   /// adapters that override this (``RpcBackend``), so a fake never has to model offsets
   /// yet still satisfies the port — and the offset-driven reconnect logic is exercised
   /// against the real adapter.
+  ///
+  /// The synthetic sequence honors the SAME offset origin as production: durable offsets
+  /// are strictly `> 0` (the daemon's journal starts at 1), so an origin subscription
+  /// (`sinceOffset: nil`) mints its first offset at `1`, not `0`. A `0`-based origin would
+  /// contradict that `> 0` invariant AND be silently dropped by ``ContiguousOffsetTracker``
+  /// (whose origin prefix seeds at `0`, so an offset of `0` is not `> contiguous` and never
+  /// advances the prefix) — so the fake would exercise a different origin boundary than the
+  /// real adapter. Starting at `1` keeps the fake faithful to the production invariant.
   public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
     let base = events()
     return AsyncThrowingStream { continuation in
       let task = Task {
-        var offset = (sinceOffset ?? -1) + 1
+        var offset = (sinceOffset ?? 0) + 1
         do {
           for try await event in base {
             continuation.yield(OffsetEvent(offset: offset, event: event))
