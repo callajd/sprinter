@@ -21,10 +21,12 @@ actor RpcConnection {
   private var receiveTask: Task<Void, Never>?
   private var closed = false
 
-  /// `streamBufferLimit` bounds each subscription's un-drained backlog in the demand-
-  /// gated ``AckGate``: under correct flow control the daemon holds the next chunk until
-  /// our ack, so at most one un-acked batch is buffered — the bound is the safety net for
-  /// an over-large chunk or a daemon that ignores flow control (overflow → resync).
+  /// `streamBufferLimit` bounds each subscription's un-drained backlog in the ``AckGate``.
+  /// It is the hard memory bound per stream: a fast daemon can push at most this many
+  /// values ahead of the consumer before ``AckGate/Overflow`` trips and the resync loop
+  /// recovers — the safety net for an over-large chunk, a daemon that ignores flow control,
+  /// or the production ``RpcBackend/events(sinceOffset:)`` path (which drains into an
+  /// unbounded stream, so the ack is not a live throttle and this bound is what caps it).
   init(transport: any RpcTransport, streamBufferLimit: Int = 1024) {
     self.transport = transport
     self.streamBufferLimit = streamBufferLimit
@@ -65,11 +67,13 @@ actor RpcConnection {
     }
   }
 
-  /// Opens a streaming subscription: sends a `Request` and returns a **demand-gated**
-  /// ``AckGatedStream`` fed by correlated `Chunk` frames until the terminal `Exit`. The
-  /// per-batch `Ack` is deferred until the consumer drains that batch (true
-  /// backpressure), and the backlog is bounded (overflow → the consumer sees a failure →
-  /// resync). Early consumer termination (task cancel or a dropped iterator) sends an
+  /// Opens a streaming subscription: sends a `Request` and returns an ``AckGatedStream``
+  /// fed by correlated `Chunk` frames until the terminal `Exit`. The per-batch `Ack` is
+  /// deferred until the consumer drains that batch (demand-gating for a consumer that
+  /// paces itself; on the unbounded-interposed ``RpcBackend/events(sinceOffset:)`` path the
+  /// drain is instant, so the bound below — not the ack — is the flow control), and the
+  /// backlog is bounded (overflow → the consumer sees a failure → resync). Early consumer
+  /// termination (task cancel, a dropped iterator, or an ``AckGate/Overflow``) sends an
   /// `Interrupt` for the request.
   func stream(tag: String, payload: JSONValue?) async -> AckGatedStream {
     guard !closed else {
@@ -189,11 +193,12 @@ actor RpcConnection {
 
   private func handleChunk(_ id: RequestId, _ values: [JSONValue]) {
     guard case .stream(let gate)? = pending[id] else { return }
-    // Hand the batch to the demand-gated buffer WITHOUT acking: the `Ack` is deferred
-    // until the consumer drains this batch (``AckGate/next()`` sends it then), so the
-    // daemon's chunk→ack→chunk flow control now gates on downstream demand — true
-    // backpressure — and the backlog stays bounded (overflow → the consumer sees a
-    // failure → resync). The receive loop never blocks on the consumer here.
+    // Hand the batch to the bounded gate WITHOUT acking: the `Ack` is deferred until the
+    // consumer drains this batch (``AckGate/next()`` sends it then). For a self-paced
+    // consumer that gates the daemon's chunk→ack→chunk flow on downstream demand; on the
+    // production `events` path the drain is instant, so the gate's bound (overflow →
+    // resync) is what keeps the backlog bounded. Either way the receive loop never blocks
+    // on the consumer here.
     gate.push(values)
   }
 

@@ -280,7 +280,7 @@ struct WorkGraphResyncTests {
 /// `snapshot()` throws so the attempt collapses at once (forcing a reconnect); otherwise
 /// its `snapshot()` succeeds and `events()` stays open, so the attempt STAYS ALIVE and the
 /// reconnect loop quiesces (never spins). `close()` reports through the injected hook.
-private final class ControllableBackend: Backend {
+final class ControllableBackend: Backend {
   private let tearsDown: Bool
   private let onClose: @Sendable () async -> Void
 

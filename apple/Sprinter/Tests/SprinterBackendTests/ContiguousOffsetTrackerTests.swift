@@ -4,25 +4,41 @@ import Testing
 
 @Suite("Contiguous-prefix offset tracking")
 struct ContiguousOffsetTrackerTests {
-  @Test("in-order arrivals advance the prefix one step at a time")
+  @Test("an origin tracker seeds the prefix at 0 (nothing applied), then advances in order")
   func inOrderAdvances() {
     var tracker = ContiguousOffsetTracker()
-    #expect(tracker.contiguous == nil)
-    tracker.observe(0)
+    // Origin: nothing applied yet, so the prefix seeds at 0 (durable offsets are > 0).
     #expect(tracker.contiguous == 0)
     tracker.observe(1)
     #expect(tracker.contiguous == 1)
     tracker.observe(2)
     #expect(tracker.contiguous == 2)
+    tracker.observe(3)
+    #expect(tracker.contiguous == 3)
   }
 
-  @Test("the smallest offset seen seeds the prefix origin")
-  func minimumSeeds() {
+  /// FIX3 — the offset-tracker loss hole at the origin boundary. A HIGHER offset observed
+  /// before a LOWER one at the very start (5 before 3) must NOT seed the prefix from the
+  /// first arrival and then discard the later 3 as a duplicate. From an origin start the
+  /// prefix is seeded at 0, so 3, 4, 5 are ALL above it → all genuinely un-applied → none
+  /// discarded. The prefix legitimately stays at 0 (offsets 1, 2 have not been seen); once
+  /// they fill in, the whole held-ahead run (3, 4, 5) joins the prefix — proving nothing
+  /// was dropped.
+  @Test("a higher offset before a lower one at origin discards nothing (the loss hole)")
+  func higherBeforeLowerAtOriginDiscardsNothing() {
     var tracker = ContiguousOffsetTracker()
     tracker.observe(5)
+    tracker.observe(3)  // BELOW the max seen (5) but ABOVE the prefix (0): a real event.
+    tracker.observe(4)
+    // The prefix stays at 0: offsets 1 and 2 are genuinely un-seen (this is an origin
+    // start), so nothing may be assumed applied below the seed. Crucially, 3/4/5 were NOT
+    // discarded — they are held ahead.
+    #expect(tracker.contiguous == 0)
+    // Filling the true origin run advances the prefix across ALL of 1…5 — 3, 4, 5 were
+    // retained the whole time, never lost as duplicates.
+    tracker.observe(1)
+    tracker.observe(2)
     #expect(tracker.contiguous == 5)
-    tracker.observe(6)
-    #expect(tracker.contiguous == 6)
   }
 
   @Test("an offset ahead of a gap does NOT advance the prefix past the gap")

@@ -62,6 +62,14 @@ public struct RpcBackend: Backend {
   }
 
   public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
+    // FLOW CONTROL NOTE: this interposes an UNBOUNDED ``AsyncThrowingStream`` over the
+    // bounded ``AckGatedStream`` and drains it as fast as it can, so the gate's deferred
+    // ack fires on arrival — it is NOT a live demand signal that throttles the daemon on
+    // this path. Memory is still bounded, by two per-request bounds upstream of any
+    // unbounded growth: the ``AckGate`` backlog cap (``RpcConnection``'s streamBufferLimit)
+    // caps how far a fast daemon can run ahead, and ``WorkGraphResync``'s bounded
+    // reconciler queue collapses the attempt into a snapshot/offset resync the moment the
+    // reconciler falls behind — loss-free via the offset cursor. See ``AckGate``.
     AsyncThrowingStream { continuation in
       let task = Task {
         do {

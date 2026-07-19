@@ -1,22 +1,29 @@
 import Foundation
 import SprinterContract
 
-/// The **demand-gated** delivery buffer for one streaming RPC subscription (CE2.2
-/// deliverable — demand-gated backpressure).
+/// The **bounded, ack-gated** delivery buffer for one streaming RPC subscription (CE2.2).
 ///
 /// BE1.1 acked each `Chunk` on RECEIPT: the client sent the per-batch `Ack` the instant
-/// the frame arrived and buffered the values unbounded, so a slow consumer could not
-/// slow the daemon and the backlog grew without bound (the carried #36 F1 constraint).
-/// This gate instead defers the `Ack` until the consumer has **drained the batch** —
-/// the `Ack` is the "ready for more" signal, so the daemon's own chunk→ack→chunk flow
-/// control now gates on downstream demand, not on arrival. Real backpressure.
+/// the frame arrived and buffered the values unbounded, so nothing bounded the backlog
+/// (the carried #36 F1 constraint). This gate instead defers the `Ack` until the consumer
+/// has **drained the batch** — the `Ack` is the "ready for more" signal.
 ///
-/// The buffer is **bounded**: `push` rejects a batch that would exceed `limit`,
-/// surfacing an ``Overflow`` the consumer sees as a stream failure — which
-/// ``WorkGraphResync`` turns into a snapshot/offset resync rather than a silent drop or
-/// unbounded growth. Under correct demand-gating the daemon holds the next chunk until
-/// the ack, so at most one un-acked batch is ever buffered; the bound is the safety net
-/// for a single over-large chunk or a daemon that ignores flow control.
+/// **Where the deferred ack actually throttles the daemon.** For a consumer that iterates
+/// this stream AT ITS OWN PACE (a direct/bounded consumer), the deferred ack is genuine
+/// end-to-end demand-gating: the daemon's chunk→ack→chunk flow control stalls until the
+/// consumer asks for more. It is NOT a live throttle on the production
+/// ``RpcBackend/events(sinceOffset:)`` path, however: that adapter drains this gate into
+/// an UNBOUNDED ``AsyncThrowingStream`` (so the inner drain task acks every batch
+/// instantly), so the ack there fires on arrival, not on downstream demand. The operative
+/// production flow control on that path is not the ack but the **bounded backlog below**
+/// plus ``WorkGraphResync``'s bounded reconciler queue: overflow → snapshot/offset resync.
+///
+/// The buffer is **bounded**: `push` rejects a batch that would exceed `limit`, surfacing
+/// an ``Overflow`` the consumer sees as a stream failure — which ``WorkGraphResync`` turns
+/// into a snapshot/offset resync (loss-free via the offset cursor) rather than a silent
+/// drop or unbounded growth. This per-request bound caps how much a fast daemon can push
+/// ahead of the reconciler even on the unbounded-interposed `events` path, so memory stays
+/// bounded regardless of whether the ack is a live demand signal.
 ///
 /// Single producer (the connection's receive loop calls ``push(_:)``/``finish()``/
 /// ``fail(_:)``), single consumer (the subscription's iterator calls ``next()``). State
@@ -204,9 +211,19 @@ final class AckGate: @unchecked Sendable {
   }
 
   /// Abandons the stream from the consumer side (task cancelled or iterator dropped):
-  /// unblocks a suspended ``next()`` and interrupts the request — but only if the stream
-  /// had not already reached a terminal state (a clean finish/failure must not fire a
-  /// spurious interrupt). Idempotent.
+  /// unblocks a suspended ``next()`` and interrupts the request unless the stream reached
+  /// a CLEAN finish (a terminal success `Exit`, whose request is already resolved).
+  /// Idempotent.
+  ///
+  /// The interrupt is REQUIRED after an ``Overflow`` failure: overflow is a LOCAL buffer
+  /// failure (the receive loop set it), so the request is still `pending` in
+  /// ``RpcConnection`` and the daemon is still streaming into a now-dropping gate. Without
+  /// the interrupt a consumer that abandons the stream on overflow (no ``fail(_:)`` from a
+  /// terminal `Exit`, no explicit `close()`) would leak `pending[id]` and leave the daemon
+  /// pumping deltas forever — so overflow must be self-cleaning. For a failure that came
+  /// from a terminal `Exit` or connection teardown the request was already removed from
+  /// `pending`, so the interrupt is a harmless no-op (``RpcConnection`` guards on
+  /// still-pending), never a spurious wire frame.
   func cancelFromConsumer() async {
     guard let outcome = markCancelled() else { return }
     outcome.waiter?.resume()
@@ -216,13 +233,17 @@ final class AckGate: @unchecked Sendable {
   }
 
   /// Marks the stream cancelled under the lock; returns the waiter to resume and whether
-  /// an interrupt is owed, or `nil` if it was already cancelled.
+  /// an interrupt is owed, or `nil` if it was already cancelled. An interrupt is owed
+  /// whenever the stream did not reach a clean finish — including the ``Overflow`` failure
+  /// path, so the still-pending request is cancelled and the daemon stops streaming into a
+  /// dropped gate (the guard in ``RpcConnection`` makes it a no-op for an already-resolved
+  /// request).
   private func markCancelled() -> CancelOutcome? {
     lock.lock()
     defer { lock.unlock() }
     guard !cancelled else { return nil }
     cancelled = true
-    let shouldInterrupt = !finished && failure == nil
+    let shouldInterrupt = !finished
     let resumed = takeWaiter()
     return CancelOutcome(waiter: resumed, shouldInterrupt: shouldInterrupt)
   }

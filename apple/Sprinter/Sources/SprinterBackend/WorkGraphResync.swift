@@ -31,11 +31,17 @@ import SprinterContract
 /// whose entire prefix has been applied — never the max — else a reconnect could skip an
 /// event that is `≤ max` but was never applied (see ``ContiguousOffsetTracker``).
 ///
-/// **Bounded backlog → resync.** The un-reconciled delta backlog is bounded by
-/// ``BoundedDeltaQueue``: if the reconciler falls behind the demand-gated `events`
+/// **Bounded backlog → resync (the production flow control).** The un-reconciled delta
+/// backlog is bounded by ``BoundedDeltaQueue``: if the reconciler falls behind the `events`
 /// stream, the overflow forces a reconnect+resync rather than dropping deltas or growing
-/// unbounded (the carried #36 F1 recovery). Because the resume cursor tracks only APPLIED
-/// offsets, the incremental resume re-sends whatever overflowed — no loss.
+/// unbounded (the carried #36 F1 recovery). This — NOT daemon-stalling demand-gating — is
+/// the real end-to-end flow control on the ``RpcBackend`` path: that adapter drains the
+/// per-request ``AckGate`` into an unbounded stream, so the ack does not throttle the
+/// daemon; the daemon is instead capped by the ``AckGate`` backlog bound and, downstream,
+/// this bounded queue whose overflow triggers the resync. Because the resume cursor tracks
+/// only APPLIED offsets, the incremental resume re-sends whatever overflowed — no loss. A
+/// bounded resync is the intended, better-for-a-live-UI mechanism (a live view coalesces to
+/// the latest baseline; it does not need every intermediate delta stalled into it).
 ///
 /// **Reconnect backoff + jitter (CE2.2).** Reconnect delays follow
 /// ``ReconnectBackoff`` — exponential with full jitter, reset on a successful connect —
@@ -132,9 +138,13 @@ public actor WorkGraphResync {
     while !Task.isCancelled {
       do {
         let backend = try await connect()
-        // A successful connect resets the backoff, so a healthy connection that later
-        // drops reconnects promptly from `base` rather than inheriting a widened delay.
-        backoff.reset()
+        // NOTE: the backoff is NOT reset here. A bare `connect()` success is not progress —
+        // a daemon that accepts the socket then immediately drops the subscription would
+        // reset `failures` to 0 every attempt, pinning the delay at `base` and hot-spinning
+        // against a flapping daemon. It is reset only once the connection has DEMONSTRABLY
+        // made progress — the first published snapshot or the first applied delta of the
+        // attempt (see ``markProgress()``) — so an accept-then-immediately-drop flap is
+        // treated as a failure and the backoff widens exponentially as intended.
         let resume = resumePoint()
         await runAttempt(backend, resume: resume, continuation)
         // Fully drain the OLD transport BEFORE the loop dials the next one (the CE2.1
@@ -164,6 +174,15 @@ public actor WorkGraphResync {
     if let contiguous {
       resumeOffset = contiguous
     }
+  }
+
+  /// Resets the reconnect backoff once the current attempt has DEMONSTRABLY made progress
+  /// — the first published snapshot (first connect) or the first applied delta (resume).
+  /// Reset on real progress, NOT on a bare `connect()`, so a daemon that accepts then
+  /// immediately drops (no snapshot, no delta) keeps widening the backoff instead of
+  /// hot-spinning at `base`. Idempotent, so calling it per delta is harmless.
+  private func markProgress() {
+    backoff.reset()
   }
 
   /// One attempt. With `resume == nil` it subscribes-around-snapshot (first connect);
@@ -214,6 +233,9 @@ public actor WorkGraphResync {
             await self.record(state: base, contiguous: nil)
             await observer?(base)
             continuation.yield(base)
+            // A published snapshot IS demonstrated progress — reset the backoff so a later
+            // clean drop reconnects promptly from `base`.
+            await self.markProgress()
           }
           while let offsetEvent = await queue.next() {
             state = reconciler.reconcile(state, applying: offsetEvent.event)
@@ -221,6 +243,9 @@ public actor WorkGraphResync {
             await self.record(state: state, contiguous: tracker.contiguous)
             await observer?(state)
             continuation.yield(state)
+            // An applied delta IS demonstrated progress (the only progress signal on the
+            // resume path, which has no snapshot) — reset the backoff.
+            await self.markProgress()
           }
         }
         do {

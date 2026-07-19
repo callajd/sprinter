@@ -217,4 +217,40 @@ struct StreamTests {
     }
     transport.close()
   }
+
+  /// FIX4 — overflow is self-cleaning. An ``AckGate/Overflow`` is a LOCAL failure: the
+  /// request stays `pending` in ``RpcConnection`` and the daemon keeps streaming. A
+  /// consumer that abandons the stream on overflow (no terminal `Exit`, no explicit
+  /// `close()`) must NOT leak that pending request — abandoning after overflow sends an
+  /// `Interrupt`, cancelling the request and telling the daemon to stop. Proven on the real
+  /// outbound wire: after the overflow throws and the iterator is dropped, an `Interrupt`
+  /// frame for the request appears.
+  @Test("abandoning the stream after an overflow interrupts the request (no pending leak)")
+  func overflowInterruptsPendingRequest() async throws {
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport, streamBufferLimit: 2)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let stream = await connection.stream(tag: "events", payload: nil)
+    let request = try await nextSent(&outbound)
+    let id = try #require(request.id)
+
+    // One over-limit chunk trips the overflow.
+    transport.emit(Wire.chunk(requestId: id, values: [#""a""#, #""b""#, #""c""#]))
+
+    // Consume-then-abandon: the for-loop's iterator is released when this scope exits,
+    // driving the drop path (deinit → cancelFromConsumer) — the leak scenario FIX4 closes.
+    do {
+      for try await _ in stream {}
+      Issue.record("expected the over-limit batch to overflow")
+    } catch is AckGate.Overflow {
+      // Expected: the bounded gate surfaced the overflow.
+    }
+
+    // Self-cleaning: an Interrupt for the request is sent (pending cleared, daemon stopped).
+    let interrupt = try await nextSent(&outbound)
+    #expect(interrupt.envelopeTag == "Interrupt")
+    #expect(interrupt.requestId == id)
+    transport.close()
+  }
 }
