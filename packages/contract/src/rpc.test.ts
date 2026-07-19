@@ -140,6 +140,28 @@ it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)"
   expect(() => Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: -1 })).toThrow();
 });
 
+it("decodes the events request through the wire JSON codec — {} replays from origin (CE2.0 B1)", () => {
+  // Regression for the v3 end-to-end decode bug (CE2.0 re-review): the daemon decodes
+  // each request payload through `Schema.toCodecJson(payloadSchema)` — the exact seam
+  // `RpcServer` drives over the NDJSON serializer, NOT the `RpcTest` shortcut that
+  // bypasses serialization. Under v3 the events payload is a `Struct`, so what the
+  // client puts on the wire for the `payload` key matters end-to-end.
+  const codec = Schema.toCodecJson(events.payloadSchema);
+
+  // The canonical Effect client (and the fixed Swift client) send a PRESENT empty
+  // object `{}` for `.events({})`; it MUST decode to the origin-replay case (no
+  // `sinceOffset`). This is the assertion that would have caught the Swift client
+  // omitting the `payload` key.
+  expect(Schema.decodeUnknownSync(codec)({}).sinceOffset).toBeUndefined();
+
+  // Documents the boundary the omitted-payload bug tripped: an ABSENT payload
+  // (`undefined`, an omitted `payload` key on the wire) is NOT a valid events
+  // request under the v3 `Struct` schema and fails to decode ("Expected object, got
+  // undefined"). The fix is to send a present `{}`, not to widen the schema to accept
+  // `undefined`.
+  expect(() => Schema.decodeUnknownSync(codec)(undefined)).toThrow();
+});
+
 it("accepts a workstream plan and answers with a WorkstreamId", () => {
   const plan = { plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" } };
   const decodedPayload = Schema.decodeUnknownSync(createWorkstreamFromPlan.payloadSchema)(plan);

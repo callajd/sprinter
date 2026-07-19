@@ -363,9 +363,11 @@ export const handlers = SprinterRpc.toLayer(
       // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
       // durable offset (contract v3 / CE2.0), and replay + live offsets share one
       // coordinate space, so the client can feed a streamed item's offset back as
-      // `sinceOffset`. The cursor is OPTIONAL: absent → replay from origin
-      // (backward-compatible), present → resume strictly after that offset, over the
-      // same `resyncFrom` primitive.
+      // `sinceOffset`. The cursor is OPTIONAL: a request with NO `sinceOffset` (a
+      // present but empty `{}` payload) replays from origin, present resumes strictly
+      // after that offset, over the same `resyncFrom` primitive. The strict
+      // `> sinceOffset` ordering is scoped to that resume; within one stream the
+      // subscribe-before-replay boundary can overlap (harmless under upsert).
       events: ({ sinceOffset }) => resyncEvents(store, feed, sinceOffset),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>

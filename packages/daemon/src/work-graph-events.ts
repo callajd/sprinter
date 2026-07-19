@@ -32,8 +32,13 @@ import type { OffsetEvent } from "@sprinter/contract";
  * `event_log` offset it was journaled at (contract v3 / CE2.0). The producer (the
  * journaling `StateStore` decorator, `./event-journal.ts`) is the one layer that
  * mints that offset, so it is also the one that publishes: the live-tail offset
- * shares ONE coordinate space with the durable replay (`EventLogStore.tail`), and
- * a client can resume from any streamed item's offset without a gap or duplicate.
+ * shares ONE coordinate space with the durable replay (`EventLogStore.tail`), so a
+ * client can resume from any streamed item's offset. The strict `> sinceOffset`,
+ * no-re-delivery guarantee is scoped to that RECONNECT RESUME (the durable
+ * `tail`); the live feed itself is not guaranteed strictly monotonic — publish
+ * happens after the durable commit, so concurrent writers can interleave — and it
+ * can overlap the durable replay at the boundary, all harmless under upsert
+ * idempotency.
  */
 export class WorkGraphEvents extends Context.Service<
   WorkGraphEvents,

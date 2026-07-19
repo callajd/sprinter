@@ -120,9 +120,9 @@ struct ReadModelTests {
     // bare delta the existing consumers use (RpcBackend / WorkGraphResync).
     let workstream = try Golden.decode(Workstream.self, from: "workstream")
     #expect(items[0].event == .workstreamChanged(workstream))
-    // The offsets are monotonic and strictly increasing — the resume coordinate the
-    // client feeds back as `sinceOffset`.
-    #expect(items.map(\.offset) == [0, 1, 2])
+    // Real `event_log` offsets are 1-based (> 0); the sample resumes from a mid-log
+    // position — the durable-replay coordinate the client feeds back as `sinceOffset`.
+    #expect(items.map(\.offset) == [3, 4, 5])
     for item in items {
       #expect(try Golden.roundTrip(item) == item)
     }

@@ -1,6 +1,6 @@
 [
   {
-    "offset": 0,
+    "offset": 3,
     "event": {
       "_tag": "WorkstreamChanged",
       "workstream": {
@@ -15,7 +15,7 @@
     }
   },
   {
-    "offset": 1,
+    "offset": 4,
     "event": {
       "_tag": "IssueChanged",
       "issue": {
@@ -36,7 +36,7 @@
     }
   },
   {
-    "offset": 2,
+    "offset": 5,
     "event": {
       "_tag": "SessionChanged",
       "session": {

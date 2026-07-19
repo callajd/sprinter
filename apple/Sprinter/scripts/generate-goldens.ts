@@ -160,13 +160,15 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
 // ── OffsetEvent — the streamed `events` success envelope (contract v3 / CE2.0) ──
 //
 // Each streamed item pairs a WorkGraphEvent with its DURABLE offset, so a client
-// can feed the offset back as the request's `sinceOffset` cursor. The offsets are
-// monotonic and strictly increasing — the coordinate space of a gap-free resume.
+// can feed the offset back as the request's `sinceOffset` cursor. Real `event_log`
+// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3,4,5)
+// rather than the origin — the strict `> sinceOffset` ordering is the durable-replay
+// slice a reconnect resumes from.
 
 write("offset-events", Schema.Array(OffsetEvent), [
-  { offset: 0, event: { _tag: "WorkstreamChanged", workstream } },
-  { offset: 1, event: { _tag: "IssueChanged", issue: issueWithPr } },
-  { offset: 2, event: { _tag: "SessionChanged", session } },
+  { offset: 3, event: { _tag: "WorkstreamChanged", workstream } },
+  { offset: 4, event: { _tag: "IssueChanged", issue: issueWithPr } },
+  { offset: 5, event: { _tag: "SessionChanged", session } },
 ]);
 
 // ── SessionEvent — every variant (+ optional present/absent) ─────────────────

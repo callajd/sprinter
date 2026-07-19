@@ -49,9 +49,9 @@ import {
  * FE2.4 goldens in one bump (INV-CONTRACT: version once, re-freeze once).
  *
  * `v3` (CE2.0) makes the `events` cursor usable end-to-end, as ONE change: the
- * REQUEST gains an OPTIONAL `sinceOffset` cursor (absent replays from the log
- * origin — backward-compatible, the pre-v3 wire had no request field; present
- * resumes strictly after that offset), AND the streamed RESPONSE becomes the
+ * REQUEST gains an OPTIONAL `sinceOffset` cursor (an events request with NO
+ * `sinceOffset` — a present but empty `{}` payload — replays from the log origin;
+ * present resumes strictly after that offset), AND the streamed RESPONSE becomes the
  * {@link OffsetEvent} envelope so each item carries the durable offset the client
  * feeds back as that cursor. (A cold review caught that the bare-`WorkGraphEvent`
  * response gave the client no offset to resume from, leaving the cursor inert; the
@@ -143,14 +143,21 @@ export type WorkGraphEvent = (typeof WorkGraphEvent)["Type"];
  * One streamed `events` item: a {@link WorkGraphEvent} paired with its DURABLE
  * `offset` — the `event_log` row position the delta was journaled at (contract v3 /
  * CE2.0). The stream carries the offset so a reconnecting client can remember its
- * last-seen position and hand it back as the request's `sinceOffset` cursor to
- * resume STRICTLY AFTER it (no gap, no duplicate). Without this envelope the bare
- * `WorkGraphEvent` gave the client no coordinate to resume from, so the cursor was
- * inert; the offset closes that loop end-to-end.
+ * last-seen position and hand it back as the request's `sinceOffset` cursor. Without
+ * this envelope the bare `WorkGraphEvent` gave the client no coordinate to resume
+ * from, so the cursor was inert; the offset closes that loop end-to-end.
  *
- * The offsets are MONOTONIC and share ONE coordinate space with both the durable
- * replay (`EventLogStore.tail`) and the live tail — a replay from `sinceOffset = N`
- * yields items whose offsets are all `> N` and contiguous with the live feed.
+ * The offset is a durable `event_log` coordinate shared by both the replay
+ * (`EventLogStore.tail`) and the live tail, so a client CAN resume from any streamed
+ * item's offset. The strict guarantee is scoped to the RECONNECT RESUME: a request
+ * with `sinceOffset = N` replays only offsets `> N` (the durable `tail(N)`), so a
+ * resume never re-delivers what the client already saw. It is NOT a within-stream
+ * guarantee: a single live stream can show a harmless boundary overlap (an offset
+ * repeating, or momentarily going backwards) where an eager live subscription and
+ * the durable replay meet, and because the live fan-out publishes AFTER the durable
+ * commit, concurrent writers can interleave so the LIVE feed order is not guaranteed
+ * strictly monotonic by offset. All of this is absorbed by upsert idempotency (the
+ * carried node replaces any prior of the same id), so a client folds it losslessly.
  */
 export const OffsetEvent = Schema.Struct({
   offset: NonNegativeInt,
@@ -187,13 +194,15 @@ export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 
 // (2) events — streaming work-graph deltas (INV-REACTIVE). Each streamed item is
 // an {@link OffsetEvent} — the delta PLUS its durable `event_log` offset — so the
-// client can track its last-seen position (contract v3 / CE2.0). The request
-// carries an OPTIONAL `sinceOffset` resume cursor: absent → replay from the log
-// ORIGIN (backward-compatible: the pre-v3 request carried no field, so an omitted
-// key decodes to the same origin replay); present → resume STRICTLY AFTER that
-// offset, over the daemon's existing `resyncFrom(offset)` primitive (CE1.2). The
-// success offset and the request cursor are the SAME coordinate: a client feeds a
-// streamed item's `offset` straight back as the next `sinceOffset`.
+// client can track its last-seen position (contract v3 / CE2.0). The request payload
+// carries an OPTIONAL `sinceOffset` resume cursor: an events request with NO
+// `sinceOffset` (a PRESENT but empty `{}` payload) replays from the log ORIGIN,
+// present resumes STRICTLY AFTER that offset, over the daemon's existing
+// `resyncFrom(offset)` primitive (CE1.2). Note the payload OBJECT itself is required
+// (the v3 schema is a `Struct`): the canonical client sends `{}` for `.events({})` —
+// an omitted `payload` key on the wire (decoding to `undefined`) is NOT a valid v3
+// request. The success offset and the request cursor are the SAME coordinate: a
+// client feeds a streamed item's `offset` straight back as the next `sinceOffset`.
 export const events = Rpc.make("events", {
   payload: { sinceOffset: Schema.optionalKey(NonNegativeInt) },
   success: OffsetEvent,

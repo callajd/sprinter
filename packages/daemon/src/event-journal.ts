@@ -16,8 +16,8 @@
  *   that fans the delta out live on the {@link WorkGraphEvents} feed, stamped with
  *   that same offset — the durable write commits BEFORE the live publish, and the
  *   live and replay offsets are one coordinate space by construction (the property
- *   the gap-free resume relies on). Being itself a `StateStore` (same port), every
- *   writer through the port — the command handlers AND the `JobRunner` — journals and
+ *   the `sinceOffset` reconnect resume relies on). Being itself a `StateStore` (same
+ *   port), every writer through the port — the command handlers AND the `JobRunner` — journals and
  *   fans out atomically for free, with no consumer knowing (INV-PORT).
  *
  * - {@link resyncEvents} — the stream the `events` RPC returns: it EAGERLY subscribes
@@ -30,10 +30,10 @@
  *   history deterministically, not just the deltas that happen after it attaches.
  *
  * The wire `events` procedure carries an OPTIONAL `sinceOffset` REQUEST cursor and an
- * {@link OffsetEvent} RESPONSE envelope (contract v3 / CE2.0, INV-CONTRACT): absent
- * cursor replays from the log ORIGIN (`tail(0)`, backward-compatible), present
- * resumes STRICTLY AFTER that offset, and each streamed item exposes the durable
- * offset the client feeds back as its next cursor. {@link resyncFrom} is the
+ * {@link OffsetEvent} RESPONSE envelope (contract v3 / CE2.0, INV-CONTRACT): a request
+ * with NO `sinceOffset` (a present but empty `{}` payload) replays from the log ORIGIN
+ * (`tail(0)`), present resumes STRICTLY AFTER that offset, and each streamed item
+ * exposes the durable offset the client feeds back as its next cursor. {@link resyncFrom} is the
  * offset-parameterized primitive both cases drive (CE2.2 layers reconnect/
  * backpressure on top) without re-deriving a snapshot.
  */
@@ -75,7 +75,12 @@ const journalDelta = (
  * make the offset feed an incomplete history); the live {@link WorkGraphEvents}
  * publish happens AFTER that transaction commits (never on a rolled-back write) and
  * carries the same offset, so the live tail and the durable replay share ONE
- * coordinate space — the property the gap-free `sinceOffset` resume relies on.
+ * coordinate space — the property the `sinceOffset` reconnect resume relies on.
+ * Because the live publish happens AFTER the commit rather than inside it, two
+ * concurrent writers can commit in one order and publish in the other, so the LIVE
+ * feed order is not guaranteed strictly monotonic by offset; that ordering slack is
+ * absorbed by upsert idempotency, and the durable replay a reconnect resumes from is
+ * still strictly ordered by offset.
  */
 const putAndJournal = (
   base: Store,
@@ -164,12 +169,14 @@ const decodeDelta = (entry: PersistedEvent): Effect.Effect<Option.Option<OffsetE
 
 /**
  * The durable replay stream: every persisted {@link OffsetEvent} with an offset
- * strictly greater than `offset`, in order — the AE1 {@link EventLogStore.tail}
- * primitive a client resumes from its last-seen cursor. Each item carries its
- * durable offset, so the offsets are strictly greater than `offset` and contiguous
- * with the live tail. A store read failure is a defect (`orDie`) rather than a
- * stream error, keeping the feed's error channel empty (matching the frozen
- * contract's `events` success/never shape).
+ * strictly greater than `offset`, in offset order — the AE1 {@link EventLogStore.tail}
+ * primitive a client resumes from its last-seen cursor. This durable replay is the
+ * strictly-ordered, `> offset` slice the `sinceOffset` reconnect resume relies on;
+ * where {@link resyncEvents} hands over to the live tail, an event committed at the
+ * boundary can also arrive on the eager live subscription, so the two feeds can
+ * overlap (a repeated offset) — harmless under upsert idempotency. A store read
+ * failure is a defect (`orDie`) rather than a stream error, keeping the feed's error
+ * channel empty (matching the frozen contract's `events` success/never shape).
  */
 export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEvent> =>
   Stream.unwrap(
@@ -186,11 +193,17 @@ export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEv
  * CE2.0; absent → `0`, replay from the ORIGIN), THEN stream the live tail. Every
  * streamed item is an {@link OffsetEvent} carrying its durable offset; replay and
  * live offsets share one coordinate space (the journaling decorator mints and
- * publishes the same offset it appended), so a resume from `sinceOffset = N` yields
- * offsets all `> N`, contiguous, with no gap or duplicate. Subscribing before the
- * durable read closes the replay/live gap; upsert-idempotent deltas make the small
- * boundary overlap harmless. The result is a deterministic catch-up from durable
- * history, not merely snapshot-on-connect (D17).
+ * publishes the same offset it appended), so a reconnecting request with
+ * `sinceOffset = N` replays only offsets `> N` and never re-delivers what the client
+ * already acknowledged — the strict guarantee is scoped to that RESUME. WITHIN a
+ * single stream the guarantee is looser: subscribing before the durable read closes
+ * the replay/live gap, but an event committed at the boundary can appear in BOTH the
+ * replay and the buffered live subscription, so an offset can repeat and momentarily
+ * go backwards there; and because the live publish happens after the durable commit,
+ * concurrent writers can make the live order not strictly monotonic. All of it is
+ * absorbed by upsert-idempotent deltas, so the boundary overlap is harmless. The
+ * result is a deterministic catch-up from durable history, not merely
+ * snapshot-on-connect (D17).
  */
 export const resyncEvents = (
   store: Store,

@@ -51,7 +51,14 @@ public struct RpcBackend: Backend {
           // ``Backend`` port still yields the bare delta, so unwrap to ``event``.
           // Tracking the offset for resume (`sinceOffset`) is CE2.2's job — an
           // unknown inner `_tag` still surfaces as a decode failure, never a drop.
-          for try await value in await connection.stream(tag: "events", payload: nil) {
+          //
+          // Send a PRESENT empty ``EventsPayload`` (no `sinceOffset` → replay from
+          // origin) so the request encodes `"payload": {}`, matching the canonical
+          // Effect client which sends `{}` for `.events({})` (INV-CONTRACT). Under
+          // v3 the payload schema is a `Struct`, so an OMITTED key would decode to
+          // `undefined` and fail — an empty object decodes to the origin-replay case.
+          let payload = try toJSONValue(EventsPayload())
+          for try await value in await connection.stream(tag: "events", payload: payload) {
             continuation.yield(try fromJSONValue(OffsetEvent.self, value).event)
           }
           continuation.finish()
