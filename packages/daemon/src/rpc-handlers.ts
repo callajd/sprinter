@@ -22,9 +22,27 @@
  * - `retryIssue` — re-dispatch an issue's Job, reusing its SAME session id.
  *
  * The session-channel procedures (`sessionEvents` / `sessionSend` / `interrupt` /
- * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle},
- * resolved through the {@link SessionRegistry} PORT (AE4.2). All four address the
- * same live session for a `sessionId`; a miss is the contract's `SessionNotFound`.
+ * `answerUiRequest`) bridge a LIVE `@sprinter/runner` {@link SessionHandle}, resolved
+ * through the {@link SessionRegistry} PORT (AE4.2) via the shared {@link resolveLive}
+ * helper. A registry entry only lives for its session's run scope, so the helper gates
+ * on DURABLE state (`StateStore`) to pick wait-vs-fail-fast — keying on the durable
+ * JOB status (session → job → job-status), the dispatch unit `startup-reconcile`
+ * maintains (CE4.1 FIX A):
+ *
+ * - a session whose durable `Job` is still NON-TERMINAL (`queued`/`running`) is
+ *   genuinely MID-DISPATCH: the `running` delta is fanned out BEFORE
+ *   `ExecutionRunner.run` registers the handle, so a client reacting to it can arrive
+ *   before registration. The helper routes it to `SessionRegistry.resolve`, which
+ *   bounded-waits for the handle to land rather than returning a spurious
+ *   `SessionNotFound` (so the app needs no retry);
+ * - a session whose durable Job is TERMINAL (`succeeded`/`failed`/`cancelled`; the
+ *   Inspector opens channels for SETTLED jobs by design, BE4.1) OR whose Job/Session
+ *   row does not exist is routed to `SessionRegistry.get`, which FAILS FAST with
+ *   `SessionNotFound` — no multi-second stall waiting for a registration that will
+ *   never come. Keying on the Job (not the Session row) closes the crash-orphaned case:
+ *   `startup-reconcile` settles a stale Job it cannot resume by writing ONLY the Job
+ *   row, leaving its Session row NON-TERMINAL — a Session-row gate would stall on it.
+ *
  * They carry ONLY owned neutral types (`SessionEvent` / `SessionInput` /
  * `UiResponse`) — no Pi wire type reaches this surface (INV-BOUNDARY) — and
  * `sessionEvents` streams live over `SessionHandle.events`, never a poll
@@ -63,6 +81,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import type { SessionHandle } from "@sprinter/runner";
 import { StateStore } from "@sprinter/state";
 import { resyncEvents } from "./event-journal.ts";
 import { SessionRegistry } from "./session-registry.ts";
@@ -286,56 +305,138 @@ const retry = (
 // ── session channel (bridge a live SessionHandle) ────────────────────────────
 
 /**
+ * True while a durable {@link Job} row is still MID-DISPATCH — i.e. genuinely queued
+ * or running, so its live {@link SessionHandle} either is registered now or is about
+ * to be within the register-after-dispatch window. The complement is a TERMINAL job
+ * (settled: `succeeded`/`failed`/`cancelled`), whose registry entry has already been
+ * torn down and will never reappear. Expressed as a POSITIVE allow-list of the
+ * non-terminal statuses so any future status defaults to fail-fast (never
+ * re-introducing a spurious multi-second stall on a settled/unknown state).
+ *
+ * The gate keys on the JOB, not the durable `Session` row, ON PURPOSE (CE4.1 FIX A):
+ * `startup-reconcile` settles a stale `running` Job it cannot resume by writing ONLY
+ * the Job row (its `putJob` → terminal), and NEVER settles the Session row. So after a
+ * crash + restart a settled-not-resumed job leaves its Session row NON-TERMINAL
+ * (`starting`/`active`) while its Job is terminal. Gating on the Session row would
+ * mistake that crash-orphaned state for mid-dispatch and stall the full resolve bound;
+ * the Job — the dispatch unit reconcile maintains — is the authoritative signal.
+ */
+const isMidDispatchJob = (status: Job["status"]): boolean =>
+  status === "queued" || status === "running";
+
+/**
+ * Resolve the live {@link SessionHandle} for a `sessionId`, choosing wait-vs-fail-fast
+ * on DURABLE state (the shared gate behind all four session-channel procedures). It
+ * resolves session → job → job-status and gates on the JOB:
+ *
+ * - read the durable `Session` row from the {@link StateStore} to recover the `jobId`
+ *   it belongs to (1 Job = 1 session); ABSENT → nothing is or will be registered, fail
+ *   fast through `SessionRegistry.get`;
+ * - read that {@link Job} row; a job that is present AND still {@link isMidDispatchJob
+ *   mid-dispatch} (`queued`/`running`) is bridged through `SessionRegistry.resolve`,
+ *   which bounded-WAITS out the register-after-dispatch window so a client reacting to
+ *   the `running` delta needs no retry;
+ * - a job that is TERMINAL (settled) OR ABSENT is resolved through
+ *   `SessionRegistry.get`, which FAILS FAST with {@link SessionNotFound} — no
+ *   multi-second stall on a registration that will never land. This covers both the
+ *   Inspector opening channels for SETTLED jobs (BE4.1) AND the crash-orphaned case a
+ *   Session-row gate would miss: a terminal Job whose Session row `startup-reconcile`
+ *   left NON-TERMINAL (see {@link isMidDispatchJob}).
+ *
+ * FIX B (CE4.1): a transient `StateStoreError` from either durable read is mapped to a
+ * graceful {@link SessionNotFound} rather than `orDie`'d into an unrecoverable defect —
+ * a store hiccup on this hot path treats the session as (momentarily) unresolvable
+ * instead of killing the long-lived `sessionEvents` stream/handler fiber. The resolved
+ * error channel stays exactly `SessionNotFound`.
+ */
+const resolveLive = (
+  store: Store,
+  registry: Registry,
+  sessionId: SessionId,
+): Effect.Effect<SessionHandle, SessionNotFound> =>
+  Effect.gen(function* () {
+    const session = yield* store.jobs.getSession(sessionId);
+    // No Session row → never existed / already torn down; fail fast.
+    if (Option.isNone(session)) return yield* registry.get(sessionId);
+    const job = yield* store.jobs.getJob(session.value.jobId);
+    // Job absent, or terminal → registry entry gone for good; fail fast.
+    // Job mid-dispatch (queued/running) → bridge the register-after-dispatch window.
+    if (Option.isNone(job) || !isMidDispatchJob(job.value.status)) {
+      return yield* registry.get(sessionId);
+    }
+    return yield* registry.resolve(sessionId);
+  }).pipe(
+    // FIX B: a transient store read failure is surfaced as SessionNotFound (the
+    // handler's existing typed channel), never a defect that crashes the stream fiber.
+    Effect.catchTag("StateStoreError", () => Effect.fail(new SessionNotFound({ id: sessionId }))),
+  );
+
+/**
  * Stream a live session's owned {@link SessionEvent} feed for the contract's
  * `sessionEvents` RPC (INV-REACTIVE): resolve the {@link SessionHandle} through
- * the registry and hand back its live `events` stream. A `SessionNotFound` from
+ * {@link resolveLive} and hand back its live `events` stream. A `SessionNotFound` from
  * the lookup surfaces as the stream's failure; the handle's `PiTransportError`
  * (transport teardown — not a contract error) becomes a defect via `Stream.orDie`,
  * so the stream's error channel is exactly `SessionNotFound`.
  */
 const bridgeEvents = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
 ): Stream.Stream<SessionEvent, SessionNotFound> =>
-  Stream.unwrap(registry.get(sessionId).pipe(Effect.map((handle) => Stream.orDie(handle.events))));
+  Stream.unwrap(
+    resolveLive(store, registry, sessionId).pipe(
+      Effect.map((handle) => Stream.orDie(handle.events)),
+    ),
+  );
 
 /**
  * Drive a {@link SessionInput} into the live session for the `sessionSend` RPC:
- * resolve the {@link SessionHandle} ({@link SessionNotFound} on a miss) and call
- * `send`. The handle's `PiRpcError`/`PiTransportError` are infrastructure failures,
- * not contract errors, so they become defects — the error channel is exactly
- * `SessionNotFound`.
+ * resolve the {@link SessionHandle} through {@link resolveLive} ({@link SessionNotFound}
+ * on a miss) and call `send`. The handle's `PiRpcError`/`PiTransportError` are
+ * infrastructure failures, not contract errors, so they become defects — the error
+ * channel is exactly `SessionNotFound`.
  */
 const driveInput = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
   input: SessionInput,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.send(input).pipe(Effect.orDie)),
+  );
 
 /**
  * Abort the live session's in-flight turn for the `interrupt` RPC: resolve the
- * {@link SessionHandle} ({@link SessionNotFound} on a miss) and call `interrupt`;
- * the handle's transport failures become defects, not contract errors.
+ * {@link SessionHandle} through {@link resolveLive} ({@link SessionNotFound} on a miss)
+ * and call `interrupt`; the handle's transport failures become defects, not contract
+ * errors.
  */
 const abortTurn = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.interrupt.pipe(Effect.orDie)),
+  );
 
 /**
  * Answer an outstanding UI request for the `answerUiRequest` RPC, completing the
- * `extension_ui_request` round-trip: resolve the {@link SessionHandle}
- * ({@link SessionNotFound} on a miss) and hand the neutral {@link UiResponse} to
- * the live session via `answerUi` (which is total — it cannot fail).
+ * `extension_ui_request` round-trip: resolve the {@link SessionHandle} through
+ * {@link resolveLive} ({@link SessionNotFound} on a miss) and hand the neutral
+ * {@link UiResponse} to the live session via `answerUi` (which is total — it cannot fail).
  */
 const answerUi = (
+  store: Store,
   registry: Registry,
   sessionId: SessionId,
   response: UiResponse,
 ): Effect.Effect<void, SessionNotFound> =>
-  registry.get(sessionId).pipe(Effect.flatMap((handle) => handle.answerUi(response)));
+  resolveLive(store, registry, sessionId).pipe(
+    Effect.flatMap((handle) => handle.answerUi(response)),
+  );
 
 // ── the handler layer ─────────────────────────────────────────────────────────
 
@@ -374,13 +475,14 @@ export const handlers = SprinterRpc.toLayer(
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),
       // Session channel — AE4.2. Each procedure resolves the SAME live session
-      // through the `SessionRegistry` port and bridges its neutral `SessionHandle`
-      // surface; a miss is the contract's `SessionNotFound`. `sessionEvents`
-      // streams live over `SessionHandle.events` (INV-REACTIVE).
-      sessionEvents: ({ sessionId }) => bridgeEvents(sessions, sessionId),
-      sessionSend: ({ sessionId, input }) => driveInput(sessions, sessionId, input),
-      interrupt: ({ sessionId }) => abortTurn(sessions, sessionId),
-      answerUiRequest: ({ sessionId, response }) => answerUi(sessions, sessionId, response),
+      // through `resolveLive` (the durable-state gate: mid-dispatch → bounded wait,
+      // settled/absent → fail fast) and bridges its neutral `SessionHandle` surface;
+      // a miss is the contract's `SessionNotFound`. `sessionEvents` streams live over
+      // `SessionHandle.events` (INV-REACTIVE).
+      sessionEvents: ({ sessionId }) => bridgeEvents(store, sessions, sessionId),
+      sessionSend: ({ sessionId, input }) => driveInput(store, sessions, sessionId, input),
+      interrupt: ({ sessionId }) => abortTurn(store, sessions, sessionId),
+      answerUiRequest: ({ sessionId, response }) => answerUi(store, sessions, sessionId, response),
     };
   }),
 );

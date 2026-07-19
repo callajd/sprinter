@@ -28,6 +28,6 @@
  * `@sprinter/domain`.
  */
 export { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
-export { JobRunner, layer } from "./job-runner.ts";
+export { JobRunner, layer, sessionIdFor } from "./job-runner.ts";
 export { layerLocalPi } from "./local-pi-runner.ts";
 export { layerInheritCwd, layerWorktreeRouter, PiSpawnRouter } from "./spawn-router.ts";

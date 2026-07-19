@@ -41,8 +41,13 @@ type DispatchError = ExecutionRunnerError | StateStoreError | PiRpcError | PiTra
  * stable id derived from the job id. Derivation is decoded through the owned
  * {@link SessionId} schema (never a cast); the input is non-empty by construction,
  * so a decode failure is a broken invariant (`orDie`).
+ *
+ * Exported so a consumer that must key a live session by the SAME id `dispatch`
+ * persists — notably the daemon's session-registry wiring (CE4.1), which registers
+ * the live `SessionHandle` under exactly this id so the session channel resolves it
+ * — derives it identically rather than re-deriving (and risking drift from) it.
  */
-const sessionIdFor = (job: Job): Effect.Effect<SessionId> =>
+export const sessionIdFor = (job: Job): Effect.Effect<SessionId> =>
   job.sessionId !== undefined
     ? Effect.succeed(job.sessionId)
     : Schema.decodeUnknownEffect(SessionId)(`session-${job.id}`).pipe(Effect.orDie);

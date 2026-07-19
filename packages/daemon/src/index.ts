@@ -46,6 +46,7 @@ export {
 } from "./main.ts";
 export { handlers } from "./rpc-handlers.ts";
 export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
+export { layerRegisterSessions } from "./session-runner.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";
 export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
