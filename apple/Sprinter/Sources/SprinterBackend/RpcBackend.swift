@@ -44,22 +44,40 @@ public struct RpcBackend: Backend {
   }
 
   public func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
+    // The port's bare feed is the origin-replay offset feed with the offset dropped.
+    let offsetEvents = events(sinceOffset: nil)
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        do {
+          for try await offsetEvent in offsetEvents {
+            continuation.yield(offsetEvent.event)
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
+
+  public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          // The wire carries the ``OffsetEvent`` envelope (contract v3 / CE2.0); the
-          // ``Backend`` port still yields the bare delta, so unwrap to ``event``.
-          // Tracking the offset for resume (`sinceOffset`) is CE2.2's job — an
-          // unknown inner `_tag` still surfaces as a decode failure, never a drop.
+          // The wire carries the ``OffsetEvent`` envelope (contract v3 / CE2.0): each
+          // item pairs the delta with its DURABLE offset, which ``WorkGraphResync`` tracks
+          // to resume STRICTLY AFTER the last-applied offset on reconnect. An unknown
+          // inner `_tag` still surfaces as a decode failure, never a silent drop.
           //
-          // Send a PRESENT empty ``EventsPayload`` (no `sinceOffset` → replay from
-          // origin) so the request encodes `"payload": {}`, matching the canonical
-          // Effect client which sends `{}` for `.events({})` (INV-CONTRACT). Under
-          // v3 the payload schema is a `Struct`, so an OMITTED key would decode to
-          // `undefined` and fail — an empty object decodes to the origin-replay case.
-          let payload = try toJSONValue(EventsPayload())
+          // Send a PRESENT ``EventsPayload`` (the `sinceOffset` KEY is omitted when `nil`
+          // → origin replay; present → incremental resume) so the request encodes a
+          // payload object, matching the canonical Effect client (INV-CONTRACT). Under v3
+          // the payload schema is a `Struct`, so an OMITTED payload key would decode to
+          // `undefined` and fail — a present object decodes correctly.
+          let payload = try toJSONValue(EventsPayload(sinceOffset: sinceOffset))
           for try await value in await connection.stream(tag: "events", payload: payload) {
-            continuation.yield(try fromJSONValue(OffsetEvent.self, value).event)
+            continuation.yield(try fromJSONValue(OffsetEvent.self, value))
           }
           continuation.finish()
         } catch {

@@ -26,4 +26,20 @@ public protocol RpcTransport: Sendable {
   /// underlying resource (a real socket; a no-op once already closed). Called by
   /// the connection's teardown so a dropped ``Backend`` does not leak the transport.
   func close()
+
+  /// Suspends until an initiated ``close()`` has FULLY drained — the read loop has left
+  /// `read(2)` and the write queue has flushed, so the underlying resource (fd) is
+  /// released. The reconnect path awaits this so the OLD transport is fully torn down
+  /// BEFORE the new socket is dialed (the CE2.1 carried teardown constraint): no
+  /// in-flight frame crosses connections and the old fd is reclaimed first. An in-memory
+  /// transport has no such resource, so the default is a no-op; the live socket
+  /// conformer overrides it.
+  func awaitClosed() async
+}
+
+extension RpcTransport {
+  /// Default: nothing to drain (an in-memory transport holds no OS resource). The live
+  /// ``UnixSocketTransport`` overrides this to await its read-loop exit and deferred
+  /// `close(2)`.
+  public func awaitClosed() async {}
 }

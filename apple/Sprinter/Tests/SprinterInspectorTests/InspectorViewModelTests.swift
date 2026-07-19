@@ -22,7 +22,7 @@ struct InspectorViewModelTests {
     let backend = InspectorFakeBackend(
       knownSession: Self.session,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
     let model = InspectorViewModel(backend: backend, sessionId: Self.session)
     model.start(feed)
 
@@ -57,7 +57,7 @@ struct InspectorViewModelTests {
     let backend = InspectorFakeBackend(
       knownSession: Self.session,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
     let model = InspectorViewModel(backend: backend, sessionId: Self.session)
     model.start(feed)
 
@@ -84,7 +84,7 @@ struct InspectorViewModelTests {
     let backend = InspectorFakeBackend(
       knownSession: Self.session,
       snapshot: InspectorFixtures.snapshotWithIssuePullRequest(InspectorFixtures.issuePullRequest))
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
     let model = InspectorViewModel(backend: backend, sessionId: Self.session)
     model.start(feed)
 
@@ -140,7 +140,7 @@ struct InspectorViewModelTests {
     let backend = InspectorFakeBackend(
       knownSession: Self.session,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
     let model = InspectorViewModel(backend: backend, sessionId: Self.session)
 
     model.start(feed)
@@ -163,7 +163,7 @@ struct InspectorViewModelTests {
     let backend2 = InspectorFakeBackend(
       knownSession: Self.session,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
-    let feed2 = WorkGraphResync(connect: { backend2 }, retryDelay: .zero)
+    let feed2 = WorkGraphResync(connect: { backend2 }, backoff: .noDelay)
     model.start(feed2)
     #expect(await waitUntil { backend.sessionFeedCount == 2 })
     #expect(model.transcript.lifecycle == .live)

@@ -154,4 +154,67 @@ struct StreamTests {
     #expect(try await nextSent(&outbound).envelopeTag == "Eof")
     transport.close()
   }
+
+  /// Demand-gated backpressure (CE2.2): the per-batch `Ack` is DEFERRED until the
+  /// consumer drains that batch — it is the "ready for more" signal, not an on-receipt
+  /// handshake. Two batches, drained in turn, yield exactly two acks, each emitted only
+  /// once its batch has been fully consumed and the consumer has asked for more.
+  @Test("each batch's ack is deferred until the consumer drains it")
+  func ackDeferredUntilDrain() async throws {
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let stream = await connection.stream(tag: "events", payload: nil)
+    let request = try await nextSent(&outbound)
+    #expect(request.envelopeTag == "Request")
+    let id = try #require(request.id)
+
+    // Two separate batches (chunks).
+    transport.emit(Wire.chunk(requestId: id, values: [#""a""#]))
+    transport.emit(Wire.chunk(requestId: id, values: [#""b""#]))
+
+    let collector = Task { () -> [JSONValue] in
+      var values: [JSONValue] = []
+      for try await value in stream {
+        values.append(value)
+      }
+      return values
+    }
+
+    // Draining batch 1 (and requesting more) sends ack 1; draining batch 2 sends ack 2.
+    let ack1 = try await nextSent(&outbound)
+    #expect(ack1.envelopeTag == "Ack")
+    #expect(ack1.requestId == id)
+    let ack2 = try await nextSent(&outbound)
+    #expect(ack2.envelopeTag == "Ack")
+    #expect(ack2.requestId == id)
+
+    transport.emit(Wire.exitSuccessVoid(requestId: id))
+    #expect(try await collector.value == [.string("a"), .string("b")])
+    transport.close()
+  }
+
+  /// The bounded backlog (CE2.2 / the CE2.1-F4 carried constraint): an un-drained
+  /// subscription does NOT ack-and-buffer unbounded — the demand-gated buffer is bounded,
+  /// and a batch past the bound surfaces an ``AckGate/Overflow`` the consumer sees as a
+  /// failure (→ resync upstream), never a silent drop. A single over-limit chunk trips it
+  /// deterministically.
+  @Test("an over-limit batch overflows the bounded buffer instead of buffering unbounded")
+  func boundedBufferOverflows() async throws {
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport, streamBufferLimit: 2)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let stream = await connection.stream(tag: "events", payload: nil)
+    let id = try #require(try await nextSent(&outbound).id)
+
+    // One chunk of three values exceeds the limit of two → overflow at push time.
+    transport.emit(Wire.chunk(requestId: id, values: [#""a""#, #""b""#, #""c""#]))
+
+    await #expect(throws: AckGate.Overflow.self) {
+      for try await _ in stream {}
+    }
+    transport.close()
+  }
 }

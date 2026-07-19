@@ -14,7 +14,7 @@ struct MissionControlBoardTests {
   @Test("builds from the snapshot, then reflects a live status flip")
   func buildsThenReflectsLiveEvent() async throws {
     let backend = ScriptedBackend(snapshot: BoardFixtures.snapshot)
-    let feed = WorkGraphResync(connect: { backend }, retryDelay: .zero)
+    let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
     let board = MissionControlBoard()
     board.start(feed)
 
@@ -61,7 +61,7 @@ struct MissionControlBoardTests {
   @Test("start is idempotent; stop then start on a fresh feed re-consumes")
   func startAndStopLifecycle() async throws {
     let backend1 = ScriptedBackend(snapshot: BoardFixtures.snapshot)
-    let feed1 = WorkGraphResync(connect: { backend1 }, retryDelay: .zero)
+    let feed1 = WorkGraphResync(connect: { backend1 }, backoff: .noDelay)
     let board = MissionControlBoard()
 
     board.start(feed1)
@@ -75,7 +75,7 @@ struct MissionControlBoardTests {
 
     // Reconnect: a freshly-constructed feed re-consumes deterministically.
     let backend2 = ScriptedBackend(snapshot: BoardFixtures.snapshot)
-    let feed2 = WorkGraphResync(connect: { backend2 }, retryDelay: .zero)
+    let feed2 = WorkGraphResync(connect: { backend2 }, backoff: .noDelay)
     board.start(feed2)
     #expect(await waitUntil(board) { !$0.isEmpty })
 

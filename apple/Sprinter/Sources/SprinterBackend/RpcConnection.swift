@@ -1,9 +1,6 @@
 import Foundation
 import SprinterContract
 
-/// A stream of raw envelope values (chunk payloads), decoded by the typed surface.
-typealias JSONStream = AsyncThrowingStream<JSONValue, any Error>
-
 /// The RPC client connection: an actor that speaks the NDJSON-framed
 /// `effect/unstable/rpc` envelope over an injected ``RpcTransport`` (BE1.1).
 ///
@@ -17,32 +14,41 @@ typealias JSONStream = AsyncThrowingStream<JSONValue, any Error>
 /// commands, the `events` stream) lives in ``RpcBackend`` on top of it.
 actor RpcConnection {
   private let transport: any RpcTransport
+  private let streamBufferLimit: Int
   private var reassembler = NdjsonReassembler()
   private var pending: [RequestId: PendingEntry] = [:]
   private var nextRequestId = 0
   private var receiveTask: Task<Void, Never>?
   private var closed = false
 
-  init(transport: any RpcTransport) {
+  /// `streamBufferLimit` bounds each subscription's un-drained backlog in the demand-
+  /// gated ``AckGate``: under correct flow control the daemon holds the next chunk until
+  /// our ack, so at most one un-acked batch is buffered — the bound is the safety net for
+  /// an over-large chunk or a daemon that ignores flow control (overflow → resync).
+  init(transport: any RpcTransport, streamBufferLimit: Int = 1024) {
     self.transport = transport
+    self.streamBufferLimit = streamBufferLimit
   }
 
-  /// Tears the connection down: cancels the receive loop, closes the transport, and
-  /// fails every in-flight request with ``BackendError/connectionClosed``. Idempotent
-  /// — a second call is a no-op — so the port's `close()` is safe to call repeatedly.
-  func close() {
+  /// Tears the connection down: cancels the receive loop, fails every in-flight request
+  /// with ``BackendError/connectionClosed``, closes the transport, and — for the live
+  /// socket — awaits its FULL drain before returning (so a reconnect dials the new socket
+  /// only after the old fd is released; the CE2.1 carried teardown constraint).
+  /// Idempotent — a second call is a no-op.
+  func close() async {
     guard !closed else { return }
     closed = true
     receiveTask?.cancel()
     receiveTask = nil
-    transport.close()
     failAll(with: BackendError.connectionClosed)
+    transport.close()
+    await transport.awaitClosed()
   }
 
   /// One in-flight request, resolved off its correlated terminal `Exit`.
   private enum PendingEntry {
     case query(CheckedContinuation<JSONValue?, any Error>)
-    case stream(JSONStream.Continuation)
+    case stream(AckGate)
   }
 
   // MARK: - Issuing requests
@@ -59,24 +65,33 @@ actor RpcConnection {
     }
   }
 
-  /// Opens a streaming subscription: sends a `Request` and returns a stream fed by
-  /// correlated `Chunk` frames until the terminal `Exit`. Early consumer
-  /// termination sends an `Interrupt` for the request.
-  func stream(tag: String, payload: JSONValue?) async -> JSONStream {
-    let (stream, continuation) = JSONStream.makeStream()
+  /// Opens a streaming subscription: sends a `Request` and returns a **demand-gated**
+  /// ``AckGatedStream`` fed by correlated `Chunk` frames until the terminal `Exit`. The
+  /// per-batch `Ack` is deferred until the consumer drains that batch (true
+  /// backpressure), and the backlog is bounded (overflow → the consumer sees a failure →
+  /// resync). Early consumer termination (task cancel or a dropped iterator) sends an
+  /// `Interrupt` for the request.
+  func stream(tag: String, payload: JSONValue?) async -> AckGatedStream {
     guard !closed else {
-      continuation.finish(throwing: BackendError.connectionClosed)
-      return stream
+      let gate = AckGate(limit: streamBufferLimit, ack: {}, cancelHandler: {})
+      gate.fail(BackendError.connectionClosed)
+      return AckGatedStream(gate: gate)
     }
     startReceiving()
     let id = allocateId()
-    continuation.onTermination = { [weak self] _ in
-      guard let self else { return }
-      Task { await self.interruptIfPending(id) }
-    }
-    pending[id] = .stream(continuation)
+    let gate = AckGate(
+      limit: streamBufferLimit,
+      ack: { [weak self] in await self?.sendAck(id) },
+      cancelHandler: { [weak self] in await self?.interruptIfPending(id) })
+    pending[id] = .stream(gate)
     await transmit(.request(id: id, tag: tag, payload: payload))
-    return stream
+    return AckGatedStream(gate: gate)
+  }
+
+  /// Sends the deferred per-batch `Ack` (the demand signal) once the consumer has drained
+  /// a batch — the ``AckGate``'s callback into the connection.
+  private func sendAck(_ id: RequestId) async {
+    await transmit(.ack(requestId: id))
   }
 
   /// Sends a liveness `Ping` keepalive frame.
@@ -160,7 +175,7 @@ actor RpcConnection {
   private func handle(_ frame: ServerFrame) async {
     switch frame {
     case .chunk(let requestId, let values):
-      await handleChunk(requestId, values)
+      handleChunk(requestId, values)
     case .exit(let requestId, let exit):
       handleExit(requestId, exit)
     case .defect:
@@ -172,18 +187,14 @@ actor RpcConnection {
     }
   }
 
-  private func handleChunk(_ id: RequestId, _ values: [JSONValue]) async {
-    guard case .stream(let continuation)? = pending[id] else { return }
-    for value in values {
-      continuation.yield(value)
-    }
-    // Send the per-batch `Ack` flow-control frame the envelope defines. NOTE: this
-    // acks on RECEIPT, not on consumer DEMAND — it does not yet gate the server on
-    // downstream consumption, so it is the handshake, not true backpressure. Demand-
-    // gated acking (defer the `Ack` until the consumer drains) + a bounded buffer
-    // with overflow→resync belong with the live streaming transport and BE1.2's
-    // snapshot-resync (which owns the recovery); see the workstream ledger.
-    await transmit(.ack(requestId: id))
+  private func handleChunk(_ id: RequestId, _ values: [JSONValue]) {
+    guard case .stream(let gate)? = pending[id] else { return }
+    // Hand the batch to the demand-gated buffer WITHOUT acking: the `Ack` is deferred
+    // until the consumer drains this batch (``AckGate/next()`` sends it then), so the
+    // daemon's chunk→ack→chunk flow control now gates on downstream demand — true
+    // backpressure — and the backlog stays bounded (overflow → the consumer sees a
+    // failure → resync). The receive loop never blocks on the consumer here.
+    gate.push(values)
   }
 
   private func handleExit(_ id: RequestId, _ exit: ExitFrame) {
@@ -196,12 +207,12 @@ actor RpcConnection {
       case .failure(let cause):
         continuation.resume(throwing: causeError(cause))
       }
-    case .stream(let continuation):
+    case .stream(let gate):
       switch exit {
       case .success:
-        continuation.finish()
+        gate.finish()
       case .failure(let cause):
-        continuation.finish(throwing: causeError(cause))
+        gate.fail(causeError(cause))
       }
     }
   }
@@ -213,8 +224,8 @@ actor RpcConnection {
       switch entry {
       case .query(let continuation):
         continuation.resume(throwing: error)
-      case .stream(let continuation):
-        continuation.finish(throwing: error)
+      case .stream(let gate):
+        gate.fail(error)
       }
     }
   }

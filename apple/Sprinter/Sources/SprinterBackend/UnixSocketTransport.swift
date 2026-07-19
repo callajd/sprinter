@@ -78,12 +78,30 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   /// parked read to return, so the signal always arrives — the wait is deadlock-free.
   private let readLoopExited = DispatchSemaphore(value: 0)
 
+  /// Signalled once the deferred `close(2)` has run — i.e. the read loop has exited AND
+  /// the write queue has drained AND the fd is released. ``awaitClosed()`` waits on it so
+  /// a reconnect can gate the new dial on the OLD transport being FULLY torn down (the
+  /// CE2.1 carried teardown constraint). Only ever signalled once (`close()` is
+  /// idempotent), and ``awaitClosed()`` is called at most once per connection teardown.
+  private let closeCompleted = DispatchSemaphore(value: 0)
+  /// `true` once ``close()`` has actually initiated teardown (guards ``awaitClosed()``
+  /// from waiting on a `closeCompleted` that will never be signalled).
+  private var closeInitiated = false
+
   /// Wraps an already-connected socket descriptor and starts pumping inbound bytes.
   /// Internal so tests can drive the framing seam over a `socketpair(2)` peer without
   /// a real `connect` — production goes through ``connect(toUnixSocketPath:)``.
-  init(connectedDescriptor descriptor: Int32) {
+  ///
+  /// `receiveBufferLimit` BOUNDS the inbound stream (the CE2.1 carried constraint): the
+  /// read loop pumps from here while the connection's `receive()` consumer is lazy, so an
+  /// unbounded `AsyncThrowingStream` would let bytes accumulate without limit. The stream
+  /// keeps at most `receiveBufferLimit` un-consumed chunks; a chunk that would overflow
+  /// that bound ends the stream with ``UnixSocketTransportError/receiveBufferOverflow``
+  /// (→ a resync upstream) rather than being silently dropped or growing unbounded.
+  init(connectedDescriptor descriptor: Int32, receiveBufferLimit: Int = 1024) {
     self.descriptor = descriptor
-    (inbound, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+    (inbound, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(
+      bufferingPolicy: .bufferingNewest(receiveBufferLimit))
     startReadLoop()
   }
 
@@ -170,10 +188,26 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     inbound
   }
 
+  /// Suspends until an initiated ``close()`` has fully drained (read loop exited, write
+  /// queue flushed, fd released). The blocking semaphore wait is hopped onto the
+  /// concurrent ``dialQueue`` so it never parks a cooperative executor thread. A no-op if
+  /// ``close()`` was never initiated (nothing to drain).
+  public func awaitClosed() async {
+    let initiated = lock.withLock { closeInitiated }
+    guard initiated else { return }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      Self.dialQueue.async { [closeCompleted] in
+        closeCompleted.wait()
+        continuation.resume()
+      }
+    }
+  }
+
   public func close() {
     let descriptor: Int32 = lock.withLock {
       guard !isClosed else { return -1 }
       isClosed = true
+      closeInitiated = true
       let current = self.descriptor
       self.descriptor = -1
       return current
@@ -190,9 +224,12 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     // loop to exit, so it is deadlock-free. `send` re-checks `isClosed` on the same queue,
     // so a write enqueued after this point is skipped rather than landing on the closed fd.
     shutdownDescriptor(descriptor)
-    writeQueue.async { [readLoopExited] in
+    writeQueue.async { [readLoopExited, closeCompleted] in
       readLoopExited.wait()
       closeDescriptor(descriptor)
+      // The fd is now released and neither a queued write nor the read thread can touch
+      // it: a reconnect awaiting `awaitClosed()` may safely dial the new socket.
+      closeCompleted.signal()
     }
     continuation.finish()
   }
@@ -226,7 +263,21 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
         read(descriptor, raw.baseAddress, bufferSize)
       }
       if count > 0 {
-        continuation.yield(Data(buffer[0..<count]))
+        // Bounded inbound (the CE2.1 carried constraint): the stream keeps at most
+        // `receiveBufferLimit` un-consumed chunks. A yield the bound would overflow comes
+        // back `.dropped`; for a BYTE stream any drop corrupts framing, so surface it as
+        // a hard overflow error (→ resync upstream) instead of silently losing bytes.
+        switch continuation.yield(Data(buffer[0..<count])) {
+        case .enqueued:
+          continue
+        case .dropped:
+          continuation.finish(throwing: UnixSocketTransportError.receiveBufferOverflow)
+          return
+        case .terminated:
+          return
+        @unknown default:
+          return
+        }
       } else if count == 0 {
         break  // EOF: the daemon closed the connection.
       } else if errno == EINTR {
@@ -253,6 +304,11 @@ public enum UnixSocketTransportError: Error, Equatable, Sendable {
   case socketPathTooLong(maxBytes: Int)
   /// A `write(2)` failed before the whole frame was flushed.
   case writeFailed(errno: Int32)
+  /// The bounded inbound receive buffer overflowed: the read loop produced chunks faster
+  /// than the connection consumed them, past the bound. Surfaced instead of silently
+  /// dropping bytes (which would corrupt NDJSON framing); the reconnect/resync loop
+  /// recovers with a fresh incremental resume.
+  case receiveBufferOverflow
   /// A `.remoteDaemon` endpoint was selected, but no remote transport adapter exists yet
   /// (CE1/CE2 serve only a local Unix-domain socket). Distinct from a dial failure — this
   /// is "no adapter", not "the dial did not connect".
