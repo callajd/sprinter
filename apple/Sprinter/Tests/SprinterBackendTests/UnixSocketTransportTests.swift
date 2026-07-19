@@ -240,6 +240,42 @@ struct UnixSocketTransportTests {
     }
   }
 
+  @Test("the bounded receive buffer overflows to an error instead of growing unbounded")
+  func receiveBufferOverflows() async throws {
+    // The CE2.1-F4 carried constraint: the read loop pumps from `init` into a BOUNDED
+    // stream, so bytes cannot accumulate without limit. With a limit of one un-consumed
+    // chunk, a second un-consumed chunk trips the bound — the read loop surfaces a hard
+    // error (never a silent byte drop that would corrupt framing). The two small writes
+    // are spaced so the read loop yields them as two separate chunks; neither write blocks
+    // (they are tiny), and the read loop stops after overflowing, so nothing deadlocks.
+    let (transport, peer) = try RawSocketPeer.pair(receiveBufferLimit: 1)
+    try await peer.write(Data("first\n".utf8))
+    try await Task.sleep(for: .milliseconds(50))  // let the read loop read + buffer chunk 1.
+    try await peer.write(Data("second\n".utf8))  // the second un-consumed chunk overflows.
+    try await Task.sleep(for: .milliseconds(50))  // let the read loop trip the bound.
+
+    await #expect(throws: UnixSocketTransportError.receiveBufferOverflow) {
+      for try await _ in transport.receive() {}
+    }
+    transport.close()
+    peer.close()
+  }
+
+  @Test("backend close awaits the socket transport's full drain, deadlock-free")
+  func closeAwaitsFullDrain() async throws {
+    // The CE2.1-F1 carried constraint: teardown must fully drain (read loop exited + write
+    // queue flushed + fd released) before returning, so a reconnect dials the new socket
+    // only after the old one is gone. `close()` returning at all here proves the drain is
+    // deadlock-free (a stuck `awaitClosed()` would hang the test to a timeout).
+    let (transport, peer) = try RawSocketPeer.pair()
+    let backend = RpcBackend(transport: transport)
+    try await peer.write(Data("{\"k\":\"v\"}\n".utf8))  // keep the read loop actively reading.
+    await backend.close()
+    // Idempotent: a second close still returns cleanly.
+    await backend.close()
+    peer.close()
+  }
+
   @Test("a transport write failure surfaces to the caller as BackendError.connectionClosed")
   func writeFailureSurfacesAsConnectionClosed() async throws {
     // NB1: a mid-write transport failure (UnixSocketTransportError.writeFailed) must reach

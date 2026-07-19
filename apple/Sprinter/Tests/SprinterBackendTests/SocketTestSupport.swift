@@ -32,7 +32,11 @@ final class RawSocketPeer: @unchecked Sendable {
   }
 
   /// A `socketpair`: the client transport plus the raw daemon-side peer.
-  static func pair() throws -> (transport: UnixSocketTransport, peer: RawSocketPeer) {
+  /// `receiveBufferLimit` bounds the transport's inbound stream (tests of the bound pass a
+  /// small value; the rest take the production default).
+  static func pair(
+    receiveBufferLimit: Int = 1024
+  ) throws -> (transport: UnixSocketTransport, peer: RawSocketPeer) {
     var descriptors: [Int32] = [-1, -1]
     let result = socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors)
     guard result == 0 else { throw LoopbackError.setupFailed("socketpair errno \(errno)") }
@@ -46,7 +50,8 @@ final class RawSocketPeer: @unchecked Sendable {
       throw LoopbackError.setupFailed("SO_NOSIGPIPE errno \(noSigPipe)")
     }
     return (
-      transport: UnixSocketTransport(connectedDescriptor: descriptors[0]),
+      transport: UnixSocketTransport(
+        connectedDescriptor: descriptors[0], receiveBufferLimit: receiveBufferLimit),
       peer: RawSocketPeer(descriptor: descriptors[1])
     )
   }

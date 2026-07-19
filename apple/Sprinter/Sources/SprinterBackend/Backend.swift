@@ -30,6 +30,16 @@ public protocol Backend: Sendable {
   /// ``WorkGraphEvent`` fed until the daemon ends the subscription.
   func events() -> AsyncThrowingStream<WorkGraphEvent, any Error>
 
+  /// The live work-graph subscription **with durable offsets** for reconnect replay
+  /// (CE2.2). `sinceOffset` is the resume cursor: `nil` replays from the log ORIGIN,
+  /// a value resumes STRICTLY AFTER it (an incremental resume, not a snapshot
+  /// re-derive). Each item is an ``OffsetEvent`` pairing the delta with the durable
+  /// offset it was journaled at, so a reconnecting client can track its last-applied
+  /// position (see ``WorkGraphResync``). The daemon replays gaplessly after the cursor,
+  /// so no delta is missed across a disconnect. A default adapter implementation wraps
+  /// ``events()`` with synthetic offsets; the live ``RpcBackend`` carries real ones.
+  func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error>
+
   // MARK: - Session channel (BE1.2 / D9)
 
   /// The live session feed: a stream of owned ``SessionEvent`` for `sessionId`
@@ -59,6 +69,41 @@ public protocol Backend: Sendable {
   /// leaking the receive task or the socket — so the port contract owns teardown,
   /// not just the transport provider.
   func close() async
+}
+
+extension Backend {
+  /// Default offset-aware feed for adapters WITHOUT durable offsets (the in-memory test
+  /// fakes): it wraps the bare ``events()`` stream, assigning synthetic sequential
+  /// offsets starting strictly after `sinceOffset`. Real durable replay is provided by
+  /// adapters that override this (``RpcBackend``), so a fake never has to model offsets
+  /// yet still satisfies the port — and the offset-driven reconnect logic is exercised
+  /// against the real adapter.
+  ///
+  /// The synthetic sequence honors the SAME offset origin as production: durable offsets
+  /// are strictly `> 0` (the daemon's journal starts at 1), so an origin subscription
+  /// (`sinceOffset: nil`) mints its first offset at `1`, not `0`. A `0`-based origin would
+  /// contradict that `> 0` invariant AND be silently dropped by ``ContiguousOffsetTracker``
+  /// (whose origin prefix seeds at `0`, so an offset of `0` is not `> contiguous` and never
+  /// advances the prefix) — so the fake would exercise a different origin boundary than the
+  /// real adapter. Starting at `1` keeps the fake faithful to the production invariant.
+  public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
+    let base = events()
+    return AsyncThrowingStream { continuation in
+      let task = Task {
+        var offset = (sinceOffset ?? 0) + 1
+        do {
+          for try await event in base {
+            continuation.yield(OffsetEvent(offset: offset, event: event))
+            offset += 1
+          }
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+      continuation.onTermination = { _ in task.cancel() }
+    }
+  }
 }
 
 /// Transport / protocol-level failures surfaced by the client, distinct from the
