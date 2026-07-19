@@ -369,11 +369,15 @@ const isLiveSessionRow = (status: Session["status"]): boolean =>
  *   whose Session row an older reconcile left NON-TERMINAL), and — via the Session-row
  *   check above — the `queued`-orphan the Job gate alone would miss.
  *
- * FIX B (CE4.1): a transient `StateStoreError` from either durable read is mapped to a
- * graceful {@link SessionNotFound} rather than `orDie`'d into an unrecoverable defect —
- * a store hiccup on this hot path treats the session as (momentarily) unresolvable
- * instead of killing the long-lived `sessionEvents` stream/handler fiber. The resolved
- * error channel stays exactly `SessionNotFound`.
+ * FIX B (CE4.1, revised #76): a transient `StateStoreError` from either durable read is
+ * a DEFECT (`Effect.die`), never folded into `SessionNotFound`. Conflating a store
+ * hiccup with a genuine "no live handle / not mid-dispatch" miss is the #76 bug: the
+ * `sessionEvents` serving path catches `SessionNotFound` to `succeedNone`, so a transient
+ * store error on a genuinely LIVE session would collapse `live` to `None`, replay only the
+ * durable prefix, and silently COMPLETE — dropping the live tail. Surfacing the store
+ * error as a defect instead fails LOUDLY rather than silently truncating a live stream.
+ * The resolved typed error channel stays exactly `SessionNotFound` (infra failures cross
+ * as defects), and only a genuine registry miss yields `SessionNotFound`.
  */
 const resolveLive = (
   store: Store,
@@ -396,9 +400,11 @@ const resolveLive = (
     }
     return yield* registry.resolve(sessionId);
   }).pipe(
-    // FIX B: a transient store read failure is surfaced as SessionNotFound (the
-    // handler's existing typed channel), never a defect that crashes the stream fiber.
-    Effect.catchTag("StateStoreError", () => Effect.fail(new SessionNotFound({ id: sessionId }))),
+    // FIX B (revised #76): a transient store read failure is a DEFECT, never folded into
+    // SessionNotFound — the conflation let the sessionEvents path mis-classify a LIVE
+    // session as settled and silently drop its live tail. The typed channel stays exactly
+    // SessionNotFound; only a genuine registry miss produces it.
+    Effect.catchTag("StateStoreError", (error) => Effect.die(error)),
   );
 
 /**
@@ -439,8 +445,9 @@ const resolveLive = (
  *   closes).
  *
  * The stream's error channel is exactly `SessionNotFound`: the durable read is `orDie`'d and
- * the liveness gate maps its transient failures to `SessionNotFound`, so no store hiccup
- * leaks past the frozen contract.
+ * the liveness gate turns its transient store failures into DEFECTS (#76) — never a
+ * `SessionNotFound` that `succeedNone` would silently collapse into a settled replay,
+ * dropping a live session's tail — so no store hiccup leaks past the frozen contract.
  */
 const resyncSessionEvents = (
   store: Store,

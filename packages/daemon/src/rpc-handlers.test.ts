@@ -21,6 +21,7 @@ import {
   Option,
   PubSub,
   Queue,
+  Ref,
   Schema,
   Stream,
 } from "effect";
@@ -1021,13 +1022,14 @@ it.effect("a mid-dispatch session whose handle never registers fails AFTER the b
   ),
 );
 
-// FIX B — a TRANSIENT `StateStoreError` on the resolve-path durable read must NOT
-// become an unrecoverable defect that kills a long-lived `sessionEvents` stream/handler
-// fiber. `resolveLive` maps it to a graceful `SessionNotFound` (the handler's existing
-// typed channel), so the error surfaces in the TYPED failure channel — provably not a
-// die. A StateStore whose `getSession` fails transiently is substituted for the memory
-// store; the send must fail with a typed `SessionNotFound`, never a defect.
-it.effect("a transient store read failure surfaces as SessionNotFound, not a defect", () =>
+// FIX B (revised #76) — a TRANSIENT `StateStoreError` on the resolve-path durable read
+// must be surfaced as a DEFECT, NOT folded into the typed `SessionNotFound` channel.
+// Conflating a store hiccup with a genuine registry miss is the #76 bug (a live session
+// mis-classified as settled); `resolveLive` now `Effect.die`s the store error. A StateStore
+// whose `getSession` fails transiently is substituted for the memory store; the send must
+// die with the `StateStoreError` defect and leak NO typed error (INV-CONTRACT: the channel
+// stays exactly `SessionNotFound`, so a store failure crosses only as a defect).
+it.effect("a transient store read failure surfaces as a DEFECT, never a typed error", () =>
   Effect.gen(function* () {
     const failingStore = Layer.effect(
       StateStore,
@@ -1062,9 +1064,94 @@ it.effect("a transient store read failure surfaces as SessionNotFound, not a def
         .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
         .pipe(Effect.exit);
       expect(Exit.isFailure(exit)).toBe(true);
-      const failure = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
-      // Present in the TYPED channel as SessionNotFound → a graceful fail, not `orDie`.
-      expect(Option.isSome(failure) && failure.value instanceof SessionNotFound).toBe(true);
+      const cause = Exit.isFailure(exit) ? exit.cause : Cause.empty;
+      // A DEFECT (the store error died), and NO typed failure leaked (INV-CONTRACT).
+      expect(Cause.hasDies(cause)).toBe(true);
+      expect(Cause.squash(cause) instanceof StateStoreError).toBe(true);
+      expect(Option.isNone(Cause.findErrorOption(cause))).toBe(true);
     }).pipe(Effect.provide(app), Effect.scoped);
   }),
+);
+
+// FIX B (revised #76) — the CORE regression: a genuinely LIVE session whose `resolveLive`
+// hits a transient `StateStoreError` must NOT be mis-classified as settled and silently
+// completed as a truncated durable replay (dropping the live tail). The session's durable
+// row is NON-TERMINAL and it has a registered handle + a durable transcript, so before the
+// fix `resolveLive`'s store error folded to `SessionNotFound` → `succeedNone` → `live`
+// `None` → the stream replayed only the durable prefix and COMPLETED. Now it must DEFECT.
+//
+// Deterministic + non-hanging: `getSession` fails EXACTLY on its first call (the
+// `resolveLive` read) and delegates thereafter, so with the fix the stream dies at once
+// (no handle wait), and were the fix reverted the second read would succeed and the stream
+// would COMPLETE as a truncated success — which this assertion (a defect, not a success)
+// would catch.
+it.effect(
+  "a transient store error on a LIVE session's resolveLive DEFECTS, not a truncated replay",
+  () =>
+    Effect.gen(function* () {
+      // `armed` trips the FIRST `getSession` (resolveLive's read) into a transient failure,
+      // then disarms so the handler's later reads delegate to the real memory store.
+      const armed = yield* Ref.make(true);
+      const failingStore = Layer.effect(
+        StateStore,
+        Effect.gen(function* () {
+          const base = yield* StateStore;
+          return StateStore.of({
+            ...base,
+            jobs: {
+              ...base.jobs,
+              getSession: (id) =>
+                Ref.getAndSet(armed, false).pipe(
+                  Effect.flatMap((wasArmed) =>
+                    wasArmed
+                      ? Effect.fail(
+                          new StateStoreError({ operation: "getSession", detail: "transient" }),
+                        )
+                      : base.jobs.getSession(id),
+                  ),
+                ),
+            },
+          });
+        }),
+      ).pipe(Layer.provide(layerJournaling(layerMemory)));
+      const runner = Layer.succeed(
+        JobRunner,
+        JobRunner.of({ dispatch: () => Effect.succeed(succeededResult) }),
+      );
+      const app = handlers.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
+            Layer.provideMerge(layerWorkGraphEvents),
+            Layer.provideMerge(layerSessionEvents),
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const store = yield* StateStore;
+        const sessions = yield* SessionRegistry;
+        // A genuinely LIVE session: NON-TERMINAL row, mid-dispatch Job, a registered handle
+        // (result pending so the live tail would keep tailing), and a durable transcript that
+        // the buggy path would replay-and-complete.
+        const fake = yield* makeFakeSession([]);
+        yield* sessions.register(sessionId, { ...fake.handle, result: Effect.never });
+        yield* Ref.set(armed, false); // seed with the store DISARMED …
+        yield* store.jobs.putSession(startingSession);
+        yield* store.jobs.putJob(midDispatchJob);
+        yield* store.sessionLog.append(sessionId, entryAppended);
+        yield* Ref.set(armed, true); // … then arm for the resolveLive read under test.
+
+        const client = yield* clientEffect();
+        const exit = yield* client
+          .sessionEvents({ sessionId })
+          .pipe(Stream.runCollect, Effect.exit);
+        // Must DEFECT (loud), never a truncated-replay success that drops the live tail.
+        expect(Exit.isFailure(exit)).toBe(true);
+        const cause = Exit.isFailure(exit) ? exit.cause : Cause.empty;
+        expect(Cause.hasDies(cause)).toBe(true);
+        expect(Cause.squash(cause) instanceof StateStoreError).toBe(true);
+        // INV-CONTRACT: the store failure crossed as a defect, not the typed channel.
+        expect(Option.isNone(Cause.findErrorOption(cause))).toBe(true);
+      }).pipe(Effect.provide(app), Effect.scoped);
+    }),
 );
