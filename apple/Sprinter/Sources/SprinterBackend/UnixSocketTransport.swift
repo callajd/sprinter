@@ -18,14 +18,36 @@ import Foundation
 /// above the port learns about sockets or localness.
 ///
 /// Concurrency: inbound bytes are pumped on a dedicated blocking read thread that
-/// feeds the `receive()` stream; outbound writes are serialized on a private queue
-/// so a blocking `write(2)` never occupies a cooperative executor thread. All
-/// mutable descriptor state is guarded by a lock, so `close()` may race a `send`
-/// or the read loop safely (`@unchecked Sendable` is discharged by that lock).
+/// feeds the `receive()` stream; outbound writes are serialized on a private
+/// `writeQueue` so a blocking `write(2)` never occupies a cooperative executor
+/// thread; the blocking dial (`socket(2)`/`connect(2)`) is likewise hopped off the
+/// cooperative executor by ``connect(toUnixSocketPath:)``'s `async` form.
+///
+/// It is the fd's *lifetime* — not just the `descriptor` variable — that makes a
+/// `close()` racing a `send` safe. The lock alone does NOT protect the fd across the
+/// blocking `write(2)`: were `close()` to `close(2)` the descriptor while a queued
+/// write is mid-flight, that fd number could be reused by a concurrent dial (a
+/// reconnect, or a second backend) and the write would land RPC bytes on an
+/// unrelated connection. So the real `close(2)` is serialized onto the SAME
+/// `writeQueue` as writes, running strictly after the last queued write on that fd,
+/// and `send` re-checks `isClosed` on that queue and skips a closed fd. The lock
+/// guards the `descriptor`/`isClosed` *variables*; `writeQueue` guards the fd's
+/// *lifetime* (`@unchecked Sendable` is discharged by both together).
+///
+/// `close()` is LOAD-BEARING for this conformer: it owns a real OS thread (the read
+/// loop, parked in `read(2)`) and a file descriptor. The parked read thread retains
+/// `self`, so `deinit` can never fire while it runs — skipping `close()` leaks BOTH
+/// the thread and the fd. The connection's teardown must call it.
 public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   private let inbound: AsyncThrowingStream<Data, any Error>
   private let continuation: AsyncThrowingStream<Data, any Error>.Continuation
   private let writeQueue = DispatchQueue(label: "sprinter.UnixSocketTransport.write")
+
+  /// Off-executor home for the blocking dial (`socket(2)`/`connect(2)`): a full listen
+  /// backlog can park `connect(2)` for a while, so it must never run on a cooperative
+  /// executor thread. Concurrent so independent dials don't serialize behind each other.
+  private static let dialQueue = DispatchQueue(
+    label: "sprinter.UnixSocketTransport.dial", attributes: .concurrent)
 
   /// Guards ``descriptor`` and ``isClosed`` across the read thread, the write
   /// queue, and a caller's `close()`.
@@ -66,12 +88,37 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     return UnixSocketTransport(connectedDescriptor: descriptor)
   }
 
-  public func send(_ bytes: Data) async throws {
-    let (descriptor, closed) = lock.withLock { (self.descriptor, isClosed) }
-    guard !closed, descriptor >= 0 else { throw BackendError.connectionClosed }
+  /// `async` dial that runs the blocking `socket(2)`/`connect(2)` on a dedicated
+  /// off-executor thread (never a cooperative one), so a full listen backlog cannot
+  /// stall the shared cooperative pool. Throws the same typed
+  /// ``UnixSocketTransportError`` as the synchronous form.
+  public static func connect(toUnixSocketPath path: String) async throws -> UnixSocketTransport {
+    try await withCheckedThrowingContinuation { resume in
+      dialQueue.async {
+        do {
+          resume.resume(returning: try connect(toUnixSocketPath: path))
+        } catch {
+          resume.resume(throwing: error)
+        }
+      }
+    }
+  }
 
+  /// Writes one already-NDJSON-framed frame to the socket. A closed connection surfaces
+  /// as ``BackendError/connectionClosed`` (the fd is gone — nothing is written); a
+  /// mid-write `write(2)` failure surfaces as ``UnixSocketTransportError/writeFailed``.
+  public func send(_ bytes: Data) async throws {
     try await withCheckedThrowingContinuation { (resume: CheckedContinuation<Void, any Error>) in
       writeQueue.async {
+        // Read the descriptor ON the write queue — the same serial queue onto which
+        // `close()` defers the real `close(2)`. So between this check and `write(2)`
+        // the fd cannot be released (and its number reused by a concurrent dial): a
+        // closed connection is skipped here, never written to a freed/reused fd.
+        let descriptor: Int32 = self.lock.withLock { self.isClosed ? -1 : self.descriptor }
+        guard descriptor >= 0 else {
+          resume.resume(throwing: BackendError.connectionClosed)
+          return
+        }
         do {
           try writeAll(descriptor, bytes)
           resume.resume()
@@ -87,22 +134,23 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   }
 
   public func close() {
-    lock.lock()
-    if isClosed {
-      lock.unlock()
-      return
+    let descriptor: Int32 = lock.withLock {
+      guard !isClosed else { return -1 }
+      isClosed = true
+      let current = self.descriptor
+      self.descriptor = -1
+      return current
     }
-    isClosed = true
-    let descriptor = self.descriptor
-    self.descriptor = -1
-    lock.unlock()
+    guard descriptor >= 0 else { return }  // already closed — idempotent no-op.
 
-    if descriptor >= 0 {
-      // `shutdown` unblocks a read blocked in the read loop (it returns EOF), so the
-      // loop exits promptly; then release the descriptor.
-      shutdownDescriptor(descriptor)
-      closeDescriptor(descriptor)
-    }
+    // `shutdown` immediately unblocks a read parked in the read loop (it returns EOF),
+    // so the loop exits promptly. The real `close(2)` is DEFERRED onto `writeQueue`, so
+    // it runs strictly AFTER any writes already enqueued on this fd — the fd number can
+    // never be released (and reused by a concurrent dial) while a queued write is
+    // mid-flight. `send` re-checks `isClosed` on the same queue, so a write enqueued
+    // after this point is skipped rather than landing on the closed fd.
+    shutdownDescriptor(descriptor)
+    writeQueue.async { closeDescriptor(descriptor) }
     continuation.finish()
   }
 

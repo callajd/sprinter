@@ -7,7 +7,13 @@ import Foundation
 /// connection — the only place localness is named. A ``BackendConnector`` built over
 /// it yields an ``RpcBackend`` whose feature-facing surface is identical regardless
 /// of endpoint (INV-PORT); selecting `.localDaemon` dials CE1.2's Unix-domain socket
-/// via ``UnixSocketTransport``.
+/// via ``UnixSocketTransport`` — the blocking dial is hopped off the cooperative
+/// executor by that type's `async` ``UnixSocketTransport/connect(toUnixSocketPath:)``.
+///
+/// The returned ``UnixSocketTransport`` holds a real OS thread and file descriptor, so
+/// `close()` is LOAD-BEARING: the owning ``BackendConnector``/``RpcConnection`` teardown
+/// must call it or both leak (the parked read thread retains the transport, so no
+/// `deinit` fires on its own).
 ///
 /// `.remoteDaemon` has no counterpart yet: CE1/CE2's daemon serves ONLY a local
 /// Unix-domain socket (per `docs/architecture.md`, a remote daemon is reached over an
@@ -21,7 +27,7 @@ public struct DaemonTransports: DaemonTransportProvider {
   public func makeTransport(for endpoint: DaemonEndpoint) async throws -> any RpcTransport {
     switch endpoint {
     case .localDaemon(let socketPath):
-      return try UnixSocketTransport.connect(toUnixSocketPath: socketPath)
+      return try await UnixSocketTransport.connect(toUnixSocketPath: socketPath)
     case .remoteDaemon:
       // No remote transport exists yet (CE1/CE2 serve a local Unix socket only). Fail
       // loudly instead of dialing nothing — the remote adapter lands behind this seam.

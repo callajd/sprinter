@@ -4,6 +4,10 @@ import Testing
 
 @testable import SprinterBackend
 
+#if canImport(Darwin)
+  import Darwin
+#endif
+
 /// Exercises the concrete ``UnixSocketTransport`` over REAL kernel sockets (CE2.1):
 /// real NDJSON envelope frames round-trip in both directions, the endpoint-selection
 /// path (`DaemonTransports` → `BackendConnector`) dials a live socket, and the
@@ -137,11 +141,49 @@ struct UnixSocketTransportTests {
     peer.close()
   }
 
+  @Test("close() racing a queued write never lands a write on a freed fd, and fails cleanly")
+  func closeRacingQueuedWrite() async throws {
+    // A write that loses the race to `shutdown` may see EPIPE; it must not crash the
+    // test. What FIX1 guarantees is that a queued write never reaches a CLOSED fd
+    // (which would surface as EBADF) — the real `close(2)` is serialized behind writes
+    // on `writeQueue` and `send` re-checks `isClosed` there.
+    let previous = signal(SIGPIPE, SIG_IGN)
+    defer { signal(SIGPIPE, previous) }
+
+    for _ in 0..<32 {
+      let (transport, peer) = try RawSocketPeer.pair()
+      let frame = Data("{\"k\":\"v\"}\n".utf8)
+
+      // Enqueue a write, then close concurrently, twice (idempotent). Whichever wins
+      // the race, the write either lands on the still-valid fd or is skipped — it can
+      // never write to the closed/reused fd.
+      async let outcome: Void = transport.send(frame)
+      transport.close()
+      transport.close()  // idempotent — a second close is a no-op.
+
+      do {
+        try await outcome
+      } catch is CancellationError {
+        // not expected, but harmless
+      } catch let error as UnixSocketTransportError {
+        guard case .writeFailed(let errno) = error else { throw error }
+        #expect(errno != EBADF, "a queued write reached a closed fd (EBADF)")
+      } catch BackendError.connectionClosed {
+        // Skipped because close won the race — the clean, expected outcome.
+      }
+
+      // A send issued strictly after close() always fails cleanly with
+      // connectionClosed, never writing to (or crashing on) the closed fd.
+      await #expect(throws: BackendError.connectionClosed) { try await transport.send(frame) }
+      peer.close()
+    }
+  }
+
   @Test("connect to a path with no listener throws connectionFailed")
   func connectWithNoListenerThrows() async throws {
     let path = "/tmp/sprinter-absent-\(UUID().uuidString.prefix(8)).sock"
     do {
-      _ = try UnixSocketTransport.connect(toUnixSocketPath: path)
+      _ = try await UnixSocketTransport.connect(toUnixSocketPath: path)
       Issue.record("expected connect to throw")
     } catch let error as UnixSocketTransportError {
       guard case .connectionFailed = error else {
@@ -155,7 +197,7 @@ struct UnixSocketTransportTests {
   func connectWithOverLongPathThrows() async throws {
     let path = String(repeating: "a", count: unixSocketPathCapacity + 16)
     do {
-      _ = try UnixSocketTransport.connect(toUnixSocketPath: path)
+      _ = try await UnixSocketTransport.connect(toUnixSocketPath: path)
       Issue.record("expected connect to throw")
     } catch let error as UnixSocketTransportError {
       guard case .socketPathTooLong = error else {
