@@ -52,6 +52,27 @@ struct SnapshotReconcilerTests {
     #expect(result.sessions == [session])
   }
 
+  @Test("an agent delta appends a new revision, then upserts a retirement in place")
+  func upsertsAgent() {
+    let agent = Agent(
+      id: AgentId(rawValue: "agt-1"), name: "implementer", model: "claude-opus-4-8",
+      version: "1.0.0", tools: ["read"], supersedes: nil, retiredAt: nil)
+    let appended = reconciler.reconcile(Fixtures.snapshot, applying: .agentChanged(agent))
+    #expect(appended.agents == [agent])
+
+    // Retirement is an ordinary upsert of the SAME id carrying the stamp — the
+    // append-only registry never removes, so there is no removal delta to fold.
+    let retired = Agent(
+      id: AgentId(rawValue: "agt-1"), name: "implementer", model: "claude-opus-4-8",
+      version: "1.0.0", tools: ["read"], supersedes: nil,
+      retiredAt: "2026-07-20T12:00:00.000Z")
+    let result = reconciler.reconcile(appended, applying: .agentChanged(retired))
+    #expect(result.agents.count == 1)
+    #expect(result.agents.first?.isRetired == true)
+    // Sibling collections are untouched.
+    #expect(result.issues == Fixtures.snapshot.issues)
+  }
+
   @Test("folding a sequence of deltas keeps the state consistent")
   func foldsSequence() {
     let session = Session(id: Fixtures.sessionId, jobId: JobId(rawValue: "job-1"), status: .active)

@@ -22,6 +22,7 @@
 import { Schema } from "effect";
 import { Rpc, RpcGroup } from "effect/unstable/rpc";
 import {
+  Agent,
   Epic,
   Issue,
   IssueId,
@@ -62,9 +63,16 @@ export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanR
 // ── Aggregate contract schemas (composed only of owned domain types) ────────
 
 /**
- * The full owned read-model state, hydrated on connect by the `snapshot` RPC:
- * every planning node (`Workstream ⊃ Epic ⊃ Issue`) plus the execution nodes
- * (`Job`, `Session`). Composed exclusively of FE2.1 domain types (INV-PORT).
+ * The full owned state, hydrated on connect by the `snapshot` RPC: every planning
+ * node (`Workstream ⊃ Epic ⊃ Issue`), the execution nodes (`Job`, `Session`), and
+ * the REGISTRY layer (`agents`). Composed exclusively of FE2.1 domain types
+ * (INV-PORT).
+ *
+ * `agents` is the whole append-only registry, NOT a per-repository slice: an
+ * `Agent` is global (it names no repository), so "the agents used in this repo" is
+ * a fold a client computes over that repo's executions — never a list carried here
+ * (INV-DERIVED). Retired and superseded revisions are included, because a
+ * historical node may still resolve to one.
  */
 export const Snapshot = Schema.Struct({
   workstreams: Schema.Array(Workstream),
@@ -72,6 +80,7 @@ export const Snapshot = Schema.Struct({
   issues: Schema.Array(Issue),
   jobs: Schema.Array(Job),
   sessions: Schema.Array(Session),
+  agents: Schema.Array(Agent),
 });
 export type Snapshot = (typeof Snapshot)["Type"];
 
@@ -86,6 +95,12 @@ export type Snapshot = (typeof Snapshot)["Type"];
  * change; it stays in the snapshot. So there is deliberately no `*Removed` delta.
  * If a future model ever drops nodes from the graph, a `*Removed` variant (id
  * only) is a backward-compatible additive change.
+ *
+ * `AgentChanged` carries the REGISTRY layer under that same upsert-only model, and
+ * the fit is exact rather than incidental: the registry is APPEND-ONLY, so a delta
+ * is always either a brand-new revision or a retirement stamp on an existing one —
+ * never a removal. There is deliberately no `AgentRemoved`, and no delete anywhere
+ * on this contract.
  */
 export const WorkGraphEvent = Schema.TaggedUnion({
   WorkstreamChanged: { workstream: Workstream },
@@ -93,6 +108,7 @@ export const WorkGraphEvent = Schema.TaggedUnion({
   IssueChanged: { issue: Issue },
   JobChanged: { job: Job },
   SessionChanged: { session: Session },
+  AgentChanged: { agent: Agent },
 });
 export type WorkGraphEvent = (typeof WorkGraphEvent)["Type"];
 

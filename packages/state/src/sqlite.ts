@@ -2,12 +2,29 @@
  * The SQLite ADAPTER behind the {@link StateStore} port (Track A, task AE2.1).
  *
  * This is the ONLY module in the codebase permitted to reference a concrete
- * backing (INV-PORT): `@effect/sql-sqlite-bun` (`SqliteClient` / `SqliteMigrator`)
- * driven through Effect's own SQL layer `effect/unstable/sql` (`SqlClient`,
- * `SqlSchema`, `Migrator`), and SQL strings. It is Bun-native (`bun:sqlite` under
+ * backing (INV-PORT): `@effect/sql-sqlite-bun` (`SqliteClient`) driven through
+ * Effect's own SQL layer `effect/unstable/sql` (`SqlClient`, `SqlSchema`), and SQL
+ * strings. It is Bun-native (`bun:sqlite` under
  * the client) — never `node:*`. The port ({@link ./store.ts}) and every consumer
  * build to the Service, never to this instance; the exported {@link layer} hides
  * the backing entirely behind a `Layer<StateStore, StateStoreError>`.
+ *
+ * ## The schema version is the ONLY schema-evolution mechanism (INV-FRESH)
+ *
+ * This store holds DERIVED, re-derivable daemon state, so it is treated as
+ * GREENFIELD: **it never migrates**. There is no migration ladder and no
+ * `SqliteMigrator` — there is exactly ONE constant, {@link SCHEMA_VERSION}, and one
+ * DDL definition ({@link createSchema}) describing the schema AT that version.
+ * On open, the adapter compares the database's `PRAGMA user_version` against the
+ * constant; on ANY mismatch it DROPS every table and recreates the schema from
+ * scratch, then stamps the new version. No data is preserved and no migration is
+ * ever written.
+ *
+ * **{@link SCHEMA_VERSION} is the guard.** Any change to the persisted shape —
+ * a new table, a new column, a changed column — is landed by editing
+ * {@link createSchema} AND bumping {@link SCHEMA_VERSION}. Bumping it is what makes
+ * existing stores reset; forgetting to bump it is the one way to get a stale
+ * database, so the bump is part of every schema change, not an afterthought.
  *
  * Persistence strategy (all reads decode raw driver rows back through `Schema` —
  * never `as` / `!` / `any`, INV-NOCAST):
@@ -22,13 +39,15 @@
  * - The event feed is an `AUTOINCREMENT` table; the auto-assigned rowid is the
  *   monotonic offset.
  *
- * Query building, migrations, and row decoding are all Effect's own SQL layer —
- * nothing hand-rolled.
+ * Query building and row decoding are all Effect's own SQL layer — nothing
+ * hand-rolled.
  */
 import { Array as Arr, Effect, Layer, Option, Schema } from "effect";
 import { SqlClient, SqlError, SqlSchema } from "effect/unstable/sql";
-import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-bun";
+import { SqliteClient } from "@effect/sql-sqlite-bun";
 import {
+  Agent,
+  AgentId,
   EpicId,
   type Issue,
   IssueId,
@@ -43,11 +62,13 @@ import {
   SessionEvent,
   SessionId,
   SessionStatus,
+  Timestamp,
   WorkstreamId,
   WorkStatus,
   IssueStatus,
 } from "@sprinter/domain";
 import {
+  type AgentStore,
   type AppendEvent,
   type EventLogStore,
   type JobStore,
@@ -94,6 +115,22 @@ const EpicRow = Schema.Struct({
   name: Schema.NonEmptyString,
   status: WorkStatus,
   issues: Schema.fromJsonString(Schema.Array(IssueId)),
+});
+
+/**
+ * An `Agent` registry row: `tools` is a JSON-encoded list; `supersedes` and
+ * `retiredAt` are nullable columns (SQL `NULL` ⇔ the domain's absent optional key).
+ * There is deliberately NO repository/workstream column — the registry is global
+ * (INV-DERIVED) — and no status column: retired-ness IS `retiredAt` (INV-SUM).
+ */
+const AgentRow = Schema.Struct({
+  id: AgentId,
+  name: Schema.NonEmptyString,
+  model: Schema.NonEmptyString,
+  version: Schema.NonEmptyString,
+  tools: Schema.fromJsonString(Schema.Array(Schema.NonEmptyString)),
+  supersedes: Schema.NullOr(AgentId),
+  retiredAt: Schema.NullOr(Timestamp),
 });
 
 /** A session row — no optional or JSON columns. */
@@ -160,32 +197,90 @@ const OffsetRow = Schema.Struct({ offset: NonNegativeInt });
 const CountRow = Schema.Struct({ n: NonNegativeInt });
 
 // ============================================================================
-// Schema (DDL) — one migration, run at layer construction via SqliteMigrator
+// Schema (DDL) — ONE versioned definition; drop-and-recreate, never migrate
 // ============================================================================
 
 /**
- * Programmatic migrations (no filesystem — deterministic and offline, suitable
- * for a temp/in-memory database). Keyed `<id>_<name>` per {@link SqliteMigrator.fromRecord}.
+ * The version of the persisted schema below — the ONE constant that governs
+ * schema evolution (INV-FRESH). It is compared against the database's
+ * `PRAGMA user_version` on open: on ANY mismatch the store is DROPPED and
+ * recreated at this version. It is never migrated, so no data survives a bump.
+ *
+ * **Bump this in the same change as any edit to {@link createSchema}.** A new
+ * table, a new column, a changed column type, a changed index — all of them are a
+ * new version. This constant is the guard the rest of the domain remodel bumps;
+ * the store holds derived, re-derivable daemon state, so resetting it is the
+ * intended cost of a shape change.
+ *
+ * Version 1 is the greenfield reset that REPLACED the previous incremental
+ * migration ladder (`1_initial` / `2_session_event_log`). A database left by that
+ * ladder has `user_version = 0`, so it mismatches and is reset like any other
+ * stale store.
  */
-const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClient>> = {
-  "1_initial": Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql`CREATE TABLE workstream (
+export const SCHEMA_VERSION = 1;
+
+/**
+ * Every table this schema owns, in DROP order (children before parents — SQLite
+ * has no FK constraints declared here, so the order is purely for readability).
+ * `effect_sql_migrations` is the bookkeeping table the RETIRED migration ladder
+ * left behind: dropping it is what makes a pre-INV-FRESH database reset cleanly
+ * rather than keep a ghost of the old mechanism.
+ */
+const TABLES = [
+  "agent",
+  "issue_dependency",
+  "issue",
+  "epic",
+  "workstream",
+  "session_event_log",
+  "session",
+  "job",
+  "event_log",
+  "effect_sql_migrations",
+] as const;
+
+/** Drop every table this schema owns — the first half of a version reset. */
+const dropSchema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  for (const table of TABLES) yield* sql.unsafe(`DROP TABLE IF EXISTS "${table}"`);
+});
+
+/**
+ * The COMPLETE schema at {@link SCHEMA_VERSION} — one definition, not a ladder.
+ * Every table lands here (the `agent` registry included); nothing is expressed as
+ * an incremental step off a previous version.
+ */
+const createSchema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // The append-only Agent REGISTRY: owned, global, scoped to NO repository — hence
+  // no repositoryId/workstreamId column and no per-repo join table ("agents used in
+  // this repo" is a fold over that repo's executions, INV-DERIVED). `retiredAt` is a
+  // nullable stamp, not a status column (INV-SUM). Nothing DELETEs from this table.
+  yield* sql`CREATE TABLE agent (
+      id TEXT PRIMARY KEY NOT NULL,
+      name TEXT NOT NULL,
+      model TEXT NOT NULL,
+      version TEXT NOT NULL,
+      tools TEXT NOT NULL,
+      supersedes TEXT,
+      "retiredAt" TEXT
+    )`;
+  yield* sql`CREATE TABLE workstream (
       id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
       repo TEXT NOT NULL,
       status TEXT NOT NULL,
       epics TEXT NOT NULL
     )`;
-    yield* sql`CREATE TABLE epic (
+  yield* sql`CREATE TABLE epic (
       id TEXT PRIMARY KEY NOT NULL,
       "workstreamId" TEXT NOT NULL,
       name TEXT NOT NULL,
       status TEXT NOT NULL,
       issues TEXT NOT NULL
     )`;
-    yield* sql`CREATE INDEX epic_workstream ON epic ("workstreamId")`;
-    yield* sql`CREATE TABLE issue (
+  yield* sql`CREATE INDEX epic_workstream ON epic ("workstreamId")`;
+  yield* sql`CREATE TABLE issue (
       id TEXT PRIMARY KEY NOT NULL,
       "epicId" TEXT NOT NULL,
       number INTEGER NOT NULL,
@@ -193,14 +288,14 @@ const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClien
       status TEXT NOT NULL,
       pr TEXT
     )`;
-    yield* sql`CREATE INDEX issue_epic ON issue ("epicId")`;
-    yield* sql`CREATE TABLE issue_dependency (
+  yield* sql`CREATE INDEX issue_epic ON issue ("epicId")`;
+  yield* sql`CREATE TABLE issue_dependency (
       "issueId" TEXT NOT NULL,
       seq INTEGER NOT NULL,
       "dependsOn" TEXT NOT NULL,
       PRIMARY KEY ("issueId", seq)
     )`;
-    yield* sql`CREATE TABLE job (
+  yield* sql`CREATE TABLE job (
       id TEXT PRIMARY KEY NOT NULL,
       "issueId" TEXT NOT NULL,
       kind TEXT NOT NULL,
@@ -209,39 +304,64 @@ const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClien
       "transcriptRef" TEXT,
       pr TEXT
     )`;
-    yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
-    yield* sql`CREATE TABLE session (
+  yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
+  yield* sql`CREATE TABLE session (
       id TEXT PRIMARY KEY NOT NULL,
       "jobId" TEXT NOT NULL,
       status TEXT NOT NULL
     )`;
-    // UNIQUE enforces the domain invariant 1 Job = 1 session (conventions): at most
-    // one session per job, so `getSessionForJob` is deterministic by construction and
-    // a stray second session for a job fails at the backing (surfacing as a
-    // StateStoreError) rather than silently returning an arbitrary row.
-    yield* sql`CREATE UNIQUE INDEX session_job ON session ("jobId")`;
-    yield* sql`CREATE TABLE event_log (
+  // UNIQUE enforces the domain invariant 1 Job = 1 session (conventions): at most
+  // one session per job, so `getSessionForJob` is deterministic by construction and
+  // a stray second session for a job fails at the backing (surfacing as a
+  // StateStoreError) rather than silently returning an arbitrary row.
+  yield* sql`CREATE UNIQUE INDEX session_job ON session ("jobId")`;
+  yield* sql`CREATE TABLE event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL,
       payload TEXT NOT NULL
     )`;
-  }),
   // The durable per-session transcript log: one append-only row per
   // durable, transcript-grade session event, scoped by "sessionId". The AUTOINCREMENT
   // rowid is the monotonic offset — globally unique, so a re-dispatch of the same session
   // id APPENDS with fresh higher offsets rather than reusing or resetting the sequence
   // (never a duplicated/corrupted offset). The `session_event_log_session` index keeps a
   // per-session ordered read/tail cheap.
-  "2_session_event_log": Effect.gen(function* () {
-    const sql = yield* SqlClient.SqlClient;
-    yield* sql`CREATE TABLE session_event_log (
+  yield* sql`CREATE TABLE session_event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       "sessionId" TEXT NOT NULL,
       event TEXT NOT NULL
     )`;
-    yield* sql`CREATE INDEX session_event_log_session ON session_event_log ("sessionId")`;
-  }),
-};
+  yield* sql`CREATE INDEX session_event_log_session ON session_event_log ("sessionId")`;
+});
+
+/** The single row returned by `PRAGMA user_version`. */
+const UserVersionRow = Schema.Struct({ user_version: NonNegativeInt });
+
+/**
+ * Bring the database to {@link SCHEMA_VERSION}, the ONLY schema-evolution path
+ * (INV-FRESH): read `PRAGMA user_version`, and if it does not already equal the
+ * constant, DROP every table and recreate the schema from {@link createSchema},
+ * then stamp the new version. A fresh database reports `0`, so it takes the same
+ * reset path — there is exactly one code path, and it never migrates.
+ *
+ * The whole reset runs in a transaction so a crash mid-reset cannot leave a
+ * half-built schema stamped with the new version. `PRAGMA` statements take no
+ * bound parameters, so the version is interpolated from our own numeric constant
+ * (never user input).
+ */
+const applySchema = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql`PRAGMA user_version`;
+  const decoded = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(UserVersionRow))(rows);
+  if (decoded[0].user_version === SCHEMA_VERSION) return;
+  yield* sql.withTransaction(
+    Effect.gen(function* () {
+      yield* dropSchema;
+      yield* createSchema;
+      yield* sql.unsafe(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    }),
+  );
+});
 
 // ============================================================================
 // Service construction
@@ -255,6 +375,66 @@ const migrations: Record<string, Effect.Effect<void, unknown, SqlClient.SqlClien
  */
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+
+  // ── AgentStore ──────────────────────────────────────────────────────────
+  //
+  // Append + read only: there is no DELETE statement here, by design. An edit
+  // appends a NEW revision (a new id linked by `supersedes`) and a retirement
+  // appends one carrying `retiredAt`, so the table is immutable history.
+
+  /**
+   * Reconstruct one {@link Agent} from its row, dropping SQL `NULL`s to absent
+   * optionals. `operation` is the calling store method so a failure reports the
+   * caller, not a fixed label.
+   */
+  const hydrateAgent = (row: unknown, operation: string): Effect.Effect<Agent, StateStoreError> =>
+    Schema.decodeUnknownEffect(AgentRow)(row).pipe(
+      Effect.map(
+        (r): Agent => ({
+          id: r.id,
+          name: r.name,
+          model: r.model,
+          version: r.version,
+          tools: r.tools,
+          ...(r.supersedes !== null ? { supersedes: r.supersedes } : {}),
+          ...(r.retiredAt !== null ? { retiredAt: r.retiredAt } : {}),
+        }),
+      ),
+      Effect.mapError(fail(operation)),
+    );
+
+  const agents: AgentStore = {
+    putAgent: (agent) =>
+      Effect.gen(function* () {
+        const tools = yield* Schema.encodeEffect(
+          Schema.fromJsonString(Schema.Array(Schema.NonEmptyString)),
+        )(agent.tools);
+        const row = {
+          id: agent.id,
+          name: agent.name,
+          model: agent.model,
+          version: agent.version,
+          tools,
+          supersedes: agent.supersedes ?? null,
+          retiredAt: agent.retiredAt ?? null,
+        };
+        yield* sql`INSERT INTO agent ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`;
+      }).pipe(Effect.mapError(fail("putAgent"))),
+    getAgent: (id) =>
+      sql`SELECT * FROM agent WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getAgent")),
+        Effect.flatMap((rows) =>
+          Option.match(Arr.head(rows), {
+            onNone: () => Effect.succeedNone,
+            onSome: (row) => Effect.asSome(hydrateAgent(row, "getAgent")),
+          }),
+        ),
+      ),
+    listAgents: sql`SELECT * FROM agent ORDER BY id`.pipe(
+      Effect.mapError(fail("listAgents")),
+      Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateAgent(row, "listAgents"))),
+    ),
+  };
 
   // ── WorkGraphStore ──────────────────────────────────────────────────────
 
@@ -532,7 +712,14 @@ const make = Effect.gen(function* () {
       ),
     );
 
-  return StateStore.of({ workGraph: putWorkGraph, jobs, events, sessionLog, withTransaction });
+  return StateStore.of({
+    agents,
+    workGraph: putWorkGraph,
+    jobs,
+    events,
+    sessionLog,
+    withTransaction,
+  });
 });
 
 // ============================================================================
@@ -554,20 +741,17 @@ export interface StateStoreConfig {
 }
 
 /**
- * The SQLite adapter for {@link StateStore}. Opens the database, runs the schema
- * migration at construction, and provides the `StateStore` service — all behind a
- * `Layer<StateStore, StateStoreError>` that exposes no backing type (INV-PORT).
+ * The SQLite adapter for {@link StateStore}. Opens the database, brings it to
+ * {@link SCHEMA_VERSION} at construction (drop-and-recreate on a version mismatch —
+ * never a migration, INV-FRESH), and provides the `StateStore` service — all behind
+ * a `Layer<StateStore, StateStoreError>` that exposes no backing type (INV-PORT).
  */
 export const layer = (config: StateStoreConfig): Layer.Layer<StateStore, StateStoreError> => {
   const disableWAL = config.disableWAL ?? config.filename === ":memory:";
   const clientLayer = SqliteClient.layer({ filename: config.filename, disableWAL });
-  const migrationsLayer = Layer.effectDiscard(
-    SqliteMigrator.run({ loader: SqliteMigrator.fromRecord(migrations) }).pipe(
-      Effect.mapError(fail("migrate")),
-    ),
-  );
+  const schemaLayer = Layer.effectDiscard(applySchema.pipe(Effect.mapError(fail("applySchema"))));
   return Layer.effect(StateStore, make).pipe(
-    Layer.provide(migrationsLayer),
+    Layer.provide(schemaLayer),
     Layer.provide(clientLayer),
   );
 };

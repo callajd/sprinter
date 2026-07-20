@@ -74,5 +74,39 @@
       "jobId": "job-1",
       "status": "active"
     }
+  ],
+  "agents": [
+    {
+      "id": "agt-0",
+      "name": "scout",
+      "model": "claude-haiku-4-5",
+      "version": "0.9.0",
+      "tools": [],
+      "retiredAt": "2026-07-20T12:00:00.000Z"
+    },
+    {
+      "id": "agt-1",
+      "name": "implementer",
+      "model": "claude-opus-4-8",
+      "version": "1.0.0",
+      "tools": [
+        "read",
+        "edit",
+        "bash"
+      ]
+    },
+    {
+      "id": "agt-2",
+      "name": "implementer",
+      "model": "claude-opus-4-8",
+      "version": "1.1.0",
+      "tools": [
+        "read",
+        "edit",
+        "bash",
+        "web_search"
+      ],
+      "supersedes": "agt-1"
+    }
   ]
 }

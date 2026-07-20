@@ -3,8 +3,8 @@
  * against an in-memory database (deterministic, offline, no filesystem). Every
  * test provides {@link layerMemory}, so each runs on a fresh `:memory:` database.
  *
- * The suite proves the three capability groups round-trip the OWNED domain
- * schemas: the work graph (`Workstream ⊃ Epic ⊃ Issue`), the dependency DAG
+ * The suite proves the capability groups round-trip the OWNED domain
+ * schemas: the append-only `Agent` registry (append + read, no delete), the work graph (`Workstream ⊃ Epic ⊃ Issue`), the dependency DAG
  * (`Issue.dependsOn`) as real replaceable edges, the `Job` model and the
  * `Issue → Job → session → PR` mapping, and the append-only event feed
  * (append / ordered read / tail-from-offset). It also covers absent-optional
@@ -16,7 +16,7 @@
 import { it } from "@effect/vitest";
 import { Array as Arr, Effect, Option, Schema } from "effect";
 import { expect } from "vitest";
-import { Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
+import { Agent, Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
 import {
   AppendEvent,
   layer,
@@ -76,7 +76,71 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
 const session = (over: Partial<(typeof Session)["Encoded"]> = {}) =>
   decode(Session, { id: "session-1", jobId: "job-1", status: "active", ...over });
 
+const agent = (over: Partial<(typeof Agent)["Encoded"]> = {}) =>
+  decode(Agent, {
+    id: "agt-1",
+    name: "implementer",
+    model: "claude-opus-4-8",
+    version: "1.0.0",
+    tools: ["read", "edit"],
+    ...over,
+  });
+
 const prRef = { number: 42, url: "https://github.com/callajd/sprinter/pull/42", merged: true };
+
+// ============================================================================
+// AgentStore — the append-only, globally-scoped registry
+// ============================================================================
+
+it.effect("round-trips an Agent revision and lists the registry", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const first = yield* agent();
+    const revised = yield* agent({ id: "agt-2", version: "1.1.0", supersedes: "agt-1" });
+
+    yield* store.agents.putAgent(first);
+    yield* store.agents.putAgent(revised);
+
+    expect(Option.getOrThrow(yield* store.agents.getAgent(first.id))).toStrictEqual(first);
+    expect(Option.getOrThrow(yield* store.agents.getAgent(revised.id))).toStrictEqual(revised);
+    // Both revisions persist: an edit APPENDS, it never replaces the record it
+    // supersedes, so a past execution still resolves to the exact revision that ran.
+    expect(yield* store.agents.listAgents).toStrictEqual([first, revised]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("elides an Agent's absent optional keys, and retirement is a stamp not a delete", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const plain = yield* agent();
+    yield* store.agents.putAgent(plain);
+    const read = Option.getOrThrow(yield* store.agents.getAgent(plain.id));
+    expect("supersedes" in read).toBe(false);
+    expect("retiredAt" in read).toBe(false);
+
+    // Retiring stamps `retiredAt` on a NEW revision; the registry only ever grows.
+    const retired = yield* agent({ id: "agt-3", retiredAt: "2026-07-20T12:00:00.000Z" });
+    yield* store.agents.putAgent(retired);
+    const all = yield* store.agents.listAgents;
+    expect(all).toHaveLength(2);
+    expect(Option.getOrThrow(yield* store.agents.getAgent(retired.id)).retiredAt).toBe(
+      "2026-07-20T12:00:00.000Z",
+    );
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("exposes NO delete on the AgentStore surface (append + read only)", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // The port surface is exactly append + read. A delete/remove/retire method
+    // would be a contract break — there is nowhere to call one from.
+    expect(Object.keys(store.agents).toSorted()).toStrictEqual([
+      "getAgent",
+      "listAgents",
+      "putAgent",
+    ]);
+  }).pipe(Effect.provide(layerMemory)),
+);
 
 // ============================================================================
 // WorkGraphStore
@@ -257,6 +321,8 @@ it.effect("returns None for every missing node", () =>
     expect(yield* store.jobs.listJobsForIssue(iss.id)).toStrictEqual([]);
     expect(yield* store.events.read).toStrictEqual([]);
     expect(yield* store.events.tail(0)).toStrictEqual([]);
+    expect(yield* store.agents.getAgent((yield* agent()).id)).toStrictEqual(Option.none());
+    expect(yield* store.agents.listAgents).toStrictEqual([]);
   }).pipe(Effect.provide(layerMemory)),
 );
 

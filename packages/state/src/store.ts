@@ -7,10 +7,14 @@
  * backing store, no SQL, and no running instance — a concrete backing (the
  * SQLite adapter in {@link ./sqlite.ts}) is a `Layer` provided behind this port,
  * and NOTHING outside that adapter module may import `@effect/sql-sqlite-bun`,
- * `effect/unstable/sql`, `bun:sqlite`, or SQL strings.
+ * `effect/unstable/sql`, `bun:sqlite`, or SQL strings. (The adapter's own
+ * white-box tests, which live beside it in this package, may probe the raw
+ * database to assert the schema-version reset — no CONSUMER ever can.)
  *
- * The port is composed of three capability groups (INV-NAMING, `*Store` suffix):
+ * The port is composed of these capability groups (INV-NAMING, `*Store` suffix):
  *
+ * - {@link AgentStore} — the append-only `Agent` REGISTRY: global, scoped to no
+ *   repository, exposing append + read and NO delete.
  * - {@link WorkGraphStore} — the work graph `Workstream ⊃ Epic ⊃ Issue` plus the
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
@@ -27,6 +31,8 @@
  */
 import { Context, Effect, Option, Schema } from "effect";
 import {
+  type Agent,
+  AgentId,
   type Epic,
   EpicId,
   type Issue,
@@ -116,6 +122,31 @@ export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
 // ============================================================================
 // Capability groups
 // ============================================================================
+
+/**
+ * Persist and read the append-only {@link Agent} REGISTRY — owned, global, scoped
+ * to NO repository (there is deliberately no repository- or workstream-scoped read
+ * here: "the agents used in this repo" is a FOLD over that repo's executions,
+ * never a stored per-repo list — INV-DERIVED).
+ *
+ * The surface is APPEND + READ, and there is deliberately **no delete** — not
+ * here, and not on the contract. An agent's record is immutable history: editing
+ * appends a NEW revision whose `supersedes` names the one it replaces, and
+ * retiring appends a revision carrying `retiredAt`. Removing a record would strand
+ * every past execution that ran on it.
+ *
+ * `putAgent` is an upsert BY ID so a re-append of the same revision is idempotent
+ * (a crash-retry re-writes the identical row); it is not an edit path, because an
+ * edit mints a new id.
+ */
+export interface AgentStore {
+  /** Append an {@link Agent} revision (idempotent by id). Never removes a prior revision. */
+  readonly putAgent: (agent: Agent) => Effect.Effect<void, StateStoreError>;
+  /** Read one {@link Agent} revision by id, if present. */
+  readonly getAgent: (id: AgentId) => Effect.Effect<Option.Option<Agent>, StateStoreError>;
+  /** Every persisted {@link Agent} revision — retired and superseded included — ordered by id. */
+  readonly listAgents: Effect.Effect<ReadonlyArray<Agent>, StateStoreError>;
+}
 
 /**
  * Persist and read the work graph `Workstream ⊃ Epic ⊃ Issue` and its dependency
@@ -269,8 +300,8 @@ export interface SessionLogStore {
 // ============================================================================
 
 /**
- * The persistence-agnostic `StateStore` port — the durable spine composed of the
- * three capability groups. The core and every consumer (AE3 Job runner, AE4
+ * The persistence-agnostic `StateStore` port — the durable spine composed of its
+ * capability groups. The core and every consumer (AE3 Job runner, AE4
  * `RpcServer` snapshot) depend on THIS service; a backing is chosen by providing
  * one of its adapter `Layer`s (the SQLite adapter in {@link ./sqlite.ts}). The
  * tag id follows INV-NAMING: `sprinter/<area>/<Name>`.
@@ -278,6 +309,8 @@ export interface SessionLogStore {
 export class StateStore extends Context.Service<
   StateStore,
   {
+    /** The append-only, globally-scoped `Agent` registry capability group. */
+    readonly agents: AgentStore;
     /** The work-graph capability group. */
     readonly workGraph: WorkGraphStore;
     /** The Job / Session / mapping capability group. */

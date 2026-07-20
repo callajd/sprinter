@@ -199,6 +199,7 @@ it.effect("snapshot of an empty daemon is empty", () =>
         issues: [],
         jobs: [],
         sessions: [],
+        agents: [],
       });
     }),
   ),

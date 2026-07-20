@@ -45,5 +45,19 @@
         "status": "active"
       }
     }
+  },
+  {
+    "offset": 6,
+    "event": {
+      "_tag": "AgentChanged",
+      "agent": {
+        "id": "agt-0",
+        "name": "scout",
+        "model": "claude-haiku-4-5",
+        "version": "0.9.0",
+        "tools": [],
+        "retiredAt": "2026-07-20T12:00:00.000Z"
+      }
+    }
   }
 ]

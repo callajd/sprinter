@@ -108,8 +108,19 @@ struct ConstructionTests {
       epics: decoded.epics,
       issues: decoded.issues,
       jobs: decoded.jobs,
-      sessions: decoded.sessions)
+      sessions: decoded.sessions,
+      agents: decoded.agents)
     #expect(built == decoded)
+    // The registry defaults to empty when omitted — the read-model-only baseline a
+    // fixture builds — and that default is NOT what the wire carries.
+    #expect(
+      Snapshot(
+        workstreams: decoded.workstreams,
+        epics: decoded.epics,
+        issues: decoded.issues,
+        jobs: decoded.jobs,
+        sessions: decoded.sessions
+      ).agents.isEmpty)
   }
 
   @Test("builds Usage equal to the golden")

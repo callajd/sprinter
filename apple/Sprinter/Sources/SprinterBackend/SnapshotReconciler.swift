@@ -27,6 +27,10 @@ public struct SnapshotReconciler: Sendable {
       return snapshot.replacing(jobs: Self.upsert(job, into: snapshot.jobs, by: \.id))
     case .sessionChanged(let session):
       return snapshot.replacing(sessions: Self.upsert(session, into: snapshot.sessions, by: \.id))
+    // The registry folds under the SAME upsert rule: an append-only registry only
+    // ever produces a new revision or a `retiredAt` stamp, never a removal.
+    case .agentChanged(let agent):
+      return snapshot.replacing(agents: Self.upsert(agent, into: snapshot.agents, by: \.id))
     }
   }
 
@@ -49,20 +53,22 @@ public struct SnapshotReconciler: Sendable {
 
 extension Snapshot {
   /// Returns a copy with the given collections swapped in; an omitted argument
-  /// keeps the current value. Keeps ``SnapshotReconciler`` free of the five-field
+  /// keeps the current value. Keeps ``SnapshotReconciler`` free of the full
   /// initializer boilerplate at each case.
   fileprivate func replacing(
     workstreams: [Workstream]? = nil,
     epics: [Epic]? = nil,
     issues: [Issue]? = nil,
     jobs: [Job]? = nil,
-    sessions: [Session]? = nil
+    sessions: [Session]? = nil,
+    agents: [Agent]? = nil
   ) -> Snapshot {
     Snapshot(
       workstreams: workstreams ?? self.workstreams,
       epics: epics ?? self.epics,
       issues: issues ?? self.issues,
       jobs: jobs ?? self.jobs,
-      sessions: sessions ?? self.sessions)
+      sessions: sessions ?? self.sessions,
+      agents: agents ?? self.agents)
   }
 }

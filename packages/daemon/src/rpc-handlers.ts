@@ -105,9 +105,15 @@ type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
  * every workstream, its epics (by FK), their issues (by FK), each issue's jobs,
  * and each job's session. Reuses the store's FK-scoped reads so the result is
  * consistent regardless of a node's cached child list.
+ *
+ * The REGISTRY layer is hydrated flat and WHOLE — `listAgents`, not a per-repo or
+ * per-workstream read — because an `Agent` is global and carries no repository:
+ * "the agents used in this repo" is a fold the client computes over that repo's
+ * executions, never a slice the daemon stores or ships (INV-DERIVED).
  */
 const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   Effect.gen(function* () {
+    const agents = yield* store.agents.listAgents;
     const workstreams = yield* store.workGraph.listWorkstreams;
     const epics: Array<Epic> = [];
     const issues: Array<Issue> = [];
@@ -129,7 +135,7 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
         }
       }
     }
-    return { workstreams, epics, issues, jobs, sessions } satisfies Snapshot;
+    return { workstreams, epics, issues, jobs, sessions, agents } satisfies Snapshot;
   }).pipe(Effect.orDie);
 
 // ── createWorkstreamFromPlan ──────────────────────────────────────────────────

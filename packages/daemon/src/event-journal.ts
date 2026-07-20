@@ -143,6 +143,16 @@ const publishEphemeralLive =
  */
 const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
   StateStore.of({
+    // The REGISTRY layer journals through the SAME seam as the work graph: an
+    // append is durable-plus-live in one transaction, fanned out as `AgentChanged`.
+    // Only the append needs decorating — the registry exposes no delete, so there is
+    // no removal delta to journal (and none on the contract either).
+    agents: {
+      putAgent: (agent) =>
+        putAndJournal(base, feed, base.agents.putAgent(agent), { _tag: "AgentChanged", agent }),
+      getAgent: base.agents.getAgent,
+      listAgents: base.agents.listAgents,
+    },
     workGraph: {
       putWorkstream: (workstream) =>
         putAndJournal(base, feed, base.workGraph.putWorkstream(workstream), {

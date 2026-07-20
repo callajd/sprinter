@@ -26,6 +26,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
 import {
+  Agent,
   Epic,
   Issue,
   Job,
@@ -108,6 +109,38 @@ const jobFull = {
 const jobMinimal = { id: "job-2", issueId: "iss-2", kind: "review", status: "queued" };
 
 const session = { id: "ses-1", jobId: "job-1", status: "active" };
+
+// ── Registry fixtures (DE1.1) ────────────────────────────────────────────────
+//
+// The registry is APPEND-ONLY and GLOBAL: `agentRevised` is a NEW revision linked
+// to the one it replaced by `supersedes`, and `agentRetired` carries a `retiredAt`
+// stamp (retired-ness is the stamp's presence — there is no status enum, INV-SUM).
+// `agentOriginal` exercises BOTH optional keys ABSENT. No agent names a repository:
+// "agents used in this repo" is a fold over that repo's executions (INV-DERIVED).
+const agentOriginal = {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read", "edit", "bash"],
+};
+const agentRevised = {
+  id: "agt-2",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit", "bash", "web_search"],
+  supersedes: "agt-1",
+};
+const agentRetired = {
+  id: "agt-0",
+  name: "scout",
+  model: "claude-haiku-4-5",
+  version: "0.9.0",
+  tools: [],
+  retiredAt: "2026-07-20T12:00:00.000Z",
+};
+
 const epic = {
   id: "ep-1",
   workstreamId: "ws-1",
@@ -131,6 +164,7 @@ write("snapshot", Snapshot, {
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
   sessions: [session],
+  agents: [agentRetired, agentOriginal, agentRevised],
 });
 
 // Individual owned nodes (exercise every DTO + optional-key present/absent).
@@ -141,6 +175,9 @@ write("issue-no-pr", Issue, issueNoPr);
 write("job-full", Job, jobFull);
 write("job-minimal", Job, jobMinimal);
 write("session", Session, session);
+write("agent-original", Agent, agentOriginal);
+write("agent-revised", Agent, agentRevised);
+write("agent-retired", Agent, agentRetired);
 write("pull-request-ref", PullRequestRef, prMerged);
 
 // The distinct terminal `cancelled` WorkStatus (CE5.1) — a cancelled
@@ -156,13 +193,14 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
   { _tag: "IssueChanged", issue: issueWithPr },
   { _tag: "JobChanged", job: jobFull },
   { _tag: "SessionChanged", session },
+  { _tag: "AgentChanged", agent: agentRevised },
 ]);
 
 // ── OffsetEvent — the streamed `events` success envelope (CE2.0) ──
 //
 // Each streamed item pairs a WorkGraphEvent with its DURABLE offset, so a client
 // can feed the offset back as the request's `sinceOffset` cursor. Real `event_log`
-// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3,4,5)
+// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3…6)
 // rather than the origin — the strict `> sinceOffset` ordering is the durable-replay
 // slice a reconnect resumes from.
 
@@ -170,6 +208,7 @@ write("offset-events", Schema.Array(OffsetEvent), [
   { offset: 3, event: { _tag: "WorkstreamChanged", workstream } },
   { offset: 4, event: { _tag: "IssueChanged", issue: issueWithPr } },
   { offset: 5, event: { _tag: "SessionChanged", session } },
+  { offset: 6, event: { _tag: "AgentChanged", agent: agentRetired } },
 ]);
 
 // ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────

@@ -28,3 +28,12 @@ export type JobId = (typeof JobId)["Type"];
 /** Identifies a {@link Session} — one agent run executing a {@link Job}. */
 export const SessionId = Schema.NonEmptyString.pipe(Schema.brand("SessionId"));
 export type SessionId = (typeof SessionId)["Type"];
+
+/**
+ * Identifies an {@link Agent} — a member of the REGISTRY layer: owned, global,
+ * and scoped to NO repository. Because the registry is append-only, an `AgentId`
+ * identifies one immutable REVISION: editing an agent mints a NEW id whose record
+ * points back at the previous one through `supersedes`.
+ */
+export const AgentId = Schema.NonEmptyString.pipe(Schema.brand("AgentId"));
+export type AgentId = (typeof AgentId)["Type"];

@@ -12,6 +12,7 @@ import { Context, Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
 import type { OffsetEvent } from "@sprinter/contract";
 import {
+  Agent,
   Epic,
   Issue,
   Job,
@@ -61,6 +62,13 @@ const session = Schema.decodeUnknownSync(Session)({
   jobId: "job-1",
   status: "active",
 });
+const agent = Schema.decodeUnknownSync(Agent)({
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read", "edit"],
+});
 // An issue WITH dependency edges, so `putIssue` is genuinely multi-statement
 // (rewrite the issue row + its `issue_dependency` edges) and opens its own inner
 // transaction — the NESTED SAVEPOINT case (FIX 3).
@@ -82,6 +90,7 @@ const seedGraph = (store: Context.Service.Shape<typeof StateStore>) =>
     yield* store.workGraph.putIssue(issue);
     yield* store.jobs.putJob(job);
     yield* store.jobs.putSession(session);
+    yield* store.agents.putAgent(agent);
   });
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -98,6 +107,7 @@ it.effect("journals every persisted mutation to the durable offset log, in order
       "IssueChanged",
       "JobChanged",
       "SessionChanged",
+      "AgentChanged",
     ]);
     // Offsets are strictly increasing (the monotonic tail cursor).
     const offsets = entries.map((e) => e.offset);
@@ -203,6 +213,8 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
       { _tag: "IssueChanged", issue },
       { _tag: "JobChanged", job },
       { _tag: "SessionChanged", session },
+      // The REGISTRY delta rides the same durable log as the work graph.
+      { _tag: "AgentChanged", agent },
     ]);
     // Offsets are strictly increasing (the monotonic tail cursor) and all > 0.
     const offsets = replay.map((e) => e.offset);
@@ -218,6 +230,7 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
       "IssueChanged",
       "JobChanged",
       "SessionChanged",
+      "AgentChanged",
     ]);
     expect(fromThird.every((e) => e.offset > cursor)).toBe(true);
   }).pipe(
@@ -238,7 +251,7 @@ it.effect("the live feed stamps every fanned-out delta with its durable offset (
     yield* seedGraph(store);
 
     const received: Array<OffsetEvent> = [];
-    for (let i = 0; i < 5; i++) received.push(yield* PubSub.take(subscription));
+    for (let i = 0; i < 6; i++) received.push(yield* PubSub.take(subscription));
 
     // The live tail carries the SAME coordinate space as the durable replay: the
     // published offsets match the journaled `event_log` offsets exactly.
@@ -250,6 +263,7 @@ it.effect("the live feed stamps every fanned-out delta with its durable offset (
       "IssueChanged",
       "JobChanged",
       "SessionChanged",
+      "AgentChanged",
     ]);
     // Monotonic, strictly increasing.
     const offsets = received.map((e) => e.offset);

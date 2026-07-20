@@ -213,25 +213,37 @@ public struct Session: Codable, Equatable, Sendable {
   }
 }
 
-/// The full owned read-model state, hydrated on connect by the `snapshot` RPC.
+/// The full owned state, hydrated on connect by the `snapshot` RPC: the read model
+/// plus the registry layer (``agents``).
+///
+/// ``agents`` is the WHOLE append-only registry, not a per-repository slice — an
+/// ``Agent`` is global, so the per-repo view is a fold over that repo's executions
+/// (INV-DERIVED). Retired and superseded revisions are included, because a
+/// historical node may still resolve to one. It defaults to empty in the
+/// memberwise initializer so a caller building a read-model-only baseline (test
+/// fixtures, an empty starting snapshot) need not name it; decoding always requires
+/// the wire key, exactly as the contract emits it.
 public struct Snapshot: Codable, Equatable, Sendable {
   public let workstreams: [Workstream]
   public let epics: [Epic]
   public let issues: [Issue]
   public let jobs: [Job]
   public let sessions: [Session]
+  public let agents: [Agent]
 
   public init(
     workstreams: [Workstream],
     epics: [Epic],
     issues: [Issue],
     jobs: [Job],
-    sessions: [Session]
+    sessions: [Session],
+    agents: [Agent] = []
   ) {
     self.workstreams = workstreams
     self.epics = epics
     self.issues = issues
     self.jobs = jobs
     self.sessions = sessions
+    self.agents = agents
   }
 }

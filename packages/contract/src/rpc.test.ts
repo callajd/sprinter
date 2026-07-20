@@ -3,6 +3,7 @@ import { Schema } from "effect";
 import { RpcSchema } from "effect/unstable/rpc";
 import { expect } from "vitest";
 import {
+  Agent,
   Issue,
   IssueId,
   Job,
@@ -67,6 +68,13 @@ const issue = {
 };
 const job = { id: "job-1", issueId: "iss-1", kind: "implement", status: "running" };
 const session = { id: "ses-1", jobId: "job-1", status: "active" };
+const agent = {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read", "edit"],
+};
 
 it("carries every model of the contract as a procedure", () => {
   expect([...SprinterRpc.requests.keys()].sort()).toEqual([...ALL_TAGS].sort());
@@ -88,6 +96,7 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
     issues: [issue],
     jobs: [job],
     sessions: [session],
+    agents: [agent, { ...agent, id: "agt-2", supersedes: "agt-1" }],
   };
   const decoded = Schema.decodeUnknownSync(snapshot.successSchema)(full);
 
@@ -96,6 +105,26 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   expect(decoded).toEqual(Schema.decodeUnknownSync(Snapshot)(full));
   expect(Schema.decodeUnknownSync(Workstream)(workstream).id).toBe("ws-1");
   expect(decoded.issues[0]?.number).toBe(10);
+  // The REGISTRY layer rides the snapshot whole — every revision, no per-repo slice
+  // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED).
+  expect(decoded.agents.map((a) => a.id)).toEqual(["agt-1", "agt-2"]);
+  expect(decoded.agents[1]?.supersedes).toBe("agt-1");
+  expect("retiredAt" in (decoded.agents[0] ?? {})).toBe(false);
+});
+
+it("carries the registry as an upsert-only AgentChanged delta with no removal variant", () => {
+  const retired = { ...agent, retiredAt: "2026-07-20T12:00:00.000Z" };
+  const decoded = Schema.decodeUnknownSync(WorkGraphEvent)({
+    _tag: "AgentChanged",
+    agent: retired,
+  });
+  if (decoded._tag !== "AgentChanged") throw new Error("expected AgentChanged");
+  expect(decoded.agent.retiredAt).toBe("2026-07-20T12:00:00.000Z");
+  // Retirement is a STAMP carried by an ordinary change delta; the append-only
+  // registry has no removal, so there is no `AgentRemoved` variant to decode.
+  expect(() =>
+    Schema.decodeUnknownSync(WorkGraphEvent)({ _tag: "AgentRemoved", id: "agt-1" }),
+  ).toThrow();
 });
 
 it("streams offset-stamped owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
@@ -295,6 +324,18 @@ it("rejects a payload that is not an owned domain value", () => {
       issues: [{ id: "iss-1" }],
       jobs: [],
       sessions: [],
+      agents: [],
+    }),
+  ).toThrow();
+  // And a malformed agent (an unparseable `retiredAt`) fails the same way.
+  expect(() =>
+    Schema.decodeUnknownSync(snapshot.successSchema)({
+      workstreams: [],
+      epics: [],
+      issues: [],
+      jobs: [],
+      sessions: [],
+      agents: [{ ...agent, retiredAt: "yesterday" }],
     }),
   ).toThrow();
 });
@@ -305,4 +346,5 @@ it("uses only owned domain fixtures", () => {
   expect(Schema.decodeUnknownSync(Issue)(issue).epicId).toBe("ep-1");
   expect(Schema.decodeUnknownSync(Job)(job).kind).toBe("implement");
   expect(Schema.decodeUnknownSync(Session)(session).status).toBe("active");
+  expect(Schema.decodeUnknownSync(Agent)(agent).tools).toEqual(["read", "edit"]);
 });

@@ -46,6 +46,14 @@ Notes threaded to the contract's own decisions:
 - Wire field `pr` maps to the Swift property `pullRequest` via `CodingKeys`.
 - `WorkGraphEvent` is **upsert-only** — there is no `*Removed` variant (contract
   §events); a terminal status is an ordinary change.
+- The **registry layer** (`Agent`, mirrored in `Sources/SprinterContract/Registry.swift`)
+  rides the same two surfaces as the read model: `Snapshot.agents` and the
+  `AgentChanged` delta. It is **append-only**, so the upsert-only rule is exact —
+  an edit is a new revision linked by `supersedes` and a retirement is a `retiredAt`
+  stamp, so there is no delete on the contract and no `AgentRemoved`. Retired-ness is
+  read off `retiredAt`'s presence; there is deliberately no `AgentStatus` enum
+  (INV-SUM). `retiredAt` is the domain's `Timestamp` — an ISO-8601 UTC string on the
+  wire, so the mirror models it as `String`.
 - The streamed `events` **success is the `OffsetEvent` envelope** — `{ "offset":
   12, "event": { "_tag": "IssueChanged", … } }` — not the bare `WorkGraphEvent`
   (CE2.0). Each item pairs the delta with its durable `event_log`

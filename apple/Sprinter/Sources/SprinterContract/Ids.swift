@@ -58,3 +58,14 @@ public struct SessionId: StringIdentifier {
   public let rawValue: String
   public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+/// Identifies an ``Agent`` — a member of the registry layer: owned, global, scoped
+/// to no repository.
+///
+/// The registry is append-only, so an `AgentId` identifies one immutable REVISION:
+/// editing an agent mints a NEW id whose record points back at the previous one
+/// through ``Agent/supersedes``.
+public struct AgentId: StringIdentifier {
+  public let rawValue: String
+  public init(rawValue: String) { self.rawValue = rawValue }
+}
