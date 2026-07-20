@@ -63,6 +63,5 @@ and parallelism. At any time many workstreams run across many repos.
 - [`docs/architecture.md`](docs/architecture.md) — the reference architecture.
 - [`docs/decisions.md`](docs/decisions.md) — the decision log and rationale.
 - [`docs/plan/`](docs/plan/) — open workstream specs; one file per workstream.
-- [`docs/design/`](docs/design/) — design references behind the open workstreams.
 - [`docs/conventions.md`](docs/conventions.md) — naming & API conventions.
 - [`docs/policy.md`](docs/policy.md) — engineering policy (coverage, `check`, lint, pinning, CI).
