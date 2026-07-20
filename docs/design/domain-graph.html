@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sprinter — Domain Graph</title>
+
+<style>
+  /* ── Tokens ──────────────────────────────────────────────────────────
+     Deliberately single-theme (light). Pinned under the dark selectors
+     so the viewer toggle cannot invert the page.
+
+     Three axes, three encodings, no overlap:
+       LAYER      → hue (teal / plum / indigo; registry gets none)
+       STATUS     → grey→ochre ramp on the chip
+       OWNERSHIP  → a monochrome glyph, ▪ owned / ▫ referenced          */
+  :root {
+    color-scheme: light;
+
+    --paper:      #F5F7F5;
+    --card:       #FFFFFF;
+    --ink:        #16211F;
+    --ink-soft:   #46534F;
+    --ink-mute:   #74827D;
+    --rule:       #D8DFDB;
+    --rule-soft:  #E7ECE9;
+
+    --state:      #0F5257;
+    --state-wash: #E4EEEE;
+    --trans:      #6D3B5E;
+    --trans-wash: #F2E8EF;
+    --plan:       #33436B;
+    --plan-wash:  #E8EBF3;
+
+    --ochre:      #96601A;
+    --ochre-wash: #F6EEDF;
+
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, "Cascadia Mono", "Roboto Mono", monospace;
+    --serif: "Charter", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+
+    --fs-xs:   0.6875rem;
+    --fs-sm:   0.8125rem;
+    --fs-base: 1.0625rem;
+    --fs-lg:   1.25rem;
+    --fs-xl:   1.6rem;
+    --fs-2xl:  2.5rem;
+
+    --measure: 66ch;
+  }
+  @media (prefers-color-scheme: dark) { :root { color-scheme: light; } }
+  :root[data-theme="dark"], :root[data-theme="light"] { color-scheme: light; }
+
+  /* ── Base ────────────────────────────────────────────────────────── */
+  body {
+    background: var(--paper); color: var(--ink);
+    font-family: var(--serif); font-size: var(--fs-base); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 64rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; display: flex; flex-direction: column; gap: 4rem; }
+  a { color: var(--state); }
+  a:focus-visible { outline: 2px solid var(--state); outline-offset: 3px; border-radius: 2px; }
+
+  /* ── Typographic roles ───────────────────────────────────────────── */
+  .eyebrow {
+    font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--ink-mute); margin: 0;
+  }
+  h1 { font-family: var(--mono); font-size: var(--fs-2xl); font-weight: 600; letter-spacing: -0.02em; line-height: 1.05; margin: 0; text-wrap: balance; }
+  h2 { font-family: var(--mono); font-size: var(--fs-xl); font-weight: 600; letter-spacing: -0.015em; margin: 0; text-wrap: balance; }
+  h3 { font-family: var(--mono); font-size: var(--fs-base); font-weight: 600; margin: 0; }
+
+  p { margin: 0; max-width: var(--measure); }
+  .lede { font-size: var(--fs-lg); line-height: 1.5; color: var(--ink-soft); }
+
+  code, .m { font-family: var(--mono); font-size: 0.875em; }
+  code { color: var(--state); }
+
+  section { display: flex; flex-direction: column; gap: 1.5rem; }
+  .section-head { display: flex; flex-direction: column; gap: 0.5rem; }
+  hr.rule { border: 0; border-top: 1px solid var(--rule); margin: 0; }
+
+  /* ── Layer wrapper: hue injected per section ─────────────────────── */
+  .layer { border-left: 3px solid var(--hue); padding-left: 1.75rem; }
+  .layer .eyebrow { color: var(--hue); }
+  .layer .entity { border-left: 2px solid var(--hue); }
+  .layer .authority {
+    background: var(--wash); border-radius: 2px; padding: 0.85rem 1.1rem;
+    font-size: var(--fs-sm); color: var(--ink); max-width: var(--measure);
+  }
+  .layer .authority strong { font-family: var(--mono); font-size: 0.9em; letter-spacing: 0.03em; }
+
+  /* ── Status chips: monochrome grey → ochre ramp ──────────────────── */
+  .chip {
+    display: inline-flex; align-items: center; gap: 0.4em;
+    font-family: var(--mono); font-size: var(--fs-xs);
+    letter-spacing: 0.07em; text-transform: uppercase;
+    padding: 0.22em 0.6em; border-radius: 2px; white-space: nowrap;
+    border: 1px solid var(--rule); color: var(--ink-mute); background: #FBFCFB;
+  }
+  .chip-reshape { color: var(--ochre); border-color: #E0CDA8; background: #FDFAF4; }
+  .chip-gap     { color: var(--ochre); border-color: var(--ochre); border-style: dashed; background: var(--ochre-wash); }
+
+  /* ── Ownership label: glyph only, no colour budget spent ─────────── */
+  .own { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.1em; text-transform: uppercase; }
+  .own-owned { color: var(--ink); }
+  .own-ref   { color: var(--ink-mute); }
+
+  /* ── Header ──────────────────────────────────────────────────────── */
+  .masthead { display: flex; flex-direction: column; gap: 1.25rem; }
+  .stack { display: flex; flex-direction: column; border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
+  .stack-row {
+    display: grid; grid-template-columns: 8.5rem 1fr; gap: 0 1.25rem;
+    padding: 0.85rem 1.1rem; background: var(--card);
+    border-bottom: 1px solid var(--rule-soft); align-items: baseline;
+  }
+  .stack-row:last-child { border-bottom: 0; }
+  .stack-row .name {
+    font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--hue);
+    border-left: 3px solid var(--hue); padding-left: 0.7rem;
+  }
+  .stack-row .body { font-size: var(--fs-sm); color: var(--ink-soft); }
+  .stack-row .body .m { color: var(--ink); }
+
+  .principle {
+    border: 1px solid var(--rule); border-left: 3px solid var(--ochre);
+    background: var(--card); border-radius: 3px;
+    padding: 1.1rem 1.25rem; max-width: var(--measure);
+    font-size: var(--fs-base); line-height: 1.55;
+  }
+  .principle .lbl {
+    display: block; font-family: var(--mono); font-size: var(--fs-xs);
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ochre); margin-bottom: 0.5rem;
+  }
+
+  /* ── Diagrams ────────────────────────────────────────────────────────
+     Hand-authored inline SVG. No renderer, no build step, no dependency.
+     Node hue carries LAYER; a dashed stroke carries "does not exist yet",
+     so both axes read at once.                                          */
+  .diagram { background: var(--card); border: 1px solid var(--rule); border-radius: 3px; padding: 1.5rem 1rem; overflow-x: auto; }
+  .diagram svg { display: block; width: 100%; min-width: 34rem; height: auto; margin: 0 auto; }
+  .caption { font-size: var(--fs-sm); color: var(--ink-mute); max-width: var(--measure); }
+
+  /* bands */
+  .band      { fill: #FBFCFB; stroke: var(--rule); stroke-width: 1; }
+  .band-name { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.14em; fill: var(--ink-mute); }
+
+  /* nodes */
+  .nb        { stroke-width: 1.5; rx: 3; }
+  .n-plan    { fill: var(--plan-wash);  stroke: var(--plan); }
+  .n-state   { fill: var(--state-wash); stroke: var(--state); }
+  .n-trans   { fill: var(--trans-wash); stroke: var(--trans); }
+  .n-reg     { fill: #EFF1EF;           stroke: var(--ink-mute); }
+  .is-gap    { stroke-dasharray: 5 3.5; }
+
+  .nt        { font-family: var(--mono); font-size: 12px; text-anchor: middle; dominant-baseline: middle; }
+  .t-plan    { fill: #1E2840; }
+  .t-state   { fill: #0F2A2C; }
+  .t-trans   { fill: #3E2036; }
+  .t-reg     { fill: var(--ink); }
+
+  /* edges */
+  .e         { fill: none; stroke: var(--ink-mute); stroke-width: 1.3; }
+  .e-soft    { stroke-dasharray: 4 3; }
+  .e-strong  { stroke: var(--trans); stroke-width: 2; }
+  /* paint-order halo knocks the edge out from behind its own label,
+     so labels stay legible wherever a line passes under them */
+  .el        {
+    font-family: var(--mono); font-size: 10px; fill: var(--ink-mute);
+    paint-order: stroke; stroke: #FCFDFC; stroke-width: 3.5px; stroke-linejoin: round;
+  }
+  .el-mid    { text-anchor: middle; }
+  .el-end    { text-anchor: end; }
+  .el-strong { fill: var(--trans); font-size: 10.5px; letter-spacing: 0.04em; }
+  .dot       { fill: var(--ink-soft); }
+
+  /* ── Type sketch ─────────────────────────────────────────────────── */
+  .sketch {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+    padding: 1.4rem 1.5rem; overflow-x: auto;
+    font-family: var(--mono); font-size: var(--fs-sm); line-height: 1.85;
+    color: var(--ink); margin: 0; tab-size: 2;
+  }
+  .sketch .t { color: var(--state); font-weight: 600; }
+  .sketch .v { color: var(--trans); font-weight: 600; }
+  .sketch .c { color: var(--ink-mute); }
+
+  /* ── Entity cards ────────────────────────────────────────────────── */
+  .entities { display: grid; grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr)); gap: 1rem; }
+  .entity {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 3px;
+    padding: 1.15rem 1.25rem 1rem; display: flex; flex-direction: column; gap: 0.8rem;
+  }
+  .entity-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+  .entity-head .id { display: flex; flex-direction: column; gap: 0.3rem; }
+  .entity-gloss { font-size: var(--fs-sm); line-height: 1.5; color: var(--ink-soft); margin: 0; }
+
+  dl.fields {
+    display: grid; grid-template-columns: max-content 1fr; gap: 0.28rem 1rem; margin: 0;
+    font-family: var(--mono); font-size: var(--fs-sm); font-variant-numeric: tabular-nums;
+  }
+  dl.fields dt { color: var(--ink); }
+  dl.fields dd { margin: 0; color: var(--ink-mute); }
+  dl.fields dd.ref { color: var(--state); }
+  dl.fields dd.missing { color: var(--ochre); }
+  dl.fields dt.variant { color: var(--trans); font-weight: 600; }
+
+  .src {
+    font-family: var(--mono); font-size: var(--fs-xs); color: var(--ink-mute);
+    border-top: 1px solid var(--rule-soft); padding-top: 0.65rem; margin: 0; overflow-wrap: anywhere;
+  }
+
+  /* ── Tables ──────────────────────────────────────────────────────── */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 3px; background: var(--card); }
+  table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); }
+  th, td { text-align: left; padding: 0.7rem 1rem; border-bottom: 1px solid var(--rule-soft); vertical-align: top; }
+  thead th {
+    font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--ink-mute); font-weight: 500;
+    background: #FBFCFB; white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.m, th.m { font-family: var(--mono); }
+  td.nowrap { white-space: nowrap; }
+  td .lyr { font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.08em; text-transform: uppercase; }
+  .lyr-state { color: var(--state); }
+  .lyr-trans { color: var(--trans); }
+  .lyr-plan  { color: var(--plan); }
+  .lyr-reg   { color: var(--ink-mute); }
+  td .was { color: var(--ink-mute); }
+  td .now { color: var(--ochre); }
+
+  /* ── Unrepresentable list ────────────────────────────────────────── */
+  ul.illegal { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.55rem; }
+  ul.illegal li {
+    display: grid; grid-template-columns: 1.4rem 1fr; gap: 0.6rem;
+    font-size: var(--fs-sm); color: var(--ink-soft); align-items: baseline;
+  }
+  ul.illegal li::before { content: "×"; font-family: var(--mono); color: var(--ochre); font-size: 1rem; }
+  ul.illegal .m { color: var(--ink); }
+
+  /* ── Invariants ──────────────────────────────────────────────────── */
+  ul.invariants { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.65rem; }
+  ul.invariants li { display: grid; grid-template-columns: 1.6rem 1fr; gap: 0.5rem; font-size: var(--fs-sm); max-width: 78ch; }
+  ul.invariants li::before { content: "§"; font-family: var(--mono); color: var(--state); }
+  ul.invariants .status { color: var(--ochre); font-family: var(--mono); font-size: var(--fs-xs); letter-spacing: 0.06em; }
+
+  /* ── Open questions (a real queue, so numbering earns it) ────────── */
+  ol.questions { list-style: none; counter-reset: q; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1rem; }
+  ol.questions > li {
+    counter-increment: q; display: grid; grid-template-columns: 2.25rem 1fr; gap: 0 0.75rem;
+    background: var(--card); border: 1px solid var(--rule); border-radius: 3px; padding: 1.1rem 1.25rem;
+  }
+  ol.questions > li::before {
+    content: "Q" counter(q); font-family: var(--mono); font-size: var(--fs-xs);
+    color: var(--ochre); letter-spacing: 0.06em; padding-top: 0.25rem;
+  }
+  ol.questions h3 { grid-column: 2; }
+  ol.questions p { grid-column: 2; font-size: var(--fs-sm); color: var(--ink-soft); margin-top: 0.35rem; }
+
+  @media (max-width: 40rem) {
+    .page { padding: 2.5rem 1rem 4rem; gap: 3rem; }
+    .layer { padding-left: 1rem; }
+    .stack-row { grid-template-columns: 1fr; gap: 0.4rem; }
+    :root { --fs-2xl: 1.9rem; --fs-xl: 1.3rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <header class="masthead">
+    <p class="eyebrow">Sprinter · front-end domain modeling · working reference</p>
+    <h1>State, Transition, Plan</h1>
+    <p class="lede">A repository and its open issues are a <em>state</em>. Pull requests are <em>transitions</em> over it. Everything else is either the derivation of a transition or a plan for future ones. Two seams run through the model: which layer an object belongs to, and whether Sprinter owns it or merely references it.</p>
+
+    <div class="stack">
+      <div class="stack-row" style="--hue: var(--plan)">
+        <span class="name">Plan</span>
+        <span class="body"><span class="m">Workstream · Epic · dependsOn</span> — about the future. A partial order over intended transitions.</span>
+      </div>
+      <div class="stack-row" style="--hue: var(--trans)">
+        <span class="name">Transition</span>
+        <span class="body"><span class="m">Workspace → PullRequest · Attempt · Execution · Transcript</span> — proposed locally, applied externally. Only a merge takes effect.</span>
+      </div>
+      <div class="stack-row" style="--hue: var(--state)">
+        <span class="name">State</span>
+        <span class="body"><span class="m">Repository @ commit · open Issues</span> — the code host's. Sprinter can only observe it.</span>
+      </div>
+      <div class="stack-row" style="--hue: var(--ink-mute)">
+        <span class="name">Registry</span>
+        <span class="body"><span class="m">Agent</span> — not a layer. Global, scoped to no repository and no plan, with a lifecycle of its own. Executions reference into it.</span>
+      </div>
+    </div>
+
+    <p class="principle">
+      <span class="lbl">The through-line</span>
+      A fact about referenced state carries the state it was observed against — and is otherwise <strong>unknown</strong>, not stale. Staleness, ownership and mergeability are three instances of the same rule.
+    </p>
+  </header>
+
+  <hr class="rule" />
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">01 · The graph</p>
+      <h2>Three layers, a registry, one graph</h2>
+      <p>Solid edges hold today. Dashed edges are proposed. Note that <span class="m">Agent</span> attaches to <span class="m">Execution</span>, not to <span class="m">Attempt</span> — one attempt runs many agents.</p>
+    </div>
+
+    <div class="diagram">
+<svg viewBox="0 0 960 560" role="img" aria-labelledby="g1t g1d">
+  <title id="g1t">Sprinter domain graph</title>
+  <desc id="g1d">Four bands. Plan contains Workstream and Epic. State contains Issue and Repository. Transition contains Attempt, Execution, transcripts, Workspace and PullRequest. Registry contains Agent. Dashed outlines mark entities that do not exist in the model today.</desc>
+
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#74827D" />
+    </marker>
+  </defs>
+
+  <!-- bands -->
+  <rect class="band" x="8"  y="22"  width="944" height="92"  rx="4" />
+  <rect class="band" x="8"  y="132" width="944" height="92"  rx="4" />
+  <rect class="band" x="8"  y="242" width="944" height="172" rx="4" />
+  <rect class="band" x="8"  y="432" width="944" height="92"  rx="4" />
+  <text class="band-name" x="24" y="40">PLAN &#183; OWNED BY SPRINTER</text>
+  <text class="band-name" x="24" y="150">STATE &#183; THE CODE HOST&#8217;S, OBSERVED</text>
+  <text class="band-name" x="24" y="260">TRANSITION &#183; PROPOSAL REFERENCED, DERIVATION OWNED</text>
+  <text class="band-name" x="24" y="450">REGISTRY &#183; GLOBAL, SCOPED TO NOTHING</text>
+
+  <!-- ══ edges (drawn first so nodes sit on top) ══ -->
+  <!-- Workstream -> Epic -->
+  <path class="e" d="M278,75 H322" marker-end="url(#ah)" />
+  <text class="el el-mid" x="300" y="68">1 : &#8727;</text>
+
+  <!-- Epic -> Issue (spine) -->
+  <path class="e" d="M394,92 V160" marker-end="url(#ah)" />
+  <text class="el" x="402" y="130">1 : &#8727; plans</text>
+
+  <!-- Issue self-loop: dependsOn -->
+  <path class="e" d="M330,176 C296,176 296,194 330,194" marker-end="url(#ah)" />
+  <text class="el el-end" x="288" y="189">dependsOn &#8727; : &#8727;</text>
+
+  <!-- Repository -> Issue -->
+  <path class="e e-soft" d="M510,185 H466" marker-end="url(#ah)" />
+  <text class="el el-mid" x="488" y="178">1 : &#8727;</text>
+
+  <!-- Issue -> Attempt (spine) -->
+  <path class="e" d="M394,202 V262" marker-end="url(#ah)" />
+  <text class="el el-end" x="386" y="236">1 : &#8727; targets</text>
+
+  <!-- Attempt -> Execution -->
+  <path class="e" d="M458,287 H502" marker-end="url(#ah)" />
+  <text class="el el-mid" x="480" y="262">1 : &#8727; tree</text>
+
+  <!-- Execution -> LiveTranscript -->
+  <path class="e" d="M638,280 L752,266" marker-end="url(#ah)" />
+  <text class="el el-end" x="748" y="258">Running 1 : 1</text>
+
+  <!-- Execution -> SealedTranscript -->
+  <path class="e" d="M638,294 L752,328" marker-end="url(#ah)" />
+  <text class="el el-end" x="748" y="336">Finished 1 : 1</text>
+
+  <!-- Attempt -> Workspace -->
+  <path class="e" d="M348,304 L242,344" marker-end="url(#ah)" />
+  <text class="el el-end" x="330" y="332">Running 1 : 1</text>
+
+  <!-- Attempt -> PullRequest (spine) -->
+  <path class="e" d="M394,304 V342" marker-end="url(#ah)" />
+  <text class="el" x="402" y="328">Landed 1 : 1</text>
+
+  <!-- Workspace -> PullRequest -->
+  <path class="e e-soft" d="M278,367 H322" marker-end="url(#ah)" />
+  <text class="el el-mid" x="300" y="392">freezes into</text>
+
+  <!-- PullRequest -> Repository -->
+  <path class="e e-soft" d="M458,362 L528,222" marker-end="url(#ah)" />
+  <text class="el" x="492" y="330">target &#183; base</text>
+
+  <!-- PullRequest -> Issue (routed left of the spine) -->
+  <path class="e e-soft" d="M458,376 H478 V193 H466" marker-end="url(#ah)" />
+  <text class="el" x="486" y="372">closes 1 : &#8727;</text>
+
+  <!-- Agent -> Execution -->
+  <path class="e e-soft" d="M574,450 V312" marker-end="url(#ah)" />
+  <text class="el" x="584" y="386">1 : &#8727; across all repos</text>
+
+  <!-- ══ nodes ══ -->
+  <rect class="nb n-plan"  x="150" y="58"  width="128" height="34" />
+  <text class="nt t-plan"  x="214" y="76">Workstream</text>
+  <rect class="nb n-plan"  x="330" y="58"  width="128" height="34" />
+  <text class="nt t-plan"  x="394" y="76">Epic</text>
+
+  <rect class="nb n-state" x="330" y="168" width="128" height="34" />
+  <text class="nt t-state" x="394" y="186">Issue</text>
+  <rect class="nb n-state is-gap" x="510" y="168" width="128" height="34" />
+  <text class="nt t-state" x="574" y="186">Repository</text>
+
+  <rect class="nb n-trans" x="330" y="270" width="128" height="34" />
+  <text class="nt t-trans" x="394" y="288">Attempt</text>
+  <rect class="nb n-trans is-gap" x="510" y="270" width="128" height="34" />
+  <text class="nt t-trans" x="574" y="288">Execution</text>
+  <rect class="nb n-trans" x="760" y="250" width="152" height="34" />
+  <text class="nt t-trans" x="836" y="268">LiveTranscript</text>
+  <rect class="nb n-trans" x="760" y="310" width="152" height="34" />
+  <text class="nt t-trans" x="836" y="328">SealedTranscript</text>
+  <rect class="nb n-trans is-gap" x="150" y="350" width="128" height="34" />
+  <text class="nt t-trans" x="214" y="368">Workspace</text>
+  <rect class="nb n-trans" x="330" y="350" width="128" height="34" />
+  <text class="nt t-trans" x="394" y="368">PullRequest</text>
+
+  <rect class="nb n-reg is-gap" x="510" y="450" width="128" height="34" />
+  <text class="nt t-reg"   x="574" y="468">Agent</text>
+</svg>
+    </div>
+    <p class="caption">Dashed outlines mark entities that do not exist in the model today; each keeps its layer hue. <span class="m">Repository</span> is a service port with no identity; <span class="m">Agent</span> has no representation at all.</p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">02 · The seam</p>
+      <h2>Owned or referenced</h2>
+      <p>This cuts <em>across</em> the layers rather than aligning with them, and it is what determines whether a screen may offer an edit at all.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Entity</th><th>Layer</th><th>Ownership</th><th>What the front end may do</th></tr></thead>
+        <tbody>
+          <tr><td class="m">Workstream</td><td><span class="lyr lyr-plan">Plan</span></td><td class="own own-owned">▪ Owned</td><td>create, edit, reorder, abandon — optimistically</td></tr>
+          <tr><td class="m">Epic</td><td><span class="lyr lyr-plan">Plan</span></td><td class="own own-owned">▪ Owned · bindable</td><td>as above; may bind to a host milestone</td></tr>
+          <tr><td class="m">Attempt</td><td><span class="lyr lyr-trans">Transition</span></td><td class="own own-owned">▪ Owned</td><td>start, interrupt, abandon — the host knows nothing of it</td></tr>
+          <tr><td class="m">Execution</td><td><span class="lyr lyr-trans">Transition</span></td><td class="own own-owned">▪ Owned</td><td>watch, interrupt, answer — one per running agent</td></tr>
+          <tr><td class="m">Workspace</td><td><span class="lyr lyr-trans">Transition</span></td><td class="own own-owned">▪ Owned</td><td>inspect the diff so far; release. Never leaves the daemon whole.</td></tr>
+          <tr><td class="m">Transcript</td><td><span class="lyr lyr-trans">Transition</span></td><td class="own own-owned">▪ Owned</td><td>read, export, cite</td></tr>
+          <tr><td class="m">PullRequest</td><td><span class="lyr lyr-trans">Transition</span></td><td class="own own-ref">▫ Referenced</td><td>request a merge; never assume one. Refresh.</td></tr>
+          <tr><td class="m">Issue</td><td><span class="lyr lyr-state">State</span></td><td class="own own-ref">▫ Referenced</td><td>observe. A local close is a request that can fail.</td></tr>
+          <tr><td class="m">Repository</td><td><span class="lyr lyr-state">State</span></td><td class="own own-ref">▫ Referenced</td><td>observe only</td></tr>
+          <tr><td class="m">Agent</td><td><span class="lyr lyr-reg">Registry</span></td><td class="own own-owned">▪ Owned</td><td>define, revise, retire — never delete</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Read the Transition rows carefully — <strong>the layer is split by the seam.</strong> The proposal is referenced; the derivation is owned. Sprinter's entire durable contribution to the world is the derivation: the <em>why</em> behind a diff that the host stores without explanation.</p>
+
+    <p>Two consequences follow mechanically. <strong>Referenced entities carry an <code>observedAt</code>; owned ones do not</strong> — a reference without a timestamp is a claim about <em>now</em> that cannot be backed up. And <strong>referenced entities take no optimistic updates</strong>: a local write is a request to the host that may be rejected, so the only unconditionally correct local operation is refresh.</p>
+  </section>
+
+  <!-- ══ STATE ══════════════════════════════════════════════════════ -->
+  <section class="layer" style="--hue: var(--state); --wash: var(--state-wash)">
+    <div class="section-head">
+      <p class="eyebrow">03 · State</p>
+      <h2>Repository @ refs, and the open issue set</h2>
+    </div>
+
+    <p class="authority"><strong>AUTHORITY — the code host. Referenced throughout.</strong> Sprinter never writes here. Every value is a replica, and it can change while Sprinter is doing nothing at all.</p>
+
+    <p>The state is compound and moves atomically: a merge advances the code <em>and</em> removes issues from the open set in one step. <code>Closes #12</code> in a pull request body is not a convenience — it is the issue-half of the transition's effect, which is why <code>closes</code> belongs on the PullRequest rather than being inferred.</p>
+
+    <p>Git already gives the state an identity we are not using. A commit <em>is</em> a state; a merge <em>is</em> a transition applied. And because a transition may target something other than the default branch, the repository's state is not one head but a map of refs.</p>
+
+    <div class="entities">
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Repository</h3><span class="own own-ref">▫ Referenced</span></span>
+          <span class="chip chip-gap">Gap</span>
+        </div>
+        <p class="entity-gloss">The state's container and its identity. Today a <em>service port</em>, not an entity — repo identity in the domain is a bare string on <code>Workstream</code>, so nothing can name the state a transition was computed against.</p>
+        <dl class="fields">
+          <dt>id</dt><dd class="missing">RepositoryId — none</dd>
+          <dt>host · owner · name</dt><dd class="missing">none</dd>
+          <dt>defaultBranch</dt><dd>on the port only</dd>
+          <dt>refs</dt><dd class="missing">BranchName → CommitSha</dd>
+          <dt>observedAt</dt><dd class="missing">none</dd>
+        </dl>
+        <p class="src">packages/repository/src/repository.ts:139 — <span class="m">Context.Service</span>, groups <span class="m">code · issues · pullRequests</span></p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Issue</h3><span class="own own-ref">▫ Referenced</span></span>
+          <span class="chip chip-reshape">Reshape</span>
+        </div>
+        <p class="entity-gloss">An element of the open set — the residual between the repository as it is and as it should be. Becomes a sum so <em>fixed</em> and <em>dismissed</em> stop sharing one enum, and so a fixed issue cannot exist without the transition that fixed it.</p>
+        <dl class="fields">
+          <dt>id</dt><dd>IssueId</dd>
+          <dt>repositoryId</dt><dd class="missing">derived by walking up</dd>
+          <dt>epicId</dt><dd class="ref">EpicId — plan link</dd>
+          <dt>number · title</dt><dd>PositiveInt · string</dd>
+          <dt>dependsOn</dt><dd class="ref">IssueId[] — DAG</dd>
+          <dt class="variant">Fixed.by</dt><dd class="ref">PullRequestId — merged</dd>
+          <dt class="variant">Dismissed.reason</dt><dd class="missing">no such state today</dd>
+          <dt>observedAt</dt><dd class="missing">none</dd>
+        </dl>
+        <p class="src">packages/domain/src/read-model.ts:92 — replaces <span class="m">status: IssueStatus</span> + <span class="m">pr?</span></p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ══ TRANSITION ═════════════════════════════════════════════════ -->
+  <section class="layer" style="--hue: var(--trans); --wash: var(--trans-wash)">
+    <div class="section-head">
+      <p class="eyebrow">04 · Transition</p>
+      <h2>Only a merge advances the machine</h2>
+    </div>
+
+    <p class="authority"><strong>AUTHORITY — split, and so is ownership.</strong> Sprinter authors transitions; the host applies them. The proposal is referenced, the derivation is owned. An agent can propose all day and the state does not move.</p>
+
+    <div class="diagram">
+<svg viewBox="0 0 760 300" role="img" aria-labelledby="g2t g2d">
+  <title id="g2t">Only a merge advances the state</title>
+  <desc id="g2d">State S0 has three self-loops: attempt running, pull request opened, and pull request closed unmerged. A single labelled arrow, merged closes issue 12, advances to state S1.</desc>
+
+  <defs>
+    <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#74827D" />
+    </marker>
+    <marker id="ah2s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6D3B5E" />
+    </marker>
+  </defs>
+
+  <!-- self-loops -->
+  <path class="e" d="M120,180 C120,140 200,140 200,178" marker-end="url(#ah2)" />
+  <text class="el el-mid" x="160" y="140">attempt running</text>
+  <path class="e" d="M100,180 C94,86 226,86 220,178" marker-end="url(#ah2)" />
+  <text class="el el-mid" x="160" y="100">pull request opened</text>
+  <path class="e" d="M80,180 C70,26 250,26 240,178" marker-end="url(#ah2)" />
+  <text class="el el-mid" x="160" y="55">pull request closed unmerged</text>
+
+  <!-- entry -->
+  <circle class="dot" cx="30" cy="206" r="5" />
+  <path class="e" d="M38,206 H52" marker-end="url(#ah2)" />
+
+  <!-- the only real transition -->
+  <path class="e e-strong" d="M262,206 H492" marker-end="url(#ah2s)" />
+  <text class="el el-strong el-mid" x="377" y="198">MERGED &#8212; closes #12</text>
+
+  <rect class="nb n-state" x="60"  y="180" width="202" height="52" />
+  <text class="nt t-state" x="161" y="199">Repo @ c0</text>
+  <text class="nt t-state" x="161" y="219">open {12, 14}</text>
+
+  <rect class="nb n-state" x="492" y="180" width="202" height="52" />
+  <text class="nt t-state" x="593" y="199">Repo @ c1</text>
+  <text class="nt t-state" x="593" y="219">open {14}</text>
+</svg>
+    </div>
+    <p class="caption">Three of the four events are self-loops. Everything an agent does is speculative until a merge commits it.</p>
+
+    <h3>Attempt and Execution are different things</h3>
+    <p>An Attempt is <em>one bounded effort to resolve an Issue</em>: picked up, worked, proposed, reviewed, and driven until the pull request merges — or given up on. An Execution is <em>one agent's continuous run</em>, and it yields exactly one transcript. These have different cardinalities, and collapsing them models only the simplest possible case.</p>
+
+    <p><strong>The Attempt is the scope boundary, not a stage within it.</strong> Everything from triage to merge happens inside one — review and merge-verification included. How that work is orchestrated underneath is an implementation question and will not resemble a chain of skills, but the unit itself holds: one issue in, one merged pull request or one abandonment out.</p>
+
+    <p>An attempt may fan out — an agent delegating to a specialist, a verifier, a second opinion — and each of those is a separate run with its own transcript, its own agent revision and its own lifetime. So executions form a <strong>tree</strong> rooted at the attempt, and <code>agentId</code> belongs on the execution, never on the attempt.</p>
+
+    <p>The tree stops at the attempt boundary. <strong>Agents derive transitions; they do not plan.</strong> Sequencing an epic's issues, respecting <code>dependsOn</code>, deciding what runs next — that is deterministic daemon logic, not agent work, so it has no execution, no agent and no transcript. An Execution's only subject is its Attempt.</p>
+
+<pre class="sketch"><span class="c">// One agent's continuous run. Exactly one transcript. Forms a tree.</span>
+<span class="t">Execution</span> =
+  | <span class="v">Running</span>  { id, attemptId, agentId, parent: <span class="t">ExecutionId</span>?,
+               transcript: <span class="t">LiveTranscript</span> }
+  | <span class="v">Finished</span> { id, attemptId, agentId, parent: <span class="t">ExecutionId</span>?,
+               transcript: <span class="t">SealedTranscript</span>, outcome }
+
+<span class="c">// One issue, picked up and driven all the way to merged — or given up.</span>
+<span class="c">// Running holds a workspace; the terminal variants cannot — it is gone.</span>
+<span class="c">// The optional PR on Running is honest: mid-flight, one may not exist yet.</span>
+<span class="t">Attempt</span> =
+  | <span class="v">Running</span>   { id, issueId, base, root: <span class="t">ExecutionId</span>,
+                  workspace: <span class="t">Workspace</span>,
+                  pullRequest: <span class="t">PullRequestId</span>? }
+  | <span class="v">Abandoned</span> { id, issueId, base, root: <span class="t">ExecutionId</span>, reason }
+  | <span class="v">Landed</span>    { id, issueId, base, root: <span class="t">ExecutionId</span>,
+                  pullRequest: <span class="t">PullRequestId</span> }   <span class="c">// observed Merged</span>
+
+<span class="c">// The in-flight mutation. Owned, local, uncommitted, ephemeral.</span>
+<span class="c">// These fields are the teardown checklist, currently maintained by hand.</span>
+<span class="t">Workspace</span> = {
+  id, attemptId, base: <span class="t">CommitSha</span>,
+  path, branch, diff,
+  processes, ports, tasks
+}</pre>
+
+    <p>Three things follow. The <strong>attempt's transcript is a composition, not a thing</strong> — what a screen renders is the root execution's transcript with spawn tool-calls expanded inline into their children, which is how these are already read. <strong>Cost is a fold over the tree</strong>: <code>Usage</code> is per-turn on session events today, and an attempt's total is a sum across its executions — currently unaskable. And the <strong>freeze relocates without changing</strong>: live on <code>Running</code>, sealed on <code>Finished</code>, one transcript per execution, total.</p>
+
+    <h3>The handoff — derivation and mutation freeze at different times</h3>
+    <p>Sealed transcripts paired with a merged pull request are a natural unit: <em>why it changed</em> beside <em>what changed</em>, both immutable. The in-flight analog is the same two halves unfrozen — live transcripts beside the <strong>worktree</strong>, the uncommitted diff against <code>base</code>.</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Derivation — why</th><th>Mutation — what</th><th>Ownership of the mutation</th></tr></thead>
+        <tbody>
+          <tr><td class="m nowrap">working</td><td class="m">LiveTranscript</td><td class="m">Workspace</td><td class="own own-owned">▪ Owned · local, uncommitted</td></tr>
+          <tr><td class="m nowrap">proposed</td><td class="m">still accumulating</td><td class="m">PullRequest.Open</td><td class="own own-ref">▫ Referenced — the handoff</td></tr>
+          <tr><td class="m nowrap">landed</td><td class="m">SealedTranscript ∗</td><td class="m">PullRequest.Merged</td><td class="own own-ref">▫ Referenced</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The mutation crosses the ownership seam <em>mid-attempt</em>: the moment a pull request opens, the diff stops being Sprinter's and becomes the host's. The derivation does not seal then — review and fixes are still to come, and each adds executions. Only when the attempt terminates is every transcript in its tree sealed.</p>
+
+    <p>So the two halves freeze at different moments, and the natural unit is the attempt's terminal state: <strong>all executions sealed, and a pull request observed merged.</strong> That is <code>Attempt.Landed</code> — the pairing you can point at is a variant, not a join.</p>
+
+    <p>Modelling the in-flight half also gives teardown a home. The <code>teardown</code> checklist — processes, bound ports, background task ids, a launched browser, the worktree, its branches — is the untyped field list of a <code>Workspace</code>. As an entity, releasing it is <em>drop the workspace</em> rather than a procedure someone has to remember, and a leaked one becomes unrepresentable rather than merely discouraged.</p>
+
+    <h3>Target and base are different things</h3>
+    <p>A branch cannot be the base, because a mutable pointer makes staleness undecidable — you cannot compare against a thing that redefines itself. A commit cannot be the target, because <em>this lands on main</em> is what the pull request means and no sha expresses it.</p>
+
+<pre class="sketch"><span class="c">// A transition. Endpoints are not optional — they are what makes it one.</span>
+<span class="t">PullRequest</span> = {
+  id, repositoryId, number, url,
+  target: <span class="t">BranchName</span>,       <span class="c">// where it is destined to apply — intent, stable</span>
+  base:   <span class="t">CommitSha</span>,        <span class="c">// the state it was computed from — fact, immutable</span>
+  head:   <span class="t">CommitSha</span>,        <span class="c">// the state it proposes</span>
+  state:  <span class="v">Open</span> | <span class="v">Merged</span> { at: <span class="t">CommitSha</span> } | <span class="v">Closed</span>,
+  closes: <span class="t">IssueId</span>[],        <span class="c">// the issue-half of the effect</span>
+  mergeability: <span class="t">Mergeability</span>,
+  observedAt
+}
+
+<span class="c">// Never a stored boolean. A verdict is a function of</span>
+<span class="c">// (transition, current target state) — so it carries that state.</span>
+<span class="t">Mergeability</span> = {
+  applies:  <span class="v">Clean</span> | <span class="v">Conflicted</span> { paths },   <span class="c">// git decides — cheap</span>
+  verified: <span class="v">Passed</span> | <span class="v">Failed</span> | <span class="v">NotRun</span>,     <span class="c">// checks decide — expensive</span>
+  against:  <span class="t">CommitSha</span>                     <span class="c">// what both were computed on</span>
+}</pre>
+
+    <p>Staleness is then a comparison rather than a stored flag: <code>tipOf(pr.target) ≠ pr.base</code>. And a <code>Mergeability</code> whose <code>against</code> is behind that tip is <strong>unknown</strong> — the front end must render it as such, never as the last value it happened to see.</p>
+
+    <h3>Three signals, easy to confuse</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Signal</th><th>Who decides</th><th>Cost</th><th>What it actually means</th></tr></thead>
+        <tbody>
+          <tr><td class="m nowrap">diverged</td><td>comparison</td><td>free</td><td>nearly always true on an active repo. Not a problem, and a UI that flags it is noise.</td></tr>
+          <tr><td class="m nowrap">applies</td><td>git</td><td>cheap</td><td>textual only. Clean means almost nothing about whether the result works.</td></tr>
+          <tr><td class="m nowrap">verified</td><td>full check on the combined state</td><td>expensive</td><td>the only signal that gates a merge. Two transitions can both apply cleanly and still break each other.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>N attempts derive transitions from the same base. At most one applies cleanly; the rest must be recomputed against the state that won. This is optimistic concurrency, and the model has no version column.</p>
+
+    <p>One subtlety the endpoints expose: <strong>after a rebase, the Attempt's base and the PullRequest's base diverge.</strong> The transcripts explain a derivation from <code>c0</code> while the pull request now proposes from <code>c5</code>. The provenance link weakens without breaking, and the model should be able to say so rather than implying the transcripts still describe the diff.</p>
+
+    <div class="entities">
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Attempt</h3><span class="own own-owned">▪ Owned</span></span>
+          <span class="chip chip-reshape">Reshape</span>
+        </div>
+        <p class="entity-gloss">Formerly <code>Job</code>. One bounded effort at one Issue, from pickup through merge — many per Issue, most not the one that landed. The scope boundary for all agent work. Holds no agent and no transcript of its own; both live on its executions.</p>
+        <dl class="fields">
+          <dt>id</dt><dd>AttemptId</dd>
+          <dt>issueId</dt><dd class="ref">IssueId</dd>
+          <dt>base</dt><dd class="missing">CommitSha — derived against</dd>
+          <dt>root</dt><dd class="missing">ExecutionId</dd>
+          <dt class="variant">Running</dt><dd class="missing">+ Workspace, PR?</dd>
+          <dt class="variant">Abandoned</dt><dd>+ reason, no PR</dd>
+          <dt class="variant">Landed</dt><dd class="ref">+ PullRequestId, merged</dd>
+        </dl>
+        <p class="src">packages/domain/src/read-model.ts:133 — drops <span class="m">transcriptRef</span>, <span class="m">sessionId</span>, <span class="m">kind</span>, <span class="m">pr</span></p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Execution</h3><span class="own own-owned">▪ Owned</span></span>
+          <span class="chip chip-gap">Gap</span>
+        </div>
+        <p class="entity-gloss">One agent's continuous run, and the tree node — a delegating agent's execution parents the one it delegates to. This is where <code>agentId</code> and the transcript actually live. Always subordinate to exactly one Attempt. <code>ExecutionRunner</code> already exists in the runner; the entity does not.</p>
+        <dl class="fields">
+          <dt>id</dt><dd class="missing">ExecutionId — none</dd>
+          <dt>agentId</dt><dd class="missing">AgentId — a revision</dd>
+          <dt>attemptId</dt><dd class="missing">AttemptId — its only subject</dd>
+          <dt>parent</dt><dd class="missing">ExecutionId? — the tree</dd>
+          <dt class="variant">Running</dt><dd>transcript: Live</dd>
+          <dt class="variant">Finished</dt><dd>Sealed + outcome</dd>
+        </dl>
+        <p class="src">packages/job/src/execution-runner.ts:56 — the runner exists, the domain entity does not</p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Workspace</h3><span class="own own-owned">▪ Owned · ephemeral</span></span>
+          <span class="chip chip-gap">Gap</span>
+        </div>
+        <p class="entity-gloss">The in-flight mutation — the merged pull request's unfrozen analog. Held only by <code>Attempt.Running</code>, so its absence in every terminal variant is structural. Its field list is what <code>teardown</code> tracks by hand today.</p>
+        <dl class="fields">
+          <dt>id</dt><dd class="missing">WorkspaceId — none</dd>
+          <dt>attemptId</dt><dd class="missing">AttemptId</dd>
+          <dt>base</dt><dd class="missing">CommitSha</dd>
+          <dt>path · branch</dt><dd class="missing">the worktree</dd>
+          <dt>diff</dt><dd class="missing">uncommitted changes</dd>
+          <dt>processes · ports · tasks</dt><dd class="missing">the leak surface</dd>
+        </dl>
+        <p class="src">no domain representation — the concept lives only in the <span class="m">teardown</span> skill's checklist</p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Transcript</h3><span class="own own-owned">▪ Owned</span></span>
+          <span class="chip chip-reshape">Reshape</span>
+        </div>
+        <p class="entity-gloss">The derivation, and the thing only Sprinter has. One per <em>execution</em> — not per attempt. Splits into two types so the freeze is enforced by the compiler rather than by a flag, and so a live subscription is unrepresentable on a finished execution.</p>
+        <dl class="fields">
+          <dt class="variant">LiveTranscript</dt><dd>open range + tail</dd>
+          <dt class="variant">SealedTranscript</dt><dd>[0, N], immutable</dd>
+          <dt>events</dt><dd>SessionEvent[]</dd>
+          <dt>address</dt><dd class="missing">SessionId → ExecutionId</dd>
+        </dl>
+        <p class="src">session_event_log · packages/domain/src/session.ts:100 · SprinterSession/TranscriptProjection.swift:20</p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Session</h3><span class="own own-owned">▪ Owned</span></span>
+          <span class="chip chip-gap">Absorbed</span>
+        </div>
+        <p class="entity-gloss">Returns as <code>Execution</code>, but for the opposite reason it was retired. The <code>UNIQUE session_job(jobId)</code> index was not modeling reality — it was asserting one agent per unit of work, which is false the moment a skill spawns a subagent. <code>SessionId</code> stays a runner handle, out of the contract.</p>
+        <dl class="fields">
+          <dt>id</dt><dd class="missing">SessionId — runner-internal</dd>
+          <dt>jobId</dt><dd class="missing">UNIQUE — the false invariant</dd>
+          <dt>status</dt><dd class="missing">→ Execution variants</dd>
+        </dl>
+        <p class="src">read-model.ts:145 · sessionIdFor() at packages/job/src/job-runner.ts:51 · UNIQUE session_job(jobId)</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ══ PLAN ═══════════════════════════════════════════════════════ -->
+  <section class="layer" style="--hue: var(--plan); --wash: var(--plan-wash)">
+    <div class="section-head">
+      <p class="eyebrow">05 · Plan</p>
+      <h2>A partial order over intended transitions</h2>
+    </div>
+
+    <p class="authority"><strong>AUTHORITY — Sprinter. Owned throughout.</strong> The only layer Sprinter fully owns. It is about the future, so it is the only layer that can be <em>wrong</em> without being invalid.</p>
+
+    <p>Workstream and Epic are neither state nor transition — they are intent. This is what <code>dependsOn</code> has always been: a topological constraint on the order transitions may be applied in, not a property of any issue on its own.</p>
+
+    <p>It also explains the flat <code>WorkStatus</code> on both. Plan objects have no terminal state of their own; their completion is a fold over the state layer. The enum is a cache, and caches drift.</p>
+
+    <p><strong>This layer is driven deterministically.</strong> Topologically sorting an epic's issues, honouring <code>dependsOn</code>, choosing what dispatches next — that is daemon logic, not agent work. It has no execution, no agent revision and no transcript, and nothing here is a subject an agent operates on. Agents derive transitions; the plan layer decides which ones to ask for.</p>
+
+    <p>That is worth stating as a boundary rather than an implementation note: it means the plan layer needs no provenance at all. Its behaviour is reproducible from its inputs, so an audit trail here is an event log, not a transcript.</p>
+
+    <p>An Epic may additionally <em>bind</em> to a host milestone. That does not make it referenced — the Epic stays Sprinter's, and the binding is a reference it holds, which is exactly the distinction the seam draws.</p>
+
+    <div class="entities">
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Workstream</h3><span class="own own-owned">▪ Owned</span></span>
+          <span class="chip chip-reshape">Reshape</span>
+        </div>
+        <p class="entity-gloss">The largest unit of intent. Owns a repo by string, which makes a cross-repo workstream unrepresentable — and the <code>status</code> enum is a fold over issues it does not hold directly.</p>
+        <dl class="fields">
+          <dt>id</dt><dd>WorkstreamId</dd>
+          <dt>name</dt><dd>string</dd>
+          <dt>repo</dt><dd class="missing">string → RepositoryId</dd>
+          <dt>status</dt><dd class="missing">stored → derived</dd>
+          <dt>epics</dt><dd class="ref">EpicId[]</dd>
+        </dl>
+        <p class="src">packages/domain/src/read-model.ts:118</p>
+      </article>
+
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Epic</h3><span class="own own-owned">▪ Owned · bindable</span></span>
+          <span class="chip chip-reshape">Reshape</span>
+        </div>
+        <p class="entity-gloss">A coherent slice of intent. Pure containment — carries no repo and no outcome of its own, which is correct for a plan object. Same cache problem on <code>status</code>; may hold a reference to a host milestone.</p>
+        <dl class="fields">
+          <dt>id</dt><dd>EpicId</dd>
+          <dt>workstreamId</dt><dd class="ref">WorkstreamId</dd>
+          <dt>name</dt><dd>string</dd>
+          <dt>status</dt><dd class="missing">stored → derived</dd>
+          <dt>milestone</dt><dd class="missing">Ref&lt;Milestone&gt;?</dd>
+          <dt>issues</dt><dd class="ref">IssueId[]</dd>
+        </dl>
+        <p class="src">packages/domain/src/read-model.ts:104</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ══ REGISTRY ═══════════════════════════════════════════════════ -->
+  <section class="layer" style="--hue: var(--ink-mute); --wash: #F1F3F1">
+    <div class="section-head">
+      <p class="eyebrow">06 · Registry</p>
+      <h2>Agent — scoped to nothing</h2>
+    </div>
+
+    <p class="authority"><strong>AUTHORITY — Sprinter. Owned, and global.</strong> Not a layer. An Agent belongs to no repository, no workstream and no attempt; it has a lifecycle of its own and can be used anywhere. Executions reference into it.</p>
+
+    <p>That global scope is what forces the shape. A single revision is referenced by Executions across <em>many</em> repositories, so mutating one would corrupt provenance everywhere at once rather than locally. Agents are therefore <strong>append-only</strong>: editing writes a new revision, and a stable name groups revisions for filtering.</p>
+
+    <p>It also makes deletion unrepresentable. An Agent referenced by any Execution can only be <em>retired</em> — never removed — or the sealed transcripts that name it point at nothing.</p>
+
+    <p>Anything repository-shaped about an agent is therefore derived, never stored. "Agents used in this repo" is a fold over that repo's Executions.</p>
+
+    <div class="entities">
+      <article class="entity">
+        <div class="entity-head">
+          <span class="id"><h3>Agent</h3><span class="own own-owned">▪ Owned · global</span></span>
+          <span class="chip chip-gap">Gap</span>
+        </div>
+        <p class="entity-gloss">Who derived a transition, and the last link in the provenance chain. Nothing today records who ran, on what model, at what version — <code>JobKind</code> stands in, but that is a task type, not an actor.</p>
+        <dl class="fields">
+          <dt>id</dt><dd class="missing">AgentId — a revision</dd>
+          <dt>name</dt><dd class="missing">stable, groups revisions</dd>
+          <dt>model · version</dt><dd class="missing">none</dd>
+          <dt>tools</dt><dd class="missing">none</dd>
+          <dt>supersedes</dt><dd class="missing">AgentId? — prior revision</dd>
+          <dt>retiredAt</dt><dd class="missing">no deletion, ever</dd>
+        </dl>
+        <p class="src">nearest existing concept: <span class="m">JobKind</span> at read-model.ts:51 — no repository or workstream scope</p>
+      </article>
+    </div>
+  </section>
+
+  <hr class="rule" />
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">07 · Projections</p>
+      <h2>Landing — a shape, not a thing</h2>
+    </div>
+
+    <p><code>[SealedTranscripts, merged PullRequest]</code> is the record you want when you ask <em>why does this code look like this</em>. Once the Attempt spans through to merge, that pairing has an obvious home: it is <code>Attempt.Landed</code> together with its execution tree. Not a cross-entity join — a variant and its children.</p>
+
+    <p>Which is why it should stay <strong>derived</strong>. Everything it shows already exists on the attempt, its executions and the referenced pull request; as an entity it could only disagree with its own parts, and it would need storage to hold nothing new. Being derived costs it nothing — the attempt's identity <em>is</em> its address, so a Landing can be linked, cited and deep-linked without being a row.</p>
+
+    <p>But because it is always presented as a unit, it belongs in the <strong>contract</strong>, not only in the client. The daemon composes it once; the app does not walk <span class="m">Attempt → Executions → Transcripts → PullRequest</span> over four round trips to render one pane.</p>
+
+    <p class="principle">
+      <span class="lbl">Domain is not contract</span>
+      The domain carries what the system needs; the contract carries what the interface needs. <code>Workspace</code> is the clean case in the other direction — an entity in the domain, but process ids and bound ports have no business crossing to the app. The Swift mirror mirrors the <em>contract</em>, and the contract is a projection.
+    </p>
+
+    <p>The one thing that would flip Landing into an entity: if it ever needs to carry something not derivable — a human annotation, a curation flag, a note about why it mattered. Then it needs identity and storage, and this decision should be revisited rather than patched.</p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">08 · Stored and derived</p>
+      <h2>State is a fold over applied transitions</h2>
+      <p>Which means much of what is stored today is a cache of that fold, free to disagree with it. Every row is a place two sources of truth currently coexist.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th class="m">Today</th><th class="m">Under this model</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td class="nowrap"><span class="lyr lyr-state">State</span></td><td class="m was">Issue.status</td><td class="m now">derived</td><td>an issue is open iff it is in the current open set</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-state">State</span></td><td class="m was">Issue.pr</td><td class="m now">derived</td><td>the merged PullRequest whose <span class="m">closes</span> contains it</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">PullRequestRef.merged</td><td class="m now">observed</td><td>a three-way lifecycle the host owns, not a boolean</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">— (nothing)</td><td class="m now">derived</td><td>staleness is <span class="m">tipOf(target) ≠ base</span>, never stored</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">Job.transcriptRef</td><td class="m now">composed</td><td>an attempt's transcript is a walk of its execution tree</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">— (nothing)</td><td class="m now">folded</td><td>an attempt's cost is a sum of usage across its executions</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">JobStatus + SessionStatus</td><td class="m now">the variant</td><td>one lifecycle cannot disagree with itself</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">sealed (inferred)</td><td class="m now">the type</td><td>Live and Sealed have disjoint affordances</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-plan">Plan</span></td><td class="m was">Epic.status · Workstream.status</td><td class="m now">derived</td><td>plan objects have no terminal state of their own</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-trans">Transition</span></td><td class="m was">— (nothing)</td><td class="m now">projected</td><td>a Landing is a merged PR joined to its attempt's transcripts</td></tr>
+          <tr><td class="nowrap"><span class="lyr lyr-reg">Registry</span></td><td class="m was">— (nothing)</td><td class="m now">derived</td><td>"agents used in this repo" is a fold over executions</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">09 · The freeze</p>
+      <h2>Live and sealed differ mechanically</h2>
+      <p>The reason the split is two types and not a boolean: disjoint affordances, and the front end pays for confusing them. One transcript per execution — so an attempt can hold both kinds at once.</p>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Property</th><th>LiveTranscript</th><th>SealedTranscript</th></tr></thead>
+        <tbody>
+          <tr><td class="m">offset range</td><td>open — needs a tail subscription</td><td class="m">[0, N] — fetch once</td></tr>
+          <tr><td class="m">cache</td><td>invalid on arrival</td><td>valid indefinitely</td></tr>
+          <tr><td class="m">affordances</td><td>interrupt, answer UI request, send input</td><td>export, search, diff, cite</td></tr>
+          <tr><td class="m">held by</td><td class="m">Execution.Running</td><td class="m">Execution.Finished</td></tr>
+          <tr><td class="m">failure mode</td><td>stale view if the tail drops</td><td>a socket held open on an execution that ended last week</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">10 · Today</p>
+      <h2>States the current model admits</h2>
+      <p>Each is a rule encoded as an enum plus an optional field, or an index asserting an invariant the domain does not have. None are bugs to fix; the type allows them.</p>
+    </div>
+
+    <ul class="illegal">
+      <li><span><span class="m">Issue.status = landed</span> with <span class="m">Issue.pr = undefined</span> — fixed, with no transition that fixed it</span></li>
+      <li><span><span class="m">Job.status = completed</span> with <span class="m">transcriptRef = undefined</span> — a derivation that left no record</span></li>
+      <li><span><span class="m">Job.status = completed</span> while <span class="m">Session.status = running</span> — two lifecycles for one thing</span></li>
+      <li><span><span class="m">Issue.pr</span> and <span class="m">Job.pr</span> disagreeing about the same issue</span></li>
+      <li><span>An issue closed as <em>wontfix</em> indistinguishable from one closed by a merge</span></li>
+      <li><span>A transition with no base — <em>unrepresentable that it is stale</em>, which is the failure that actually costs merges</span></li>
+      <li><span>A referenced value with no <span class="m">observedAt</span> — an unbacked claim about now, rendered as though it were live</span></li>
+      <li><span><span class="m">UNIQUE session_job(jobId)</span> — one agent per unit of work, false the moment a skill spawns a subagent</span></li>
+      <li><span>A subagent's transcript with nowhere to live, and no parent to hang from</span></li>
+      <li><span>A worktree, port or process outliving the attempt that opened it — teardown is a remembered procedure, not a structural guarantee</span></li>
+      <li><span>An in-flight diff that no screen can show, because the mutation has no model until it becomes a pull request</span></li>
+      <li><span>A merge that happened outside Sprinter, with nowhere to land</span></li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">11 · Invariants</p>
+      <h2>What the shape guarantees</h2>
+    </div>
+    <ul class="invariants">
+      <li><span>Only a merged PullRequest advances the state. Every other event is a self-loop.</span></li>
+      <li><span><span class="m">base</span> is always a commit; <span class="m">target</span> is always a branch. Staleness is decidable only because of the first.</span></li>
+      <li><span>Sprinter authors transitions and never applies them. An Attempt drives toward a merge but cannot perform one — it reaches <span class="m">Landed</span> only when its PullRequest is <em>observed</em> Merged.</span></li>
+      <li><span>A merge moves both halves of the state — code and open set — atomically.</span></li>
+      <li><span>Every fact about referenced state carries the state it was observed against.</span></li>
+      <li><span>A verdict whose <span class="m">against</span> is behind the target tip is <strong>unknown</strong>, not its last value.</span></li>
+      <li><span>Referenced entities carry <span class="m">observedAt</span>; owned entities do not, and take optimistic updates.</span></li>
+      <li><span>Every Execution holds exactly one Transcript, in both variants. <span class="status">total</span></span></li>
+      <li><span>An Attempt holds one or more Executions, arranged as a tree under its root.</span></li>
+      <li><span>An Execution is subordinate to exactly one Attempt. Agents derive transitions and never plan; the plan layer is deterministic and has no executions at all.</span></li>
+      <li><span>An Attempt holds no agent and no transcript of its own. Both belong to executions.</span></li>
+      <li><span>Only <span class="m">Attempt.Running</span> holds a Workspace. A leaked worktree is unrepresentable, not merely discouraged.</span></li>
+      <li><span>The mutation crosses from owned to referenced when the pull request opens; the derivation seals only when the Attempt terminates. The two do not coincide.</span></li>
+      <li><span>Only <span class="m">Attempt.Landed</span> holds a PullRequest <em>required</em>, and exactly one. <span class="status">partial</span></span></li>
+      <li><span>An Attempt spans pickup through merge. Review and merge-verification are executions inside it, never work on a separate subject.</span></li>
+      <li><span>A Transcript is sealed in every terminal variant by construction, not by flag.</span></li>
+      <li><span>An Issue is <span class="m">Fixed</span> only by reference to a PullRequest whose state is <span class="m">Merged</span>.</span></li>
+      <li><span>A <span class="m">Dismissed</span> Issue owes no PullRequest, but keeps whatever Attempts it accrued.</span></li>
+      <li><span>One Issue, many Attempts. Retries are new Attempts, never mutations.</span></li>
+      <li><span>An <span class="m">AgentId</span> names an immutable revision. Editing an agent appends; it never rewrites what a past Execution ran on.</span></li>
+      <li><span>An Agent is scoped to nothing — no repository, no workstream. Anything repository-shaped about one is a fold over Executions.</span></li>
+      <li><span>An Agent referenced by any Execution can be retired but never deleted.</span></li>
+      <li><span>The Plan layer may be wrong about the State layer without either being invalid.</span></li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <p class="eyebrow">12 · Parked</p>
+      <h2>None of these block the model</h2>
+      <p>Each is policy or purely additive — the types are identical under every answer. They are listed so they are not forgotten, not so they are decided. The answers come from a real screen; deciding them on a whiteboard is guessing, and hardens the guess into a type.</p>
+    </div>
+
+    <ol class="questions">
+      <li>
+        <h3>Does Sprinter keep a history of observed states, or only the latest?</h3>
+        <p>A fold implies a log. If only the head is retained, a sealed transcript will reference a base the front end can no longer resolve or diff against — a dead link in the inspector, on exactly the records meant to be permanent.</p>
+      </li>
+      <li>
+        <h3>Who computes <code>verified</code>, and when?</h3>
+        <p>It is the only signal that gates a merge and the only expensive one. Speculatively on every base move is wasteful; only at merge time means the board can never show readiness. There is a trigger policy here, and it is a product decision.</p>
+      </li>
+      <li>
+        <h3>When is an <code>observedAt</code> too old to render?</h3>
+        <p>The principle says unknown-not-stale, but every referenced value is stale the instant it arrives. Some threshold turns "recent enough to show plainly" into "show with a warning" into "refuse and refresh" — and it likely differs per entity.</p>
+      </li>
+      <li>
+        <h3>How deep does an execution tree go, and does the UI flatten it?</h3>
+        <p>Nesting is unbounded in principle. Whether a screen renders three levels inline or collapses everything below the first is a presentation call the model does not need to make.</p>
+      </li>
+      <li>
+        <h3>What happens when a bound Epic and its milestone disagree?</h3>
+        <p>The Epic is owned, the milestone is referenced, and the binding makes them describe the same intent from two authorities. Someone has to win, or the disagreement has to be first-class and visible.</p>
+      </li>
+    </ol>
+  </section>
+
+</div>
+
+</body>
+</html>
