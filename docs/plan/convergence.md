@@ -44,7 +44,7 @@ This is the one workstream that spans **both** sides, so **both** repo gates app
 | `INV-NAMING` | Follows `conventions.md` | review |
 | `INV-PORT` | The new wiring is **adapters behind existing ports** — no feature surface gains localness/transport knowledge; the concrete transport/daemon `main` are the only new edges | review |
 | `INV-EFFECT-DI` | **Daemon side:** every concrete port implementation is provided as an Effect **`Layer`** (`Layer.effect`/`scoped`/`succeed` over a `Context.Service` tag) and composed into the daemon `main`'s layer graph — no `new`/ad-hoc instantiation or manual wiring that bypasses DI; swapping an adapter (fake ↔ real, one host ↔ another) is a **`Layer` substitution**, nothing else | review + `bun run check` |
-| `INV-CONTRACT` | Both sides consume the **same** frozen contract. A contract change is a **versioned event** that ripples to the Swift mirror **and** Track A's handlers, batched, with `FE2.4` goldens + decode tests re-passing on both sides | `bun run check` + `make check` + review |
+| `INV-CONTRACT` | Both sides consume the **same** frozen contract. A contract change ripples to the Swift mirror **and** Track A's handlers, batched, with `FE2.4` goldens + decode tests re-passing on both sides | `bun run check` + `make check` + review |
 | `INV-RESTART` | Cutover survives a daemon restart mid-flight (AE5 durability exercised end-to-end): reconnect resync + re-dispatch, no lost/duplicated work | integration test + review |
 
 `INV-GATE-A`/`INV-GATE-B` (whichever the task touches), `INV-COV`, `INV-NOCAST`/
@@ -61,14 +61,14 @@ iterates, each new concrete port stays an Effect `Layer` composed into `main`.
 | `CE2` | Live client transport | app (`swift`) | `CE1`, (`TRK-B` `BE1`) |
 | `CE3` | App shell — SwiftUI Views + `.app` | app (`swift`) | `CE2`, (`TRK-B` `BE2`–`BE4`) |
 | `CE4` | Cutover — real Issue → PR through the app, restart-safe | both | `CE1`, `CE2`, `CE3` |
-| `CE5` | Contract v2 (batched, gated on need) | both | — (needs `FDN` contract) |
+| `CE5` | Batched contract changes (gated on need) | both | — (needs `FDN` contract) |
 
 ```
 (FDN + TRK-A + TRK-B all landed)
 
 CE1 ─► CE2 ─► CE3 ─► CE4   (the cutover spine)
 
-CE5 (contract v2) ┄┄ optional, batched; ripples to CE1 handlers + CE3 UI if run
+CE5 (batched contract changes) ┄┄ optional, batched; ripples to CE1 handlers + CE3 UI if run
 ```
 
 > `CE5` is **conditional** — the two changes it batches are only worth cutting if
@@ -213,15 +213,15 @@ proves the composition.
 
 ---
 
-## Epic `CE5` — Contract v2 (batched, gated on need)  ·  tags: `INV-CONTRACT`, `INV-EFFECT-DI`
+## Epic `CE5` — Batched contract changes (gated on need)  ·  tags: `INV-CONTRACT`, `INV-EFFECT-DI`
 
-Two changes both tracks flagged as **out of the frozen v1 scope**. Cut **only if
+Two changes both tracks flagged as **out of the frozen contract scope**. Cut **only if
 the product needs them**; if cut, **batch** them (a contract change ripples to the
 Swift mirror *and* Track A handlers — version once, re-freeze goldens once) and
 land before the spine epics they ripple into.
 
 ### CE5.1 — Distinct `cancelled` terminal status
-- **Done:** a distinct terminal `WorkStatus` for cancellation (v1 maps `cancel` →
+- **Done:** a distinct terminal `WorkStatus` for cancellation (the base contract maps `cancel` →
   `done`, so a cancelled workstream is indistinguishable from completed). Changes
   `Snapshot`; ripples to the daemon roll-up + the Swift board projection; goldens
   + decode tests re-pass on both sides.
@@ -230,7 +230,7 @@ land before the spine epics they ripple into.
 ### CE5.2 — Notice reconciliation key
 - **Done:** a wire-level reconciliation key on `Notice`/`NoticeEntry` (today they
   carry no id, so a notice emitted **both** live and durable would double-render;
-  v1 is safe only because the Pi adapter emits notices live-only). Cut **only if**
+  this is safe only because the Pi adapter emits notices live-only). Cut **only if**
   a daemon/Pi version begins emitting a notice both live and durable. Ripples to
   both sides; goldens re-pass.
 - **Depends on:** — (needs `FDN` contract; gated on need — conditional)
@@ -255,5 +255,5 @@ scope.
 | `CE3.2` | TRK-B ledger — planner plan-source (#45 N1), inbox wait-time ordering / no-longer-outstanding (#41 N3/N4), inspector LCS diff view (#47 N1), transcript projection perf (#44 N2) |
 | `CE4.1` | README §"Convergence → cutover" — the end-to-end goal |
 | `CE4.2` | README (restart-safe) + TRK-A AE5 restart safety (exercised end-to-end over the wire) |
-| `CE5.1` | TRK-A ledger — AE5 "`cancelled` status" (#30 N2; a contract-v2 consideration) |
-| `CE5.2` | TRK-B ledger — "Contract v2 — notice reconciliation key" (#44 N1; conditional) |
+| `CE5.1` | TRK-A ledger — AE5 "`cancelled` status" (#30 N2; a batched-contract consideration) |
+| `CE5.2` | TRK-B ledger — "notice reconciliation key" (#44 N1; conditional) |

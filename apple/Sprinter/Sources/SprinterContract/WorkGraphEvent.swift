@@ -66,8 +66,8 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
 }
 
 /// A single streamed `events` item: a ``WorkGraphEvent`` paired with its DURABLE
-/// `offset` — the daemon's `event_log` position the delta was journaled at (contract
-/// v3 / CE2.0). The stream carries the offset so a reconnecting client can remember
+/// `offset` — the daemon's `event_log` position the delta was journaled at
+/// (CE2.0). The stream carries the offset so a reconnecting client can remember
 /// its last-seen position and hand it back as the request's `sinceOffset` cursor to
 /// resume STRICTLY AFTER it (no gap, no duplicate). Wire shape:
 /// `{ "offset": 12, "event": { "_tag": "IssueChanged", "issue": { … } } }`.

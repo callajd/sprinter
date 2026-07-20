@@ -11,7 +11,7 @@
 >
 > **Prerequisites:** `CVG` landed (`main` @ `9237595`) — daemon `main`/`run.ts`, the
 > served socket transport, the Swift `UnixSocketTransport`/`RpcBackend`/`WorkGraphResync`
-> stack, contract **v3** goldens, and the CE4.1 acceptance harness all exist and are the
+> stack, contract goldens, and the CE4.1 acceptance harness all exist and are the
 > substrate this workstream hardens.
 
 ## Cross-cutting invariants
@@ -23,7 +23,7 @@ Both repo gates apply — each task names the side(s) it touches and honours tha
 | `INV-DETERMINISM` | No test consumes real wall-clock time. All timing is driven by an injected clock (`TestClock`/`ManualClock` TS; the Swift `ManualClock`/`Clock` seam). Real `sleep`/`Task.sleep`/`setTimeout` for delay is banned in tests. | lint guard (`BT7`) + review |
 | `INV-BOUNDED` | Every `await`/blocking wait in a test is bounded by a hard timeout; a deadlock **fails** (never hangs). Under a virtual clock, an un-advanced wait must surface as a test failure, not a stall. | lint guard (`BT7`) + CI wall-clock budget |
 | `INV-REAL-WIRE` | Boundary (L3+) tests exercise the **real** serialization + NDJSON framing + socket + RPC dispatch + read-model projection. Only non-deterministic **leaves** are substituted, and only at a DI `Layer`/seam: `pi` (via the `ChildProcessSpawner` seam) and GitHub (the in-process `Repository`). No fake stands in for the wire itself. | review |
-| `INV-TWO-SIDED` | Every wire type has golden vectors decoded by **both** the TS contract (`@sprinter/contract`) and the Swift mirror (`SprinterContract`). A contract change re-freezes both in one versioned event; goldens are generated, never hand-edited. | `bun run check` + `make check` + review |
+| `INV-TWO-SIDED` | Every wire type has golden vectors decoded by **both** the TS contract (`@sprinter/contract`) and the Swift mirror (`SprinterContract`). A contract change re-freezes both in one change; goldens are generated, never hand-edited. | `bun run check` + `make check` + review |
 | `INV-HONEST-SCOPE` | Each test documents what it does **not** prove. No seeded/tautological assertion may be named as a boundary proof (e.g. asserting seeded PR data round-trips is not "the loop produced a PR"). | review |
 | `INV-NO-LEAK` | Every test that starts a daemon process / binds a socket / spawns a child / opens a tempfile tears all of it down at teardown, including on failure. No leaked fd, process, socket path, or temp dir survives the test. | review + a leak-scan check (`BT7`) |
 | `INV-HERMETIC-CI` | The CI suite performs **no** real network I/O, spawns **no** real `pi`, touches **no** real GitHub, and reads **no** ambient credentials. Any check requiring real infra is excluded from CI and delivered as a documented runbook step. | CI config + review |
@@ -108,7 +108,7 @@ BT2 (harness fixture) ──┴─► BT3, BT4, BT5, BT6  ─► BT8 (gated cros
 - **Done:** a generative/round-trip test per type — encode (TS) → bytes → decode (TS)
   and (via goldens) decode (Swift) → re-encode (Swift, where the mirror encodes) →
   byte-equal — proving encode/decode are inverse and the Swift mirror is byte-parity with
-  the TS contract for the frozen version. A `contract-mirror.md` version-parity assertion
+  the TS contract for the frozen contract. A `contract-mirror.md` parity assertion
   (the doc's stated version == both sides' constant) is part of the gate.
 - **Depends on:** BT1.1
 
@@ -149,7 +149,7 @@ Anchors: `apple/Sprinter/Sources/SprinterBackend/{UnixSocketTransport,RpcConnect
   **split across two writes** is reassembled; **multiple frames coalesced** in one read
   are split; a partial trailing frame is buffered until complete; oversized/garbage lines
   surface a typed decode error (never a silent drop, never a crash); EOF mid-frame
-  terminates cleanly. Both directions (request encode, response decode incl. the v3
+  terminates cleanly. Both directions (request encode, response decode incl. the
   `OffsetEvent` stream and `Exit`/error frames).
 - **Depends on:** `BT2`
 
@@ -178,7 +178,7 @@ Anchors: `WorkGraphResync.swift`, `ContiguousOffsetTracker.swift`, `ReconnectBac
 
 ### BT4.1 — Offset-based incremental resume (no loss, no dup)
 - **Done:** a drop-then-reconnect over the real wire resumes from the **last-applied
-  offset** via the v3 `sinceOffset` cursor (incremental, not a snapshot re-derive), and
+  offset** via the `sinceOffset` cursor (incremental, not a snapshot re-derive), and
   the post-reconnect applied state equals a from-origin fold — asserted for: in-order
   delivery; the durable-replay/live-tail **boundary overlap** (duplicate offset at the
   seam is idempotent); and a genuinely-missing tail → resync.
@@ -278,7 +278,7 @@ Every task traces to a boundary hazard or technique exercised (and often a bug c
 | Task | Origin |
 |------|--------|
 | `BT7.1/7.2` | CVG CE2.2 #60 test deadlock (infinite `noDelay` reconnect loop hung the suite) → injected-clock + bounded-await discipline; leak scans from the reap protocol |
-| `BT1.*` | FE2.4 freeze/divergence gate + the CE5/CE2.0 versioned re-freeze pattern; CE2.0 R2 omitted-vs-empty `events` payload decode bug |
+| `BT1.*` | FE2.4 freeze/divergence gate + the CE5/CE2.0 re-freeze pattern; CE2.0 R2 omitted-vs-empty `events` payload decode bug |
 | `BT2.*` | CE4.1 #70 acceptance harness (`acceptance.test.ts`) — real daemon + real socket + real `RpcClient`, scripted-pi + sandboxed `Repository` leaves |
 | `BT3.1` | CE2.1 #62 NDJSON reassembly (frame split across two writes) |
 | `BT3.2` | CE2.1 #62 fd-lifetime race (write vs close, read-loop vs close) + SIGPIPE process-death bug |

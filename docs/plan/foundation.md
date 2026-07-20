@@ -8,7 +8,7 @@
 > schema, the frozen RPC contract, the Swift bridge).
 >
 > **Prerequisites:** none. This workstream unblocks `TRK-A` and `TRK-B`.
-> **Exit / divergence point:** contract v1 is frozen and the Swift bridge decodes
+> **Exit / divergence point:** the contract is frozen and the Swift bridge decodes
 > it (`FE2.4`). After that, the tracks proceed against the contract.
 
 ## Cross-cutting invariants
@@ -25,7 +25,7 @@ from [`policy.md`](../policy.md), [`conventions.md`](../conventions.md),
 | `INV-PIN` | All deps exact-pinned; lockfile committed | `check` dep-pin verification + committed lock |
 | `INV-NAMING` | Follows `conventions.md` (ports/adapters, owned vs. foreign, `*Store`/`*Ops`) | review |
 | `INV-PORT` | No concrete backing/instance depended on directly; external systems + locations sit behind ports | review |
-| `INV-CONTRACT` | Contract changes are versioned and ripple to the Swift mirror; decode tests pass | `check` + review |
+| `INV-CONTRACT` | Contract changes ripple to the Swift mirror; decode tests pass | `check` + review |
 
 `INV-GATE`/`INV-COV`/`INV-NOCAST`/`INV-PIN`/`INV-NAMING` apply to every task.
 
@@ -88,8 +88,8 @@ divergence gate.
   imported), validated against real `pi --mode rpc` output.
 - **Depends on:** —
 
-### FE2.3 — RPC contract v1
-- **Done:** the versioned `RpcGroup` (`effect/unstable/rpc`) over the domain
+### FE2.3 — RPC contract
+- **Done:** the `RpcGroup` (`effect/unstable/rpc`) over the domain
   schemas: `snapshot`, `events` (streaming), commands, and the session channel
   (`sessionEvents` streaming `SessionEvent`, `sessionSend`, `interrupt`,
   `answerUiRequest`); compiles and is exported.

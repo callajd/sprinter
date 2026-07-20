@@ -11,7 +11,7 @@ later iOS) client shells consume it as a plain SwiftPM library.
 
 This is the **divergence gate**: once this mirror decodes the contract, Track A
 (daemon) and Track B (UI) proceed against the frozen contract. The goldens are the
-only lockstep mechanism — there is no contract-version number and no wire handshake;
+only lockstep mechanism — there is no wire handshake;
 change the wire shape without re-freezing them and the decode tests fail.
 
 **Scope — message DTOs, not the transport envelope.** The mirror and its goldens

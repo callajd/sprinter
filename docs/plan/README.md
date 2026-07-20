@@ -23,7 +23,7 @@ big-bang integration.
 
 ```
         FOUNDATION  (the only shared dependency)
-   scaffold ─► domain schemas ─► RPC contract v1 ─► Swift bridge
+   scaffold ─► domain schemas ─► RPC contract ─► Swift bridge
                     │
                     ▼
         ══════════ DIVERGENCE POINT ══════════
@@ -43,7 +43,7 @@ and `TRK-B` run in parallel.
 After divergence the tracks are coupled *only* through the contract:
 
 - **Contract changes are events, not edits.** A change to the contract ripples to
-  the Swift mirror and Track A's handlers. Version the contract; batch changes.
+  the Swift mirror and Track A's handlers. Batch contract changes.
 - **Both tracks test against the contract**, never against each other's internals.
 
 ## Convergence → cutover

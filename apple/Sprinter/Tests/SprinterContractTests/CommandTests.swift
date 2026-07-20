@@ -3,7 +3,7 @@ import Testing
 
 @testable import SprinterContract
 
-@Suite("Commands, errors, and version")
+@Suite("Commands and errors")
 struct CommandTests {
   @Test("decodes the workstream plan")
   func decodesWorkstreamPlan() throws {
