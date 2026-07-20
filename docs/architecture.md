@@ -271,7 +271,7 @@ share types — it mirrors the RPC message schemas by hand or codegen against th
 wire protocol. This puts a premium on a **small, stable, cleanly-schematized RPC
 surface**: every procedure is implemented twice (free in the eventual Effect/TS
 web client, by hand in Swift). Keep the group minimal; goldens frozen from the TS
-contract keep the two sides in lockstep (no version number while both live in one repo).
+contract keep the two sides in lockstep (both live in one repo and land together).
 
 ## 8. UI surfaces
 

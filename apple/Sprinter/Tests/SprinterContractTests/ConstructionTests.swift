@@ -45,7 +45,7 @@ struct ConstructionTests {
       id: IssueId(rawValue: "iss-1"),
       epicId: EpicId(rawValue: "ep-1"),
       number: 10,
-      title: "RPC contract v1",
+      title: "RPC contract mirror",
       status: .inReview,
       dependsOn: [IssueId(rawValue: "iss-0")],
       pullRequest: PullRequestRef(

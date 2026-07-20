@@ -61,7 +61,7 @@ const issue = {
   id: "iss-1",
   epicId: "ep-1",
   number: 10,
-  title: "RPC contract v1",
+  title: "RPC contract mirror",
   status: "in_progress",
   dependsOn: ["iss-0"],
 };

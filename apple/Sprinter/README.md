@@ -10,7 +10,7 @@ minimal, existing so the verification gate runs against real code.
 - `Sources/SprinterCore/` — owned domain seed. Owned types get **plain** names
   (`Workstream`, `WorkStatus`), per `docs/conventions.md`.
 - `Sources/SprinterContract/` — the **RPC contract mirror** (FE2.4): hand-written
-  `Codable` DTOs mirroring contract v1, platform-neutral (Foundation only, no
+  `Codable` DTOs mirroring the contract, platform-neutral (Foundation only, no
   AppKit/UIKit). It is a foreign consumer (D10) that decodes the SAME wire bytes
   the TypeScript contract emits (INV-CONTRACT). See `docs/contract-mirror.md`.
 - `Tests/SprinterContractTests/` — decode tests over `Goldens/` — JSON generated

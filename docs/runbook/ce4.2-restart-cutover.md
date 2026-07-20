@@ -27,7 +27,7 @@ core, hermetic and hard-timeout-bounded:
    persisted in-flight Job (`StartupReconcile` → CE1.2 file durability), re-attaching the
    **SAME** persisted session id (1 Job = 1 session, `UNIQUE(session.jobId)`), and drives
    it to `succeeded`. A fresh client (the app re-dialing) **resyncs** by resuming the
-   `events` feed from its last-applied durable **offset** (the v3 cursor): every post-restart
+   `events` feed from its last-applied durable **offset** (the offset cursor): every post-restart
    delta arrives strictly after the cursor (no duplication) and the terminal `succeeded`
    delta arrives (no loss).
 

@@ -81,7 +81,7 @@ export type Snapshot = (typeof Snapshot)["Type"];
  * these into the {@link Snapshot} it hydrated on connect. Upsert semantics — the
  * carried node replaces any prior node with the same id.
  *
- * v1 model: the work graph is **upsert-only — nodes are never removed**. A node's
+ * The work graph is **upsert-only — nodes are never removed**. A node's
  * end of life is a terminal STATUS (`done`/`cancelled`), carried as an ordinary
  * change; it stays in the snapshot. So there is deliberately no `*Removed` delta.
  * If a future model ever drops nodes from the graph, a `*Removed` variant (id
@@ -190,7 +190,7 @@ export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 // present resumes STRICTLY AFTER that offset, over the daemon's existing
 // `resyncFrom(offset)` primitive (CE1.2). Note the payload OBJECT itself is required
 // (the events payload schema is a `Struct`): the canonical client sends `{}` for `.events({})` —
-// an omitted `payload` key on the wire (decoding to `undefined`) is NOT a valid v3
+// an omitted `payload` key on the wire (decoding to `undefined`) is NOT a valid events
 // request. The success offset and the request cursor are the SAME coordinate: a
 // client feeds a streamed item's `offset` straight back as the next `sinceOffset`.
 export const events = Rpc.make("events", {
