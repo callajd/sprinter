@@ -179,6 +179,8 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       publishEphemeral: publishEphemeralLive(sessionFeed),
       read: base.sessionLog.read,
       tail: base.sessionLog.tail,
+      // A pure read — no live fan-out — so it delegates straight to the base store.
+      countEntries: base.sessionLog.countEntries,
     },
     withTransaction: base.withTransaction,
   });

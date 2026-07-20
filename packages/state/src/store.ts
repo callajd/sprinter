@@ -255,6 +255,13 @@ export interface SessionLogStore {
     sessionId: SessionId,
     offset: number,
   ) => Effect.Effect<ReadonlyArray<PersistedSessionEvent>, StateStoreError>;
+  /**
+   * The count of DURABLE `EntryAppended` records in a session's transcript — computed in the
+   * store WITHOUT materializing or decoding the transcript rows (cheap for a long / retried
+   * session, unlike counting over {@link read}). Counts the whole merged log (a re-dispatch
+   * APPENDS), so it matches the transcript the Inspector renders.
+   */
+  readonly countEntries: (sessionId: SessionId) => Effect.Effect<number, StateStoreError>;
 }
 
 // ============================================================================
