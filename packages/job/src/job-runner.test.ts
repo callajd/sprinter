@@ -447,3 +447,77 @@ it.effect("re-dispatch re-attaches the same session id, never a second session",
     expect(forJob.id).toBe("session-job-1");
   }).pipe(provide(fakeHandle(Stream.make(entryEvent), { _tag: "Completed" }))),
 );
+
+// ============================================================================
+// Merged single-transcript on re-dispatch (issue #77) — a retry APPENDS to the
+// SAME per-session log (offsets monotonic, never reset), and `entries` counts the
+// MERGED transcript across runs, not just the latest run.
+// ============================================================================
+
+it.effect(
+  "re-dispatch APPENDS to one durable transcript (offsets monotonic) and entries counts the merged log",
+  () =>
+    Effect.gen(function* () {
+      const job = yield* makeJob();
+      const store = yield* StateStore;
+      const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+        Effect.orDie,
+      );
+
+      // Two runs of the SAME job (same session id), each emitting one distinct durable
+      // entry, so the merged transcript is unambiguously the concatenation of both runs.
+      const run1Entry: SessionEvent = {
+        _tag: "EntryAppended",
+        entry: { _tag: "UserMessage", id: "run-1", text: "first run" },
+      };
+      const run2Entry: SessionEvent = {
+        _tag: "EntryAppended",
+        entry: { _tag: "AssistantMessage", id: "run-2", text: "second run" },
+      };
+
+      // First dispatch — its own runner/handle, sharing the OUTER StateStore so the
+      // durable transcript persists across both dispatches.
+      const first = yield* Effect.gen(function* () {
+        const runner = yield* JobRunner;
+        return yield* runner.dispatch(job);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provide(fakeRunner(fakeHandle(Stream.make(run1Entry), { _tag: "Completed" }))),
+      );
+      // After run 1 the count reflects run 1's single entry.
+      expect(first.payload).toStrictEqual({
+        transcriptRef: "transcript://session-job-1",
+        entries: 1,
+      });
+
+      // A restart reloads the persisted job (now carrying its sessionId) and
+      // re-dispatches against the SAME session id.
+      const reloaded = Option.getOrThrow(yield* store.jobs.getJob(job.id));
+      expect(reloaded.sessionId).toBe("session-job-1");
+
+      const second = yield* Effect.gen(function* () {
+        const runner = yield* JobRunner;
+        return yield* runner.dispatch(reloaded);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(layer),
+        Effect.provide(fakeRunner(fakeHandle(Stream.make(run2Entry), { _tag: "Completed" }))),
+      );
+
+      // (a) The durable transcript APPENDED: both runs' entries present, in order.
+      const durable = yield* store.sessionLog.read(sessionId);
+      expect(durable.map((e) => e.event)).toEqual([run1Entry, run2Entry]);
+      // Offsets are monotonically increasing and DISTINCT — the re-dispatch never reset
+      // the sequence (run 2's offset is strictly greater than run 1's).
+      const offsets = durable.map((e) => e.offset);
+      expect(offsets.length).toBe(2);
+      expect(offsets[1]).toBeGreaterThan(offsets[0] ?? 0);
+
+      // (b) `entries` counts the MERGED transcript (both runs), not just the latest run.
+      expect(second.payload).toStrictEqual({
+        transcriptRef: "transcript://session-job-1",
+        entries: 2,
+      });
+    }).pipe(Effect.scoped, Effect.provide(layerMemory)),
+);

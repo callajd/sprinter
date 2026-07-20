@@ -17,7 +17,7 @@
  * `sessionId`), so a re-dispatch/restart re-attaches by upserting the SAME session
  * id, never a new one (the store's `UNIQUE(session.jobId)` enforces the invariant).
  */
-import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type Issue,
@@ -93,6 +93,39 @@ const isDurableTranscriptEvent = (event: SessionEvent): boolean =>
   event._tag === "EntryAppended" || event._tag === "Notice";
 
 /**
+ * The `entries` metric recorded on a settled {@link JobResult} `payload` — the count
+ * of DURABLE transcript entries in the session's log, READ BACK from the durable
+ * `sessionLog` at terminal rather than tallied by a per-dispatch counter.
+ *
+ * DECISION (issue #77) — the MERGED single-transcript model is intended by
+ * construction: 1 Job = 1 session = 1 durable transcript, and a re-dispatch/retry
+ * APPENDS to that SAME per-session log (offsets are monotonic and NEVER reset). So
+ * the transcript the Inspector renders is the concatenation of EVERY run, and this
+ * count is derived from that same durable log — it therefore matches the merged
+ * transcript across runs instead of diverging to reflect only the latest run (the
+ * divergence a per-dispatch `Ref` produced). Retry runs are deliberately NOT
+ * segmented, delimited, or offset-reset: the merged single-transcript view is the
+ * intended presentation, and run-segmentation is left to a separate product decision.
+ *
+ * Only `EntryAppended` records count (the transcript's message entries), matching the
+ * durable-transcript fold's own counting; reconcilable `Notice`s persist to the log
+ * but are not counted as entries. A read failure at terminal surfaces as the owned
+ * {@link StateStoreError} — the same class the terminal `putSession`/`putJob` writes
+ * that follow it already propagate.
+ */
+const countDurableEntries = (
+  store: Context.Service.Shape<typeof StateStore>,
+  sessionId: SessionId,
+): Effect.Effect<number, StateStoreError> =>
+  store.sessionLog
+    .read(sessionId)
+    .pipe(
+      Effect.map((entries) =>
+        entries.reduce((n, e) => (e.event._tag === "EntryAppended" ? n + 1 : n), 0),
+      ),
+    );
+
+/**
  * Map a settled session's {@link SessionResult} onto the terminal {@link Session}
  * status — TOTAL via discriminated matching (INV-NOCAST): a clean end completes
  * the session, a transport teardown fails it.
@@ -137,7 +170,7 @@ const persistFailedTerminal = (
  * the session, drive the prompt, consume events, await the terminal outcome, and
  * persist the terminal rows — returning the {@link JobResult}.
  *
- * Events are consumed by folding the live stream (counting durable transcript
+ * Events are consumed by folding the live stream (appending durable transcript
  * entries) so the runner is a real consumer of the session's reactive output; a
  * transport teardown of the stream is tolerated (the terminal authority is
  * {@link SessionHandle.result}, which reports the failure). If instead STARTING or
@@ -169,10 +202,13 @@ const dispatch = (
       const issue = yield* store.workGraph.getIssue(job.issueId);
       yield* handle.send(promptForJob(job, issue));
 
-      // Count durable transcript entries in a `Ref` so the count SURVIVES a stream
-      // teardown — `Stream.runForEach` drops its accumulator on failure/interrupt, a
-      // `Ref` keeps it. The stream is not the terminal authority (`handle.result` is),
-      // so a typed teardown of the fold is tolerated while preserving the count so far.
+      // Fold the live events into the durable transcript log — the fold APPENDS each
+      // durable entry to the session's log (the sole writer of this session's
+      // transcript). The `entries` count is not tallied here: it is read back from that
+      // durable log at terminal (`countDurableEntries`), so it survives a stream
+      // teardown AND reflects the merged transcript across every run (issue #77). The
+      // stream is not the terminal authority (`handle.result` is), so a typed teardown
+      // of the fold is tolerated.
       //
       // BOUND the fold by the terminal `result` (F1 terminal-result contract), so it
       // can NEVER outlive the session. `handle.events` is a fresh, lazily-subscribed
@@ -185,7 +221,6 @@ const dispatch = (
       // session reaches its terminal — deterministic and window-independent, not
       // reliant on the sliding-window timing — so dispatch always proceeds to read the
       // already-settled result instead of blocking on an idle-but-alive events stream.
-      const entriesRef = yield* Ref.make(0);
       yield* handle.events.pipe(
         Stream.interruptWhen(handle.result),
         Stream.runForEach((event) =>
@@ -205,38 +240,38 @@ const dispatch = (
             if (isDurableTranscriptEvent(event)) {
               // Tolerate a transient `append` failure PER EVENT — drop THIS one entry and keep
               // folding — rather than letting one hiccup tear down the whole writer and silently
-              // truncate every SUBSEQUENT durable entry. The count advances only on a real append.
-              yield* store.sessionLog.append(sessionId, event).pipe(
-                Effect.flatMap(() =>
-                  event._tag === "EntryAppended"
-                    ? Ref.update(entriesRef, (n) => n + 1)
-                    : Effect.void,
-                ),
-                Effect.catchTag("StateStoreError", () => Effect.void),
-              );
+              // truncate every SUBSEQUENT durable entry. The `entries` count is derived at
+              // terminal from the durable log itself (see `countDurableEntries`), so a dropped
+              // append is reflected there rather than tracked by a separate in-memory counter.
+              yield* store.sessionLog
+                .append(sessionId, event)
+                .pipe(Effect.catchTag("StateStoreError", () => Effect.void));
             } else {
               yield* store.sessionLog.publishEphemeral(sessionId, event);
             }
           }),
         ),
         // The stream is not the terminal authority (`handle.result` is), so a typed teardown of
-        // the fold is tolerated while preserving the count so far (transient per-append failures
-        // are already absorbed above, so one hiccup no longer truncates the rest of the fold).
+        // the fold is tolerated: whatever was appended to the durable log before the teardown is
+        // preserved and counted at terminal (transient per-append failures are already absorbed
+        // above, so one hiccup no longer truncates the rest of the fold).
         Effect.orElseSucceed(() => undefined),
       );
-      const entries = yield* Ref.get(entriesRef);
-      const result = yield* handle.result;
-      return { result, entries };
+      return yield* handle.result;
     }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, sessionId)));
 
+    // Count the entries from the DURABLE transcript log — the merged concatenation of
+    // every run for this session (1 Job = 1 session = 1 transcript; a re-dispatch
+    // APPENDS, offsets never reset). See `countDurableEntries` for the #77 decision.
+    const entries = yield* countDurableEntries(store, sessionId);
     const transcriptRef = yield* transcriptRefFor(sessionId);
-    const jobResult = toJobResult(settled.result, { transcriptRef, entries: settled.entries });
+    const jobResult = toJobResult(settled, { transcriptRef, entries });
 
     // Persist the terminal Job/session rows.
     yield* store.jobs.putSession({
       id: sessionId,
       jobId: job.id,
-      status: toSessionStatus(settled.result),
+      status: toSessionStatus(settled),
     });
     yield* store.jobs.putJob({ ...job, status: jobResult.status, sessionId, transcriptRef });
 
