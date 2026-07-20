@@ -93,39 +93,6 @@ const isDurableTranscriptEvent = (event: SessionEvent): boolean =>
   event._tag === "EntryAppended" || event._tag === "Notice";
 
 /**
- * The `entries` metric recorded on a settled {@link JobResult} `payload` — the count
- * of DURABLE transcript entries in the session's log, READ BACK from the durable
- * `sessionLog` at terminal rather than tallied by a per-dispatch counter.
- *
- * DECISION (issue #77) — the MERGED single-transcript model is intended by
- * construction: 1 Job = 1 session = 1 durable transcript, and a re-dispatch/retry
- * APPENDS to that SAME per-session log (offsets are monotonic and NEVER reset). So
- * the transcript the Inspector renders is the concatenation of EVERY run, and this
- * count is derived from that same durable log — it therefore matches the merged
- * transcript across runs instead of diverging to reflect only the latest run (the
- * divergence a per-dispatch `Ref` produced). Retry runs are deliberately NOT
- * segmented, delimited, or offset-reset: the merged single-transcript view is the
- * intended presentation, and run-segmentation is left to a separate product decision.
- *
- * Only `EntryAppended` records count (the transcript's message entries), matching the
- * durable-transcript fold's own counting; reconcilable `Notice`s persist to the log
- * but are not counted as entries. A read failure at terminal surfaces as the owned
- * {@link StateStoreError} — the same class the terminal `putSession`/`putJob` writes
- * that follow it already propagate.
- */
-const countDurableEntries = (
-  store: Context.Service.Shape<typeof StateStore>,
-  sessionId: SessionId,
-): Effect.Effect<number, StateStoreError> =>
-  store.sessionLog
-    .read(sessionId)
-    .pipe(
-      Effect.map((entries) =>
-        entries.reduce((n, e) => (e.event._tag === "EntryAppended" ? n + 1 : n), 0),
-      ),
-    );
-
-/**
  * Map a settled session's {@link SessionResult} onto the terminal {@link Session}
  * status — TOTAL via discriminated matching (INV-NOCAST): a clean end completes
  * the session, a transport teardown fails it.
@@ -205,7 +172,7 @@ const dispatch = (
       // Fold the live events into the durable transcript log — the fold APPENDS each
       // durable entry to the session's log (the sole writer of this session's
       // transcript). The `entries` count is not tallied here: it is read back from that
-      // durable log at terminal (`countDurableEntries`), so it survives a stream
+      // durable log at terminal (`sessionLog.countEntries`), so it survives a stream
       // teardown AND reflects the merged transcript across every run (issue #77). The
       // stream is not the terminal authority (`handle.result` is), so a typed teardown
       // of the fold is tolerated.
@@ -241,7 +208,7 @@ const dispatch = (
               // Tolerate a transient `append` failure PER EVENT — drop THIS one entry and keep
               // folding — rather than letting one hiccup tear down the whole writer and silently
               // truncate every SUBSEQUENT durable entry. The `entries` count is derived at
-              // terminal from the durable log itself (see `countDurableEntries`), so a dropped
+              // terminal from the durable log itself (`sessionLog.countEntries`), so a dropped
               // append is reflected there rather than tracked by a separate in-memory counter.
               yield* store.sessionLog
                 .append(sessionId, event)
@@ -260,10 +227,21 @@ const dispatch = (
       return yield* handle.result;
     }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, sessionId)));
 
-    // Count the entries from the DURABLE transcript log — the merged concatenation of
-    // every run for this session (1 Job = 1 session = 1 transcript; a re-dispatch
-    // APPENDS, offsets never reset). See `countDurableEntries` for the #77 decision.
-    const entries = yield* countDurableEntries(store, sessionId);
+    // The `entries` metric = the count of DURABLE `EntryAppended` records in the session's
+    // transcript, computed cheaply in the store (`countEntries` — a `COUNT(*)`, no full-log
+    // read/decode). DECISION (issue #77): the MERGED single-transcript model is intended by
+    // construction — 1 Job = 1 session = 1 durable transcript, and a re-dispatch/retry APPENDS
+    // to that SAME log (offsets monotonic, never reset). So the count reflects the concatenation
+    // of EVERY run — matching the transcript the Inspector renders — rather than diverging to the
+    // latest run (the per-dispatch `Ref` divergence). Retry runs are deliberately NOT segmented;
+    // run-segmentation is left to a separate product decision.
+    //
+    // Best-effort AND non-stranding: a transient count failure falls back to `0` rather than
+    // stopping the terminal `putSession`/`putJob` below — the metric is an unconsumed byproduct,
+    // so a rare count hiccup must never leave a genuinely-settled job durably `running`.
+    const entries = yield* store.sessionLog
+      .countEntries(sessionId)
+      .pipe(Effect.orElseSucceed(() => 0));
     const transcriptRef = yield* transcriptRefFor(sessionId);
     const jobResult = toJobResult(settled, { transcriptRef, entries });
 

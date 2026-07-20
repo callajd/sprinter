@@ -157,6 +157,7 @@ const SessionEventRow = Schema.Struct({
 
 /** The single row returned by an event append's `RETURNING "offset"`. */
 const OffsetRow = Schema.Struct({ offset: NonNegativeInt });
+const CountRow = Schema.Struct({ n: NonNegativeInt });
 
 // ============================================================================
 // Schema (DDL) — one migration, run at layer construction via SqliteMigrator
@@ -497,6 +498,15 @@ const make = Effect.gen(function* () {
       sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} AND "offset" > ${offset} ORDER BY "offset"`.pipe(
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),
         Effect.mapError(fail("sessionLog.tail")),
+      ),
+    // A `COUNT(*)` with a `json_extract` tag filter — the count is computed in SQLite and
+    // never materializes or JSON/Schema-decodes the transcript rows (unlike `read`), so it
+    // stays cheap on a long or many-times-retried session.
+    countEntries: (sessionId) =>
+      sql`SELECT COUNT(*) AS n FROM session_event_log WHERE "sessionId" = ${sessionId} AND json_extract(event, '$._tag') = 'EntryAppended'`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
+        Effect.map((rows) => rows[0].n),
+        Effect.mapError(fail("sessionLog.countEntries")),
       ),
   };
 
