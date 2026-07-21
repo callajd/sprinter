@@ -109,6 +109,12 @@ public final class AppModel {
         if Task.isCancelled { break }
         if wasHealthy { backoff.reset() }
       } catch {
+        // The mirror of the success case above: a dial that FAILS after `stop()` cancelled
+        // this loop must not publish that failure. `stop()` has already reset the model to
+        // `.connecting`, and there is no retry coming, so writing `.failed` here would leave
+        // a STOPPED model reporting a connection error forever. Check before the write, not
+        // after it.
+        guard !Task.isCancelled else { break }
         // The dial itself failed (daemon not up yet): surface the reason and retry.
         connectionState = .failed(reason: String(describing: error))
       }

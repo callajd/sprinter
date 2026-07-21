@@ -19,11 +19,17 @@ import Testing
 @Suite("Resync refusal outcome", .timeLimit(.minutes(1)))
 struct ResyncRefusalOutcomeTests {
   /// The race is a scheduler race, so this drives it repeatedly: the invariant must hold on
-  /// EVERY attempt, not on most of them. The count is set so a regression is caught with
-  /// overwhelming probability (the pre-fix loss rate was ~5% per attempt, i.e. a survival
-  /// probability under 1e-3 across this many iterations), while the whole loop still runs in
-  /// well under a second against the in-memory harness.
-  private static let attempts = 150
+  /// EVERY attempt, not on most of them.
+  ///
+  /// The count is calibrated against a MEASURED loss rate, not an assumed one: with the
+  /// `runAttempt` drain reverted, this harness swallowed the refusal in **80 of 750 attempts
+  /// across 5 runs — 10.7%** (per-run: 18, 21, 14, 13, 14 out of 150) on the machine this
+  /// branch was verified on. At that rate a regression survives this many iterations with
+  /// probability ~2e-5; even at HALF the measured rate it stays under 1%. (An earlier
+  /// revision of this comment cited "~5%", which no measurement here supports — the observed
+  /// density is about twice that, so the loop is trimmed rather than the claim restated.)
+  /// The whole loop runs in ~0.12s against the in-memory harness.
+  private static let attempts = 96
 
   /// Attempt 1 — a first connect that leaves the engine holding a retained baseline and a
   /// cursor at offset 1 (the state a resume is minted from).
@@ -132,5 +138,55 @@ struct ResyncRefusalOutcomeTests {
       return
     }
     #expect(value == nil)
+  }
+
+  /// Spins (yielding, under a hard cap) until a consumer has installed a waiter newer than
+  /// `generation`, and returns its generation. Capped so a consumer that never suspends
+  /// fails the test rather than spinning until the suite's `.timeLimit`.
+  private func waiterInstalled<Element: Sendable>(
+    on queue: BoundedDeltaQueue<Element>, after generation: Int
+  ) async throws -> Int {
+    for _ in 0..<10_000 {
+      let current = await queue.waiterGeneration
+      if current != generation { return current }
+      await Task.yield()
+    }
+    throw LoopbackError.setupFailed("no waiter was installed on the queue")
+  }
+
+  @Test("a late release from a retired waiter cannot resume a later consumer's wait")
+  func staleReleaseDoesNotResumeALaterWaiter() async throws {
+    // The cancellation handler schedules its release as an UNSTRUCTURED task, so it can run
+    // arbitrarily late — after `enqueue` already resumed the cancelled `next()` normally, and
+    // after a SUBSEQUENT `next()` installed a fresh waiter. Resuming that later waiter with
+    // `nil` is read by `fold`'s `while let offsetEvent = await queue.next()` as "the feed
+    // finished", silently truncating the stream. Only the waiter a given `next()` installed
+    // may be released by that `next()`'s cancellation, which the generation identity pins.
+    //
+    // Driven through the release seam rather than by racing the scheduler: the interleaving
+    // is real but rare, and a test that has to win a race is not a regression test.
+    let queue = BoundedDeltaQueue<Int>(limit: 8)
+
+    let cancelled = Task { await queue.next() }
+    let staleGeneration = try await waiterInstalled(on: queue, after: 0)
+    // Its wait ends NORMALLY, before its cancellation release has run.
+    try await queue.enqueue(1)
+    #expect(await boundedValue(of: cancelled) == 1)
+    cancelled.cancel()
+
+    // A later consumer installs a fresh waiter...
+    let later = Task { await queue.next() }
+    _ = try await waiterInstalled(on: queue, after: staleGeneration)
+    // ...and only now does the retired waiter's release land.
+    await queue.releaseWaiter(generation: staleGeneration)
+    try await queue.enqueue(2)
+
+    let delivered = await boundedValue(of: later)
+    #expect(
+      delivered == 2,
+      """
+      the stale release resumed a LATER consumer's waiter (got \
+      \(String(describing: delivered))) — fold would read that nil as end-of-feed.
+      """)
   }
 }

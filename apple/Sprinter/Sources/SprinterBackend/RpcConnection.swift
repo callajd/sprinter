@@ -49,8 +49,28 @@ actor RpcConnection {
 
   /// One in-flight request, resolved off its correlated terminal `Exit`.
   private enum PendingEntry {
-    case query(CheckedContinuation<JSONValue?, any Error>)
+    case query(QueryEntry)
     case stream(AckGate)
+  }
+
+  /// One in-flight request/response entry: the suspended caller, plus the ORDERING state
+  /// that keeps a cancellation's `Interrupt` from overtaking its own `Request` on the wire.
+  ///
+  /// Both the transmit and the cancel run as unstructured `Task`s hopping onto this actor,
+  /// and their relative order is NOT a language guarantee (priority escalation can reorder
+  /// them). So the ordering is enforced by state rather than by scheduling: the `Interrupt`
+  /// is only ever sent once ``transmitted`` is `true`, and a cancellation that arrives first
+  /// merely sets ``cancelDeferred``, which the transmit path honours the moment the `Request`
+  /// is out. A daemon can therefore never see an `Interrupt` for an id it has not been asked
+  /// about — which it would ignore, then run the request to completion with no client-side
+  /// consumer left to receive its `Exit`.
+  private struct QueryEntry {
+    let continuation: CheckedContinuation<JSONValue?, any Error>
+    /// `true` once this request's `Request` frame has been handed to the transport.
+    var transmitted = false
+    /// `true` when the caller cancelled BEFORE the `Request` went out; the transmit path
+    /// retires the entry itself, immediately after sending it.
+    var cancelDeferred = false
   }
 
   // MARK: - Issuing requests
@@ -64,29 +84,57 @@ actor RpcConnection {
   /// forever. On cancellation the pending entry is resolved with a `CancellationError` and the
   /// daemon is told to stop working on it (`Interrupt`), exactly as an abandoned stream
   /// consumer is. Registration happens synchronously on the actor before this method can
-  /// suspend, so the handler's hop can never run ahead of the entry it retires.
+  /// suspend, so the handler's hop can never run ahead of the entry it retires — and
+  /// ``QueryEntry/transmitted`` keeps the `Interrupt` behind its own `Request` on the wire.
   func request(tag: String, payload: JSONValue?) async throws -> JSONValue? {
     guard !closed else { throw BackendError.connectionClosed }
     startReceiving()
     let id = allocateId()
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
-        pending[id] = .query(continuation)
-        Task { await self.transmit(.request(id: id, tag: tag, payload: payload)) }
+        pending[id] = .query(QueryEntry(continuation: continuation))
+        Task { await self.transmitRequest(id: id, tag: tag, payload: payload) }
       }
     } onCancel: {
       Task { await self.cancelPendingRequest(id) }
     }
   }
 
-  /// Retires a cancelled request/response entry: resumes its continuation with a
-  /// `CancellationError` and interrupts the daemon-side work. A no-op if the `Exit` already
-  /// landed (or the connection already failed it), so the continuation resumes exactly once;
-  /// a streaming entry with the same id is left to ``interruptIfPending(_:)``.
+  /// Sends a request/response `Request` and records that it went out, then honours a
+  /// cancellation that arrived while it was in flight. Marking `transmitted` on the actor
+  /// AFTER the send is what makes the `Request`-before-`Interrupt` ordering a state
+  /// invariant rather than a bet on which unstructured task the runtime schedules first.
+  private func transmitRequest(id: RequestId, tag: String, payload: JSONValue?) async {
+    await transmit(.request(id: id, tag: tag, payload: payload))
+    // The entry is gone if the `Exit` already landed, or if `transmit` failed everything.
+    guard case .query(var entry)? = pending[id] else { return }
+    entry.transmitted = true
+    pending[id] = .query(entry)
+    guard entry.cancelDeferred else { return }
+    await retireCancelledRequest(id)
+  }
+
+  /// Handles a caller's cancellation. If the `Request` is not yet on the wire the retirement
+  /// is DEFERRED to ``transmitRequest(id:tag:payload:)`` — never dropped, and never allowed
+  /// to emit its `Interrupt` first. A no-op if the `Exit` already landed (or the connection
+  /// already failed it), so the continuation resumes exactly once; a streaming entry with
+  /// the same id is left to ``interruptIfPending(_:)``.
   private func cancelPendingRequest(_ id: RequestId) async {
-    guard case .query(let continuation)? = pending[id] else { return }
+    guard case .query(var entry)? = pending[id] else { return }
+    guard entry.transmitted else {
+      entry.cancelDeferred = true
+      pending[id] = .query(entry)
+      return
+    }
+    await retireCancelledRequest(id)
+  }
+
+  /// Retires a cancelled request/response entry whose `Request` is already on the wire:
+  /// resumes its continuation with a `CancellationError` and interrupts the daemon-side work.
+  private func retireCancelledRequest(_ id: RequestId) async {
+    guard case .query(let entry)? = pending[id] else { return }
     pending.removeValue(forKey: id)
-    continuation.resume(throwing: CancellationError())
+    entry.continuation.resume(throwing: CancellationError())
     await transmit(.interrupt(requestId: id))
   }
 
@@ -228,12 +276,12 @@ actor RpcConnection {
   private func handleExit(_ id: RequestId, _ exit: ExitFrame) {
     guard let entry = pending.removeValue(forKey: id) else { return }
     switch entry {
-    case .query(let continuation):
+    case .query(let query):
       switch exit {
       case .success(let value):
-        continuation.resume(returning: value)
+        query.continuation.resume(returning: value)
       case .failure(let cause):
-        continuation.resume(throwing: causeError(cause))
+        query.continuation.resume(throwing: causeError(cause))
       }
     case .stream(let gate):
       switch exit {
@@ -250,8 +298,8 @@ actor RpcConnection {
     pending.removeAll()
     for entry in entries.values {
       switch entry {
-      case .query(let continuation):
-        continuation.resume(throwing: error)
+      case .query(let query):
+        query.continuation.resume(throwing: error)
       case .stream(let gate):
         gate.fail(error)
       }

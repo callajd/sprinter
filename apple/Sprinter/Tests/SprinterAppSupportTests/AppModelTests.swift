@@ -34,6 +34,9 @@ struct AppModelTests {
   func lateDialIsClosedNotAbandoned() async throws {
     let fake = FakeBackend(snapshot: AppSupportFixtures.snapshot)
     let dial = HeldDial()
+    // The board feed dials this same seam, so it parks here too; drain it at the end rather
+    // than leaving its continuation dangling.
+    defer { dial.releaseAll() }
     let model = AppModel(
       daemon: DaemonConnection(connect: {
         await dial.park()
@@ -47,6 +50,37 @@ struct AppModelTests {
     dial.release()
 
     #expect(await waitUntil { fake.wasClosed })
+    #expect(model.backend == nil)
+  }
+
+  /// The MIRROR of the case above: a dial that FAILS after `stop()` must not publish that
+  /// failure either. `stop()` has already reset the model to `.connecting` and there is no
+  /// retry coming, so writing `.failed` here would leave a STOPPED model reporting a
+  /// connection error for the rest of its life.
+  @Test("a dial that fails after stop() does not overwrite the stopped state")
+  func lateDialFailureDoesNotOverwriteStoppedState() async throws {
+    struct DialError: Error {}
+    let dial = HeldDial()
+    // The board feed dials this same seam, so it parks here too; drain it at the end rather
+    // than leaving its continuation dangling.
+    defer { dial.releaseAll() }
+    let model = AppModel(
+      daemon: DaemonConnection(connect: {
+        await dial.park()
+        throw DialError()
+      }))
+
+    model.start()
+    #expect(await waitUntil { dial.didStart })
+    // Cancel the loop while the dial is still in flight, THEN let it fail.
+    model.stop()
+    dial.release()
+
+    // The throw has reached the connect loop; give its `catch` every chance to run.
+    #expect(await waitUntil { dial.didResume })
+    for _ in 0..<100 { await Task.yield() }
+
+    #expect(model.connectionState == .connecting)
     #expect(model.backend == nil)
   }
 

@@ -3,34 +3,49 @@ import Foundation
 /// A one-way latch on a TERMINAL state — raised once, never lowered — that ``UnixSocketTransport``
 /// uses to publish "this transport is fully torn down" (see ``UnixSocketTransport/awaitClosed()``).
 ///
-/// It wraps a `DispatchSemaphore` rather than exposing one, because a raw semaphore is the wrong
-/// shape for a latch and the difference is a deadlock: teardown signals exactly ONCE, so a bare
-/// `wait()` CONSUMES that signal and silently disarms the latch for every later or concurrent
-/// waiter, who then blocks forever — the unbounded wait #94 exists to remove. Here EVERY wait
-/// re-signals on success, so the raised state is sticky and no observer can strand another.
+/// Two properties matter, and neither is what a bare `DispatchSemaphore` gives you:
 ///
-/// Both waits BLOCK the calling thread, so callers must be off the cooperative executor — the
-/// transport hops onto a dispatch queue for exactly that reason.
+/// - **Sticky.** Teardown signals exactly ONCE. A semaphore `wait()` CONSUMES that signal and
+///   silently disarms the latch for every later or concurrent waiter, who then blocks forever —
+///   the unbounded wait #94 exists to remove. Here ``signal()`` records a raised state, so an
+///   observer that arrives afterwards returns immediately, however many came before it.
+/// - **Non-blocking.** ``wait()`` is `async` and SUSPENDS its caller; it never parks a thread.
+///   A semaphore-backed latch could only be awaited by blocking a real thread, which is the
+///   antipattern this PR removes from the transport — and which, in a parallel test suite,
+///   pushes toward libdispatch's worker cap. ``signal()`` stays synchronous and lock-only, so
+///   the read thread and the write queue can raise it from their non-`async` contexts.
 final class TeardownLatch: @unchecked Sendable {
-  private let semaphore = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var raised = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
 
-  /// Raises the latch. Called once, by whichever teardown arm arrives second.
+  /// Raises the latch and releases every suspended observer. Called once, by whichever
+  /// teardown arm arrives second; safe to call from a non-`async`, non-cooperative context
+  /// (it takes a lock and resumes continuations — it never blocks on anything).
   func signal() {
-    semaphore.signal()
+    let released: [CheckedContinuation<Void, Never>] = lock.withLock {
+      guard !raised else { return [] }
+      raised = true
+      let pending = waiters
+      waiters.removeAll()
+      return pending
+    }
+    for waiter in released { waiter.resume() }
   }
 
-  /// Blocks until the latch is raised, leaving it raised.
-  func wait() {
-    semaphore.wait()
-    semaphore.signal()
-  }
-
-  /// Blocks for at most `timeout`, leaving the latch raised if it was. Returns `.timedOut`
-  /// instead of blocking indefinitely — the shape a test needs so a stuck teardown fails fast
-  /// rather than hanging the run.
-  func wait(within timeout: DispatchTimeInterval) -> DispatchTimeoutResult {
-    let result = semaphore.wait(timeout: .now() + timeout)
-    if result == .success { semaphore.signal() }
-    return result
+  /// Suspends until the latch is raised, and returns immediately if it already is. Not
+  /// cancellation-aware on purpose: this is a TERMINAL state that a teardown arm always
+  /// reaches, and callers that need a bound (the regression tests) impose it from outside.
+  func wait() async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      let alreadyRaised: Bool = lock.withLock {
+        guard raised else {
+          waiters.append(continuation)
+          return false
+        }
+        return true
+      }
+      if alreadyRaised { continuation.resume() }
+    }
   }
 }

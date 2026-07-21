@@ -17,18 +17,14 @@ import Testing
 /// `.timeLimit` is the outer backstop, not the mechanism.
 @Suite("Unix-domain socket transport teardown", .timeLimit(.minutes(1)))
 struct UnixSocketTransportTeardownTests {
-  /// Waits on a teardown latch under a bound, off the cooperative executor (the latch's wait
-  /// blocks a real thread). ``TeardownLatch`` re-raises itself on success, so waiting here can
-  /// never disarm a later wait or an ``UnixSocketTransport/awaitClosed()``.
+  /// Waits on a teardown latch under a bound. Fully async — it suspends a task and parks no
+  /// thread, so firing dozens concurrently (the batch below) costs no dispatch workers.
+  /// ``TeardownLatch`` is sticky, so waiting here can never disarm a later wait or an
+  /// ``UnixSocketTransport/awaitClosed()``.
   private func awaitTeardown(
     _ latch: TeardownLatch, within seconds: Int = 5
   ) async -> DispatchTimeoutResult {
-    typealias Waiter = CheckedContinuation<DispatchTimeoutResult, Never>
-    return await withCheckedContinuation { (waiter: Waiter) in
-      DispatchQueue.global().async {
-        waiter.resume(returning: latch.wait(within: .seconds(seconds)))
-      }
-    }
+    await runBounded(within: seconds) { await latch.wait() }
   }
 
   @Test("teardown completes even when the transport is released the instant close() returns")
@@ -60,6 +56,8 @@ struct UnixSocketTransportTeardownTests {
 
     // Awaited concurrently: a stuck teardown then costs one bound in total, not one per
     // transport, so the failure is reported within seconds even when every one is stuck.
+    // The waits are async (no thread each), so 32 of them alongside a parallel suite run
+    // cannot approach libdispatch's worker cap — no concurrency cap is needed here.
     let stuck = await withTaskGroup(of: Int.self) { group in
       for latch in latches {
         group.addTask { await self.awaitTeardown(latch) == .timedOut ? 1 : 0 }

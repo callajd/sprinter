@@ -96,3 +96,33 @@ enum UnixSocketPosix {
     _ = close(descriptor)
   }
 }
+
+/// Transport-level failures raised while dialing or writing the Unix-domain socket,
+/// distinct from the daemon's owned ``ContractError`` channel and the envelope-level
+/// ``BackendError``.
+///
+/// Housed WITH the POSIX seam above rather than with ``UnixSocketTransport``: every case is a
+/// raw `errno` (or a `sun_path` capacity) raised by one of these wrappers — ``writeAll`` throws
+/// ``writeFailed`` directly — and the transport file is at SwiftLint's 400-line cap now that
+/// its teardown reasoning is documented in place.
+public enum UnixSocketTransportError: Error, Equatable, Sendable {
+  /// `socket(2)` failed to allocate a descriptor.
+  case socketCreationFailed(errno: Int32)
+  /// `connect(2)` failed (no daemon listening, permission denied, …).
+  case connectionFailed(errno: Int32)
+  /// `setsockopt(2)` could not set a required socket option (e.g. `SO_NOSIGPIPE`).
+  case socketOptionFailed(errno: Int32)
+  /// The socket path is too long for the platform's `sun_path` buffer.
+  case socketPathTooLong(maxBytes: Int)
+  /// A `write(2)` failed before the whole frame was flushed.
+  case writeFailed(errno: Int32)
+  /// The bounded inbound receive buffer overflowed: the read loop produced chunks faster
+  /// than the connection consumed them, past the bound. Surfaced instead of silently
+  /// dropping bytes (which would corrupt NDJSON framing); the reconnect/resync loop
+  /// recovers with a fresh incremental resume.
+  case receiveBufferOverflow
+  /// A `.remoteDaemon` endpoint was selected, but no remote transport adapter exists yet
+  /// (CE1/CE2 serve only a local Unix-domain socket). Distinct from a dial failure — this
+  /// is "no adapter", not "the dial did not connect".
+  case remoteEndpointUnsupported
+}

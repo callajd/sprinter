@@ -22,6 +22,13 @@ actor BoundedDeltaQueue<Element: Sendable> {
   private var items: [Element] = []
   private var finished = false
   private var waiter: CheckedContinuation<Element?, Never>?
+  /// Identity of the CURRENTLY installed waiter, and the source it is minted from. A
+  /// cancellation release names the generation it was armed for, so it can only ever resume
+  /// the waiter that its own ``next()`` installed — never a later consumer's (see
+  /// ``releaseWaiter(generation:)``). Its getter is `internal` (not `private`) so the
+  /// regression test can drive a STALE release deterministically instead of racing for it.
+  private(set) var waiterGeneration = 0
+  private var mintedGenerations = 0
 
   init(limit: Int) {
     self.limit = limit
@@ -60,21 +67,34 @@ actor BoundedDeltaQueue<Element: Sendable> {
     if finished {
       return nil
     }
+    mintedGenerations &+= 1
+    let generation = mintedGenerations
     return await withTaskCancellationHandler {
       await withCheckedContinuation { (continuation: CheckedContinuation<Element?, Never>) in
         waiter = continuation
+        waiterGeneration = generation
       }
     } onCancel: {
-      // Hops back onto the actor: it runs after `next()` has installed its waiter (the
-      // install is synchronous with the suspension), so the wakeup cannot be lost.
-      Task { await self.releaseWaiter() }
+      // Hops back onto the actor, so it can only run AFTER this `next()` has installed its
+      // waiter (the install is synchronous with the suspension) — but it can run arbitrarily
+      // LATE, well after `enqueue` already resumed this wait normally and a SUBSEQUENT
+      // `next()` installed a fresh waiter. Naming the generation is what stops it resuming
+      // that unrelated consumer with a spurious `nil`, which `fold` would read as "the feed
+      // finished" and truncate the stream on.
+      Task { await self.releaseWaiter(generation: generation) }
     }
   }
 
-  /// Wakes a suspended ``next()`` with `nil` because its consumer was cancelled. The feed
-  /// itself is untouched — this only ends THIS consumer's wait.
-  private func releaseWaiter() {
-    waiter?.resume(returning: nil)
-    waiter = nil
+  /// Wakes the waiter installed by generation `generation` with `nil`, because THAT
+  /// consumer was cancelled. A no-op once that waiter has been resumed by any other path
+  /// (an `enqueue`, a `finish`), so a late release can never steal a later consumer's
+  /// wakeup. The feed itself is untouched — this only ends one consumer's wait.
+  ///
+  /// `internal` rather than `private` so the regression test can inject a stale release
+  /// deterministically; production's only caller is ``next()``'s cancellation handler.
+  func releaseWaiter(generation: Int) {
+    guard waiterGeneration == generation, let waiter else { return }
+    self.waiter = nil
+    waiter.resume(returning: nil)
   }
 }

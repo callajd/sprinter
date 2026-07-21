@@ -37,31 +37,29 @@ import Foundation
 /// is mid-flight OR the read loop is parked in `read(2)`, that fd number could be reused
 /// by a concurrent dial (a reconnect, or a second backend) and the write would land RPC
 /// bytes on — or the read loop would drain bytes off, then silently drop them from — an
-/// unrelated connection. So the real `close(2)` is deferred until BOTH conditions hold:
-///   - the write queue has drained past the close (the drain arm is enqueued behind the
-///     last queued write on the SAME `writeQueue`, and `send` re-checks `isClosed` there,
-///     so nothing after it writes), and
-///   - the read thread has provably left `read(2)` (the read arm runs as the read loop
-///     returns).
+/// unrelated connection. So the real `close(2)` is deferred until BOTH the write queue has
+/// drained past the close (its arm is enqueued behind the last queued write on the SAME
+/// `writeQueue`, and `send` re-checks `isClosed` there) and the read thread has provably
+/// left `read(2)` (its arm runs as the read loop returns).
 ///
 /// Those two arms meet in a RENDEZVOUS (``arriveAtTeardown(_:)``), not a wait: each arm
 /// records its arrival under the lock and whichever arrives SECOND performs the `close(2)`
-/// and signals ``closeCompleted``. No teardown path parks a thread on the other arm, so no
-/// teardown path can block — this is the fix for #94, where the drain arm instead
-/// *waited* on a read-loop-exit semaphore and could park a dispatch worker forever if that
-/// signal never came. `close()` still `shutdown(2)`s the fd first, which unblocks the
-/// parked `read(2)` (EOF) so the read arm arrives promptly rather than at the peer's
-/// leisure. Only once NEITHER a queued write NOR the read thread can still touch the fd is
-/// its number released for reuse. The lock guards the `descriptor`/`isClosed` *variables*;
-/// the `writeQueue` ordering plus the rendezvous guard the fd's *lifetime*
-/// (`@unchecked Sendable` is discharged by all three).
+/// and signals ``closeCompleted``. No teardown path parks a thread on the other arm — this
+/// is the fix for #94, where the drain arm instead *waited* on a read-loop-exit semaphore and
+/// could park a dispatch worker forever if that signal never came. `close()` still
+/// `shutdown(2)`s the fd first, which unblocks the parked `read(2)` (EOF) so the read arm
+/// arrives promptly rather than at the peer's leisure. The lock guards the
+/// `descriptor`/`isClosed` *variables*; the `writeQueue` ordering plus the rendezvous guard
+/// the fd's *lifetime* (`@unchecked Sendable` is discharged by all three).
 ///
 /// Both arms are UNCONDITIONAL, which is what makes ``closeCompleted`` — and therefore
 /// ``awaitClosed()`` — impossible to strand: the drain arm is a `writeQueue.async` block
 /// (dispatch always runs it) and the read arm is the read thread's `defer`, whose closure
 /// captures `self` STRONGLY. A `weak` capture there was the #94 root cause: a transport
 /// released before its freshly-`start()`ed read thread had loaded the reference simply never
-/// ran its read loop, so the arm never arrived.
+/// ran its read loop, so the arm never arrived. ``awaitClosed()`` is the one wait left in the
+/// type, and its bound is ARGUED from exactly these two unconditional arms — the argument is
+/// stated on that method, where a reader of it will find it.
 ///
 /// `close()` is LOAD-BEARING for this conformer: it owns a real OS thread (the read
 /// loop, parked in `read(2)`) and a file descriptor. The read thread retains `self`, so
@@ -98,23 +96,29 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   /// queue has drained AND `close(2)` has run. ``awaitClosed()`` waits on it so a reconnect
   /// can gate the new dial on the OLD transport being FULLY torn down (the CE2.1 carried
   /// teardown constraint). A ``TeardownLatch``, not a bare semaphore: teardown signals ONCE,
-  /// and every wait re-raises it, so repeated or concurrent observers all proceed instead of
-  /// the first one consuming the signal and stranding the rest.
+  /// and the raised state is STICKY, so repeated or concurrent observers all proceed instead
+  /// of the first one consuming the signal and stranding the rest. Its wait is `async` and
+  /// parks no thread.
   private let closeCompleted = TeardownLatch()
   /// `true` once ``close()`` has actually initiated teardown (guards ``awaitClosed()``
   /// from waiting on a `closeCompleted` that will never be signalled).
   private var closeInitiated = false
 
+  /// **TEST SEAM — not part of the transport contract.** No production code reads this; the
+  /// public way to observe teardown is ``awaitClosed()``. It is `internal` (invisible to the
+  /// app) and exists for exactly one reason, below. Do not build on it.
+  ///
   /// The teardown latch itself — an observation handle DETACHED from the transport, so a
-  /// holder need not keep `self` alive to wait on it. That is what lets the regression tests
-  /// take the handle and then drop their only reference to the transport, which is exactly
-  /// the interleaving #94 died on and the reason reverting the read thread's `[self]` capture
-  /// to `[weak self]` still fails those tests fast.
+  /// holder need not keep `self` alive to wait on it. That is what lets the #94 regression
+  /// tests take the handle and then drop their only reference to the transport, which is
+  /// exactly the interleaving #94 died on and the reason reverting the read thread's
+  /// `[self]` capture to `[weak self]` still fails those tests fast. ``awaitClosed()`` could
+  /// not stand in: calling it requires holding the transport, which closes the window.
   ///
   /// This is NOT a claim that the transport deallocates while teardown is pending: the read
   /// thread's strong capture owns it until the read loop returns. It is only that observing
-  /// teardown does not ITSELF have to hold a reference. Every wait on the handle re-arms it
-  /// (``TeardownLatch``), so taking it can never disarm ``awaitClosed()``.
+  /// teardown does not ITSELF have to hold a reference. ``TeardownLatch`` is sticky, so
+  /// taking the handle and waiting on it can never disarm ``awaitClosed()``.
   var teardownLatch: TeardownLatch { closeCompleted }
 
   /// Wraps an already-connected socket descriptor and starts pumping inbound bytes.
@@ -177,6 +181,15 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   /// off-executor thread (never a cooperative one), so a full listen backlog cannot
   /// stall the shared cooperative pool. Throws the same typed
   /// ``UnixSocketTransportError`` as the synchronous form.
+  ///
+  /// **NOT CANCELLATION-AWARE — tracked as issue #101.** Cancelling the caller does not
+  /// abort the in-flight `connect(2)`; this continuation still resumes with a LIVE transport
+  /// (or the dial's error) once the kernel answers. Making it cancellable means closing the
+  /// fd from the cancel handler, which races the dial itself — real design work, deliberately
+  /// out of #94's scope. Both call sites are covered instead: ``WorkGraphResync`` closes the
+  /// backend on every loop exit, and `AppModel`'s connect loop closes a dial that resolves
+  /// after `stop()` rather than abandoning it (each pinned by a regression test). A NEW call
+  /// site must do the same, or wait for #101.
   public static func connect(toUnixSocketPath path: String) async throws -> UnixSocketTransport {
     try await withCheckedThrowingContinuation { resume in
       dialQueue.async {
@@ -219,33 +232,47 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   }
 
   /// Suspends until an initiated ``close()`` has fully drained (read loop exited, write
-  /// queue flushed, fd released). The blocking semaphore wait is hopped onto the
-  /// concurrent ``dialQueue`` so it never parks a cooperative executor thread. A no-op if
-  /// ``close()`` was never initiated (nothing to drain).
+  /// queue flushed, fd released). A no-op if ``close()`` was never initiated — there is
+  /// nothing to drain, and ``closeCompleted`` would never be raised.
+  ///
+  /// **The bound is ARGUED, not mechanical.** ``TeardownLatch/wait()`` carries no timeout,
+  /// so this suspension ends only when ``arriveAtTeardown(_:)`` raises the latch. What makes
+  /// that certain is that BOTH arms are unconditional once `closeInitiated` is `true`: the
+  /// drain arm is a `writeQueue.async` block enqueued by ``close()`` on the same statement
+  /// that sets the flag (dispatch always runs an enqueued block), and the read arm is the
+  /// read thread's `defer`, whose closure captures `self` STRONGLY so the loop always runs
+  /// and always returns — `close()` `shutdown(2)`s the fd first, which returns EOF from a
+  /// parked `read(2)` rather than waiting on the peer. Neither arm waits on the other
+  /// (``arriveAtTeardown(_:)`` is a rendezvous), so neither can be starved by the other. #94
+  /// permits an argued bound; this is it, and the ledger says "argued", not "mechanical".
+  ///
+  /// **PRECONDITION: sequence `close()` BEFORE `awaitClosed()`.** The `closeInitiated` read is
+  /// a plain guard, not a rendezvous with `close()`: a caller that invokes this CONCURRENTLY
+  /// with another thread's `close()` can observe `false` and return while teardown is in
+  /// flight, reporting "fully torn down" when it is not. Every caller today sequences the two
+  /// (``RpcConnection/close()`` and the tests), which is what makes the guard sound; it is a
+  /// precondition of the API, not a property of it. Repeated and concurrent calls AFTER
+  /// `close()` are fine — that is what makes ``closeCompleted`` a latch.
   public func awaitClosed() async {
     let initiated = lock.withLock { closeInitiated }
     guard initiated else { return }
-    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-      Self.dialQueue.async { [closeCompleted] in
-        // ``TeardownLatch/wait()`` leaves the latch raised for the next waiter (a retried
-        // teardown, a second caller, a concurrent one) rather than consuming a signal that
-        // is only ever sent once.
-        closeCompleted.wait()
-        continuation.resume()
-      }
-    }
+    // Suspends the caller; parks no thread. ``TeardownLatch`` is sticky, so a second, later
+    // or concurrent observer returns rather than blocking on a signal already consumed.
+    await closeCompleted.wait()
   }
 
   public func close() {
     let descriptor: Int32 = lock.withLock {
       guard !isClosed else { return -1 }
-      isClosed = true
       let current = self.descriptor
-      // `closeInitiated` is flipped ONLY on the branch that actually arms the rendezvous
-      // below. With no descriptor to release there is nothing to signal `closeCompleted`,
-      // so claiming teardown was initiated would send ``awaitClosed()`` past its guard and
-      // onto a latch nothing will ever raise.
+      // NEITHER flag is flipped except on the branch that actually arms the rendezvous below.
+      // With no descriptor to release there is nothing to signal `closeCompleted`, so
+      // claiming teardown was initiated would send ``awaitClosed()`` past its guard and onto
+      // a latch nothing will ever raise — and flipping `isClosed` would mark the transport
+      // closed while NOTHING is armed, the inverse of the invariant. Both stay false, and the
+      // call is the idempotent no-op below.
       guard current >= 0 else { return -1 }
+      isClosed = true
       closeInitiated = true
       self.descriptor = -1
       // Hand the fd to the rendezvous: from here it is released by whichever teardown arm
@@ -370,29 +397,4 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     }
     continuation.finish()
   }
-}
-
-/// Transport-level failures raised while dialing or writing the Unix-domain socket,
-/// distinct from the daemon's owned ``ContractError`` channel and the envelope-level
-/// ``BackendError``.
-public enum UnixSocketTransportError: Error, Equatable, Sendable {
-  /// `socket(2)` failed to allocate a descriptor.
-  case socketCreationFailed(errno: Int32)
-  /// `connect(2)` failed (no daemon listening, permission denied, …).
-  case connectionFailed(errno: Int32)
-  /// `setsockopt(2)` could not set a required socket option (e.g. `SO_NOSIGPIPE`).
-  case socketOptionFailed(errno: Int32)
-  /// The socket path is too long for the platform's `sun_path` buffer.
-  case socketPathTooLong(maxBytes: Int)
-  /// A `write(2)` failed before the whole frame was flushed.
-  case writeFailed(errno: Int32)
-  /// The bounded inbound receive buffer overflowed: the read loop produced chunks faster
-  /// than the connection consumed them, past the bound. Surfaced instead of silently
-  /// dropping bytes (which would corrupt NDJSON framing); the reconnect/resync loop
-  /// recovers with a fresh incremental resume.
-  case receiveBufferOverflow
-  /// A `.remoteDaemon` endpoint was selected, but no remote transport adapter exists yet
-  /// (CE1/CE2 serve only a local Unix-domain socket). Distinct from a dial failure — this
-  /// is "no adapter", not "the dial did not connect".
-  case remoteEndpointUnsupported
 }
