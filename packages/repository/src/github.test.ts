@@ -1,5 +1,5 @@
 /**
- * GitHub adapter coverage (AE3.2) — the {@link Repository} port exercised THROUGH
+ * GitHub adapter coverage (AE3.2) — the {@link CodeHost} port exercised THROUGH
  * the GitHub adapter against a FAKE HTTP backend (a fake `Fetch` under
  * {@link FetchHttpClient}). Deterministic and OFFLINE — no live GitHub call in the
  * gate (INV-GATE): every request is answered by a canned in-memory route table.
@@ -8,7 +8,7 @@
  * closing-PR query (`closedByPullRequestsReferences`), decodes each wire response
  * through `Schema` into the OWNED port types (never a cast, INV-NOCAST), and
  * translates every host failure — an HTTP error, a decode error, a GraphQL
- * `errors[]` — into the owned {@link RepositoryError} (INV-PORT). The tests depend
+ * `errors[]` — into the owned {@link CodeHostError} (INV-PORT). The tests depend
  * ONLY on the package's public surface plus the standard `FetchHttpClient` transport
  * seam — never a concrete GitHub client.
  */
@@ -18,7 +18,14 @@ import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
 import { PositiveInt } from "@sprinter/domain";
 import { CLOSING_PR_QUERY } from "./github.ts";
-import { layer, layerFetch, Repository, RepositoryError } from "./index.ts";
+import {
+  CodeHost,
+  CodeHostError,
+  hostInstant,
+  layer,
+  layerFetch,
+  repositoryIdFor,
+} from "./index.ts";
 
 // ============================================================================
 // Fake HTTP backend — a canned route table over a fake `Fetch`
@@ -44,7 +51,7 @@ const makeFetch = (routes: Record<string, Route>): typeof globalThis.fetch =>
 
 const config = { owner: "callajd", repo: "sprinter", token: "test-token" };
 
-const backend = (routes: Record<string, Route>): Layer.Layer<Repository, RepositoryError> =>
+const backend = (routes: Record<string, Route>): Layer.Layer<CodeHost, CodeHostError> =>
   layer(config).pipe(
     Layer.provide(
       FetchHttpClient.layer.pipe(
@@ -61,11 +68,11 @@ const num = (n: number): PositiveInt => Schema.decodeUnknownSync(PositiveInt)(n)
 
 it.effect("reads an Issue's host state (open / closed)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const issue = yield* repo.issues.getIssue(num(25));
     expect(issue).toStrictEqual({
       number: 25,
-      title: "AE3.2 — Repository port + GitHub adapter",
+      title: "AE3.2 — CodeHost port + GitHub adapter",
       state: "closed",
     });
   }).pipe(
@@ -74,7 +81,7 @@ it.effect("reads an Issue's host state (open / closed)", () =>
         "/repos/callajd/sprinter/issues/25": () =>
           json({
             number: 25,
-            title: "AE3.2 — Repository port + GitHub adapter",
+            title: "AE3.2 — CodeHost port + GitHub adapter",
             state: "closed",
             body: "ignored excess field",
           }),
@@ -89,7 +96,7 @@ it.effect("reads an Issue's host state (open / closed)", () =>
 
 it.effect("reads the default branch and detects branch existence (present / absent)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     expect(yield* repo.code.defaultBranch).toBe("main");
     expect(yield* repo.code.branchExists("main")).toBe(true);
     expect(yield* repo.code.branchExists("feat/does-not-exist")).toBe(false);
@@ -103,11 +110,11 @@ it.effect("reads the default branch and detects branch existence (present / abse
   ),
 );
 
-it.effect("surfaces an unexpected branch status as RepositoryError", () =>
+it.effect("surfaces an unexpected branch status as CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.code.branchExists("main").pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("branchExists");
   }).pipe(
     Effect.provide(
@@ -124,7 +131,7 @@ it.effect("surfaces an unexpected branch status as RepositoryError", () =>
 
 it.effect("reads a PR and reports whether it merged", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const pr = yield* repo.pullRequests.getPullRequest(num(42));
     expect(pr).toStrictEqual({
       number: 42,
@@ -170,7 +177,7 @@ const gqlClosing =
 
 it.effect("detects the PR that CLOSED an Issue via GraphQL closedByPullRequestsReferences", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
   }).pipe(Effect.provide(backend({ "/graphql": gqlClosing(42) }))),
@@ -231,7 +238,7 @@ it.effect(
         },
         { preconnect: globalThis.fetch.preconnect },
       );
-      const repo = yield* Repository.pipe(
+      const repo = yield* CodeHost.pipe(
         Effect.provide(
           layer(config).pipe(
             Layer.provide(
@@ -261,7 +268,7 @@ it.effect(
     // it — where the retired timeline `cross-referenced` heuristic false-positived,
     // GraphQL returns an empty node set, so the reconciler never mis-lands (D18/CE1.3).
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const found = yield* repo.pullRequests.closingPullRequest(num(25));
       expect(found).toStrictEqual(Option.none());
     }).pipe(Effect.provide(backend({ "/graphql": gqlClosing() }))),
@@ -269,7 +276,7 @@ it.effect(
 
 it.effect("reports no closing PR when the host has no record of the Issue (null issue)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.none());
   }).pipe(
@@ -277,11 +284,11 @@ it.effect("reports no closing PR when the host has no record of the Issue (null 
   ),
 );
 
-it.effect("surfaces a GraphQL errors[] response as RepositoryError", () =>
+it.effect("surfaces a GraphQL errors[] response as CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("closingPullRequest");
     expect(error.detail).toContain("rate limited");
   }).pipe(
@@ -293,7 +300,7 @@ it.effect("addresses the GraphQL endpoint for a GitHub Enterprise base URL", () 
   // GHE exposes REST at `/api/v3` and GraphQL at `/api/graphql`; the adapter must
   // POST the closing-PR query to the latter, not `baseUrl + /graphql`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(7));
   }).pipe(
@@ -319,7 +326,7 @@ it.effect(
     // `nodes[0]` + a merged-gate would wrongly report not-landed; the adapter must
     // select the merged reference among the page.
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const found = yield* repo.pullRequests.closingPullRequest(num(25));
       expect(found).toStrictEqual(Option.some(99));
     }).pipe(
@@ -334,7 +341,7 @@ it.effect(
 it.effect("reports no closing PR when every closing reference is unmerged (NB2)", () =>
   // Only closed-but-unmerged references exist — nothing landed, so `Option.none`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.none());
   }).pipe(Effect.provide(backend({ "/graphql": gqlNodes({ number: 41, merged: false }) }))),
@@ -343,7 +350,7 @@ it.effect("reports no closing PR when every closing reference is unmerged (NB2)"
 it.effect("normalizes a trailing slash on the base URL so the endpoint is /graphql (NB3)", () =>
   // A base URL ending in `/` must yield `.../graphql`, never `...//graphql`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
   }).pipe(
@@ -362,14 +369,14 @@ it.effect("normalizes a trailing slash on the base URL so the endpoint is /graph
 );
 
 it.effect(
-  "surfaces a 401 from the GraphQL endpoint as a loud RepositoryError, not Option.none (B1)",
+  "surfaces a 401 from the GraphQL endpoint as a loud CodeHostError, not Option.none (B1)",
   () =>
     // GitHub 401s an unauthenticated/invalid-token GraphQL request. That must be a
     // DISTINCT, loud failure the reconciler can see — never masked as "no closing PR".
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(RepositoryError);
+      expect(error).toBeInstanceOf(CodeHostError);
       expect(error.operation).toBe("closingPullRequest");
     }).pipe(
       Effect.provide(
@@ -386,7 +393,7 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
   // adapter refuses to build at all — one construction-time fail-fast covering every
   // op — rather than a per-op guard, and never silently reports "no closing PR".
   Effect.gen(function* () {
-    const error = yield* Repository.pipe(
+    const error = yield* CodeHost.pipe(
       Effect.provide(
         layer({ ...config, token: "" }).pipe(
           Layer.provide(
@@ -398,7 +405,7 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
       ),
       Effect.flip,
     );
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.detail).toContain("token is required");
   }),
 );
@@ -407,11 +414,11 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
 // Error translation (INV-PORT) & production wiring
 // ============================================================================
 
-it.effect("translates a non-2xx host response into RepositoryError", () =>
+it.effect("translates a non-2xx host response into CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.issues.getIssue(num(25)).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("getIssue");
     expect(error.detail.length).toBeGreaterThan(0);
   }).pipe(
@@ -429,7 +436,7 @@ it.effect("layerFetch builds a self-contained adapter (Bun-native fetch transpor
     // HttpClient (the transport is sealed inside), which we assert by type: the
     // layer is provided with nothing else and yields the port.
     const authed = layerFetch({ ...config, token: "t0ken", baseUrl: "https://ghe.example/api/v3" });
-    const repo = yield* Repository.pipe(Effect.provide(authed));
+    const repo = yield* CodeHost.pipe(Effect.provide(authed));
     expect(typeof repo.issues.getIssue).toBe("function");
   }),
 );
@@ -447,4 +454,153 @@ it.effect("the transport seam is satisfiable by a fake HttpClient", () =>
       ),
     ),
   ),
+);
+
+// ============================================================================
+// RepositoryOps — observing the owned `Repository` entity (DE1.2)
+// ============================================================================
+
+const KEY = { host: "github", owner: "callajd", name: "sprinter" } as const;
+const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
+const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
+
+/**
+ * A canned repository route pair (the repo itself + its branches), optionally under a
+ * host `Date` response header — the instant the adapter reads `observedAt` from.
+ */
+const repoRoutes = (date?: string): Record<string, Route> => ({
+  "/repos/callajd/sprinter": () =>
+    new Response(JSON.stringify({ default_branch: "main" }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        ...(date === undefined ? {} : { date }),
+      },
+    }),
+  "/repos/callajd/sprinter/branches": () =>
+    json([
+      { name: "main", commit: { sha: SHA_MAIN } },
+      { name: "feat/x-1", commit: { sha: SHA_FEAT } },
+    ]),
+});
+
+it.effect("resolves a repository into the owned entity, refs and all", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.host).toBe("github");
+    expect(resolved.owner).toBe("callajd");
+    expect(resolved.name).toBe("sprinter");
+    // The observed refs are ORDERED BY NAME, whatever order the host paginated them
+    // in, so one observation has one spelling.
+    expect(resolved.refs).toStrictEqual([
+      { name: "feat/x-1", sha: SHA_FEAT },
+      { name: "main", sha: SHA_MAIN },
+    ]);
+    // The id is a FUNCTION of the natural key — a refresh must land on the same row,
+    // not collide with it (the store holds the triple UNIQUE).
+    expect(resolved.id).toBe(yield* repositoryIdFor(KEY));
+    expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
+  }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT")))),
+);
+
+// `Option.none`, not a failure: "no such repository" is INFORMATION the host has,
+// where a `CodeHostError` means the host could not be asked. The daemon turns the
+// former into a `PlanRejected` that writes nothing and the latter into a defect.
+it.effect("answers Option.none for a repository the host does not know", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    expect(yield* host.repositories.resolve(KEY)).toStrictEqual(Option.none());
+  }).pipe(Effect.provide(backend({}))),
+);
+
+// D7 — a second observation REPLACES the record and ADVANCES `observedAt`. The port
+// has no partial/merge variant: a refresh is just another resolve.
+it.effect("a REFRESH is a new complete observation with a later observedAt (D7)", () =>
+  Effect.gen(function* () {
+    const first = yield* Effect.gen(function* () {
+      const host = yield* CodeHost;
+      return Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"))));
+
+    const second = yield* Effect.gen(function* () {
+      const host = yield* CodeHost;
+      return Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    }).pipe(
+      Effect.provide(
+        backend({
+          ...repoRoutes("Tue, 21 Jul 2026 09:30:00 GMT"),
+          // The tip of `main` moved and `feat/x-1` was deleted upstream.
+          "/repos/callajd/sprinter/branches": () =>
+            json([{ name: "main", commit: { sha: SHA_FEAT } }]),
+        }),
+      ),
+    );
+
+    // SAME id (so the store upserts the same row) …
+    expect(second.id).toBe(first.id);
+    // … NEW observedAt, and a record describing ONE later moment: the deleted branch
+    // is simply absent, never merged in from the earlier read.
+    expect(second.observedAt).toBe("2026-07-21T09:30:00.000Z");
+    expect(second.observedAt > first.observedAt).toBe(true);
+    expect(second.refs).toStrictEqual([{ name: "main", sha: SHA_FEAT }]);
+  }),
+);
+
+// D5 — the LEAP SECOND is translated at the ADAPTER boundary, not in `Timestamp`.
+// `Timestamp` rejects `:60` outright by design; a code host can still emit one, so
+// this module translates it to the instant it denotes BEFORE the value reaches the
+// domain. The whole observation must survive — a decode failure here would drop a
+// repository because its host restated a UTC broadcast.
+it.effect("translates a host LEAP SECOND to the following second (D5)", () =>
+  Effect.forEach(
+    [
+      // The canonical case: the end of a UTC day.
+      ["2012-06-30T23:59:60Z", "2012-07-01T00:00:00.000Z"],
+      // Mid-year, mid-month — the roll is the platform's date arithmetic, not string
+      // surgery, so every boundary behaves.
+      ["2026-07-20T12:00:60Z", "2026-07-20T12:01:00.000Z"],
+      // The zero-offset spelling of the same thing.
+      ["2015-06-30T23:59:60+00:00", "2015-07-01T00:00:00.000Z"],
+    ],
+    ([raw = "", expected = ""]) =>
+      Effect.gen(function* () {
+        expect(yield* hostInstant(raw, "resolve")).toBe(expected);
+      }),
+  ),
+);
+
+it.effect("the leap-second translation does NOT weaken Timestamp for anything else", () =>
+  Effect.forEach(
+    // Every other refusal still stands: an impossible field value, a rolled-over date,
+    // a non-zero offset, and a non-instant string all fail at this boundary rather
+    // than being smuggled past it.
+    ["2026-13-45T99:99:99Z", "2026-02-30T00:00:00.000Z", "2026-07-20T12:00:00+02:00", "nope"],
+    (raw) =>
+      Effect.gen(function* () {
+        const error = yield* hostInstant(raw, "resolve").pipe(Effect.flip);
+        expect(error).toBeInstanceOf(CodeHostError);
+      }),
+  ),
+);
+
+it.effect("carries a host leap second all the way through resolve, as a real Timestamp", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    // End-to-end: the host's `Date` header said `23:59:60`, and the observation
+    // survived — stamped with the instant that spelling denotes.
+    expect(resolved.observedAt).toBe("2012-07-01T00:00:00.000Z");
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 30 Jun 2012 23:59:60 GMT")))),
+);
+
+// The id encoding must be INJECTIVE, or two different repositories would share one id
+// and the store's id-keyed upsert would let either silently overwrite the other's row.
+// `a-b/c` and `a/b-c` are the pair a `-`-joined encoding would collapse.
+it.effect("mints DISTINCT ids for repositories a naive encoding would collide", () =>
+  Effect.gen(function* () {
+    const left = yield* repositoryIdFor({ host: "github", owner: "a-b", name: "c" });
+    const right = yield* repositoryIdFor({ host: "github", owner: "a", name: "b-c" });
+    expect(left).not.toBe(right);
+  }),
 );

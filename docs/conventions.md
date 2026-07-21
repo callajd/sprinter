@@ -15,18 +15,23 @@ invariant).
 ## Ports
 
 - Named by **role-noun**: `ExecutionRunner`, `StateStore`, `ControlPlaneTransport`,
-  `Repository`, `Backend`.
+  `CodeHost`, `Backend`.
 - Do **not** reuse a meta-word (`Provider`, `Adapter`, `Port`) as a concrete port
   suffix.
+- A port's role-noun names the **external system**, never the record read off it. The
+  code-host port is `CodeHost`; the owned entity it observes is `Repository` (DMR
+  DE1.2 D1). Holding both under one name is what the rule prevents: "the Repository"
+  would mean either the remote system or the record depending on the sentence, and it
+  would deny the owned type the plain name the section below reserves for it.
 - The core depends only on ports. *Every* external system and location-variant is
   a port with adapters — "local vs. remote" is just one adapter axis (others:
   which backing, which host).
-- Service tag ids: `sprinter/<area>/<Name>` (e.g. `sprinter/repository/Repository`).
+- Service tag ids: `sprinter/<area>/<Name>` (e.g. `sprinter/repository/CodeHost`).
 
 ## Owned vs. foreign types
 
 - Our domain types get **plain** names: `Job`, `Session`, `SessionEvent`,
-  `Workstream`, `Epic`, `Issue`.
+  `Workstream`, `Epic`, `Issue`, `Repository`.
 - Foreign/protocol types keep a **qualifier**: `AgentSessionEvent`, `RpcCommand`,
   `RpcResponse` are **Pi's**.
 - Never leak a foreign type past the boundary that owns its translation — e.g.

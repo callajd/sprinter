@@ -5,10 +5,24 @@ import SprinterContract
 
 /// Representative owned-DTO values used to drive the fake-transport tests.
 enum Fixtures {
+  /// The repository the workstream fixtures REFERENCE. Every Snapshot carries it,
+  /// because Workstream.repositoryId is a reference a client must be able to resolve.
+  static let repository = Repository(
+    id: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    host: .github,
+    owner: "callajd",
+    name: "sprinter",
+    refs: [
+      RepositoryRef(
+        name: BranchName(rawValue: "main"),
+        sha: CommitSha(rawValue: "0123456789abcdef0123456789abcdef01234567"))
+    ],
+    observedAt: "2026-07-20T12:00:00.000Z")
+
   static let workstream = Workstream(
     id: WorkstreamId(rawValue: "ws-1"),
     name: "Foundation",
-    repo: "callajd/sprinter",
+    repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
     status: .active,
     epics: [EpicId(rawValue: "ep-1")])
 
@@ -30,6 +44,7 @@ enum Fixtures {
   static let generationAfterReset = StoreGenerationId(rawValue: "gen-2")
 
   static let snapshot = Snapshot(
+    repositories: [repository],
     workstreams: [workstream],
     epics: [
       Epic(
@@ -62,7 +77,9 @@ enum Fixtures {
   }
 
   static let plan = WorkstreamPlan(
-    name: "Foundation", repo: "callajd/sprinter", spec: "build the thing")
+    name: "Foundation",
+    repository: RepositoryKey(host: .github, owner: "callajd", name: "sprinter"),
+    spec: "build the thing")
 
   static let issueEvent = WorkGraphEvent.issueChanged(issue)
   static let workstreamEvent = WorkGraphEvent.workstreamChanged(workstream)
@@ -89,11 +106,12 @@ enum Fixtures {
   /// `snapshot` so a test can prove the reconnect re-fetched a fresh snapshot
   /// (never delta-only).
   static let snapshotAfterReconnect = Snapshot(
+    repositories: [repository],
     workstreams: [
       Workstream(
         id: WorkstreamId(rawValue: "ws-1"),
         name: "Foundation",
-        repo: "callajd/sprinter",
+        repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
         status: .done,
         epics: [EpicId(rawValue: "ep-1")])
     ],

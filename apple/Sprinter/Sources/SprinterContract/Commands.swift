@@ -14,15 +14,40 @@ public enum ControlAction: String, Codable, CaseIterable, Sendable {
   case cancel
 }
 
+/// The NATURAL KEY of a repository on a code host — the triple that identifies it,
+/// independently of any ``RepositoryId`` the daemon has minted for it.
+///
+/// It is one value rather than three sibling fields because its parts are meaningful
+/// only together (an `owner` with no `host` names nothing), and because it is exactly
+/// what a client that has never seen a repository id can supply.
+public struct RepositoryKey: Codable, Equatable, Sendable {
+  public let host: RepositoryHost
+  public let owner: String
+  public let name: String
+
+  public init(host: RepositoryHost, owner: String, name: String) {
+    self.host = host
+    self.owner = owner
+    self.name = name
+  }
+}
+
 /// The plan the `createWorkstreamFromPlan` command turns into a new workstream.
+///
+/// ``repository`` is the NATURAL KEY, not a ``RepositoryId``, and that is forced by
+/// who composes this: a client that has never seen a repository id and cannot mint
+/// one. The daemon RESOLVES the key through its code-host port to an existing
+/// ``Repository`` or creates one from the observation; a plan naming a repository the
+/// host does not know is refused with ``ContractError/planRejected(reason:)`` and
+/// writes nothing — it never silently creates an unobserved record.
 public struct WorkstreamPlan: Codable, Equatable, Sendable {
   public let name: String
-  public let repo: String
+  public let repository: RepositoryKey
   public let spec: String
 
-  public init(name: String, repo: String, spec: String) {
+  public init(name: String, repository: RepositoryKey, spec: String) {
     self.name = name
-    self.repo = repo
+    self.repository = repository
     self.spec = spec
   }
 }

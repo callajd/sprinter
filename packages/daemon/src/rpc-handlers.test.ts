@@ -44,6 +44,7 @@ import {
   Issue,
   Job,
   type JobResult,
+  Repository,
   Session,
   type SessionEvent,
   type SessionId,
@@ -54,6 +55,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import { CodeHost } from "@sprinter/repository";
 import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
@@ -71,7 +73,7 @@ import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-eve
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
   name: "Foundation",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:callajd/sprinter",
   status: "pending",
   epics: ["ep-1"],
 });
@@ -145,6 +147,64 @@ const orphanedJob = Schema.decodeUnknownSync(Job)({
 
 const succeededResult: JobResult = { status: "succeeded" };
 
+/**
+ * The repository the {@link workstream} fixture is anchored to.
+ * `workstream.repositoryId` is a real FOREIGN KEY, so it must be stored first.
+ */
+const repository = Schema.decodeUnknownSync(Repository)({
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
+/**
+ * The name a plan uses to mean "a repository the code host does NOT know" — the
+ * unknown branch of D6, which must be a `PlanRejected` that writes nothing.
+ */
+const UNKNOWN_REPOSITORY_NAME = "does-not-exist";
+
+/**
+ * A fake {@link CodeHost} whose repository resolution knows every key EXCEPT
+ * {@link UNKNOWN_REPOSITORY_NAME}. The observation it returns is derived from the key
+ * it was asked about, so the daemon's resolve-or-create path is exercised for real
+ * rather than against a single canned record. Its Issue/PR capabilities are never
+ * driven here (reconciliation has its own suite).
+ */
+const fakeCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      resolve: (key) =>
+        Effect.succeed(
+          key.name === UNKNOWN_REPOSITORY_NAME
+            ? Option.none()
+            : Option.some(
+                Schema.decodeUnknownSync(Repository)({
+                  id: `repo:${key.host}:${key.owner}/${key.name}`,
+                  host: key.host,
+                  owner: key.owner,
+                  name: key.name,
+                  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+                  observedAt: "2026-07-20T12:00:00.000Z",
+                }),
+              ),
+        ),
+    },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: {
+      getIssue: () => Effect.die("the fake CodeHost's Issue reads are never driven by these tests"),
+    },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () =>
+        Effect.die("the fake CodeHost's PR reads are never driven by these tests"),
+    },
+  }),
+);
+
 // ── harness: RpcTest client over the handlers + fakes ─────────────────────────
 
 const clientEffect = () => RpcTest.makeClient(SprinterRpc);
@@ -172,10 +232,12 @@ const harness = <A, E>(
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry).pipe(
-          Layer.provideMerge(layerWorkGraphEvents),
-          Layer.provideMerge(layerSessionEvents),
-        ),
+        Layer.mergeAll(
+          layerJournaling(layerMemory),
+          runner,
+          layerSessionRegistry,
+          fakeCodeHost,
+        ).pipe(Layer.provideMerge(layerWorkGraphEvents), Layer.provideMerge(layerSessionEvents)),
       ),
     );
     return yield* Effect.gen(function* () {
@@ -190,6 +252,9 @@ const harness = <A, E>(
 
 const seedGraph = (store: StateStore["Service"]) =>
   Effect.gen(function* () {
+    // The ANCHOR first: `workstream.repositoryId` is a FOREIGN KEY, so the repository
+    // has to exist before anything can reference it.
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
     yield* store.workGraph.putIssue(issue);
@@ -226,6 +291,7 @@ it.effect("snapshot of an empty daemon is empty", () =>
     Effect.gen(function* () {
       const snapshot = yield* client.snapshot();
       expect(snapshot).toEqual({
+        repositories: [],
         workstreams: [],
         epics: [],
         issues: [],
@@ -248,20 +314,73 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
     Effect.gen(function* () {
       const subscription = yield* feed.subscribe;
       const id = yield* client.createWorkstreamFromPlan({
-        plan: { name: "Payments Revamp", repo: "callajd/sprinter", spec: "ship it" },
+        plan: {
+          name: "Payments Revamp",
+          repository: { host: "github", owner: "callajd", name: "sprinter" },
+          spec: "ship it",
+        },
       });
-      // The id is derived from BOTH the name and the (repo-scoped, D14) repo.
-      expect(id).toBe("ws-payments-revamp-callajd-sprinter");
+      // The id is derived from BOTH the name and the repository's NATURAL KEY
+      // (a workstream is repo-scoped, D14) — the key the plan states, not the id the
+      // host adapter happened to mint, so it is stable across adapters.
+      expect(id).toBe("ws-payments-revamp-github-callajd-sprinter");
 
       const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(id));
       expect(persisted.name).toBe("Payments Revamp");
       expect(persisted.status).toBe("pending");
       expect(persisted.epics).toEqual([]);
+      // The plan named a natural key; the workstream references the RESOLVED record.
+      expect(persisted.repositoryId).toBe("repo:github:callajd/sprinter");
 
-      const delta = yield* PubSub.take(subscription);
-      expect(delta.event._tag).toBe("WorkstreamChanged");
+      // The plan's repository was RESOLVED through the `CodeHost` port and STORED
+      // (D6): the workstream's `repositoryId` is a FOREIGN KEY, so the anchor is not
+      // optional bookkeeping — the workstream write could not have succeeded without it.
+      const anchor = Option.getOrThrow(
+        yield* store.repositories.findRepository({
+          host: "github",
+          owner: "callajd",
+          name: "sprinter",
+        }),
+      );
+      expect(anchor.id).toBe(persisted.repositoryId);
+
+      // Both deltas fan out, anchor first — a client folds the repository before the
+      // workstream that references it.
+      const deltas = [yield* PubSub.take(subscription), yield* PubSub.take(subscription)];
+      expect(deltas.map((delta) => delta.event._tag)).toEqual([
+        "RepositoryChanged",
+        "WorkstreamChanged",
+      ]);
       // The live fan-out carries the durable offset it was journaled at (CE2.0).
-      expect(delta.offset).toBeGreaterThan(0);
+      expect(deltas.every((delta) => delta.offset > 0)).toBe(true);
+    }),
+  ),
+);
+
+// D6, the OTHER branch: a plan naming a repository the code host does NOT know is
+// refused with a reason, and NOTHING is written — not the workstream, and not a
+// fabricated "observation" of a repository nobody observed. The latter is the real
+// hazard: an unobserved row would satisfy the foreign key and let every downstream
+// reference resolve to a record no host ever confirmed.
+it.effect("createWorkstreamFromPlan rejects an UNKNOWN repository and writes nothing", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      const error = yield* client
+        .createWorkstreamFromPlan({
+          plan: {
+            name: "Ghost",
+            repository: { host: "github", owner: "callajd", name: UNKNOWN_REPOSITORY_NAME },
+            spec: "real spec",
+          },
+        })
+        .pipe(Effect.flip);
+      expect(error).toBeInstanceOf(PlanRejected);
+      expect(error.reason).toContain(UNKNOWN_REPOSITORY_NAME);
+
+      // Nothing landed on EITHER table, and nothing was journaled.
+      expect(yield* store.repositories.listRepositories).toStrictEqual([]);
+      expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      expect(yield* store.events.read).toStrictEqual([]);
     }),
   ),
 );
@@ -271,7 +390,11 @@ it.effect("createWorkstreamFromPlan rejects a blank spec with PlanRejected", () 
     Effect.gen(function* () {
       const error = yield* client
         .createWorkstreamFromPlan({
-          plan: { name: "Empty", repo: "callajd/sprinter", spec: "   " },
+          plan: {
+            name: "Empty",
+            repository: { host: "github", owner: "callajd", name: "sprinter" },
+            spec: "   ",
+          },
         })
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PlanRejected);
@@ -285,7 +408,11 @@ it.effect("createWorkstreamFromPlan rejects a name with no derivable id", () =>
     Effect.gen(function* () {
       const error = yield* client
         .createWorkstreamFromPlan({
-          plan: { name: "!@#$", repo: "callajd/sprinter", spec: "real spec" },
+          plan: {
+            name: "!@#$",
+            repository: { host: "github", owner: "callajd", name: "sprinter" },
+            spec: "real spec",
+          },
         })
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PlanRejected);
@@ -297,7 +424,11 @@ it.effect("createWorkstreamFromPlan rejects a name with no derivable id", () =>
 it.effect("createWorkstreamFromPlan rejects a colliding create rather than clobbering", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      const plan = { name: "Payments Revamp", repo: "callajd/sprinter", spec: "v1" } as const;
+      const plan = {
+        name: "Payments Revamp",
+        repository: { host: "github", owner: "callajd", name: "sprinter" },
+        spec: "v1",
+      } as const;
       const id = yield* client.createWorkstreamFromPlan({ plan });
 
       // A second create with the same name+repo must NOT upsert-clobber the first
@@ -319,10 +450,18 @@ it.effect("createWorkstreamFromPlan does not collide the same name across differ
   harness(({ client }) =>
     Effect.gen(function* () {
       const a = yield* client.createWorkstreamFromPlan({
-        plan: { name: "Revamp", repo: "callajd/one", spec: "s" },
+        plan: {
+          name: "Revamp",
+          repository: { host: "github", owner: "callajd", name: "one" },
+          spec: "s",
+        },
       });
       const b = yield* client.createWorkstreamFromPlan({
-        plan: { name: "Revamp", repo: "callajd/two", spec: "s" },
+        plan: {
+          name: "Revamp",
+          repository: { host: "github", owner: "callajd", name: "two" },
+          spec: "s",
+        },
       });
       // Repo-scoped ids (D14): the same name for different repos yields distinct
       // workstreams, not a silent overwrite.
@@ -495,16 +634,17 @@ it.effect("events streams a work-graph delta produced by a command", () =>
 it.effect("events resumes durable replay after a client-supplied sinceOffset cursor (CE2.0)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      // Seed durable history: five journaled deltas at offsets 1..5.
+      // Seed durable history: six journaled deltas at offsets 1..6 (the first is the
+      // repository the workstream is anchored to).
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
       yield* store.jobs.putSession(session);
 
-      // Subscribe with a cursor PAST the first two entries (offset 2): the served
+      // Subscribe with a cursor PAST the first three entries (offset 3): the served
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
-      // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
+      // offset 3 — the issue/job/session deltas — never re-sending the earlier ones.
       const replay = yield* client
-        .events({ resume: { sinceOffset: 2, generation: store.generation } })
+        .events({ resume: { sinceOffset: 3, generation: store.generation } })
         .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
         .pipe(Effect.flatMap(Fiber.join));
 
@@ -514,9 +654,9 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
         "SessionChanged",
       ]);
       // The response envelope carries the durable offsets: all STRICTLY GREATER than
-      // the supplied cursor (2) and contiguous (3, 4, 5) — the coordinate the client
+      // the supplied cursor (3) and contiguous (4, 5, 6) — the coordinate the client
       // feeds back as its next `sinceOffset`, so a resume is gap-free and dup-free.
-      expect(replay.map((item) => item.offset)).toEqual([3, 4, 5]);
+      expect(replay.map((item) => item.offset)).toEqual([4, 5, 6]);
     }),
   ),
 );
@@ -1197,7 +1337,7 @@ it.effect("a transient store read failure surfaces as a DEFECT, never a typed er
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
+        Layer.mergeAll(failingStore, runner, layerSessionRegistry, fakeCodeHost).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
           Layer.provideMerge(layerSessionEvents),
         ),
@@ -1266,7 +1406,7 @@ it.effect(
       );
       const app = handlers.pipe(
         Layer.provideMerge(
-          Layer.mergeAll(failingStore, runner, layerSessionRegistry).pipe(
+          Layer.mergeAll(failingStore, runner, layerSessionRegistry, fakeCodeHost).pipe(
             Layer.provideMerge(layerWorkGraphEvents),
             Layer.provideMerge(layerSessionEvents),
           ),

@@ -19,16 +19,36 @@ import { Effect, Option, Schema } from "effect";
 import { FileSystem } from "effect/FileSystem";
 import { BunFileSystem } from "@effect/platform-bun";
 import { expect } from "vitest";
-import { Epic, Issue, Job, PullRequestRef, Session, Workstream } from "@sprinter/domain";
+import {
+  Epic,
+  Issue,
+  Job,
+  PullRequestRef,
+  Repository,
+  Session,
+  Workstream,
+} from "@sprinter/domain";
 import { layer, StateStore } from "@sprinter/state";
 
 const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
   Schema.decodeUnknownSync(schema)(raw);
 
+/**
+ * The repository the workstream fixture is anchored to — `repositoryId` is a real
+ * FOREIGN KEY, so it has to be stored before anything references it.
+ */
+const repository = decode(Repository, {
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
 const workstream = decode(Workstream, {
   id: "ws-a",
   name: "Track A",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:callajd/sprinter",
   status: "active",
   epics: ["epic-1"],
 });
@@ -78,6 +98,7 @@ it.effect("the Job↔session↔PR mapping survives a restart (build-write-rebuil
     // ── build + write, then TEAR DOWN the layer (the "process exit") ──────────
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream);
       yield* store.workGraph.putEpic(epic);
       yield* store.workGraph.putIssue(issue);

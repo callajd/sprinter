@@ -12,7 +12,7 @@
  *   - a CONTROLLABLE `pi` stand-in at the `ChildProcessSpawner` seam — a scripted
  *     process that acks the runner's commands and emits a canned NDJSON transcript
  *     reaching a terminal settle (NOT the real `pi` binary), and
- *   - a SANDBOXED in-process `Repository` that deterministically yields a PR-open
+ *   - a SANDBOXED in-process `CodeHost` that deterministically yields a PR-open
  *     (NOT real GitHub — no `GITHUB_TOKEN`, no network).
  *
  * ## Harness choice (justification)
@@ -48,7 +48,7 @@
  *   4. **a SEEDED PR pairs through the real read model** — the **Inspector** pairing:
  *      the settled Job carries a `transcriptRef` and resolves, session → job → issue,
  *      to a PR. That PR-open is SEED DATA — injected into the materialized plan
- *      (`seedIssue.pr`) and the fake `Repository`, NOT produced by the loop and NOT
+ *      (`seedIssue.pr`) and the fake `CodeHost`, NOT produced by the loop and NOT
  *      discovered by the daemon. So this proves the read-model pairing WIRE carries a
  *      PR through to the app; it does NOT prove the daemon can discover an
  *      agent-opened PR. In fact the production daemon has no such path — reconcile
@@ -74,7 +74,8 @@ import {
   SessionId,
   Workstream,
 } from "@sprinter/domain";
-import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
+import { Repository as DomainRepository } from "@sprinter/domain";
+import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
 import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
 import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
@@ -87,7 +88,7 @@ const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
 
 // ── the sandboxed GitHub truth: one deterministic OPEN pull request ───────────
 //
-// The seeded work graph AND the fake `Repository` both reflect THIS single fact —
+// The seeded work graph AND the fake `CodeHost` both reflect THIS single fact —
 // the PR the agent opened for issue #68, open (unmerged) and awaiting review. It is
 // the sandbox's stand-in for GitHub; nothing here reads real GitHub or a token.
 const PR_NUMBER = 4210;
@@ -98,14 +99,31 @@ const openPr: (typeof PullRequestRef)["Encoded"] = {
 };
 
 /**
- * The sandboxed in-process `Repository` (NOT real GitHub): every read is a canned,
+ * The sandboxed in-process `CodeHost` (NOT real GitHub): every read is a canned,
  * deterministic value consistent with {@link openPr} — the issue is still open, its
  * closing PR is #4210, and that PR is open (unmerged). Wired into the real daemon
  * graph exactly where the GitHub adapter would be (a `Layer` substitution).
  */
-const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
-  Repository,
-  Repository.of({
+const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      // Resolves ANY key to a canned observation: these suites exercise Issue/PR
+      // reconciliation, not repository resolution (which is tested on its own).
+      resolve: (key) =>
+        Effect.succeed(
+          Option.some(
+            decode(DomainRepository, {
+              id: `repo:${key.host}:${key.owner}/${key.name}`,
+              host: key.host,
+              owner: key.owner,
+              name: key.name,
+              refs: [{ name: "main", sha: "a".repeat(40) }],
+              observedAt: "2026-07-20T12:00:00.000Z",
+            }),
+          ),
+        ),
+    },
     code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(true) },
     issues: {
       getIssue: (number) =>
@@ -123,7 +141,7 @@ const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
         number === PR_NUMBER
           ? Effect.succeed(decode(PullRequestRef, openPr))
           : Effect.die(
-              new RepositoryError({ operation: "getPullRequest", detail: `unused #${number}` }),
+              new CodeHostError({ operation: "getPullRequest", detail: `unused #${number}` }),
             ),
     },
   }),
@@ -225,10 +243,23 @@ const entryAppended = (id: string, text: string) => ({
 });
 
 // ── the seeded "materialized plan" (post-planning, agent-opened-PR state) ─────
+/**
+ * The repository the seeded workstream is anchored to — `repositoryId` is a real
+ * FOREIGN KEY, so it has to be written before the workstream that references it.
+ */
+const seedRepository = decode(DomainRepository, {
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
 const seedWorkstream = decode(Workstream, {
   id: "ws-seed",
   name: "Convergence Seed",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:callajd/sprinter",
   status: "active",
   epics: ["epic-seed"],
 });
@@ -261,7 +292,7 @@ const harnessDaemon = (config: DaemonConfig, pi: ScriptedPi) =>
   Layer.mergeAll(RpcServer.layer(SprinterRpc), bootLayer).pipe(
     Layer.provide(appLayer(config)),
     Layer.provide(socketProtocolLayer(config)),
-    // Fake leaves win (provided nearest): the sandboxed Repository + the scripted pi
+    // Fake leaves win (provided nearest): the sandboxed CodeHost + the scripted pi
     // spawner. Real Bun services satisfy the rest (FileSystem/Path/socket platform).
     Layer.provide(Layer.mergeAll(fakeRepository, pi.layer)),
     Layer.provide(BunServices.layer),
@@ -292,13 +323,14 @@ it.effect(
       const pi = yield* makeScriptedPi;
 
       // Seed the "materialized plan" into the durable FILE BEFORE the daemon boots,
-      // so the boot reconcile runs against the sandboxed Repository (which reports the
+      // so the boot reconcile runs against the sandboxed CodeHost (which reports the
       // issue still open → conservatively no-op, keeping the seeded open PR) and the
       // app hydrates the plan on connect. A separate short-lived StateStore instance
       // on the same file; its scope closes (the "process exit") before the daemon
       // opens the file.
       yield* Effect.gen(function* () {
         const store = yield* StateStore;
+        yield* store.repositories.putRepository(seedRepository);
         yield* store.workGraph.putWorkstream(seedWorkstream);
         yield* store.workGraph.putEpic(seedEpic);
         yield* store.workGraph.putIssue(seedIssue);
@@ -333,7 +365,11 @@ it.effect(
 
           // ── (1) materialize a plan → workstream (live board update) ─────────
           const newId = yield* client.createWorkstreamFromPlan({
-            plan: { name: "CE4 New Plan", repo: "callajd/sprinter", spec: "drive the loop" },
+            plan: {
+              name: "CE4 New Plan",
+              repository: { host: "github", owner: "callajd", name: "sprinter" },
+              spec: "drive the loop",
+            },
           });
           const materialized = yield* waitForDelta(
             (e) => e._tag === "WorkstreamChanged" && e.workstream.id === newId,
@@ -400,7 +436,7 @@ it.effect(
           expect(finalJob?.transcriptRef).toBeDefined();
           // …and resolves — session → job → issue — to the PR (the "PR" side), exactly
           // the Inspector's session↔PR pairing. NB: this open PR is SEED DATA
-          // (`seedIssue.pr` + the fake `Repository`), carried through the real read
+          // (`seedIssue.pr` + the fake `CodeHost`), carried through the real read
           // model — it is NOT discovered by the daemon (production reconcile pairs a PR
           // only once MERGED; see the runbook's "Known limitation"). This asserts the
           // pairing WIRE, not open-PR discovery.

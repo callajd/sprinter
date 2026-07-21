@@ -13,7 +13,10 @@ struct CommandTests {
   func decodesWorkstreamPlan() throws {
     let plan = try Golden.decode(WorkstreamPlan.self, from: "workstream-plan")
     #expect(plan.name == "Foundation")
-    #expect(plan.repo == "callajd/sprinter")
+    // The plan names the repository by its NATURAL KEY: this client has never seen a
+    // RepositoryId and cannot mint one (D6).
+    #expect(
+      plan.repository == RepositoryKey(host: .github, owner: "callajd", name: "sprinter"))
     #expect(try Golden.roundTrip(plan) == plan)
   }
 

@@ -1,11 +1,11 @@
 /**
  * `StartupReconcile` — the daemon's restart-safety service (Track A, task AE5.1).
  * It is what makes the daemon survive a restart: durable state comes back from the
- * {@link StateStore}, status is reconciled against the {@link Repository} code host,
+ * {@link StateStore}, status is reconciled against the {@link CodeHost} code host,
  * and a Job that was in flight is resumed through the {@link JobRunner} — without
  * loss and without a double-run.
  *
- * It depends ONLY on the three PORTS — `StateStore` / `Repository` / `JobRunner`
+ * It depends ONLY on the three PORTS — `StateStore` / `CodeHost` / `JobRunner`
  * (INV-PORT) — never on a concrete backing, HTTP client, or `pi` process. A
  * consumer chooses the backings by providing adapter `Layer`s; the logic here is
  * exercised offline against `layerMemory` + a real tmpfile SQLite `layer` + fakes
@@ -76,7 +76,7 @@ import {
   type WorkStatus,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
-import { reconcileWorkstream, Repository } from "@sprinter/repository";
+import { reconcileWorkstream, CodeHost } from "@sprinter/repository";
 import { StateStore, type StateStoreError } from "@sprinter/state";
 
 /**
@@ -177,18 +177,18 @@ export class StartupReconcile extends Context.Service<
 >()("sprinter/daemon/StartupReconcile") {}
 
 /**
- * The {@link StartupReconcile} implementation over the `StateStore` / `Repository` /
+ * The {@link StartupReconcile} implementation over the `StateStore` / `CodeHost` /
  * `JobRunner` ports (`Layer.effect` + `Service.of`, per conventions). The three
  * ports are captured at construction and re-provided into the reused
  * `reconcileWorkstream` and each `dispatch`; a consumer supplies concrete adapters
  * for them (INV-PORT).
  */
-export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository | JobRunner> =
+export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost | JobRunner> =
   Layer.effect(
     StartupReconcile,
     Effect.gen(function* () {
       const store = yield* StateStore;
-      const repo = yield* Repository;
+      const host = yield* CodeHost;
       const jobRunner = yield* JobRunner;
       // The daemon's boot scope: background resume fibers are tied to it, so they
       // live for the daemon's lifetime and are interrupted when it stops.
@@ -198,7 +198,7 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | Repository
       const reconcile = (workstreamId: Parameters<typeof reconcileWorkstream>[0]) =>
         reconcileWorkstream(workstreamId).pipe(
           Effect.provideService(StateStore, store),
-          Effect.provideService(Repository, repo),
+          Effect.provideService(CodeHost, host),
         );
 
       /**

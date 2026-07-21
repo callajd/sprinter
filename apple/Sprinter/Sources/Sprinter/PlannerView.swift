@@ -28,7 +28,9 @@ struct PlannerView: View {
     VStack(alignment: .leading, spacing: 8) {
       TextField("Workstream name", text: $model.name)
         .textFieldStyle(.roundedBorder)
-      TextField("Repository (owner/name)", text: $model.repo)
+      TextField("Repository owner", text: $model.owner)
+        .textFieldStyle(.roundedBorder)
+      TextField("Repository name", text: $model.repositoryName)
         .textFieldStyle(.roundedBorder)
       TextField("Spec", text: $model.spec)
         .textFieldStyle(.roundedBorder)

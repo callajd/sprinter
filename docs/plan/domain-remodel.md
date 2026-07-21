@@ -233,6 +233,15 @@ Later tasks must reuse it rather than reinvent or rediscover it.
 | `check:goldens` stage | `bun run check` | `INV-MIRROR` is now gate-enforced; golden drift fails CI rather than relying on manual regeneration. |
 | `Timestamp` (canonical `…THH:MM:SS.sssZ`) | `packages/domain/src/time.ts` | The single owned instant type. Reuse it for every `observedAt`; **a leap second is a hard decode failure**, so an adapter reading externally-sourced instants translates at its boundary (`INV-PORT`). |
 
+### Landed by DE1.2 (issue #86) — also inherit these
+
+| Foundation | Where | What later tasks owe it |
+|---|---|---|
+| `CodeHost` port (was `Repository`) | `packages/repository/src/code-host.ts` | The role-noun names the external SYSTEM; the plain name `Repository` belongs to the owned entity. Tag `sprinter/repository/CodeHost`; its error is `CodeHostError`. |
+| `Repository` entity + `RepositoryKey` | `packages/domain/src/repository.ts` | The `── STATE ──` anchor. `(host, owner, name)` is the natural key and is `UNIQUE`; the `RepositoryId` an adapter mints is a **function of that key** (a refresh must land on the same row). |
+| `CommitSha` / `BranchName` | `packages/domain/src/ids.ts` | Real checks IN the schema, not branded `NonEmptyString`s. Reuse them wherever a sha or a ref name enters the domain. |
+| `hostInstant` (leap-second translation) | `packages/repository/src/github.ts` | The one place a host's instant spelling becomes a `Timestamp`. Any new host-sourced instant goes through it — never a raw host string into `Timestamp`. |
+
 ### A known tension — `INV-FRESH` vs. the registry's durability
 
 `INV-FRESH` drops and recreates the store on every schema bump. The `Agent` registry is

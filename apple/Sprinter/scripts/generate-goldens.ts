@@ -36,6 +36,7 @@ import {
   Issue,
   Job,
   PullRequestRef,
+  Repository,
   Session,
   SessionEvent,
   SessionInput,
@@ -162,10 +163,30 @@ const epic = {
   status: "active",
   issues: ["iss-1", "iss-2"],
 };
+// ── STATE-layer fixture (DE1.2) ──────────────────────────────────────────────
+//
+// A `Repository` is REFERENCED, not owned — it is a snapshot of something on a code
+// host — so it carries `observedAt` (INV-OBSERVED), which the owned nodes never do.
+// Its `refs` are the OBSERVED ref map, ordered by branch name; an EMPTY one is valid
+// ("nothing observed yet"), and `repository-no-refs` pins that shape too.
+const repository = {
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [
+    { name: "feat/x-1", sha: "89abcdef0123456789abcdef0123456789abcdef" },
+    { name: "main", sha: "0123456789abcdef0123456789abcdef01234567" },
+  ],
+  observedAt: "2026-07-20T12:00:00.000Z",
+};
+
 const workstream = {
   id: "ws-1",
   name: "Foundation",
-  repo: "callajd/sprinter",
+  // A REFERENCE to the repository above, not a bare string: the two cannot disagree
+  // about which repository this workstream is bound to.
+  repositoryId: "repo:github:callajd/sprinter",
   status: "active",
   epics: ["ep-1"],
 };
@@ -180,6 +201,10 @@ const workstream = {
 const generation = "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b";
 
 write("snapshot", Snapshot, {
+  // The STATE layer: every repository the daemon has observed. It is hydrated because
+  // `Workstream.repositoryId` is a REFERENCE — without it a client could resolve none
+  // of them, nor render how stale each observation is.
+  repositories: [repository],
   workstreams: [workstream],
   epics: [epic],
   issues: [issueWithPr, issueNoPr],
@@ -197,6 +222,10 @@ write("snapshot", Snapshot, {
 });
 
 // Individual owned nodes (exercise every DTO + optional-key present/absent).
+write("repository", Repository, repository);
+// An EMPTY ref set is a VALID observation — "nothing observed yet", not a malformed
+// record — so the mirror must decode it as an empty list rather than a missing key.
+write("repository-no-refs", Repository, { ...repository, refs: [] });
 write("workstream", Workstream, workstream);
 write("epic", Epic, epic);
 write("issue-with-pr", Issue, issueWithPr);
@@ -217,6 +246,7 @@ write("epic-cancelled", Epic, { ...epic, status: "cancelled" });
 // ── WorkGraphEvent — every variant ───────────────────────────────────────────
 
 write("work-graph-events", Schema.Array(WorkGraphEvent), [
+  { _tag: "RepositoryChanged", repository },
   { _tag: "WorkstreamChanged", workstream },
   { _tag: "EpicChanged", epic },
   { _tag: "IssueChanged", issue: issueWithPr },
@@ -346,9 +376,12 @@ write("ui-responses", Schema.Array(UiResponse), [
 
 // ── WorkstreamPlan ───────────────────────────────────────────────────────────
 
+// The plan carries the repository's NATURAL KEY, not an id: it is composed by a
+// client that has never seen a `RepositoryId` (D6). The daemon resolves the key
+// through the `CodeHost` port, and refuses a plan the host does not recognise.
 write("workstream-plan", WorkstreamPlan, {
   name: "Foundation",
-  repo: "callajd/sprinter",
+  repository: { host: "github", owner: "callajd", name: "sprinter" },
   spec: "Build the daemon↔client contract and its mirrors.",
 });
 
@@ -405,7 +438,11 @@ writeFileSync(
 write("payload-events", events.payloadSchema, { resume: { sinceOffset: 12, generation } });
 write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
-  plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
+  plan: {
+    name: "Foundation",
+    repository: { host: "github", owner: "callajd", name: "sprinter" },
+    spec: "build it",
+  },
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });

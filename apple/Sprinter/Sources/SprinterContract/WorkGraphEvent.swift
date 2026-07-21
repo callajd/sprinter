@@ -5,6 +5,11 @@
 /// The mirror decodes by switching on `_tag`; an unknown tag is a decode failure
 /// (a contract the mirror does not understand), never a silent drop.
 public enum WorkGraphEvent: Codable, Equatable, Sendable {
+  /// The STATE layer's delta. A repository record is REPLACED WHOLESALE on every
+  /// refresh, under a new `observedAt`, so this always carries the complete new
+  /// observation and an upsert by id is exactly right. There is deliberately no
+  /// removal variant — a repository leaves the graph only with the whole store.
+  case repositoryChanged(Repository)
   case workstreamChanged(Workstream)
   case epicChanged(Epic)
   case issueChanged(Issue)
@@ -14,6 +19,7 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case tag = "_tag"
+    case repository
     case workstream
     case epic
     case issue
@@ -26,6 +32,8 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     let tag = try container.decode(String.self, forKey: .tag)
     switch tag {
+    case "RepositoryChanged":
+      self = .repositoryChanged(try container.decode(Repository.self, forKey: .repository))
     case "WorkstreamChanged":
       self = .workstreamChanged(try container.decode(Workstream.self, forKey: .workstream))
     case "EpicChanged":
@@ -50,6 +58,9 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
   public func encode(to encoder: any Encoder) throws {
     var container = encoder.container(keyedBy: CodingKeys.self)
     switch self {
+    case .repositoryChanged(let value):
+      try container.encode("RepositoryChanged", forKey: .tag)
+      try container.encode(value, forKey: .repository)
     case .workstreamChanged(let value):
       try container.encode("WorkstreamChanged", forKey: .tag)
       try container.encode(value, forKey: .workstream)

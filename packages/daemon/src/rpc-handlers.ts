@@ -83,6 +83,7 @@ import {
   type Issue,
   type IssueId,
   Job,
+  type Repository,
   type Session,
   type SessionId,
   type SessionInput,
@@ -92,6 +93,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import { CodeHost } from "@sprinter/repository";
 import type { SessionHandle } from "@sprinter/runner";
 import { StateStore } from "@sprinter/state";
 import { resyncEvents } from "./event-journal.ts";
@@ -101,6 +103,7 @@ import { WorkGraphEvents } from "./work-graph-events.ts";
 
 type Store = Context.Service.Shape<typeof StateStore>;
 type Runner = Context.Service.Shape<typeof JobRunner>;
+type Host = Context.Service.Shape<typeof CodeHost>;
 type Registry = Context.Service.Shape<typeof SessionRegistry>;
 type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
 
@@ -120,6 +123,13 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
  * and each job's session. Reuses the store's FK-scoped reads so the result is
  * consistent regardless of a node's cached child list.
  *
+ * The `── STATE ──` layer (`repositories`) is hydrated WHOLE for a different reason
+ * than the registry: `Workstream.repositoryId` is a REFERENCE, so a client that
+ * received workstreams without the repositories they name could resolve none of them.
+ * Every observation is shipped as stored, INCLUDING an old one — staleness is rendered
+ * from each record's `observedAt` (DE4.4), and withholding a stale record would delete
+ * the very evidence that rendering needs (D7: reads never gate on staleness).
+ *
  * The REGISTRY layer is hydrated flat and WHOLE — `listAgents`, not a per-repo or
  * per-workstream read — because an `Agent` is global and carries no repository:
  * "the agents used in this repo" is a fold the client computes over that repo's
@@ -134,6 +144,7 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
 const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   Effect.gen(function* () {
     const agents = yield* store.agents.listAgents;
+    const repositories = yield* store.repositories.listRepositories;
     const workstreams = yield* store.workGraph.listWorkstreams;
     const epics: Array<Epic> = [];
     const issues: Array<Issue> = [];
@@ -156,6 +167,7 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
       }
     }
     return {
+      repositories,
       workstreams,
       epics,
       issues,
@@ -176,21 +188,68 @@ const slugify = (name: string): string =>
     .replace(/^-+|-+$/g, "");
 
 /**
+ * RESOLVE-OR-CREATE the {@link Repository} a plan names (DE1.2 D6).
+ *
+ * The plan carries the NATURAL key `(host, owner, name)` because the client composing
+ * it has never seen a `RepositoryId`. So the key is OBSERVED through the {@link CodeHost}
+ * port: the host either knows the repository — and the observation it returns is stored
+ * (creating the record on a first sighting, REFRESHING it wholesale under a new
+ * `observedAt` on a later one, D7) — or it does not, in which case the plan is
+ * {@link PlanRejected} with a reason.
+ *
+ * The rejection branch writes NOTHING, and that is the point rather than an
+ * optimisation: fabricating a repository row from the plan's own words would put a
+ * record in the `── STATE ──` layer that no host ever confirmed — an "observation" of
+ * something nobody observed — and every workstream anchored to it would then reference
+ * a repository that may not exist. `Workstream.repositoryId` is a real FOREIGN KEY, so
+ * this is also the only way the workstream write below can succeed at all.
+ *
+ * A host that could not be ASKED (a 500, a rate limit) is a different outcome from a
+ * host that answered "no such repository", and it stays that way: the port's
+ * `CodeHostError` is a DEFECT here, never folded into `PlanRejected`. Reporting "that
+ * repository does not exist" because GitHub was briefly unreachable would be a lie the
+ * user would act on.
+ */
+const resolveRepository = (
+  store: Store,
+  host: Host,
+  plan: WorkstreamPlan,
+): Effect.Effect<Repository, PlanRejected> =>
+  Effect.gen(function* () {
+    const observed = yield* host.repositories.resolve(plan.repository).pipe(Effect.orDie);
+    if (Option.isNone(observed)) {
+      return yield* Effect.fail(
+        new PlanRejected({
+          reason: `the code host does not know the repository ${plan.repository.owner}/${plan.repository.name}`,
+        }),
+      );
+    }
+    yield* store.repositories.putRepository(observed.value).pipe(Effect.orDie);
+    return observed.value;
+  });
+
+/**
  * Materialize a {@link WorkstreamPlan} into a new top-level {@link Workstream}
  * and persist it (the publishing decorator fans out a `WorkstreamChanged` delta).
  * A blank spec, or a name that yields no slug, is a {@link PlanRejected}. The
  * epic/issue breakdown is produced later by a planning Job — a fresh workstream
  * has an empty `epics` list, so FK/child-list consistency holds trivially.
  *
- * The id is derived from BOTH the plan name and its repo (a workstream is
- * repo-scoped, D14), so the same name for different repos does not collide. And
+ * The plan's repository key is resolved (or created) FIRST, through
+ * {@link resolveRepository}: the workstream's `repositoryId` is a real FOREIGN KEY,
+ * so the anchor has to exist before the workstream that references it can be written
+ * at all. A plan the host does not recognise fails there, having written nothing.
+ *
+ * The id is derived from BOTH the plan name and its repository (a workstream is
+ * repo-scoped, D14), so the same name for different repositories does not collide. And
  * because `putWorkstream` is an UPSERT, a create whose id already exists would
- * silently clobber the existing workstream — resetting its `name`/`repo` and its
- * `epics` list while the epics' FK rows persist (a parentage desync). The contract
+ * silently clobber the existing workstream — resetting its `name`/`repositoryId` and
+ * its `epics` list while the epics' FK rows persist (a parentage desync). The contract
  * materializes a NEW workstream, so a colliding create is rejected, not upserted.
  */
 const materialize = (
   store: Store,
+  host: Host,
   plan: WorkstreamPlan,
 ): Effect.Effect<WorkstreamId, PlanRejected> =>
   Effect.gen(function* () {
@@ -203,7 +262,11 @@ const materialize = (
         new PlanRejected({ reason: "cannot derive a workstream id from the plan name" }),
       );
     }
-    const repoSlug = slugify(plan.repo);
+    // Derived from the plan's stated key rather than from the resolved record's id, so
+    // the workstream id stays stable no matter how the host adapter mints ids.
+    const repoSlug = slugify(
+      `${plan.repository.host}-${plan.repository.owner}-${plan.repository.name}`,
+    );
     // Both parts are slugified; `ws-<slug>[-<repoSlug>]` is non-empty by
     // construction, so the branded decode cannot fail.
     const idString = repoSlug.length > 0 ? `ws-${slug}-${repoSlug}` : `ws-${slug}`;
@@ -214,10 +277,11 @@ const materialize = (
         new PlanRejected({ reason: "a workstream already exists for this plan name and repo" }),
       );
     }
+    const repository = yield* resolveRepository(store, host, plan);
     const workstream: Workstream = {
       id,
       name: plan.name,
-      repo: plan.repo,
+      repositoryId: repository.id,
       status: "pending",
       epics: [],
     };
@@ -664,6 +728,7 @@ export const handlers = SprinterRpc.toLayer(
   Effect.gen(function* () {
     const store = yield* StateStore;
     const runner = yield* JobRunner;
+    const host = yield* CodeHost;
     const feed = yield* WorkGraphEvents;
     const sessionFeed = yield* SessionEvents;
     const sessions = yield* SessionRegistry;
@@ -690,7 +755,7 @@ export const handlers = SprinterRpc.toLayer(
       // drop-and-recreate can never be resumed incrementally against the new log
       // (`ResyncRequired`).
       events: ({ resume }) => resyncEvents(store, feed, resume),
-      createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
+      createWorkstreamFromPlan: ({ plan }) => materialize(store, host, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),

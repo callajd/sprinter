@@ -13,8 +13,9 @@ import Testing
 @MainActor
 struct PlannerViewModelTests {
   private static let session = SessionId(rawValue: "plan-session")
+  private static let repositoryKey = RepositoryKey(host: .github, owner: "acme", name: "pipe")
   private static let plan = WorkstreamPlan(
-    name: "Postgres sink", repo: "acme/pipe", spec: "batch writes to Postgres")
+    name: "Postgres sink", repository: repositoryKey, spec: "batch writes to Postgres")
 
   /// Planning IS a normal interactive session: the reused `SessionViewModel`'s
   /// transcript builds live off the scripted planning feed, driven by the fake.
@@ -145,16 +146,17 @@ struct PlannerViewModelTests {
         knownSession: Self.session, materializeResult: .success(created)),
       planningSessionId: Self.session)
     let corrected = WorkstreamPlan(
-      name: Self.plan.name, repo: Self.plan.repo, spec: "corrected spec")
+      name: Self.plan.name, repository: Self.plan.repository, spec: "corrected spec")
     try await accepting.materialize(corrected)
     #expect(accepting.outcome == .created(created))
     #expect(accepting.createdWorkstreamId == created)
   }
 
   /// The plan-construction FORM (CE3.2): `canMaterialize` gates on a non-empty name
-  /// AND repo (spec optional), and whitespace-only fields don't count — the plan is
-  /// built explicitly from the fields, never extracted from the transcript.
-  @Test("the form gates materialize on a non-empty name and repo")
+  /// AND a COMPLETE repository key — both halves, since the contract's key is a triple
+  /// and a half-filled one names nothing. Whitespace-only fields don't count, and the
+  /// plan is built explicitly from the fields, never extracted from the transcript.
+  @Test("the form gates materialize on a non-empty name and a complete repository key")
   func formValidationGatesMaterialize() {
     let backend = PlannerFakeBackend(
       knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
@@ -163,16 +165,22 @@ struct PlannerViewModelTests {
     // Empty form → cannot materialize.
     #expect(!planner.canMaterialize)
 
-    // Name only is not enough; a repo is required too.
+    // Name only is not enough; a repository key is required too.
     planner.name = "Postgres sink"
     #expect(!planner.canMaterialize)
 
-    // Whitespace-only repo still doesn't count.
-    planner.repo = "   "
+    // Whitespace-only fields still don't count.
+    planner.owner = "   "
+    planner.repositoryName = "   "
     #expect(!planner.canMaterialize)
 
-    // Name + repo (spec may stay empty) → ready.
-    planner.repo = "acme/pipe"
+    // HALF the key is still not a key: an owner with no repository name names nothing.
+    planner.owner = "acme"
+    planner.repositoryName = ""
+    #expect(!planner.canMaterialize)
+
+    // Name + the COMPLETE key (spec may stay empty) → ready.
+    planner.repositoryName = "pipe"
     #expect(planner.canMaterialize)
   }
 
@@ -184,12 +192,14 @@ struct PlannerViewModelTests {
       knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
     let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
     planner.name = "  Postgres sink\n"
-    planner.repo = " acme/pipe "
+    planner.owner = " acme "
+    planner.repositoryName = " pipe "
     planner.spec = "  batch writes  "
 
     #expect(
       planner.draftPlan
-        == WorkstreamPlan(name: "Postgres sink", repo: "acme/pipe", spec: "batch writes"))
+        == WorkstreamPlan(
+          name: "Postgres sink", repository: Self.repositoryKey, spec: "batch writes"))
   }
 
   /// `materializeDraft` submits the plan the form describes through the port and
@@ -202,7 +212,8 @@ struct PlannerViewModelTests {
     let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
     var observed = backend.submittedPlans.makeAsyncIterator()
     planner.name = "Postgres sink"
-    planner.repo = "acme/pipe"
+    planner.owner = "acme"
+    planner.repositoryName = "pipe"
     planner.spec = "batch writes to Postgres"
 
     try await planner.materializeDraft()

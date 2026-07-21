@@ -74,7 +74,13 @@ public struct BoardEpic: Sendable, Equatable, Identifiable {
 public struct BoardWorkstream: Sendable, Equatable, Identifiable {
   public let id: WorkstreamId
   public let name: String
-  /// The repository this workstream is scoped to (`owner/name`).
+  /// The repository this workstream is scoped to, RENDERED as `owner/name`.
+  ///
+  /// It is a projected DISPLAY string, resolved from the observed `Repository` the
+  /// workstream references — not the reference itself. The board renders a name; the
+  /// identity lives on the reference itself, and a workstream whose repository
+  /// is missing from the snapshot renders its raw id rather than dropping the row
+  /// (INV-NOFORCE: the projection stays total).
   public let repo: String
   public let status: BoardStatus
   public let epics: [BoardEpic]

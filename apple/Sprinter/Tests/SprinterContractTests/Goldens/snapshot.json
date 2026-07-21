@@ -1,9 +1,28 @@
 {
+  "repositories": [
+    {
+      "id": "repo:github:callajd/sprinter",
+      "host": "github",
+      "owner": "callajd",
+      "name": "sprinter",
+      "refs": [
+        {
+          "name": "feat/x-1",
+          "sha": "89abcdef0123456789abcdef0123456789abcdef"
+        },
+        {
+          "name": "main",
+          "sha": "0123456789abcdef0123456789abcdef01234567"
+        }
+      ],
+      "observedAt": "2026-07-20T12:00:00.000Z"
+    }
+  ],
   "workstreams": [
     {
       "id": "ws-1",
       "name": "Foundation",
-      "repo": "callajd/sprinter",
+      "repositoryId": "repo:github:callajd/sprinter",
       "status": "active",
       "epics": [
         "ep-1"

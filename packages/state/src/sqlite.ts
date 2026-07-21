@@ -96,6 +96,11 @@ import {
   NonNegativeInt,
   PositiveInt,
   PullRequestRef,
+  type Repository,
+  RepositoryHost,
+  RepositoryId,
+  RepositoryRef,
+  RepositorySegment,
   Session,
   SessionEvent,
   SessionId,
@@ -113,6 +118,7 @@ import {
   type JobStore,
   type PersistedEvent,
   type PersistedSessionEvent,
+  type RepositoryStore,
   type SessionLogStore,
   StateStore,
   StateStoreError,
@@ -138,11 +144,28 @@ const fail =
 // Persistence schemas — `.Type` is the owned domain shape, `.Encoded` is the row
 // ============================================================================
 
+/**
+ * A `repository` row — the entity's SCALAR columns only. Its observed refs live in
+ * the `repository_ref` child table (D4) and are joined in separately, exactly as an
+ * issue's `dependsOn` edges are: a JSON blob would make a duplicate branch name merely
+ * unlikely, while the child table's composite PRIMARY KEY makes it unconstructible.
+ */
+const RepositoryScalarRow = Schema.Struct({
+  id: RepositoryId,
+  host: RepositoryHost,
+  owner: RepositorySegment,
+  name: RepositorySegment,
+  observedAt: Timestamp,
+});
+
+/** A single `repository_ref` row: one observed branch tip. */
+const RepositoryRefRow = RepositoryRef;
+
 /** A workstream row: `epics` is a JSON-encoded child list. */
 const WorkstreamRow = Schema.Struct({
   id: WorkstreamId,
   name: Schema.NonEmptyString,
-  repo: Schema.NonEmptyString,
+  repositoryId: RepositoryId,
   status: WorkStatus,
   epics: Schema.fromJsonString(Schema.Array(EpicId)),
 });
@@ -309,7 +332,19 @@ const GENERATION_KEY = "generation";
  * `agent.supersedes` a real FOREIGN KEY onto `agent (id)` (enforced per-connection by
  * {@link configureConnection}), making a DANGLING `supersedes` unstorable — which is
  * what makes every other lineage rule order-independent instead of bypassable by
- * appending a successor before its predecessor.
+ * appending a successor before its predecessor. Version 5 lands the `── STATE ──`
+ * layer's `Repository` entity (DE1.2): the `repository` table with its `UNIQUE
+ * (host, owner, name)` natural key, the `repository_ref` child table keyed
+ * `(repositoryId, name)` with an `ON DELETE CASCADE` foreign key, and
+ * `workstream.repositoryId` as a real FOREIGN KEY onto it (replacing the bare
+ * `repo` TEXT column).
+ *
+ * That last one has a RESET consequence worth stating, because it is what makes the
+ * foreign key hold rather than merely be declared: a bump drops `repository`,
+ * `repository_ref` AND `workstream` TOGETHER (the sweep is over the whole database),
+ * so a reset can never leave a workstream behind pointing at a repository row that no
+ * longer exists. There is no window in which the reference dangles — the referencing
+ * table does not outlive the referenced one.
  *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
@@ -318,7 +353,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -449,13 +484,53 @@ const createSchema = Effect.gen(function* () {
   // other. (SQLite treats NULLs as distinct in a UNIQUE index anyway; the predicate
   // says so explicitly and keeps the index off the rows that never need it.)
   yield* sql`CREATE UNIQUE INDEX agent_supersedes ON agent (supersedes) WHERE supersedes IS NOT NULL`;
+  // The `── STATE ──` layer's anchor: a repository as OBSERVED on a code host (DE1.2).
+  // It carries `observedAt` because it is REFERENCED, not owned (INV-OBSERVED); the
+  // owned nodes below carry none.
+  //
+  // `id` is the PRIMARY KEY because it is what other rows reference, but it is NOT
+  // what identifies a repository — `(host, owner, name)` is. Two rows for one
+  // repository is the domain's own "two records disagreeing about the same thing", and
+  // it is made UNCONSTRUCTIBLE by the UNIQUE index below rather than by a resolve-time
+  // read-then-check, which a concurrent or reordered write walks straight past.
+  yield* sql`CREATE TABLE repository (
+      id TEXT PRIMARY KEY NOT NULL,
+      host TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      name TEXT NOT NULL,
+      "observedAt" TEXT NOT NULL
+    )`;
+  yield* sql`CREATE UNIQUE INDEX repository_natural_key ON repository (host, owner, name)`;
+  // The OBSERVED ref map `BranchName → CommitSha`, as a CHILD TABLE rather than a JSON
+  // column on `repository` (D4). The difference is enforcement: the composite PRIMARY
+  // KEY makes a repeated branch name within ONE repository unstorable, where a blob
+  // would leave "at most one tip per branch" to whoever assembled the JSON. The
+  // FOREIGN KEY makes a ref naming an ABSENT repository unstorable for the same
+  // reason, and `ON DELETE CASCADE` means the refs cannot outlive the repository they
+  // describe — which is also the ONLY delete anywhere on this path (the port exposes
+  // none).
+  yield* sql`CREATE TABLE repository_ref (
+      "repositoryId" TEXT NOT NULL,
+      name TEXT NOT NULL,
+      sha TEXT NOT NULL,
+      PRIMARY KEY ("repositoryId", name),
+      FOREIGN KEY ("repositoryId") REFERENCES repository (id) ON DELETE CASCADE
+    )`;
+  // `repositoryId` is a REAL foreign key onto `repository`, not a bare column holding
+  // an id (and not the `repo TEXT` string it replaced). A workstream anchored to a
+  // repository that was never observed is REJECTED by the engine on the INSERT —
+  // never stored and reconciled later. That is the `supersedes` lesson from DE1.1
+  // applied one task on: while a dangling reference was storable, every rule decided
+  // by READING the referent was bypassable by writing in the other order.
   yield* sql`CREATE TABLE workstream (
       id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
-      repo TEXT NOT NULL,
+      "repositoryId" TEXT NOT NULL,
       status TEXT NOT NULL,
-      epics TEXT NOT NULL
+      epics TEXT NOT NULL,
+      FOREIGN KEY ("repositoryId") REFERENCES repository (id)
     )`;
+  yield* sql`CREATE INDEX workstream_repository ON workstream ("repositoryId")`;
   yield* sql`CREATE TABLE epic (
       id TEXT PRIMARY KEY NOT NULL,
       "workstreamId" TEXT NOT NULL,
@@ -555,7 +630,7 @@ const configureConnection = Effect.gen(function* () {
     // the caller's single `fail("applySchema")` mapping covers it too.
     return yield* Effect.fail({
       message:
-        "SQLite refused `PRAGMA foreign_keys = ON`; the agent registry's `supersedes` foreign key would not be enforced, leaving a dangling reference storable",
+        "SQLite refused `PRAGMA foreign_keys = ON`; the schema's foreign keys (the agent registry's `supersedes`, `repository_ref.repositoryId`, `workstream.repositoryId`) would not be enforced, leaving dangling references storable",
     });
   }
 });
@@ -872,6 +947,104 @@ const make = Effect.gen(function* () {
     ),
   };
 
+  // ── RepositoryStore ─────────────────────────────────────────────────────
+  //
+  // Put + read only: there is no DELETE statement here, by design (see `store.ts`).
+  // The one removal on this path is the `ON DELETE CASCADE` that clears a repository's
+  // refs with the repository itself, which only a store reset performs.
+
+  /**
+   * Reconstruct one {@link Repository} from its scalar row plus its observed refs,
+   * ordered by branch name. `operation` is the calling store method so a failure
+   * reports the caller, not a fixed label.
+   */
+  const hydrateRepository = (
+    row: unknown,
+    operation: string,
+  ): Effect.Effect<Repository, StateStoreError> =>
+    Effect.gen(function* () {
+      const base = yield* Schema.decodeUnknownEffect(RepositoryScalarRow)(row);
+      const refRows =
+        yield* sql`SELECT name, sha FROM repository_ref WHERE "repositoryId" = ${base.id} ORDER BY name`;
+      const refs = yield* Schema.decodeUnknownEffect(Schema.Array(RepositoryRefRow))(refRows);
+      const repository: Repository = {
+        id: base.id,
+        host: base.host,
+        owner: base.owner,
+        name: base.name,
+        refs,
+        observedAt: base.observedAt,
+      };
+      return repository;
+    }).pipe(Effect.mapError(fail(operation)));
+
+  const repositories: RepositoryStore = {
+    // A refresh REPLACES the record wholesale (D7) — scalars AND the whole ref set —
+    // so a branch deleted upstream disappears rather than lingering from an older
+    // read, and the stored record always describes ONE coherent moment. Both writes
+    // run in ONE transaction, so a crash can never leave the new `observedAt`
+    // alongside the previous observation's refs.
+    //
+    // There is no read-then-check for "is this natural key already taken by another
+    // id": the `repository_natural_key` UNIQUE index answers it atomically, on the
+    // INSERT, where a concurrent racing write cannot slip between the look and the
+    // leap (INV-ENFORCE). A violation surfaces as an ordinary `StateStoreError`.
+    putRepository: (repository) =>
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            const row = {
+              id: repository.id,
+              host: repository.host,
+              owner: repository.owner,
+              name: repository.name,
+              observedAt: repository.observedAt,
+            };
+            yield* sql`INSERT INTO repository ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`;
+            yield* sql`DELETE FROM repository_ref WHERE "repositoryId" = ${repository.id}`;
+            if (repository.refs.length > 0) {
+              const refs = repository.refs.map((ref) => ({
+                repositoryId: repository.id,
+                name: ref.name,
+                sha: ref.sha,
+              }));
+              yield* sql`INSERT INTO repository_ref ${sql.insert(refs)}`;
+            }
+          }),
+        )
+        .pipe(Effect.mapError(fail("putRepository"))),
+    getRepository: (id) =>
+      sql`SELECT * FROM repository WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getRepository")),
+        Effect.flatMap((rows) =>
+          Option.match(Arr.head(rows), {
+            onNone: () => Effect.succeedNone,
+            onSome: (row) => Effect.asSome(hydrateRepository(row, "getRepository")),
+          }),
+        ),
+      ),
+    // At most one row can match: the triple is UNIQUE in the backing, so taking the
+    // head is deterministic by construction rather than "the first of whatever came
+    // back". Staleness is NOT consulted (D7) — an old observation is still the
+    // answer, and hiding it would delete the evidence DE4.4 renders from.
+    findRepository: (key) =>
+      sql`SELECT * FROM repository WHERE host = ${key.host} AND owner = ${key.owner} AND name = ${key.name}`.pipe(
+        Effect.mapError(fail("findRepository")),
+        Effect.flatMap((rows) =>
+          Option.match(Arr.head(rows), {
+            onNone: () => Effect.succeedNone,
+            onSome: (row) => Effect.asSome(hydrateRepository(row, "findRepository")),
+          }),
+        ),
+      ),
+    listRepositories: sql`SELECT * FROM repository ORDER BY id`.pipe(
+      Effect.mapError(fail("listRepositories")),
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) => hydrateRepository(row, "listRepositories")),
+      ),
+    ),
+  };
+
   // ── WorkGraphStore ──────────────────────────────────────────────────────
 
   const putWorkstream = SqlSchema.void({
@@ -1171,6 +1344,7 @@ const make = Effect.gen(function* () {
 
   return StateStore.of({
     agents,
+    repositories,
     workGraph: putWorkGraph,
     jobs,
     events,

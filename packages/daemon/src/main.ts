@@ -14,7 +14,7 @@
  * - {@link ExecutionRunner} — CE1.1's real `LocalPi` adapter (`@sprinter/job`
  *   `layerLocalPi`) over a per-Job worktree router (`layerWorktreeRouter`, CE1.1-F2),
  *   spawning `pi` through the Bun `ChildProcessSpawner`.
- * - {@link JobRunner}, {@link Repository}, {@link SessionRegistry},
+ * - {@link JobRunner}, {@link CodeHost}, {@link SessionRegistry},
  *   {@link WorkGraphEvents} — the remaining ports, each an Effect `Layer`.
  * - {@link handlers} — the `SprinterRpc` server handlers, served by
  *   `RpcServer.layer` over a `SocketServer` transport (NDJSON framing) — the ONLY
@@ -22,7 +22,7 @@
  * - {@link StartupReconcile} — run once at boot so a restart resyncs the durable
  *   graph and re-dispatches persisted in-flight work (AE5, now file-backed).
  *
- * Selecting real-vs-fake (a fake `Repository`/`ChildProcessSpawner` under test) or
+ * Selecting real-vs-fake (a fake `CodeHost`/`ChildProcessSpawner` under test) or
  * one transport-vs-another is a `Layer` substitution and nothing else: NOTHING here
  * is `new`-ed or hand-wired outside DI (INV-EFFECT-DI). The runnable process
  * entrypoint (env → config → `runMain`) lives in the sibling `./run.ts`; this module
@@ -145,10 +145,10 @@ export const executionRunnerLayer = (config: DaemonConfig) =>
   );
 
 /**
- * The full port sub-graph MINUS the leaf adapters (`Repository`, the process
+ * The full port sub-graph MINUS the leaf adapters (`CodeHost`, the process
  * spawner, the filesystem) that a test substitutes: the `StateStore`,
  * `ExecutionRunner`, `SessionRegistry`, `WorkGraphEvents`, `JobRunner`, and
- * `StartupReconcile` services, cross-wired. Requires `Repository` +
+ * `StartupReconcile` services, cross-wired. Requires `CodeHost` +
  * `ChildProcessSpawner`/`FileSystem`/`Path`.
  *
  * The {@link SessionRegistry} is provided BENEATH (`provideMerge`) rather than merged
@@ -176,7 +176,7 @@ const servicesLayer = (config: DaemonConfig) =>
 
 /**
  * The handlers + all services graph, requiring only the substitutable leaves
- * (`Repository`, `ChildProcessSpawner`, `FileSystem`, `Path`). This is the surface a
+ * (`CodeHost`, `ChildProcessSpawner`, `FileSystem`, `Path`). This is the surface a
  * test drives via `RpcTest` with fake leaves (INV-EFFECT-DI); production provides
  * the real leaves and the transport in {@link mainLayer}.
  */
@@ -312,7 +312,7 @@ export const socketProtocolLayer = (config: DaemonConfig) =>
 
 /**
  * The complete daemon graph: the `SprinterRpc` server + boot, provided the app
- * services, the socket transport, the real `Repository`, and the Bun platform
+ * services, the socket transport, the real `CodeHost`, and the Bun platform
  * services — a single self-contained `Layer` whose launch IS the running daemon.
  * Building it opens the socket, runs the boot reconcile, and starts serving; closing
  * its scope tears everything down.

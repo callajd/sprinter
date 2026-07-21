@@ -6,7 +6,7 @@
       "workstream": {
         "id": "ws-1",
         "name": "Foundation",
-        "repo": "callajd/sprinter",
+        "repositoryId": "repo:github:callajd/sprinter",
         "status": "active",
         "epics": [
           "ep-1"

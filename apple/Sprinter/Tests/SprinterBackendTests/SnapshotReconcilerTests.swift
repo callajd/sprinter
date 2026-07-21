@@ -20,7 +20,8 @@ struct SnapshotReconcilerTests {
   @Test("a workstream delta replaces the matching workstream")
   func replacesWorkstream() {
     let updated = Workstream(
-      id: WorkstreamId(rawValue: "ws-1"), name: "Foundation", repo: "callajd/sprinter",
+      id: WorkstreamId(rawValue: "ws-1"), name: "Foundation",
+      repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
       status: .done, epics: [EpicId(rawValue: "ep-1")])
     let result = reconciler.reconcile(Fixtures.snapshot, applying: .workstreamChanged(updated))
     #expect(result.workstreams == [updated])

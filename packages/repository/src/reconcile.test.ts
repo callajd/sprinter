@@ -1,6 +1,6 @@
 /**
  * Status roll-up coverage (AE3.2) — the one-directional reconciler exercised
- * against a FAKE {@link Repository} + the in-memory {@link StateStore}
+ * against a FAKE {@link CodeHost} + the in-memory {@link StateStore}
  * (`layerMemory`). Deterministic and OFFLINE (INV-GATE): no HTTP, no live GitHub.
  *
  * The suite proves the D13 roll-up: reading which Issues closed / which PRs merged
@@ -23,8 +23,9 @@ import {
   PullRequestRef,
   Workstream,
 } from "@sprinter/domain";
+import { Repository as DomainRepository } from "@sprinter/domain";
 import { layerMemory, StateStore } from "@sprinter/state";
-import { reconcileWorkstream, Repository, RepositoryError, RepositoryIssue } from "./index.ts";
+import { reconcileWorkstream, CodeHost, CodeHostError, RepositoryIssue } from "./index.ts";
 
 // ============================================================================
 // Fixtures — decoded through the owned schemas (no casts)
@@ -33,10 +34,23 @@ import { reconcileWorkstream, Repository, RepositoryError, RepositoryIssue } fro
 const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
   Schema.decodeUnknownSync(schema)(raw);
 
+/**
+ * The repository the workstream fixtures are anchored to. `repositoryId` is a real
+ * FOREIGN KEY, so this has to be stored before any workstream references it.
+ */
+const repository = decode(DomainRepository, {
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
 const workstream = decode(Workstream, {
   id: "ws-a",
   name: "Track A",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:callajd/sprinter",
   status: "active",
   epics: ["epic-1"],
 });
@@ -46,7 +60,7 @@ const workstream = decode(Workstream, {
 const epic = decode(Epic, {
   id: "epic-1",
   workstreamId: "ws-a",
-  name: "Repository",
+  name: "CodeHost",
   status: "pending",
   issues: ["issue-100"],
 });
@@ -62,7 +76,7 @@ const issue = (number: number) =>
   });
 
 // ============================================================================
-// Fake Repository — a canned host, no HTTP
+// Fake CodeHost — a canned host, no HTTP
 // ============================================================================
 
 interface HostState {
@@ -88,10 +102,27 @@ const pullRef = (number: number, merged: boolean): PullRequestRef =>
     merged,
   });
 
-const fakeRepository = (host: HostState): Layer.Layer<Repository> =>
+const fakeRepository = (host: HostState): Layer.Layer<CodeHost> =>
   Layer.succeed(
-    Repository,
-    Repository.of({
+    CodeHost,
+    CodeHost.of({
+      repositories: {
+        // Resolves ANY key to a canned observation: these suites exercise Issue/PR
+        // reconciliation, not repository resolution (which is tested on its own).
+        resolve: (key) =>
+          Effect.succeed(
+            Option.some(
+              decode(DomainRepository, {
+                id: `repo:${key.host}:${key.owner}/${key.name}`,
+                host: key.host,
+                owner: key.owner,
+                name: key.name,
+                refs: [{ name: "main", sha: "a".repeat(40) }],
+                observedAt: "2026-07-20T12:00:00.000Z",
+              }),
+            ),
+          ),
+      },
       code: {
         defaultBranch: Effect.succeed("main"),
         branchExists: () => Effect.succeed(true),
@@ -100,7 +131,7 @@ const fakeRepository = (host: HostState): Layer.Layer<Repository> =>
         getIssue: (number) =>
           host.failing?.has(number) === true
             ? Effect.fail(
-                new RepositoryError({ operation: "getIssue", detail: `host 404 #${number}` }),
+                new CodeHostError({ operation: "getIssue", detail: `host 404 #${number}` }),
               )
             : Effect.succeed(repoIssue(number, host.issues.get(number) ?? "open")),
       },
@@ -117,6 +148,7 @@ const fakeRepository = (host: HostState): Layer.Layer<Repository> =>
 
 const seed = Effect.gen(function* () {
   const store = yield* StateStore;
+  yield* store.repositories.putRepository(repository);
   yield* store.workGraph.putWorkstream(workstream);
   yield* store.workGraph.putEpic(epic);
   yield* store.workGraph.putIssue(issue(100));
@@ -179,6 +211,7 @@ it.effect("never overwrites a cancelled epic/workstream to done, even once its i
     const store = yield* StateStore;
     // A cancelled epic + workstream whose issues nonetheless land on the host: the
     // roll-up treats cancelled as terminal-but-not-done and must NOT resurrect them.
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream({ ...workstream, status: "cancelled" });
     yield* store.workGraph.putEpic({ ...epic, status: "cancelled" });
     yield* store.workGraph.putIssue(issue(100));
@@ -307,7 +340,7 @@ it.effect(
       const ws = decode(Workstream, {
         id: "ws-x",
         name: "X",
-        repo: "callajd/sprinter",
+        repositoryId: "repo:github:callajd/sprinter",
         status: "active",
         epics: [],
       });
@@ -326,6 +359,7 @@ it.effect(
         status: "in_progress",
         dependsOn: [],
       });
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(ws);
       yield* store.workGraph.putEpic(ep);
       yield* store.workGraph.putIssue(iss);
@@ -357,7 +391,7 @@ it.effect("is a no-op for a missing workstream", () =>
     const missing = decode(Workstream, {
       id: "ws-missing",
       name: "Nope",
-      repo: "callajd/sprinter",
+      repositoryId: "repo:github:callajd/sprinter",
       status: "active",
       epics: [],
     });

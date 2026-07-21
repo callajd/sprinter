@@ -19,13 +19,13 @@
  * session's neutral surface (INV-BOUNDARY / INV-PORT).
  *
  * Task AE5.1 adds restart safety: the {@link StartupReconcile} service, wired to
- * the `StateStore` / `Repository` / `JobRunner` PORTS, that on boot reconciles the
+ * the `StateStore` / `CodeHost` / `JobRunner` PORTS, that on boot reconciles the
  * durable graph against the host and resumes any in-flight Job onto its persisted
  * session — without loss or double-run (INV-PORT).
  *
  * Task CE1.2 provisions the runnable daemon: {@link mainLayer} — the composition
  * root, a single Effect layer graph wiring the file-backed `StateStore`, the real
- * `ExecutionRunner`, `Repository`, and the `RpcServer` handlers into a served
+ * `ExecutionRunner`, `CodeHost`, and the `RpcServer` handlers into a served
  * endpoint over a concrete socket transport (INV-EFFECT-DI); {@link layerJournaling}
  * + {@link resyncEvents} — durable, offset-based `events` resync (D17); and
  * {@link bootLayer} — the boot-time `StartupReconcile` run. The runnable process

@@ -220,6 +220,22 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       getAgent: base.agents.getAgent,
       listAgents: base.agents.listAgents,
     },
+    // The STATE layer journals through the SAME seam as the work graph: a
+    // repository observation is durable-plus-live in one transaction, fanned out as
+    // `RepositoryChanged`. It needs no special helper the way the append-only
+    // registry does — a put here ALWAYS writes (a refresh REPLACES the record
+    // wholesale under a new `observedAt`, D7), so there is no no-op outcome to
+    // suppress, and no delete anywhere to journal.
+    repositories: {
+      putRepository: (repository) =>
+        putAndJournal(base, feed, base.repositories.putRepository(repository), {
+          _tag: "RepositoryChanged",
+          repository,
+        }),
+      getRepository: base.repositories.getRepository,
+      findRepository: base.repositories.findRepository,
+      listRepositories: base.repositories.listRepositories,
+    },
     workGraph: {
       putWorkstream: (workstream) =>
         putAndJournal(base, feed, base.workGraph.putWorkstream(workstream), {

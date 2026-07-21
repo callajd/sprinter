@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Context, Effect, Option, Schema } from "effect";
 import { expect } from "vitest";
-import { Agent } from "@sprinter/domain";
+import { Agent, Repository, Workstream } from "@sprinter/domain";
 import { layer, SCHEMA_VERSION, StateStore } from "./index.ts";
 
 /** A fresh temp database path, torn down with the surrounding scope. */
@@ -26,6 +26,24 @@ const dbFile = Effect.acquireRelease(
   Effect.sync(() => mkdtempSync(join(tmpdir(), "sprinter-state-"))),
   (dir) => Effect.sync(() => rmSync(dir, { recursive: true, force: true })),
 ).pipe(Effect.map((dir) => join(dir, "state.db")));
+
+const repository = Schema.decodeUnknownEffect(Repository)({
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+}).pipe(Effect.orDie);
+
+/** A workstream ANCHORED to {@link repository} — the FK-bearing shape a reset must clear. */
+const anchoredWorkstream = Schema.decodeUnknownEffect(Workstream)({
+  id: "ws-a",
+  name: "Track A",
+  repositoryId: "repo:github:callajd/sprinter",
+  status: "active",
+  epics: [],
+}).pipe(Effect.orDie);
 
 const agent = Schema.decodeUnknownEffect(Agent)({
   id: "agt-1",
@@ -77,6 +95,7 @@ const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   2: "4fe63e6cce2cfabc2382c99d73347aec6a08fdbf58e42791be6cfeb93f960eac",
   3: "e005c3b880ba0bb3f0cb1645504d09d31ed3dd91ab9174b7ea1e03764fa84f7b",
   4: "ac07e2636d90f3fa43cf7265cc16747c29ba0af4b822461873b1f1ec24fd9572",
+  5: "45ac3c1188e9d0fed3d26ce55a38b838389bc137da0974c3a2100ece0c9f599f",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */
@@ -268,6 +287,56 @@ it.effect(
       );
       expect(after).toStrictEqual([value]);
     }).pipe(Effect.scoped),
+);
+
+it.effect("a version bump drops repository, repository_ref AND workstream TOGETHER", () =>
+  Effect.gen(function* () {
+    const filename = yield* dbFile;
+
+    // Seed a fully-anchored graph: a repository, its observed refs, and a workstream
+    // REFERENCING it. This is the shape the `workstream.repositoryId` FOREIGN KEY
+    // protects, and the shape a reset has to be able to clear COHERENTLY.
+    yield* withStore(filename, (store) =>
+      Effect.gen(function* () {
+        yield* store.repositories.putRepository(yield* repository);
+        yield* store.workGraph.putWorkstream(yield* anchoredWorkstream);
+      }).pipe(Effect.orDie),
+    );
+
+    // Simulate the store having been written by a DIFFERENT schema version — exactly
+    // what bumping SCHEMA_VERSION looks like to an already-deployed database.
+    const stale = new Database(filename);
+    stale.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    stale.close();
+
+    const after = yield* withStore(filename, (store) =>
+      Effect.gen(function* () {
+        const repositories = yield* store.repositories.listRepositories;
+        const workstreams = yield* store.workGraph.listWorkstreams;
+        return { repositories, workstreams };
+      }).pipe(Effect.orDie),
+    );
+
+    // The store came back EMPTY and SELF-CONSISTENT. The referencing table cannot
+    // outlive the referenced one, because the reset drops the WHOLE database rather
+    // than a chosen subset of it — so there is no window in which a workstream
+    // survives pointing at a repository row that no longer exists. That is what makes
+    // the FOREIGN KEY hold ACROSS a reset and not only within one generation.
+    expect(after.repositories).toStrictEqual([]);
+    expect(after.workstreams).toStrictEqual([]);
+
+    // And the invariant is live again immediately: the recreated schema still refuses
+    // a workstream naming a repository that is not there — the reset rebuilt the
+    // constraint, it did not merely empty the tables.
+    const rejected = yield* withStore(filename, (store) =>
+      Effect.gen(function* () {
+        return yield* store.workGraph
+          .putWorkstream(yield* anchoredWorkstream)
+          .pipe(Effect.flip, Effect.orDie);
+      }),
+    );
+    expect(rejected.operation).toBe("putWorkstream");
+  }).pipe(Effect.scoped),
 );
 
 it.effect("resets a database left by the retired migration ladder (user_version 0)", () =>

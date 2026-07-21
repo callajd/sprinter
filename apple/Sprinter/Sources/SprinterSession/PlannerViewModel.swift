@@ -53,7 +53,15 @@ public final class PlannerViewModel {
   /// The view binds `TextField`s to them; ``canMaterialize`` and ``draftPlan`` are
   /// derived, so the construction/validation stays here (tested), not in the View.
   public var name = ""
-  public var repo = ""
+  /// The repository OWNER the plan names (e.g. `callajd`) — half of the natural key.
+  ///
+  /// The owner and the repository name are SEPARATE fields rather than one
+  /// `owner/name` string because the contract's ``RepositoryKey`` is a triple, and
+  /// splitting a user-typed string on `/` here would put a SECOND parser of that
+  /// syntax in the tree — one the daemon never sees and cannot validate.
+  public var owner = ""
+  /// The repository NAME the plan names (e.g. `sprinter`) — the other half of the key.
+  public var repositoryName = ""
   public var spec = ""
 
   /// The reflected materialize result: `.idle` until the first ``materialize(_:)``,
@@ -69,20 +77,26 @@ public final class PlannerViewModel {
     self.session = SessionViewModel(backend: backend, sessionId: planningSessionId)
   }
 
-  /// The plan the form currently describes — the explicit name/repo/spec, each
+  /// The plan the form currently describes — the explicit name/repository/spec, each
   /// trimmed of surrounding whitespace/newlines so a stray trailing space never
   /// leaks into the submitted ``WorkstreamPlan``.
   public var draftPlan: WorkstreamPlan {
     WorkstreamPlan(
-      name: name.trimmed, repo: repo.trimmed, spec: spec.trimmed)
+      name: name.trimmed,
+      // The plan names the repository by its NATURAL KEY: this client has never seen
+      // a RepositoryId and cannot mint one. The daemon resolves the key through its
+      // code-host port, and refuses a repository the host does not know.
+      repository: RepositoryKey(host: .github, owner: owner.trimmed, name: repositoryName.trimmed),
+      spec: spec.trimmed)
   }
 
   /// Whether the form is complete enough to materialize: a plan needs a non-empty
-  /// name AND repository (the spec may be empty — a bare workstream is valid). The
+  /// name AND a complete repository key (the spec may be empty — a bare workstream is
+  /// valid). The
   /// view disables the materialize control off this, and ``materializeDraft()``
   /// guards on it too.
   public var canMaterialize: Bool {
-    !name.trimmed.isEmpty && !repo.trimmed.isEmpty
+    !name.trimmed.isEmpty && !owner.trimmed.isEmpty && !repositoryName.trimmed.isEmpty
   }
 
   /// Materializes the plan the FORM currently describes — the explicit,

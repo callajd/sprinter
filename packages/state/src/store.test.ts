@@ -15,9 +15,18 @@
  * schemas, and the adapter layer — never on any SQL/SQLite type (INV-PORT).
  */
 import { it } from "@effect/vitest";
-import { Array as Arr, Effect, Option, Schema } from "effect";
+import { Array as Arr, type Context, Effect, Exit, Option, Schema } from "effect";
 import { expect } from "vitest";
-import { Agent, Epic, Issue, isLineageRetired, Job, Session, Workstream } from "@sprinter/domain";
+import {
+  Agent,
+  Epic,
+  Issue,
+  isLineageRetired,
+  Job,
+  Repository,
+  Session,
+  Workstream,
+} from "@sprinter/domain";
 import {
   AppendEvent,
   layer,
@@ -34,11 +43,36 @@ import {
 const decode = <S extends Schema.Top>(schema: S, raw: S["Encoded"]) =>
   Schema.decodeUnknownEffect(schema)(raw).pipe(Effect.orDie);
 
+const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
+const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
+
+const repository = (over: Partial<(typeof Repository)["Encoded"]> = {}) =>
+  decode(Repository, {
+    id: "repo:github:callajd/sprinter",
+    host: "github",
+    owner: "callajd",
+    name: "sprinter",
+    refs: [{ name: "main", sha: SHA_MAIN }],
+    observedAt: "2026-07-20T12:00:00.000Z",
+    ...over,
+  });
+
+/**
+ * Store the repository every {@link workstream} fixture is anchored to.
+ *
+ * `workstream.repositoryId` is a real FOREIGN KEY, so the anchor has to exist before
+ * anything can reference it — that ordering requirement IS the constraint working, and
+ * a test that forgot it would be rejected rather than quietly storing a dangling
+ * reference (see the FK test below, which asserts exactly that).
+ */
+const seedRepository = (store: Context.Service.Shape<typeof StateStore>) =>
+  repository().pipe(Effect.flatMap(store.repositories.putRepository), Effect.orDie);
+
 const workstream = (over: Partial<(typeof Workstream)["Encoded"]> = {}) =>
   decode(Workstream, {
     id: "ws-a",
     name: "Track A",
-    repo: "callajd/sprinter",
+    repositoryId: "repo:github:callajd/sprinter",
     status: "active",
     epics: ["epic-1"],
     ...over,
@@ -541,6 +575,134 @@ it.effect("exposes NO delete on the AgentStore surface (append + read only)", ()
 );
 
 // ============================================================================
+// RepositoryStore — the STATE layer's anchor, and the constraints behind it
+// ============================================================================
+
+it.effect("round-trips a repository observation, refs and all", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const repo = yield* repository({
+      refs: [
+        { name: "feat/x-1", sha: SHA_FEAT },
+        { name: "main", sha: SHA_MAIN },
+      ],
+    });
+    yield* store.repositories.putRepository(repo);
+
+    expect(Option.getOrThrow(yield* store.repositories.getRepository(repo.id))).toStrictEqual(repo);
+    // The natural key is what IDENTIFIES a repository, so it is a real read — the
+    // path a caller holding a plan (and no id) takes.
+    expect(
+      Option.getOrThrow(
+        yield* store.repositories.findRepository({
+          host: "github",
+          owner: "callajd",
+          name: "sprinter",
+        }),
+      ),
+    ).toStrictEqual(repo);
+    expect(yield* store.repositories.listRepositories).toStrictEqual([repo]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+// An EMPTY ref set is a valid observation ("nothing observed yet", D4) and must
+// survive the child-table round trip — the join has to produce `[]`, not a missing
+// record or a decode failure.
+it.effect("round-trips a repository with an EMPTY ref set", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const repo = yield* repository({ refs: [] });
+    yield* store.repositories.putRepository(repo);
+    expect(Option.getOrThrow(yield* store.repositories.getRepository(repo.id))).toStrictEqual(repo);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+// D7: a refresh REPLACES the record wholesale under a new `observedAt` — it does not
+// merge. So a branch that disappeared upstream must be GONE from the stored refs, not
+// left behind from the earlier read.
+it.effect("a refresh REPLACES the record wholesale and advances observedAt", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.repositories.putRepository(
+      yield* repository({
+        refs: [
+          { name: "main", sha: SHA_MAIN },
+          { name: "feat/gone", sha: SHA_FEAT },
+        ],
+      }),
+    );
+    const refreshed = yield* repository({
+      refs: [{ name: "main", sha: SHA_FEAT }],
+      observedAt: "2026-07-21T09:30:00.000Z",
+    });
+    yield* store.repositories.putRepository(refreshed);
+
+    const stored = yield* store.repositories.listRepositories;
+    expect(stored).toStrictEqual([refreshed]);
+    // The stale branch is gone, and the surviving one carries the NEW tip.
+    expect(stored[0]?.refs.map((ref) => ref.name)).toStrictEqual(["main"]);
+    expect(stored[0]?.observedAt).toBe("2026-07-21T09:30:00.000Z");
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+// D3 — the NATURAL KEY is UNIQUE, and it is the BACKING that says so. Two rows for
+// one repository is "two records disagreeing about the same thing"; a resolve-time
+// read-then-check would let a concurrent or reordered write straight past it.
+it.effect("REJECTS a second repository row for the same (host, owner, name)", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.repositories.putRepository(yield* repository());
+    const duplicate = yield* repository({ id: "repo:github:callajd/sprinter#2" });
+    // `flip` makes the REJECTION the success: a write that succeeded would flip into
+    // the error channel and fail the test rather than pass it.
+    const rejected = yield* store.repositories.putRepository(duplicate).pipe(Effect.flip);
+    expect(rejected).toBeInstanceOf(StateStoreError);
+    expect(rejected.operation).toBe("putRepository");
+    // And nothing landed — the original row is untouched.
+    expect(yield* store.repositories.listRepositories).toHaveLength(1);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+// D4(a) — a repeated branch name within ONE repository is unconstructible. The domain
+// schema refuses to build such a value at all, so the store never sees one; this
+// asserts the schema-side half, which is what keeps a hand-built wire payload or
+// fixture from carrying it either.
+it.effect("REJECTS a ref list repeating a branch name before it can reach the store", () =>
+  Effect.gen(function* () {
+    const exit = yield* Effect.exit(
+      Schema.decodeUnknownEffect(Repository)({
+        id: "repo:github:callajd/sprinter",
+        host: "github",
+        owner: "callajd",
+        name: "sprinter",
+        refs: [
+          { name: "main", sha: SHA_MAIN },
+          { name: "main", sha: SHA_FEAT },
+        ],
+        observedAt: "2026-07-20T12:00:00.000Z",
+      }),
+    );
+    expect(Exit.isFailure(exit)).toBe(true);
+  }),
+);
+
+// The FOREIGN KEY on `workstream.repositoryId`: a workstream naming a repository that
+// was never observed is REJECTED at the write. NOT stored and reconciled later — that
+// is the DE1.1 `supersedes` lesson applied here, and it is what makes every rule
+// decided by READING the referent order-independent.
+it.effect("REJECTS a workstream whose repositoryId names no stored repository", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const orphan = yield* workstream({ repositoryId: "repo:github:callajd/never-observed" });
+    const rejected = yield* store.workGraph.putWorkstream(orphan).pipe(Effect.flip);
+    expect(rejected).toBeInstanceOf(StateStoreError);
+    expect(rejected.operation).toBe("putWorkstream");
+    // Nothing was stored and later fixed up: the graph is still empty.
+    expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+// ============================================================================
 // WorkGraphStore
 // ============================================================================
 
@@ -551,6 +713,7 @@ it.effect("round-trips the work graph and lists children", () =>
     const ep = yield* epic();
     const iss = yield* issue({ pr: prRef, status: "done" });
 
+    yield* seedRepository(store);
     yield* store.workGraph.putWorkstream(ws);
     yield* store.workGraph.putEpic(ep);
     yield* store.workGraph.putIssue(iss);
@@ -735,7 +898,9 @@ it.effect("returns None for every missing node", () =>
 it.effect("upserts idempotently — a re-put updates in place", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    yield* seedRepository(store);
     yield* store.workGraph.putWorkstream(yield* workstream({ name: "Original" }));
+    yield* seedRepository(store);
     yield* store.workGraph.putWorkstream(yield* workstream({ name: "Renamed", status: "done" }));
 
     const all = yield* store.workGraph.listWorkstreams;
@@ -749,6 +914,7 @@ it.effect("the file-backed adapter constructor is usable (layer factory)", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const ws = yield* workstream();
+    yield* seedRepository(store);
     yield* store.workGraph.putWorkstream(ws);
     expect(Option.getOrThrow(yield* store.workGraph.getWorkstream(ws.id))).toStrictEqual(ws);
     // Exercise the general `layer(config)` path (not just `layerMemory`).

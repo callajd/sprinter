@@ -1,6 +1,6 @@
 /**
  * `StartupReconcile` coverage (AE5.1) — the restart-safety service exercised
- * against the in-memory {@link StateStore} (`layerMemory`), a FAKE {@link Repository}
+ * against the in-memory {@link StateStore} (`layerMemory`), a FAKE {@link CodeHost}
  * (a canned host, no HTTP), and a FAKE {@link JobRunner} (records dispatches, no
  * `pi` process). Deterministic and OFFLINE (INV-GATE / INV-PORT): the service
  * depends only on the three ports.
@@ -35,8 +35,9 @@ import {
   Session,
   Workstream,
 } from "@sprinter/domain";
+import { Repository as DomainRepository } from "@sprinter/domain";
 import { ExecutionRunnerError, JobRunner } from "@sprinter/job";
-import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
+import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
 import { layerMemory, StateStore } from "@sprinter/state";
 import { layer as startupLayer, StartupReconcile } from "./startup-reconcile.ts";
 
@@ -49,11 +50,24 @@ const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
 
 const posInt = (n: number): PositiveInt => decode(PositiveInt, n);
 
+/**
+ * The repository the {@link workstream} fixtures are anchored to — `repositoryId` is a
+ * real FOREIGN KEY, so it has to be stored before anything references it.
+ */
+const repository = decode(DomainRepository, {
+  id: "repo:github:callajd/sprinter",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
 const workstream = (over: Partial<(typeof Workstream)["Encoded"]> = {}) =>
   decode(Workstream, {
     id: "ws-a",
     name: "Track A",
-    repo: "callajd/sprinter",
+    repositoryId: "repo:github:callajd/sprinter",
     status: "active",
     epics: ["epic-1"],
     ...over,
@@ -126,10 +140,27 @@ const host = (over: Partial<HostState> = {}): HostState => ({
 const repoIssue = (number: number, state: "open" | "closed"): RepositoryIssue =>
   decode(RepositoryIssue, { number, title: `Issue ${number}`, state });
 
-const fakeRepository = (state: HostState): Layer.Layer<Repository> =>
+const fakeRepository = (state: HostState): Layer.Layer<CodeHost> =>
   Layer.succeed(
-    Repository,
-    Repository.of({
+    CodeHost,
+    CodeHost.of({
+      repositories: {
+        // Resolves ANY key to a canned observation: these suites exercise Issue/PR
+        // reconciliation, not repository resolution (which is tested on its own).
+        resolve: (key) =>
+          Effect.succeed(
+            Option.some(
+              decode(DomainRepository, {
+                id: `repo:${key.host}:${key.owner}/${key.name}`,
+                host: key.host,
+                owner: key.owner,
+                name: key.name,
+                refs: [{ name: "main", sha: "a".repeat(40) }],
+                observedAt: "2026-07-20T12:00:00.000Z",
+              }),
+            ),
+          ),
+      },
       code: {
         defaultBranch: Effect.succeed("main"),
         branchExists: () => Effect.succeed(true),
@@ -138,7 +169,7 @@ const fakeRepository = (state: HostState): Layer.Layer<Repository> =>
         getIssue: (number) =>
           state.failing.has(number)
             ? Effect.fail(
-                new RepositoryError({ operation: "getIssue", detail: `host 404 #${number}` }),
+                new CodeHostError({ operation: "getIssue", detail: `host 404 #${number}` }),
               )
             : Effect.succeed(repoIssue(number, state.issues.get(number) ?? "open")),
       },
@@ -197,6 +228,7 @@ it.effect("isolates one Issue's host error and still lands the rest of the roll-
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream({ epics: ["epic-1"] }));
       yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
       // issue-1's host read fails (a deleted-issue 404); issue-2 is closed + merged.
@@ -240,6 +272,7 @@ it.effect("resumes a running Job onto its persisted session id, never a new one"
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
@@ -273,6 +306,7 @@ it.effect("does not re-dispatch an already-terminal Job", () =>
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
@@ -302,6 +336,7 @@ it.effect(
       const dispatched = yield* Queue.unbounded<Job>();
       yield* Effect.gen(function* () {
         const store = yield* StateStore;
+        yield* store.repositories.putRepository(repository);
         yield* store.workGraph.putWorkstream(workstream());
         yield* store.workGraph.putEpic(epic());
         yield* store.workGraph.putIssue(issue(1));
@@ -347,6 +382,7 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
       yield* store.workGraph.putEpic(epic({ status: "blocked" }));
       yield* store.workGraph.putIssue(issue(1));
@@ -383,6 +419,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
       yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
       yield* store.workGraph.putIssue(issue(1));
@@ -422,6 +459,7 @@ it.effect(
         // A completed workstream/epic, but a stray `running` Job whose Issue did NOT land
         // (still open on the host, in_progress locally) — the pathological case the
         // narrowed terminal-resume guard must catch: never resurrect it.
+        yield* store.repositories.putRepository(repository);
         yield* store.workGraph.putWorkstream(workstream({ status: "done" }));
         yield* store.workGraph.putEpic(epic({ status: "done" }));
         yield* store.workGraph.putIssue(issue(1));
@@ -458,6 +496,7 @@ it.effect("isolates a resume failure so the other in-flight Jobs still resume", 
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic({ issues: ["issue-1", "issue-2"] }));
       yield* store.workGraph.putIssue(issue(1));

@@ -28,6 +28,8 @@ import {
   IssueId,
   Job,
   NonNegativeInt,
+  Repository,
+  RepositoryKey,
   Session,
   SessionEvent,
   SessionId,
@@ -161,6 +163,13 @@ export type ResumeContext = typeof ResumeContext.Type;
  * the REGISTRY layer (`agents`). Composed exclusively of FE2.1 domain types
  * (INV-PORT).
  *
+ * `repositories` is the `── STATE ──` layer: every `Repository` the daemon has
+ * OBSERVED on a code host. It is hydrated because `Workstream.repositoryId` is a
+ * REFERENCE — a client holding a workstream and no repository record could render
+ * neither the repository it is bound to nor how STALE that observation is (each record
+ * carries its own `observedAt`, DE4.4). Staleness is RENDERED from that stamp, never
+ * enforced here: no record is withheld for being old.
+ *
  * `agents` is the whole append-only registry, NOT a per-repository slice: an
  * `Agent` is global (it names no repository), so "the agents used in this repo" is
  * a fold a client computes over that repo's executions — never a list carried here
@@ -176,6 +185,7 @@ export type ResumeContext = typeof ResumeContext.Type;
  * {@link ResyncRequired}). Nothing may parse or order it — equality only.
  */
 export const Snapshot = Schema.Struct({
+  repositories: Schema.Array(Repository),
   workstreams: Schema.Array(Workstream),
   epics: Schema.Array(Epic),
   issues: Schema.Array(Issue),
@@ -198,6 +208,12 @@ export type Snapshot = (typeof Snapshot)["Type"];
  * If a future model ever drops nodes from the graph, a `*Removed` variant (id
  * only) is a backward-compatible additive change.
  *
+ * `RepositoryChanged` carries the `── STATE ──` layer under the same model, and it
+ * fits for a different reason than the rest: a repository record is REPLACED WHOLESALE
+ * on every refresh (D7), under a new `observedAt`, so a delta is always the complete
+ * new observation and an upsert by id is exactly right. There is no `RepositoryRemoved`
+ * — a repository leaves the graph only when the whole store generation does.
+ *
  * `AgentChanged` carries the REGISTRY layer under that same upsert-only model, and
  * the fit is exact rather than incidental: the registry is APPEND-ONLY, so a delta
  * is always either a brand-new revision or a retirement stamp on an existing one —
@@ -205,6 +221,7 @@ export type Snapshot = (typeof Snapshot)["Type"];
  * on this contract.
  */
 export const WorkGraphEvent = Schema.TaggedUnion({
+  RepositoryChanged: { repository: Repository },
   WorkstreamChanged: { workstream: Workstream },
   EpicChanged: { epic: Epic },
   IssueChanged: { issue: Issue },
@@ -277,10 +294,22 @@ export type OffsetSessionEvent = (typeof OffsetSessionEvent)["Type"];
  * The plan the `createWorkstreamFromPlan` command turns into a new workstream:
  * a human-readable name, the bound repository (repo-scoped per D14), and the
  * free-form spec text driving planning.
+ *
+ * `repository` is the NATURAL KEY `(host, owner, name)`, not a `RepositoryId` — and
+ * that is forced by who sends this (DE1.2 D6): the plan arrives from a client that has
+ * never seen a repository id and cannot mint one. The daemon RESOLVES the key through
+ * the `CodeHost` port to an existing `Repository` or creates one from the observation,
+ * and a plan naming a repository the host does not know is refused with
+ * {@link PlanRejected} carrying the reason — it never silently creates an UNOBSERVED
+ * row, which would put a record in the state layer that no host ever confirmed.
+ *
+ * It is one nested value rather than three sibling fields for the reason `INV-ENFORCE`
+ * states generally: the parts are meaningful only together (an `owner` with no `host`
+ * names nothing), and as one value they cannot be partially supplied.
  */
 export const WorkstreamPlan = Schema.Struct({
   name: Schema.NonEmptyString,
-  repo: Schema.NonEmptyString,
+  repository: RepositoryKey,
   spec: Schema.String,
 });
 export type WorkstreamPlan = (typeof WorkstreamPlan)["Type"];

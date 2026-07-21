@@ -43,6 +43,7 @@ struct MissionControlBoardTests {
 
     // A second snapshot fully replaces the first (snapshot-then-live, D4).
     let onlyB = Snapshot(
+      repositories: [BoardFixtures.repositoryB],
       workstreams: [BoardFixtures.workstreamB],
       epics: [BoardFixtures.epicB],
       issues: [BoardFixtures.issueB],
