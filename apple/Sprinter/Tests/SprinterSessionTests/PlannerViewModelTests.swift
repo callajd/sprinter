@@ -215,7 +215,21 @@ struct PlannerViewModelTests {
     #expect(!planner.canMaterialize)
     #expect(planner.repositoryProblem?.contains("letters, digits") == true)
 
+    // Over the LENGTH bound the contract's `RepositorySegment` enforces. The allow-list
+    // says which characters, not how many, so without this the form would happily submit
+    // a megabyte of `a` and the user would get an opaque decode failure back.
+    planner.owner = String(repeating: "a", count: 256)
+    planner.repositoryName = "pipe"
+    #expect(!planner.canMaterialize)
+    #expect(planner.repositoryProblem?.contains("too long") == true)
+
+    // The boundary itself is fine — 255 is accepted on both sides.
+    planner.owner = String(repeating: "a", count: 255)
+    #expect(planner.canMaterialize)
+    #expect(planner.repositoryProblem == nil)
+
     // A valid key clears it.
+    planner.owner = "acme"
     planner.repositoryName = "pipe"
     #expect(planner.canMaterialize)
     #expect(planner.repositoryProblem == nil)

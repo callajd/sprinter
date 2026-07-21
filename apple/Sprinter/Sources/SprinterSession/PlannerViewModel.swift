@@ -108,6 +108,22 @@ public final class PlannerViewModel {
   private static let repositorySegmentCharacters = CharacterSet(
     charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
+  /// The maximum length of a repository owner/name — the same bound the contract's
+  /// `RepositorySegment` enforces on the daemon side.
+  ///
+  /// COUPLING, same shape as ``repositorySegmentCharacters`` above: this is a hand-kept
+  /// copy of `MAX_SEGMENT_LENGTH` in `packages/domain/src/repository.ts`, where it is a
+  /// deliberately generous superset of any one host's own limit (GitHub caps an owner at
+  /// 39 and a name at 100) so it survives a second code-host adapter. Whoever raises it
+  /// there must raise it here.
+  ///
+  /// The two sides count in different units — Swift's `count` is grapheme clusters, the
+  /// daemon's `String.length` is UTF-16 code units — and they agree here only because the
+  /// character allow-list is pure ASCII and is checked FIRST, so anything reaching the
+  /// length test has one code unit per character. Widening the allow-list beyond ASCII
+  /// would break that equivalence as well as the coupling noted above.
+  private static let maxRepositorySegmentLength = 255
+
   /// A human-readable reason `segment` is not a usable repository owner/name, or `nil`
   /// when it is one. `field` names the form field so the message points at it.
   ///
@@ -130,6 +146,10 @@ public final class PlannerViewModel {
     if segment.rangeOfCharacter(from: repositorySegmentCharacters.inverted) != nil {
       return
         "The repository \(field) can only contain letters, digits, \".\", \"_\" and \"-\"."
+    }
+    if segment.count > maxRepositorySegmentLength {
+      return
+        "The repository \(field) is too long — \(maxRepositorySegmentLength) characters at most."
     }
     return nil
   }

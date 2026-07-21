@@ -131,6 +131,21 @@ const REPOSITORY_ID = /^repo:[a-z0-9-]+:[A-Za-z0-9._~-]+$/;
  * on the wire — and every identifier form a code host actually issues fits inside it
  * (decimal, hex, base64url, a UUID), so the check constrains the SHAPE without
  * committing the domain to any one host's id format.
+ *
+ * ## KNOWN LIMIT: `<host>` names a VENDOR, not an INSTANCE (issue #96)
+ *
+ * `github` is the code host as a product, not the particular deployment a repository
+ * lives on, so injectivity holds only WITHIN one instance. Two self-hosted GitHub
+ * Enterprise servers each assign their own numeric ids from 1, so `repo:github:42` on one
+ * and `repo:github:42` on the other are one id for two unrelated repositories — and the
+ * store's id-keyed upsert would let either silently overwrite the other's row.
+ *
+ * Nothing is exposed today: `configFromEnv` builds the adapter for github.com only and
+ * the adapter is repo-scoped (D14), so exactly one instance is ever addressed. The hazard
+ * is real the moment a second instance can be configured, which is why #96 must be
+ * RESOLVED before any GitHub Enterprise wiring lands — not discovered by it. Fixing it
+ * means scoping the id by instance (a host-instance component in the `<host>` segment),
+ * which changes every stored `RepositoryId` and so is a migration, not an edit.
  */
 export const RepositoryId = Schema.String.check(
   Schema.makeFilter((value: string) => REPOSITORY_ID.test(value), {

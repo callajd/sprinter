@@ -54,6 +54,7 @@ import {
   type RepositoryHost,
   RepositoryId,
   RepositoryKey,
+  RepositoryRef,
   RepositoryRefs,
   Timestamp,
 } from "@sprinter/domain";
@@ -74,12 +75,24 @@ import {
 
 /**
  * The statuses that mean the host was REACHED and REFUSED us rather than failed:
- * `401` (the token is absent, wrong or expired) and `403` (GitHub's answer for an
- * exhausted rate limit as well as for a permission the token lacks). Neither is fixed
- * by asking again with the same credentials, which is the whole reason
+ * `401` (the token is absent, wrong or expired), `403` (GitHub's answer for a permission
+ * the token lacks as well as for an exhausted PRIMARY rate limit) and `429` (its answer,
+ * with a `Retry-After`, for a SECONDARY rate limit). None is fixed by asking again with
+ * the same credentials at the same moment, which is the whole reason
  * {@link CodeHostFailure} separates `denied` from `unreachable`.
+ *
+ * `429` belongs here for exactly the rule {@link failureKind} states — is asking again
+ * the remedy? An immediate retry of a secondary-rate-limited request reproduces the 429
+ * exactly, and GitHub says so by sending `Retry-After`; classifying it `unreachable`
+ * would make the daemon's rejection invite the retry that cannot work. It is grouped
+ * with `403` rather than given a fourth `CodeHostFailure` case because the advice is the
+ * same one `403` already carries — wait for the limit to reset, do not retry now — and
+ * the port's classification is a closed set consumers BRANCH on (INV-SUM), not a place to
+ * record which status arrived. The `Retry-After` DURATION is not surfaced: nothing above
+ * this adapter schedules a retry today, so a wait hint would have no reader (see #98,
+ * which is where a retry budget and backoff would land).
  */
-const REFUSED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
+const REFUSED_STATUSES: ReadonlySet<number> = new Set([401, 403, 429]);
 
 /**
  * Classify a host failure into the closed {@link CodeHostFailure} a consumer branches
@@ -412,6 +425,17 @@ export interface RepositoryConfig {
    * The REST API base URL. Defaults to `https://api.github.com` (GitHub.com); a
    * GitHub Enterprise host overrides it. The port abstraction is unchanged — this
    * is still the GitHub adapter, just against a different base.
+   *
+   * GitHub ENTERPRISE is NOT a supported deployment as of DE1.2, and this field being
+   * settable is not the same as it being wired: `configFromEnv`
+   * (`packages/daemon/src/main.ts`) reads no base-URL variable, so production always runs
+   * against github.com. The blocker is issue **#96**: `RepositoryId` scopes identity by
+   * host VENDOR (`repo:github:<id>`), not by host INSTANCE, and two GHE servers each
+   * number their repositories from 1 — so the same id would name two unrelated
+   * repositories and the store's id-keyed upsert would let either overwrite the other.
+   * #96 must be RESOLVED before any GHE wiring lands. The field stays because the
+   * GraphQL endpoint derivation and the base-URL handling are already correct and tested
+   * against a GHE-shaped base; what is missing is the identity scoping, not the transport.
    */
   readonly baseUrl?: string;
 }
@@ -704,22 +728,57 @@ const make = (config: RepositoryConfig) =>
               Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(GhBranch))),
               Effect.mapError(fail("resolve")),
             );
-          // Sorted, then decoded through the OWNED `RepositoryRefs`, so BOTH host-supplied
-          // rules are checked here rather than asserted: a malformed branch name or a
-          // non-canonical sha fails the observation at the boundary instead of entering
-          // the domain, and so does a ref list this adapter failed to order correctly
-          // (INV-ENFORCE). `RepositoryRefs` is branded, so there is no way to skip it —
-          // the sorted array cannot simply be assigned to `Repository.refs`.
+          // KNOWN GAP — an UNREPRESENTABLE ref is OMITTED, not fatal. This is the SAME
+          // stance as the pagination note above, and deliberately so: the two would
+          // otherwise contradict each other. Each row is decoded through the owned
+          // `RepositoryRef` INDIVIDUALLY, and a row that fails — a branch name outside
+          // `BranchName`, or a sha outside `CommitSha`'s 40 lowercase hex — is dropped
+          // from the observation instead of failing it.
+          //
+          // Failing was the previous behaviour and it was strictly worse: `resolve`
+          // reported `unusable`, which the daemon turns into a `PlanRejected` saying
+          // retrying will not help, so ONE unrepresentable ref made the whole repository
+          // permanently unusable. And it is reachable without any host misbehaviour —
+          // `CommitSha` is pinned to 40 hex, so a repository using git's SHA-256 object
+          // format (64 hex) failed OUTRIGHT. Under this policy such a repository observes
+          // with an EMPTY ref set: every ref is dropped, and the record — its id, its
+          // natural key, its `observedAt` — still lands.
+          //
+          // That is safe for exactly the reason pagination is: `refs` is what WAS
+          // observed, and an absent branch reads as "not observed", never as "does not
+          // exist" (see `tipOf`). Nothing in DE1.2 looks a branch UP — `tipOf` has no
+          // production caller — and the one production reader of `refs` compares two
+          // observations for equality (`observationsAgree`, behind the journaling
+          // decorator), which is unaffected by a ref neither observation could hold. The
+          // constraint this hands DE2.3 is the one pagination already hands it: treat
+          // "not observed" as UNKNOWN staleness, never as stale.
+          //
+          // `BranchName` and `CommitSha` are NOT weakened by this. The domain still
+          // refuses to hold a malformed ref; what changed is the ADAPTER's policy for a
+          // row it cannot represent, which is this module's to decide (INV-PORT).
+          const decoded = yield* Effect.forEach(branchRows, (branch) =>
+            Schema.decodeUnknownEffect(RepositoryRef)({
+              name: branch.name,
+              sha: branch.commit.sha,
+            }).pipe(Effect.option),
+          );
+          // Sorted, then decoded through the OWNED `RepositoryRefs`, so the LIST-level
+          // rule is checked here rather than asserted: a ref list this adapter failed to
+          // order correctly fails the observation (INV-ENFORCE). `RepositoryRefs` is
+          // branded, so there is no way to skip it — the sorted array cannot simply be
+          // assigned to `Repository.refs`.
           //
           // The order is the domain's `compareBranchNames` (Unicode code point), which is
           // also the order the store reads them back in, so a round-trip cannot reorder
           // them; JS `<` here would be UTF-16 code-unit order and would disagree with the
           // store for a non-BMP branch name. Sorting also collapses nothing: a host that
-          // returned one branch name TWICE now fails the strict-ascending check instead
-          // of producing a record the store's composite PK would reject later.
+          // returned one branch name TWICE still fails the strict-ascending check instead
+          // of producing a record the store's composite PK would reject later — which is
+          // why this decode keeps a live error channel even though every ELEMENT above
+          // has already been decoded.
           const refs = yield* Schema.decodeUnknownEffect(RepositoryRefs)(
-            branchRows
-              .map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
+            decoded
+              .flatMap((ref) => (Option.isSome(ref) ? [ref.value] : []))
               .sort((left, right) => compareBranchNames(left.name, right.name)),
           ).pipe(Effect.mapError(fail("resolve")));
           const repository: Repository = {

@@ -560,6 +560,96 @@ it.effect("resolves a repository into the owned entity, refs and all", () =>
   }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT")))),
 );
 
+// N3 (round 4) — an UNREPRESENTABLE ref is OMITTED, never fatal to the observation.
+//
+// Before this, the whole branch list was decoded through `RepositoryRefs` in one go, so a
+// single ref failing `BranchName` or `CommitSha` failed `resolve` as `unusable` — which
+// the daemon turns into a `PlanRejected` saying retrying will not help, blocking that
+// repository permanently. That contradicted the adapter's own pagination stance three
+// lines above it, which argues partial observation is fine precisely because an absent
+// branch reads as "not observed" and never as "does not exist". This resolves the
+// contradiction in favour of the pagination stance — nothing in DE1.2 looks a branch UP,
+// and the one production reader of `refs` only compares two observations for equality.
+it.effect("OMITS a ref it cannot represent rather than failing the whole observation", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    // The representable refs all survive; only the unrepresentable ones are dropped.
+    expect(resolved.refs).toStrictEqual([
+      { name: "feat/x-1", sha: SHA_FEAT },
+      { name: "main", sha: SHA_MAIN },
+    ]);
+    // …and the record itself is intact — the observation landed, id and all.
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: SHA_MAIN } },
+            // A sha outside `CommitSha` — uppercase, so not the canonical spelling.
+            { name: "loud", commit: { sha: SHA_MAIN.toUpperCase() } },
+            { name: "feat/x-1", commit: { sha: SHA_FEAT } },
+            // A branch name outside `BranchName` — `..` is git's range operator.
+            { name: "a..b", commit: { sha: SHA_FEAT } },
+          ]),
+      }),
+    ),
+  ),
+);
+
+// The consequence, pinned so it stays a decision rather than a surprise: a repository
+// using git's SHA-256 object format spells every sha as 64 hex characters, and
+// `CommitSha` is pinned to 40. Under the previous behaviour such a repository was
+// UNUSABLE outright — every plan naming it rejected, permanently. It now observes with an
+// EMPTY ref set, which is a valid observation meaning "nothing observed yet", and its id,
+// natural key and `observedAt` all land.
+it.effect("observes a SHA-256 repository with an EMPTY ref set rather than failing", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.refs).toStrictEqual([]);
+    expect(resolved.name).toBe("sprinter");
+    expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: "a".repeat(64) } },
+            { name: "feat/x-1", commit: { sha: "b".repeat(64) } },
+          ]),
+      }),
+    ),
+  ),
+);
+
+// …and the LIST-level rule is still fatal, which is what keeps `RepositoryRefs`' decode
+// load-bearing: a host returning one branch name TWICE produces a list the strict
+// ascending order rejects, and that is a genuine contradiction in the answer rather than
+// a value this domain cannot spell.
+it.effect("still FAILS on a duplicated branch name — the list rule is not relaxed", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.operation).toBe("resolve");
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: SHA_MAIN } },
+            { name: "main", commit: { sha: SHA_FEAT } },
+          ]),
+      }),
+    ),
+  ),
+);
+
 // B3 — the natural key stored is the HOST's spelling, never the caller's. GitHub's
 // lookup is case-INSENSITIVE, so `CallaJD/Sprinter` and `callajd/sprinter` both answer
 // 200 for ONE repository. Building the record from the caller's key would mint one id
@@ -935,6 +1025,31 @@ it.effect("classifies 401 and 403 as `denied` — the host was reached and refus
       expect(error.detail).toContain(String(status));
     }).pipe(
       Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "no" }, status) })),
+    ),
+  ),
+);
+
+// N7 (round 4) — `429` is a REFUSAL, not a reachability problem. GitHub answers a
+// SECONDARY rate limit with 429 + `Retry-After`, and an immediate retry reproduces it
+// exactly — so classifying it `unreachable` made the daemon's rejection tell the user to
+// do the one thing that cannot work, which is the very mistake the `denied`/`unreachable`
+// split exists to prevent. The advice is the one `403` already carries: wait for the
+// limit to reset.
+it.effect("classifies 429 (secondary rate limit) as `denied`, not as `unreachable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("denied");
+    expect(error.detail).toContain("429");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () =>
+          new Response(JSON.stringify({ message: "slow down" }), {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "60" },
+          }),
+      }),
     ),
   ),
 );

@@ -143,14 +143,34 @@ export type RepositoryHost = (typeof RepositoryHost)["Type"];
  * whose grammar admits a character GitHub's does not) silently NARROWS the client: the
  * daemon would accept the key while the Swift form refused to submit it, and the
  * rejection would come from the copy rather than from the rule. Whoever adds that host
- * must widen both. The Swift side carries the same note pointing back here.
+ * must widen both. The Swift side carries the same note pointing back here, and mirrors
+ * {@link MAX_SEGMENT_LENGTH} alongside it.
  */
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 /**
+ * The maximum LENGTH of one natural-key segment, in UTF-16 code units.
+ *
+ * {@link REPOSITORY_SEGMENT} constrains WHICH characters a segment may hold but says
+ * nothing about HOW MANY, and the segment is entirely CLIENT-SUPPLIED: it arrives on
+ * `WorkstreamPlan` off the RPC surface, is interpolated into an AUTHENTICATED outbound
+ * request path by the code-host adapter, and is stored in a `TEXT` column. Unbounded, a
+ * multi-megabyte `owner` of nothing but `a` decodes cleanly and is carried to both.
+ *
+ * 255 rather than a host's exact limit, for the same reason the character rule is a
+ * SUPERSET: GitHub caps an owner at 39 characters and a repository name at 100, and this
+ * module knows nothing about GitHub (INV-PORT). 255 is a generous superset of both, so it
+ * excludes nothing any real host names a repository with and it survives a second host
+ * adapter, while still bounding what the transport and the store are handed. A segment
+ * that is under this cap but over the HOST's own limit is still refused by the host — as
+ * the 404 {@link Repository} already models as "no such repository".
+ */
+const MAX_SEGMENT_LENGTH = 255;
+
+/**
  * One SEGMENT of a repository's natural key — its `owner` or its `name`.
  *
- * Two rules, both enforced HERE rather than at a call site, because this is the one
+ * Three rules, all enforced HERE rather than at a call site, because this is the one
  * boundary every natural key crosses (INV-ENFORCE):
  *
  * 1. **{@link REPOSITORY_SEGMENT}** — the segment is one or more of `[A-Za-z0-9._-]`.
@@ -169,8 +189,14 @@ const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
  *    repository key steer the adapter's authenticated request at an unrelated endpoint
  *    (`owner: "..", name: "user"` → `GET /user`). A segment that denotes a directory
  *    traversal is not a repository name on any host, so nothing real is excluded.
+ * 3. **{@link MAX_SEGMENT_LENGTH}** — at most 255 characters. Rules 1 and 2 say WHICH
+ *    characters a segment may hold and say nothing about HOW MANY, so without this a
+ *    multi-megabyte `owner` spelled entirely from the allow-list decodes cleanly and is
+ *    then interpolated into an authenticated request path and written to a `TEXT`
+ *    column. The cap is a generous superset of any host's own limit — see
+ *    {@link MAX_SEGMENT_LENGTH} — so it excludes nothing real.
  *
- * Both rules are SCHEMA constraints, so a segment that violates either cannot be
+ * All three rules are SCHEMA constraints, so a segment that violates any cannot be
  * CONSTRUCTED — the rejection happens on DECODE, at the RPC boundary, before any
  * adapter sees the value (asserted end-to-end in `packages/daemon/src/acceptance.test.ts`,
  * which drives `owner: ".."` over the REAL serialized socket and asserts the `CodeHost`
@@ -186,10 +212,13 @@ const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
  */
 export const RepositorySegment = Schema.NonEmptyString.check(
   Schema.makeFilter(
-    (value: string) => REPOSITORY_SEGMENT.test(value) && value !== "." && value !== "..",
+    (value: string) =>
+      value.length <= MAX_SEGMENT_LENGTH &&
+      REPOSITORY_SEGMENT.test(value) &&
+      value !== "." &&
+      value !== "..",
     {
-      expected:
-        "a repository owner/name segment: one or more of [A-Za-z0-9._-], and neither '.' nor '..'",
+      expected: `a repository owner/name segment: 1 to ${MAX_SEGMENT_LENGTH} of [A-Za-z0-9._-], and neither '.' nor '..'`,
     },
   ),
 ).pipe(Schema.brand("RepositorySegment"));
@@ -380,6 +409,16 @@ const refsSignature = (refs: RepositoryRefs): string =>
  * repository's observed STATE is a property of the model — a field added to
  * {@link Repository} has to be answered for in one place, next to the schema that
  * introduced it.
+ *
+ * `id` is among the compared fields, and it is worth being precise about what that
+ * buys, because on the production path it can never differ: the journaling decorator
+ * obtains `left` by `getRepository(right.id)`, so the two ids are equal by construction
+ * and that comparison is dead THERE. It is kept as a guard for any OTHER caller — this
+ * is an exported predicate over two arbitrary records — where handing it two DIFFERENT
+ * repositories must answer `false` rather than "they agree" merely because their keys
+ * and refs happen to match. So the predicate answers "do these two observations describe
+ * the same repository in the same state?", which for the one production caller reduces
+ * to "has this repository moved since we last looked?".
  */
 export const observationsAgree = (left: Repository, right: Repository): boolean =>
   left.id === right.id &&

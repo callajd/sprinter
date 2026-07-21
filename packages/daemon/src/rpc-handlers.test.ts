@@ -619,6 +619,14 @@ it.effect("createWorkstreamFromPlan rejects an UNKNOWN repository and writes not
         .pipe(Effect.flip);
       expect(error).toBeInstanceOf(PlanRejected);
       expect(error.reason).toContain(UNKNOWN_REPOSITORY_NAME);
+      // N2 (round 4) — the reason must NOT assert non-existence. GitHub deliberately
+      // answers 404, not 403, for a repository the token cannot see (org SSO not
+      // authorised, a missing `repo` scope, a fine-grained PAT that does not select the
+      // repository), so the commonest credential failure on this path arrives as exactly
+      // this outcome. The reason names BOTH possibilities and points at the token, so a
+      // user is not sent to re-check a spelling that was right all along.
+      expect(error.reason).toContain("cannot access it");
+      expect(error.reason).toContain("token");
 
       // Nothing landed on EITHER table, and nothing was journaled.
       expect(yield* store.repositories.listRepositories).toStrictEqual([]);
@@ -748,10 +756,16 @@ it.effect("createWorkstreamFromPlan REJECTS (not dies) a stale natural-key colli
           })
           .pipe(Effect.flip);
         expect(error).toBeInstanceOf(PlanRejected);
-        // The reason NAMES the conflicting key and offers the actual explanation, so the
-        // user can see which repository is in the way rather than reading "internal error".
+        // The reason NAMES the key, so the user can see which repository is in the way
+        // rather than reading "internal error" …
         expect(error.reason).toContain("callajd/x");
-        expect(error.reason).toContain("renamed on the host");
+        expect(error.reason).toContain("rename on the host");
+        // … and N4 (round 4): it offers that as the LIKELY cause rather than ASSERTING
+        // it. `StateStoreError` carries no discriminator, so this same branch is reached
+        // by a locked database, a full disk or a decode failure, for which "another
+        // repository is already recorded there" would be flatly false. Tracked as #97.
+        expect(error.reason).toContain("most likely");
+        expect(error.reason).toContain("store may also be unavailable");
         // Nothing landed: the stale row is untouched and no workstream was written.
         expect((yield* store.repositories.listRepositories).map((row) => row.id)).toStrictEqual([
           STALE_ROW_ID,

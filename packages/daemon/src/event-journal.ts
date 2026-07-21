@@ -200,6 +200,24 @@ const putAgentAndJournal = (
  * write and its delta still commit together or not at all (INV-RESTART). The live
  * publish still happens after the commit, and is skipped entirely on the agreeing path.
  *
+ * ## What this closes, and what it does NOT
+ *
+ * Be precise about the scope, because the retry loop above has TWO halves and this
+ * closes ONE. The DURABLE half is closed: the append-only event log stops growing and
+ * the identical `RepositoryChanged` stops being broadcast to every client.
+ *
+ * The CODE-HOST half is untouched. Each rejected attempt still RESOLVES the repository
+ * before it can derive the workstream id, and a resolve is two live GitHub requests (the
+ * repository, then its branches). The adapter carries no retry budget, no backoff and no
+ * cache (`packages/repository/src/github.ts`), and the daemon adds none — so a client
+ * looping on `PlanRejected("a workstream already exists…")` issues two requests per
+ * attempt against GitHub's 5,000 requests/hour authenticated REST quota, exhausting it in
+ * roughly 2,500 attempts — about 42 minutes at one attempt per second, less for a tighter
+ * loop. After that EVERY code-host operation the daemon makes is refused (403), so a
+ * single misbehaving client's retry loop denies the whole daemon its code host until the
+ * limit resets. Nothing here defends against that; issue **#98** is where a retry budget,
+ * backoff and a short-lived resolve cache belong.
+ *
  * The COST, stated because it is real: on a suppressed refresh a client's mirror keeps
  * the `observedAt` it was last told about while the durable row moves ahead, so a
  * mirror can render a repository as staler than it is until the next genuine change

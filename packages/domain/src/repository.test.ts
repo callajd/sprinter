@@ -129,6 +129,40 @@ it.effect("accepts only [A-Za-z0-9._-] in an owner or name", () =>
   }),
 );
 
+// N6 (round 4) — the allow-list says WHICH characters, not HOW MANY. The segment is
+// client-supplied off the RPC surface, is interpolated into an AUTHENTICATED outbound
+// request path and is written to a `TEXT` column, so without a cap a multi-megabyte
+// `owner` spelled entirely from `[A-Za-z0-9._-]` decodes cleanly and reaches both. The
+// bound is 255 — a generous superset of GitHub's own 39 (owner) / 100 (name), so nothing
+// real is excluded — and it is a SCHEMA constraint (INV-ENFORCE), not a call-site check.
+it.effect("bounds an owner or name at 255 characters — the boundary, and one past it", () =>
+  Effect.gen(function* () {
+    const atCap = "a".repeat(255);
+    const overCap = "a".repeat(256);
+    // The boundary itself is ACCEPTED, on both segments.
+    expect((yield* decode({ ...wire, owner: atCap })).owner).toBe(atCap);
+    expect((yield* decode({ ...wire, name: atCap })).name).toBe(atCap);
+    // One character past it is rejected, on both segments.
+    yield* Effect.forEach(
+      [
+        { ...wire, owner: overCap },
+        { ...wire, name: overCap },
+        // …and the case the cap actually exists for: a megabyte of legal characters.
+        { ...wire, owner: "a".repeat(1_000_000) },
+      ],
+      (value) =>
+        Effect.exit(decode(value)).pipe(
+          Effect.map((exit) =>
+            expect(
+              Exit.isFailure(exit),
+              `expected a ${value.owner.length}-character owner or a ${value.name.length}-character name to be rejected`,
+            ).toBe(true),
+          ),
+        ),
+    );
+  }),
+);
+
 // `host` is a CLOSED literal set (D2): a host with no adapter behind it names a
 // repository nothing can read, resolve or refresh.
 it.effect("rejects a host outside the closed literal set", () =>

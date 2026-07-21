@@ -299,12 +299,21 @@ const slugify = (name: string): string =>
  *
  * Dying on it would deliver a client an unmodelled defect for a condition the contract
  * has a word for — the Swift client models `PlanRejected`, not a `Cause([Die(...)])` —
- * so it is REJECTED, with a reason that names the conflicting natural key so the user
- * can see which repository is in the way. Every OTHER `StateStoreError` from this write
- * is genuinely a broken store; a rejection is the strictly safer misclassification of
- * the two (a rejection that should have been a defect writes nothing and says so, while
- * a defect that should have been a rejection kills a live request), and the reason is
- * phrased as what we OBSERVED — that the key is taken — rather than as a diagnosis.
+ * so it is REJECTED, with a reason that names the natural key so the user can see which
+ * repository is in the way. Every OTHER `StateStoreError` from this write is genuinely a
+ * broken store; a rejection is the strictly safer misclassification of the two (a
+ * rejection that should have been a defect writes nothing and says so, while a defect
+ * that should have been a rejection kills a live request).
+ *
+ * The reason is therefore phrased for the WHOLE set of errors that can reach it, not for
+ * the collision alone. `StateStoreError` carries no discriminator, so this branch CANNOT
+ * tell a natural-key collision from a locked database, a full disk or a decode failure —
+ * a reason asserting "another repository is already recorded there" would be flatly false
+ * for the others. It states what was ATTEMPTED and what the LIKELY cause is, and leaves
+ * the store's own availability on the table. Issue **#97** is the real fix: carry the
+ * distinction as DATA on `StateStoreError`, exactly the way `CodeHostFailure` already
+ * does on the code-host port, after which this branch can name the cause it has instead
+ * of hedging across all of them.
  *
  * ## The resolve is BOUNDED (`RESOLVE_TIMEOUT`)
  *
@@ -356,15 +365,33 @@ const resolveRepository = (
       }),
     );
     if (Option.isNone(observed)) {
+      // The host answered "not found", and that answer is AMBIGUOUS by design on GitHub:
+      // it returns 404 — deliberately NOT 403 — for a repository the token cannot see, so
+      // it does not confirm the existence of a private repository to an unauthorized
+      // caller. Org SSO not authorised for the token, a missing `repo` scope, and a
+      // fine-grained PAT that does not select this repository all arrive here as 404, and
+      // those are the COMMONEST credential failures on this path. Saying "does not exist"
+      // would name a diagnosis this outcome cannot support and send the user off to check
+      // their spelling while the real fix is the daemon's token.
       return yield* Effect.fail(
-        new PlanRejected({ reason: `the code host does not know the repository ${named}` }),
+        new PlanRejected({
+          reason: `the code host has no repository ${named} that Sprinter can see — either it does not exist, or the daemon's code-host token cannot access it (a code host answers 404, not 403, for a private repository a token may not see); check the name, then check the token's access. The plan was not materialized`,
+        }),
       );
     }
+    // Every `StateStoreError` from this write reaches here, not just the natural-key
+    // collision — see this function's docstring. So the reason says what we ATTEMPTED and
+    // offers the collision as the LIKELY cause rather than asserting it: a locked
+    // database, a full disk or a decode failure would otherwise be reported to the user
+    // as "another repository is already recorded there", which is simply false. #97 is the
+    // real fix — carrying the distinction as DATA on `StateStoreError`, the way
+    // `CodeHostFailure` already does on the code-host port — after which this branch can
+    // name the cause it actually has.
     yield* store.repositories.putRepository(observed.value).pipe(
       Effect.mapError(
         () =>
           new PlanRejected({
-            reason: `another repository is already recorded at ${observed.value.owner}/${observed.value.name}; it may have been renamed on the host. The plan was not materialized`,
+            reason: `Sprinter could not record its observation of ${observed.value.owner}/${observed.value.name}; most likely another repository still holds that name in Sprinter's store after a rename on the host, but the store may also be unavailable. The plan was not materialized`,
           }),
       ),
     );
