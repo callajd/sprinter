@@ -361,6 +361,7 @@ const journaling = (base: Store, feed: Feed, executionFeed: ExecutionFeed): Stor
         }),
       getExecution: base.jobs.getExecution,
       getExecutionForJob: base.jobs.getExecutionForJob,
+      listExecutionsForJob: base.jobs.listExecutionsForJob,
     },
     events: base.events,
     executionLog: {

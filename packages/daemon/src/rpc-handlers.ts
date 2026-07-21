@@ -185,8 +185,13 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
           const issueJobs = yield* store.jobs.listJobsForIssue(issue.id);
           for (const job of issueJobs) {
             jobs.push(job);
-            const execution = yield* store.jobs.getExecutionForJob(job.id);
-            if (Option.isSome(execution)) executions.push(execution.value);
+            // The WHOLE tree, not just the root. `putExecution` journals an
+            // `ExecutionChanged` delta for EVERY execution, so a snapshot carrying only
+            // `getExecutionForJob`'s root would ship strictly less than the delta stream
+            // that follows it — and a client that reconnected would hold a different read
+            // model than one that never dropped, which is precisely what the
+            // snapshot-then-deltas contract exists to rule out.
+            executions.push(...(yield* store.jobs.listExecutionsForJob(job.id)));
           }
         }
       }

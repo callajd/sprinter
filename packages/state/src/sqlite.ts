@@ -465,6 +465,15 @@ const GENERATION_KEY = "generation";
  * `INV-FRESH`-vs-registry-durability tension for referential integrity (see
  * `registry.ts`).
  *
+ * Version 8 makes the execution TREE well-defined rather than merely intended: a
+ * partial `UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`.
+ * Version 7 dropped `UNIQUE execution_job` because a job owns many executions — correct,
+ * but it left "the job's ROOT execution" ({@link StateStore}'s `getExecutionForJob`)
+ * undefined whenever two PARENTLESS rows existed for one job, which was an ordinary
+ * write. The read's `ORDER BY id LIMIT 1` then picked between them by id collation and
+ * called it deterministic. The partial index refuses the second root outright, so a tree
+ * has one root by construction and the read has exactly one row it can return.
+ *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
@@ -472,7 +481,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -697,15 +706,25 @@ const createSchema = Effect.gen(function* () {
   //   agent that actually ran it — and the key is what makes that a guarantee instead of
   //   a hope (an execution naming an unregistered agent is refused by the engine, and a
   //   reset drops both tables together so the reference cannot outlive its referent).
-  // - `parent` → `execution (id)`: executions form a TREE. The key means a child cannot
-  //   name a parent that is not already stored, so a DANGLING parent is unstorable and
-  //   no write ORDER closes a cycle of length ≥ 2 (closing one requires naming a row
-  //   that does not exist yet). Self-reference — the single edge a foreign key accepts,
-  //   since a row satisfies a key against itself — is rejected by the port's
-  //   `putExecution`, exactly as `putAgent` rejects a self-`supersedes`. Together they
-  //   make the relation acyclic BY CONSTRUCTION. This is the `supersedes` lesson from
-  //   issue #85 applied to the tree: three separate lineage rules were all defeated by a
-  //   reordered write until a foreign key made the precondition unconstructible.
+  // - `parent` → `execution (id)`: executions form a TREE. Acyclicity takes THREE
+  //   things, and the key alone is only the first of them:
+  //   1. the KEY — a child cannot name a parent that is not already stored, so a
+  //      DANGLING parent is unstorable;
+  //   2. `putExecution`'s SELF-parent refusal — the single edge a foreign key accepts,
+  //      since a row satisfies a key against itself (exactly as `putAgent` rejects a
+  //      self-`supersedes`);
+  //   3. `parent` being INSERT-ONLY in `putExecution`'s upsert. This is the one the key
+  //      says NOTHING about: it constrains the REFERENCED row, not the re-pointing of an
+  //      EXISTING one, so while `parent` sat in the `DO UPDATE SET` list a 2-cycle was
+  //      constructible in three ordinary writes (insert `a` rootless, insert `b` under
+  //      `a`, upsert `a` under `b`) — each satisfying the key at the moment it ran.
+  //   With (3) in place, closing a cycle of length ≥ 2 genuinely requires naming a row
+  //   that does not exist yet, which (1) refuses, and the relation is acyclic BY
+  //   CONSTRUCTION for real. This is the `supersedes` lesson from issue #85 applied to
+  //   the tree: three separate lineage rules were all defeated by a reordered write
+  //   until a foreign key made the precondition unconstructible — and the registry's
+  //   version holds only because `putAgent` is a bare INSERT, which is the same property
+  //   (3) restores here.
   //
   // There is NO `status` column: liveness IS the transcript variant (`Transcript`,
   // `@sprinter/domain`), and a status enum beside it would be a second field that must
@@ -724,10 +743,17 @@ const createSchema = Effect.gen(function* () {
     )`;
   // PLAIN, not UNIQUE (DE2.2). It was `UNIQUE` while the model was 1 Job = 1 execution;
   // a job now owns a TREE of executions, so uniqueness would refuse the model rather
-  // than protect it. `getExecutionForJob` stays deterministic without it — it reads the
-  // job's ROOT (`parent IS NULL`), ordered and limited in the backing, rather than
-  // relying on there being only one row to find.
+  // than protect it.
   yield* sql`CREATE INDEX execution_job ON execution ("jobId")`;
+  // A job's executions are a TREE, and a tree has ONE root. Uniqueness on `"jobId"` is
+  // wrong (that is the index above), but uniqueness on `"jobId"` AMONG THE ROOTLESS rows
+  // is exactly the model: a job may own any number of executions and at most one of them
+  // has no parent. Without it `getExecutionForJob`'s "the root" was not a definition at
+  // all — two parentless rows for one job were an ordinary write, and the `ORDER BY id
+  // LIMIT 1` picked between them by id COLLATION, which is arbitrary, not deterministic.
+  // A partial UNIQUE index makes the second root unstorable instead (INV-ENFORCE), so
+  // the read's answer is the only row that can match rather than the first of several.
+  yield* sql`CREATE UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`;
   // Keeps the tree walk (a parent's children) and the foreign key's own referencing
   // scan cheap; SQLite indexes the referenced side of a key, never the referencing one.
   yield* sql`CREATE INDEX execution_parent ON execution (parent)`;
@@ -1440,13 +1466,14 @@ const make = Effect.gen(function* () {
     });
 
   const getExecutionForJobQuery = (jobId: JobId) =>
-    // The job's ROOT execution: `parent IS NULL`, lowest id. A job owns a TREE now
-    // (DE2.2 dropped `UNIQUE execution_job`), so "the execution for this job" needs a
-    // definition rather than an assumption that only one row can match — and the
-    // definition is answered by the BACKING (`ORDER BY … LIMIT 1`), so it is
-    // deterministic for every history the store can hold, not merely for the ones a
-    // caller expects. DE2.4 replaces this read entirely: a `Session` names its `root`
-    // execution outright, so the root stops being something to look up.
+    // The job's ROOT execution: `parent IS NULL`. A job owns a TREE now (DE2.2 dropped
+    // `UNIQUE execution_job`), so "the execution for this job" needs a definition rather
+    // than an assumption that only one row can match. The definition holds because the
+    // `execution_root` partial UNIQUE index makes a SECOND rootless row for one job
+    // unstorable — that, not the `LIMIT 1`, is what makes the answer deterministic. The
+    // `ORDER BY id LIMIT 1` is kept as a plan hint only; with the index there is at most
+    // one candidate to order. DE2.4 replaces this read entirely: a `Session` names its
+    // `root` execution outright, so the root stops being something to look up.
     sql`SELECT * FROM execution WHERE "jobId" = ${jobId} AND parent IS NULL ORDER BY id LIMIT 1`;
 
   const jobs: JobStore = {
@@ -1508,9 +1535,33 @@ const make = Effect.gen(function* () {
           mode: execution.mode,
           transcript,
         };
-        yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`.pipe(
-          Effect.mapError(fail("putExecution")),
-        );
+        // `parent` is INSERT-ONLY: it is absent from the `DO UPDATE SET` list, so an
+        // upsert of an EXISTING id cannot re-point its edge. That omission is what makes
+        // the foreign key mean what its docstring claims — the key only guarantees the
+        // REFERENCED row exists, and while `parent` was in the updated set a 2-cycle was
+        // constructible in three ordinary writes (insert `a` rootless, insert `b` under
+        // `a`, upsert `a` under `b`), leaving the job with no `parent IS NULL` row at all.
+        // Frozen at insert, closing a cycle genuinely requires naming a row that does not
+        // exist yet, which the key refuses (INV-ENFORCE: unconstructible, not checked).
+        //
+        // The `WHERE … IS excluded.parent` makes the freeze LOUD rather than silent, and
+        // the ENGINE decides it inside the one statement — no read-then-write window a
+        // concurrent writer can slip through. A re-attach (the intended upsert) passes the
+        // same `parent` and updates normally; a re-parent matches no row, updates nothing,
+        // and `RETURNING` comes back empty, which is the failure below. `IS` is SQLite's
+        // null-safe equality, so a rootless execution's `NULL` compares as a value.
+        const written =
+          yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id", "parent"])} WHERE execution.parent IS excluded.parent RETURNING id`.pipe(
+            Effect.mapError(fail("putExecution")),
+          );
+        if (written.length === 0) {
+          return yield* Effect.fail(
+            new StateStoreError({
+              operation: "putExecution",
+              detail: `execution "${execution.id}" is already stored with a DIFFERENT parent; an execution's parent is fixed at its first write — re-parenting is not an operation an execution has`,
+            }),
+          );
+        }
       }),
     getExecution: (id) =>
       sql`SELECT * FROM execution WHERE id = ${id}`.pipe(
@@ -1521,6 +1572,13 @@ const make = Effect.gen(function* () {
       getExecutionForJobQuery(jobId).pipe(
         Effect.mapError(fail("getExecutionForJob")),
         Effect.flatMap((rows) => findExecution(rows, "getExecutionForJob")),
+      ),
+    listExecutionsForJob: (jobId) =>
+      sql`SELECT * FROM execution WHERE "jobId" = ${jobId} ORDER BY id`.pipe(
+        Effect.mapError(fail("listExecutionsForJob")),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) => hydrateExecution(row, "listExecutionsForJob")),
+        ),
       ),
   };
 

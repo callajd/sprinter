@@ -216,8 +216,15 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
        * correct (see `Transcript`, `@sprinter/domain`).
        *
        * The extent comes from the durable log's own indexed `maxOffset`; a transient read
-       * failure seals at `0` (the empty-transcript sentinel) rather than leaving the
-       * execution LIVE forever, which is the failure this settle exists to prevent.
+       * failure seals at `0` rather than leaving the execution LIVE forever, which is the
+       * failure this settle exists to prevent. That fallback is why the contract states
+       * `lastOffset` as a LOWER BOUND rather than an exact extent (see `Transcript`,
+       * `@sprinter/domain`, and the same fallback in `job-runner.ts`'s `sealTranscript`):
+       * `0` here does NOT assert an empty transcript, it asserts only that `[0, 0]` is
+       * settled — which is trivially true and never invalidates a cached prefix. There is
+       * no local high-water mark to prefer on THIS path: the run whose appends it would
+       * have counted belongs to a process that is already gone, which is why this settle
+       * runs at all.
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {

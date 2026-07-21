@@ -40,7 +40,7 @@ import { PiSpawnRouter } from "./spawn-router.ts";
  * registry revision's id is DERIVED from it (`agent-registration.ts`), so changing any
  * field here lands as a new revision rather than colliding with the old one.
  *
- * Two fields are recorded honestly rather than invented:
+ * Three fields are recorded honestly rather than invented:
  *
  * - `model` — the model selection is `pi`'s OWN configuration. This adapter spawns
  *   `pi --mode rpc` and the wire it consumes reports the resolved model only through a
@@ -52,6 +52,24 @@ import { PiSpawnRouter } from "./spawn-router.ts";
  * - `tools` — likewise `pi`'s own configuration, so Sprinter declares NO tool
  *   allow-list here rather than asserting one it does not enforce. An empty list is
  *   "not declared by Sprinter", and it is not a claim that the agent has no tools.
+ * - `version` — a PLACEHOLDER, and a load-bearing one, so it is called out rather than
+ *   left to look settled. It does not track the `pi` binary: this adapter spawns
+ *   whatever `pi` the spawn router resolves and never asks it what it is, so upgrading
+ *   the binary leaves this content byte-identical and re-derives the SAME registry id.
+ *   The registry then records that "the same agent" ran both before and after the
+ *   upgrade, which is the OPPOSITE of the guarantee `Execution.agentId` exists to give
+ *   ("a historical execution always resolves to the agent that actually ran it" —
+ *   `sqlite.ts`). The key and the content-derived id are both working correctly; what
+ *   is wrong is the CONTENT they are computed over.
+ *
+ *   For it to track the binary, the adapter needs the resolved version at spawn time —
+ *   i.e. the `pi` version has to reach this module as DATA (a `--version` probe through
+ *   {@link PiSpawnRouter}, or the `get_state` response the {@link ExecutionHandle} does
+ *   not surface today, which is the same missing capability the `model` caveat above
+ *   names). At that point `LOCAL_PI_AGENT` stops being a constant and becomes a
+ *   per-spawn value; nothing else changes, because identity is already derived from
+ *   content, so every upgrade lands as a new revision automatically and every past
+ *   execution keeps resolving to the revision it actually ran.
  */
 export const LOCAL_PI_AGENT: AgentContent = {
   name: "pi",

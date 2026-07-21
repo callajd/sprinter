@@ -370,6 +370,44 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   foreign key too (1 Execution = 1 Transcript), and the registry's production writer
   derives an agent revision's id from its CONTENT, so re-running the same agent is an
   idempotent no-op and editing it is a new revision by construction.
+- **Decided at cold review (issue #109):**
+  - **The tree is acyclic only with `parent` FROZEN.** The `parent` foreign key
+    constrains the row a write *references*, never the re-pointing of an existing one, so
+    while `parent` sat in `putExecution`'s `ON CONFLICT … DO UPDATE SET` list a 2-cycle
+    was constructible in three ordinary writes — after which the job had no rootless row,
+    `getExecutionForJob` answered `None`, and the job's execution vanished from the
+    snapshot *and* from `startup-reconcile`'s seal, re-opening the CE4.1-R4 live-orphan
+    stall. `parent` is now INSERT-ONLY: **re-parenting is not an operation an execution
+    has**, and a write attempting one is refused by the engine inside the same statement
+    (`INV-ENFORCE` — unconstructible, not walked for).
+  - **A job has exactly ONE root**, enforced by a partial `UNIQUE (jobId) WHERE parent IS
+    NULL` index (`SCHEMA_VERSION` 8). `getExecutionForJob`'s "the root" was previously
+    undefined for two parentless rows and picked between them by id collation.
+  - **The snapshot carries the whole TREE**, via a new `listExecutionsForJob` read.
+    `putExecution` journals `ExecutionChanged` for *every* execution, so a snapshot built
+    from the root alone shipped strictly less than the deltas that follow it and a
+    reconnecting client converged differently from one that never dropped.
+  - **`SealedTranscript.lastOffset` is a LOWER BOUND**, stated on both sides of the wire.
+    `[0, lastOffset]` is complete and immutable — the entire cacheability claim, and
+    unconditionally true — but it is not a claim that nothing exists beyond it: the seal
+    falls back to `0` on a transient extent read (better than an execution left live
+    forever), the durable-append fold is bounded by the execution's terminal so an
+    in-flight append can land after the extent is read, and a per-append failure is
+    absorbed. Nothing consumes `lastOffset` yet — `resyncExecutionEvents` reads
+    `executionLog.maxOffset` directly — so the bound is documented before it has a reader.
+  - **`BoardProjection.liveActivity`'s widening is INTENDED.** The old
+    `execution?.status == .active` clause was dead; `isLive` makes the execution clause
+    decide for the first time, and a non-terminal non-`running` job with an open
+    transcript now reads live. Narrowing back would put liveness on the job's status enum
+    and make the transcript decorative — the second source of truth `INV-SUM` removed —
+    and the state it newly surfaces is exactly the live orphan the startup seal clears.
+  - **`LOCAL_PI_AGENT.version` is a placeholder that does NOT track the `pi` binary**, so
+    an upgrade re-derives the same registry id and the registry records that "the same
+    agent" ran across it. Documented alongside the `model` caveat, with what would have to
+    change (the resolved version reaching the adapter as data at spawn time).
+  - **`registerAgent` appends ORIGINAL revisions only**, so editing an agent definition
+    starts a new unlinked lineage rather than extending one; `Snapshot.agents` accumulates
+    single-revision lineages the helpers correctly treat as unrelated agents.
 - **Depends on:** `DE2.1`
 
 ### DE2.3 — `PullRequest` as an entity

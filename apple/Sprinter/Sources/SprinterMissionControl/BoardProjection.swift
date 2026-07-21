@@ -73,6 +73,21 @@ public enum BoardProjection {
   /// A job may now own a TREE of executions, so the index below keeps the job's LIVE
   /// one when there is one: "is this issue live?" must not depend on which sibling
   /// happened to come last in the snapshot.
+  ///
+  /// DELIBERATE WIDENING (DE2.2). This clause used to read `execution?.status == .active`
+  /// and was DEAD — nothing ever wrote `active`, so liveness came from `job.status ==
+  /// .running` alone. Replacing it with ``Execution/isLive`` is the first time the
+  /// execution clause decides anything, and it does widen the board: a non-terminal job
+  /// that is not `running` but holds an open transcript now renders live where it never
+  /// did. That is INTENDED. Liveness IS the transcript variant in the remodelled domain —
+  /// there is no execution-status enum left to consult, and narrowing back to
+  /// `job.status == .running` would put the board's answer back on the job's status enum
+  /// and make the transcript decorative, which is the second-source-of-truth the model
+  /// removed (`INV-SUM` / `INV-ENFORCE`). The state it newly surfaces — an open
+  /// transcript on a job nobody is driving — is the live-orphan the daemon's startup
+  /// seal exists to clear (CE4.1-R4); showing it is how a stall becomes visible rather
+  /// than a job that silently reads idle. The `!terminal` guard is what keeps the
+  /// widening bounded: a stale live execution on a settled job is still never live.
   private static func liveActivity(in snapshot: Snapshot) -> [IssueId: IssueActivity] {
     let executionsByJob = indexedPreferringLive(snapshot.executions)
     var activity: [IssueId: IssueActivity] = [:]

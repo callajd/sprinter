@@ -186,7 +186,11 @@ export type AgentWrite = "appended" | "unchanged";
  *   referential constraint accepts (a row satisfies a key against itself), and with
  *   it closed no cycle of any length is constructible: a longer one needs an edge
  *   naming a revision that does not exist yet. Acyclicity is therefore structural,
- *   not a precondition anyone owes.
+ *   not a precondition anyone owes — but note WHY the key is enough here and is not
+ *   enough for the execution tree ({@link putExecution}): a key constrains the row a
+ *   write REFERENCES, not the re-pointing of an existing one, and this store is
+ *   APPEND-ONLY, so there is no update through which an edge could be re-pointed. The
+ *   tree had to freeze `parent` explicitly to buy the same property.
  * - a RETIRING revision (one carrying BOTH `supersedes` and `retiredAt`) must carry
  *   the SAME `name` / `model` / `version` / `tools` as the revision it supersedes.
  *   Retirement is LIFECYCLE-ONLY; fusing a content edit into it would make the two
@@ -404,10 +408,23 @@ export interface JobStore {
    *   than reconciled later (INV-ENFORCE);
    * - a `parent` equal to the execution's own `id`. That is the single edge a
    *   referential constraint accepts (a row satisfies a key against itself), so it is
-   *   rejected HERE, and with it closed no cycle of any length is constructible: a
-   *   longer one needs an edge naming a row that does not exist yet.
+   *   rejected HERE;
+   * - a `parent` DIFFERENT from the one the execution was first stored with. `parent`
+   *   is fixed at insert: RE-PARENTING is not an operation an execution has, and the
+   *   upsert leaves the column out of its updated set rather than checking a tree
+   *   invariant afterwards (INV-ENFORCE).
    *
-   * A restart re-attaches by upserting the SAME execution id, not a new one.
+   * That third rule is what makes the relation ACYCLIC — the other two do not get there
+   * on their own. A foreign key constrains the row a write REFERENCES, never the
+   * re-pointing of an existing row, so while `parent` was mutable a 2-cycle was
+   * constructible out of three writes each of which satisfied the key and neither of
+   * which was a self-parent (insert `a` rootless, insert `b` under `a`, upsert `a` under
+   * `b`). With `parent` frozen, closing any cycle requires naming a row that does not
+   * exist yet — which the key refuses — so acyclicity is structural rather than a
+   * precondition callers owe or a walk someone remembers to run.
+   *
+   * A restart re-attaches by upserting the SAME execution id, not a new one — which is
+   * unaffected: a re-attach carries the parent it already had.
    */
   readonly putExecution: (execution: Execution) => Effect.Effect<void, StateStoreError>;
   /** Read an {@link Execution} by id, if present. */
@@ -415,17 +432,32 @@ export interface JobStore {
     id: ExecutionId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
   /**
-   * Read a job's ROOT execution — the one with no `parent`, lowest id — if present.
+   * Read a job's ROOT execution — the one with no `parent` — if present.
    *
    * "The execution for this job" needed a DEFINITION once a job could own a tree, and
-   * this is it. It is answered by the backing (`ORDER BY id LIMIT 1`), so it is
-   * deterministic for every history the store can hold rather than for the ones a
-   * caller happens to expect. DE2.4 removes the lookup: a `Session` names its `root`
-   * outright.
+   * this is it. It is deterministic because a job can hold AT MOST ONE parentless
+   * execution: the adapter carries a partial `UNIQUE (jobId) WHERE parent IS NULL`
+   * index, so a second root is unstorable and this read has exactly one candidate row
+   * rather than a collation-ordered pick among several (INV-ENFORCE). DE2.4 removes the
+   * lookup: a `Session` names its `root` outright.
    */
   readonly getExecutionForJob: (
     jobId: JobId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
+  /**
+   * ALL executions advancing a job — the whole tree, ordered by id, root included.
+   *
+   * {@link getExecutionForJob} answers "the" execution and is the wrong read for anyone
+   * assembling a complete picture: it returns the root ONLY, while `putExecution`
+   * journals an `ExecutionChanged` delta for EVERY execution. A snapshot built from the
+   * root alone therefore ships strictly less than the delta stream that follows it, and
+   * a reconnecting client converges to a different read model than a client that stayed
+   * connected — the divergence the snapshot exists to prevent. This read is what keeps
+   * `Snapshot.executions` carrying what the deltas carry.
+   */
+  readonly listExecutionsForJob: (
+    jobId: JobId,
+  ) => Effect.Effect<ReadonlyArray<Execution>, StateStoreError>;
 }
 
 /**

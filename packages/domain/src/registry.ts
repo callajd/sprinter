@@ -187,6 +187,19 @@ export const isRetired = (agent: Agent): boolean => agent.retiredAt !== undefine
  * observe the chain, but the walk built out of it terminates for every history the
  * store can hold: `supersedes` is acyclic BY CONSTRUCTION (see the module
  * docstring), not by a writer's promise.
+ *
+ * KNOWN CONSEQUENCE — in a live daemon this is `true` of nearly everything. The only
+ * production writer (`agent-registration.ts`, DE2.2) appends ORIGINAL revisions only:
+ * it never sets `supersedes`, because the runner knows the content it is about to run
+ * but not whether a person meant that content to REPLACE something. Identity is derived
+ * from content, so editing an agent definition (`LOCAL_PI_AGENT`, say) does not extend a
+ * lineage — it starts a NEW one, unlinked to the old. `Snapshot.agents` therefore
+ * accumulates unrelated single-revision lineages, and the helpers below are CORRECT
+ * about them in a way that may read as surprising: {@link isLineageRetired} answers for
+ * a lineage of one, and the pre-edit and post-edit revisions of "the same" agent are, to
+ * every helper here, two different agents that happen to share a `name`. Linking them is
+ * a human operation on the registry surface — nothing on the dispatch path can infer it,
+ * and no helper here should pretend otherwise (`name` is not an identity).
  */
 export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes === undefined;
 

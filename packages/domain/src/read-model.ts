@@ -96,9 +96,10 @@ export type ExecutionMode = (typeof ExecutionMode)["Type"];
  * - {@link LiveTranscript} — an OPEN offset range. The execution is still running, so
  *   the transcript has no last entry yet and a reader that wants to be current must
  *   TAIL it (subscribe to `executionEvents`).
- * - {@link SealedTranscript} — the CLOSED range `[0, lastOffset]`. The run has ended, so
- *   the transcript is complete: immutable, and therefore cacheable by any reader that
- *   has read it once.
+ * - {@link SealedTranscript} — the run has ended and `[0, lastOffset]` is a settled,
+ *   immutable PREFIX of its transcript, so a reader that has read it once may cache it
+ *   forever. `lastOffset` is a LOWER BOUND on the extent, not a claim that no entry
+ *   exists beyond it — see below.
  *
  * The difference is carried by the TYPE, and neither case carries a boolean saying
  * which it is. That is the whole point: a tail subscription must be UNREPRESENTABLE on
@@ -112,11 +113,33 @@ export type ExecutionMode = (typeof ExecutionMode)["Type"];
  * ONLY place it is written down: {@link Execution} carries no status enum beside it,
  * because two fields that must agree are one value (INV-ENFORCE / INV-SUM).
  *
- * `lastOffset` is the extent of the execution's durable transcript log at the moment
- * it settled — a coordinate in the CURRENT store generation, exactly like every other
- * durable offset, so it is interpretable only alongside `Snapshot.generation`. It is
- * `0` for a run that produced no durable entry at all (durable offsets are strictly
- * `> 0`), which is a valid sealed transcript: an empty one.
+ * `lastOffset` is a coordinate in the CURRENT store generation, exactly like every other
+ * durable offset, so it is interpretable only alongside `Snapshot.generation`. It is `0`
+ * for a run that produced no durable entry at all (durable offsets are strictly `> 0`),
+ * which is a valid sealed transcript: an empty one.
+ *
+ * CONTRACT — `lastOffset` is a LOWER BOUND on the transcript's extent, not an upper one.
+ * `[0, lastOffset]` is guaranteed COMPLETE and IMMUTABLE, which is the whole cacheability
+ * claim and is unconditionally true (entries are immutable and per-execution offsets
+ * never reset, so a cached prefix can never be invalidated). What it does NOT guarantee
+ * is that the durable log holds nothing beyond it. Three ways it can understate, none of
+ * them a defect a reader can be shielded from:
+ *
+ * - the seal reads the extent from the durable log, and a TRANSIENT read failure falls
+ *   back to `0` rather than refusing to seal — an execution left LIVE because a read
+ *   hiccuped would look forever-running to every liveness gate, which is worse than an
+ *   understated extent (`packages/job/src/job-runner.ts`, and the same fallback in
+ *   `startup-reconcile.ts`);
+ * - the durable-append fold is bounded by the execution's terminal
+ *   (`Stream.interruptWhen(handle.result)`), so an append still in flight when the
+ *   terminal resolves can land AFTER the extent is read;
+ * - a per-append `StateStoreError` is absorbed so one hiccup does not truncate the rest
+ *   of the fold, so a dropped entry leaves a gap the extent never reflects.
+ *
+ * A reader must therefore treat "sealed" as "this prefix is final", never as "this is
+ * the whole transcript" — i.e. it may cache what it has read and must still be willing
+ * to be handed more. That is the SAME discipline the re-dispatch consequence below
+ * already demands, which is why one rule covers both rather than two.
  *
  * KNOWN CONSEQUENCE — a seal is per-RUN, not per-id. A re-dispatch of the same Job
  * re-attaches the SAME execution id (issue #77's merged-transcript decision: retries
@@ -141,9 +164,11 @@ export const LiveTranscript = Transcript.cases.LiveTranscript;
 export type LiveTranscript = (typeof LiveTranscript)["Type"];
 
 /**
- * The CLOSED transcript `[0, lastOffset]` of a settled execution — see
- * {@link Transcript}. Immutable and cacheable; it has no tail, which is expressed by
- * it not being a {@link LiveTranscript} rather than by a runtime refusal.
+ * The transcript of a SETTLED execution — see {@link Transcript}. `[0, lastOffset]` is
+ * a final, immutable prefix and is therefore cacheable; `lastOffset` is a LOWER BOUND on
+ * the extent, so a reader may cache what it has and must still accept more. It has no
+ * tail, which is expressed by it not being a {@link LiveTranscript} rather than by a
+ * runtime refusal.
  */
 export const SealedTranscript = Transcript.cases.SealedTranscript;
 export type SealedTranscript = (typeof SealedTranscript)["Type"];

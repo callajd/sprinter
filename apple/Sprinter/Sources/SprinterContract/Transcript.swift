@@ -15,8 +15,9 @@ public enum Transcript: Codable, Equatable, Sendable {
   /// The execution is still running — an OPEN offset range, so a reader that wants to
   /// stay current must tail it.
   case live(LiveTranscript)
-  /// The run has ended — the CLOSED range `[0, lastOffset]`: complete, immutable, and
-  /// therefore cacheable once read.
+  /// The run has ended — `[0, lastOffset]` is a final, immutable PREFIX of the
+  /// transcript, so it is cacheable once read. `lastOffset` is a LOWER BOUND on the
+  /// extent, not a claim that nothing exists beyond it (see ``SealedTranscript``).
   case sealed(SealedTranscript)
 
   private enum CodingKeys: String, CodingKey {
@@ -60,10 +61,19 @@ public struct LiveTranscript: Codable, Equatable, Sendable {
   public init() {}
 }
 
-/// The CLOSED transcript `[0, lastOffset]` of a settled execution: complete and
-/// immutable, so a reader may cache it. `lastOffset` is a durable offset in the
+/// The transcript of a SETTLED execution. `lastOffset` is a durable offset in the
 /// daemon's CURRENT store generation (``Snapshot/generation``) — `0` for a run that
 /// produced no durable entry at all, which is a valid, EMPTY sealed transcript.
+///
+/// CONTRACT — `lastOffset` is a LOWER BOUND on the extent, mirroring the daemon's
+/// `SealedTranscript`. `[0, lastOffset]` is guaranteed COMPLETE and IMMUTABLE, which is
+/// the entire cacheability claim and is unconditionally true: entries never change and
+/// per-execution offsets never reset, so a cached prefix can never be invalidated. It is
+/// NOT a guarantee that the daemon's durable log holds nothing beyond it — the seal
+/// falls back to `0` on a transient extent read, an append in flight when the run
+/// terminates can land after the extent is read, and a re-dispatch appends to the same
+/// log. A client may therefore cache what it has read and must still be prepared to be
+/// handed more; it must never treat a sealed transcript as proof of the whole.
 ///
 /// It has no tail, and that is expressed by it NOT being a ``LiveTranscript`` rather
 /// than by a runtime refusal.

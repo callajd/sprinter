@@ -1037,6 +1037,84 @@ it.effect("refuses a DANGLING parent and a SELF-parent — the tree is acyclic b
   }).pipe(Effect.provide(layerMemory)),
 );
 
+it.effect("refuses a SECOND ROOT for one job, and lists the job's whole tree", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    const root = yield* execution();
+    yield* store.jobs.putExecution(root);
+    // A job's executions are a TREE and a tree has ONE root, so a SECOND parentless row
+    // for the same job is refused by the `execution_root` partial UNIQUE index. Without
+    // it `getExecutionForJob`'s "the root" was decided by id COLLATION among however many
+    // matched — arbitrary, not deterministic.
+    const secondRoot = yield* store.jobs
+      .putExecution(yield* execution({ id: "execution-2" }))
+      .pipe(Effect.flip);
+    expect(secondRoot).toBeInstanceOf(StateStoreError);
+    expect(secondRoot.operation).toBe("putExecution");
+    // A CHILD of the same job is ordinary — uniqueness is over the rootless rows only.
+    yield* store.jobs.putExecution(yield* execution({ id: "execution-2", parent: "execution-1" }));
+    yield* store.jobs.putExecution(yield* execution({ id: "execution-3", parent: "execution-2" }));
+    // `listExecutionsForJob` answers with the WHOLE tree, root included, in id order —
+    // what the snapshot needs, since `putExecution` journals a delta for every one of
+    // them and `getExecutionForJob` returns only the first.
+    const all = yield* store.jobs.listExecutionsForJob(root.jobId);
+    expect(all.map((e) => e.id)).toStrictEqual(["execution-1", "execution-2", "execution-3"]);
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(root.jobId)).id).toBe(
+      "execution-1",
+    );
+    // A job with no executions lists EMPTY rather than failing.
+    const empty = yield* job({ id: "job-2" });
+    yield* store.jobs.putJob(empty);
+    expect(yield* store.jobs.listExecutionsForJob(empty.id)).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect(
+  "refuses a RE-PARENT — the edge is fixed at insert, so no upsert order closes a cycle",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* seedExecutionRefs(store);
+      // The falsifying sequence the insert-time checks above do NOT cover: every write
+      // here names a parent that IS already stored, so the FOREIGN KEY is satisfied at
+      // each step, and neither is a self-parent. While `parent` sat in the upsert's
+      // `DO UPDATE SET` list this stored the cycle a→b→a — after which the job had NO
+      // `parent IS NULL` row, `getExecutionForJob` answered `None`, and the job's
+      // execution vanished from the snapshot AND from startup-reconcile's seal (whose
+      // write is guarded on that same `Option`), re-opening the CE4.1-R4 live-orphan
+      // stall. `parent` is INSERT-ONLY, so the third write is refused.
+      yield* store.jobs.putExecution(yield* execution());
+      yield* store.jobs.putExecution(
+        yield* execution({ id: "execution-2", parent: "execution-1" }),
+      );
+      const reparent = yield* store.jobs
+        .putExecution(yield* execution({ id: "execution-1", parent: "execution-2" }))
+        .pipe(Effect.flip);
+      expect(reparent).toBeInstanceOf(StateStoreError);
+      expect(reparent.operation).toBe("putExecution");
+      // The refusal is the WHOLE write: the stored row keeps its original (absent) parent,
+      // so the root survives and the job's execution is still resolvable.
+      const stored = yield* store.jobs.getExecution(yield* executionId("execution-1"));
+      expect(Option.isSome(stored)).toBe(true);
+      if (Option.isSome(stored)) expect(stored.value.parent).toBeUndefined();
+      const root = yield* store.jobs.getExecutionForJob((yield* execution()).jobId);
+      expect(Option.isSome(root)).toBe(true);
+      if (Option.isSome(root)) expect(root.value.id).toBe("execution-1");
+      // POSITIVE CONTROL: a re-attach — the upsert this port exists for — carries the SAME
+      // parent and still updates the mutable columns.
+      yield* store.jobs.putExecution(
+        yield* execution({ id: "execution-2", parent: "execution-1", mode: "interactive" }),
+      );
+      const reattached = yield* store.jobs.getExecution(yield* executionId("execution-2"));
+      expect(Option.isSome(reattached)).toBe(true);
+      if (Option.isSome(reattached)) {
+        expect(reattached.value.mode).toBe("interactive");
+        expect(reattached.value.parent).toBe("execution-1");
+      }
+    }).pipe(Effect.provide(layerMemory)),
+);
+
 it.effect("refuses a transcript entry for an execution that was never stored", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

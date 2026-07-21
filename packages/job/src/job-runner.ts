@@ -124,16 +124,29 @@ const toJobResult = (result: ExecutionResult, payload: unknown): JobResult => {
 
 /**
  * SEAL an execution's transcript at the extent its durable log has reached — the write
- * that ends a run (a settled execution's transcript is `[0, lastOffset]`: complete,
- * immutable, cacheable).
+ * that ends a run.
  *
  * The extent is read from the durable log itself (`executionLog.maxOffset`, answered
  * from the backing's index — no transcript is materialised), so the seal describes what
- * was actually persisted rather than what this dispatch believes it appended. A
- * transient read failure falls back to `0` rather than stopping the seal: an execution
- * that stayed LIVE because the extent could not be read would look forever-running to
- * every liveness gate, which is strictly worse than an understated extent (`0` is the
- * empty-transcript sentinel, below every durable offset).
+ * was actually persisted rather than what this dispatch believes it appended.
+ *
+ * `lastOffset` is a LOWER BOUND, and this function is one of the reasons the contract
+ * says so (`Transcript`, `@sprinter/domain` — the claim is mirrored client-side). TWO
+ * ways it understates, both deliberate:
+ *
+ * - a transient `maxOffset` failure falls back to `0` rather than stopping the seal. An
+ *   execution left LIVE because the extent could not be read would look forever-running
+ *   to every liveness gate — the CE4.1-R4 stall — which is strictly worse than an
+ *   understated extent. It is NOT a claim that the run produced nothing: `0` is a lower
+ *   bound like any other, which is exactly why the contract cannot promise an upper one.
+ * - the durable-append fold is bounded by `Stream.interruptWhen(handle.result)` (below),
+ *   so an append still in flight when the terminal resolves can land AFTER this read.
+ *   Waiting for it would mean deciding how long to wait for a stream the terminal has
+ *   already overtaken; the bound is the honest answer instead.
+ *
+ * Neither weakens cacheability, because the cacheability claim is about the PREFIX:
+ * `[0, lastOffset]` is complete and immutable whatever the true extent is, since entries
+ * never change and per-execution offsets never reset.
  */
 const sealTranscript = (
   store: Context.Service.Shape<typeof StateStore>,
@@ -267,9 +280,27 @@ const dispatch = (
               // truncate every SUBSEQUENT durable entry. The `entries` count is derived at
               // terminal from the durable log itself (`executionLog.countEntries`), so a dropped
               // append is reflected there rather than tracked by a separate in-memory counter.
-              yield* store.executionLog
-                .append(executionId, event)
-                .pipe(Effect.catchTag("StateStoreError", () => Effect.void));
+              //
+              // But NOT SILENTLY. `execution_event_log."executionId"` is a real FOREIGN KEY
+              // (DE2.2), so this path now has a failure mode that is NOT transient: if the
+              // execution row is missing, EVERY append of this run is rejected identically and
+              // the tolerance above turns a structural bug into a transcript that is simply
+              // empty — no log line, no delta, `entries` and `lastOffset` both `0`, and nothing
+              // anywhere saying why. A `StateStoreError` does not distinguish a constraint
+              // rejection from a hiccup, so the discipline is to LOG every one and let the
+              // repetition be the signal: one line is a hiccup, one per event is the key.
+              yield* store.executionLog.append(executionId, event).pipe(
+                Effect.catchTag("StateStoreError", (error) =>
+                  Effect.logWarning("durable transcript append rejected — entry dropped").pipe(
+                    Effect.annotateLogs({
+                      executionId,
+                      event: event._tag,
+                      operation: error.operation,
+                      detail: error.detail,
+                    }),
+                  ),
+                ),
+              );
             } else {
               yield* store.executionLog.publishEphemeral(executionId, event);
             }
