@@ -57,14 +57,37 @@ actor RpcConnection {
 
   /// Sends a request/response `Request` and awaits the value (or error) carried by
   /// its correlated `Exit`. A void-success RPC resolves to `nil`.
+  ///
+  /// CANCELLATION-AWARE (#94's general bar: no wait may be unbounded). Without a handler
+  /// this suspension is released ONLY by a correlated `Exit` or by ``failAll(with:)`` — so a
+  /// cancelled caller whose daemon never answers, and whose connection is never closed, waits
+  /// forever. On cancellation the pending entry is resolved with a `CancellationError` and the
+  /// daemon is told to stop working on it (`Interrupt`), exactly as an abandoned stream
+  /// consumer is. Registration happens synchronously on the actor before this method can
+  /// suspend, so the handler's hop can never run ahead of the entry it retires.
   func request(tag: String, payload: JSONValue?) async throws -> JSONValue? {
     guard !closed else { throw BackendError.connectionClosed }
     startReceiving()
     let id = allocateId()
-    return try await withCheckedThrowingContinuation { continuation in
-      pending[id] = .query(continuation)
-      Task { await self.transmit(.request(id: id, tag: tag, payload: payload)) }
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        pending[id] = .query(continuation)
+        Task { await self.transmit(.request(id: id, tag: tag, payload: payload)) }
+      }
+    } onCancel: {
+      Task { await self.cancelPendingRequest(id) }
     }
+  }
+
+  /// Retires a cancelled request/response entry: resumes its continuation with a
+  /// `CancellationError` and interrupts the daemon-side work. A no-op if the `Exit` already
+  /// landed (or the connection already failed it), so the continuation resumes exactly once;
+  /// a streaming entry with the same id is left to ``interruptIfPending(_:)``.
+  private func cancelPendingRequest(_ id: RequestId) async {
+    guard case .query(let continuation)? = pending[id] else { return }
+    pending.removeValue(forKey: id)
+    continuation.resume(throwing: CancellationError())
+    await transmit(.interrupt(requestId: id))
   }
 
   /// Opens a streaming subscription: sends a `Request` and returns an ``AckGatedStream``

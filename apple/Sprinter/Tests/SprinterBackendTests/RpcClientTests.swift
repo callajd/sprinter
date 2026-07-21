@@ -44,6 +44,30 @@ struct RpcClientTests {
     await #expect(throws: BackendError.connectionClosed) { try await backend.snapshot() }
   }
 
+  @Test("a cancelled request resumes rather than waiting for an Exit that never comes")
+  func cancelledRequestResumes() async throws {
+    // #94's general bar — no unbounded waits. A request's suspension is otherwise released
+    // ONLY by its correlated `Exit` or by the connection's teardown, so a cancelled caller
+    // whose daemon never answers (and whose connection nobody closes) would wait forever.
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let inflight = Task { try await connection.request(tag: "snapshot", payload: nil) }
+    // Awaiting the sent Request guarantees the entry is registered as pending, so this
+    // exercises cancelling an ALREADY-suspended request, not an early-exit check.
+    let request = try await nextSent(&outbound)
+    #expect(request.envelopeTag == "Request")
+
+    inflight.cancel()
+    await #expect(throws: CancellationError.self) { try await inflight.value }
+    // And the daemon is told to stop working on it, exactly as an abandoned stream is.
+    let interrupt = try await nextSent(&outbound)
+    #expect(interrupt.envelopeTag == "Interrupt")
+    #expect(interrupt.requestId == request.id)
+    transport.close()
+  }
+
   @Test("createWorkstreamFromPlan sends the plan payload and returns the id")
   func createWorkstreamQuery() async throws {
     let transport = FakeTransport()

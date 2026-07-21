@@ -104,7 +104,13 @@ struct ResyncRefusalOutcomeTests {
 
       await engine.stop()
       third.close()
-      for await _ in states {}
+      // Drain the feed to termination under a BOUND. A stopped engine must finish its stream;
+      // if it does not, that is a teardown regression and it has to surface as this named
+      // failure in seconds, not as a minute-long stall ended by the suite's `.timeLimit`.
+      let drained = await runBounded { for await _ in states {} }
+      #expect(
+        drained == .success,
+        Comment(rawValue: "iteration \(iteration): the feed never finished after stop()."))
     }
   }
 
@@ -119,6 +125,12 @@ struct ResyncRefusalOutcomeTests {
     // cancellation of an ALREADY-suspended wait, not an early-exit check.
     try await Task.sleep(for: .milliseconds(20))
     waiting.cancel()
-    #expect(await waiting.value == nil)
+    // BOUNDED: the whole point is that this wait ends on cancellation, so awaiting it
+    // unbounded would turn the regression it guards into a hang instead of a failure.
+    guard let value = await boundedValue(of: waiting) else {
+      Issue.record("the cancelled queue wait never returned")
+      return
+    }
+    #expect(value == nil)
   }
 }

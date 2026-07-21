@@ -10,52 +10,42 @@ import Testing
 /// Regression cover for #94 — the intermittent teardown deadlock in
 /// ``UnixSocketTransport/close()``.
 ///
-/// Every wait in here is BOUNDED and hopped off the cooperative executor: a regression test
-/// for a deadlock that can itself deadlock reproduces the very problem it exists to catch,
-/// so a stuck teardown must surface as a fast, named FAILURE (`Issue.record` on
-/// `.timedOut`), never as a hung test run. The suite-level `.timeLimit` is the outer
-/// backstop, not the mechanism.
+/// Every wait in here is BOUNDED (see `BoundedWaits.swift`) and hopped off the cooperative
+/// executor: a regression test for a deadlock that can itself deadlock reproduces the very
+/// problem it exists to catch, so a stuck teardown must surface as a fast, named FAILURE (a
+/// `#expect` on the `.timedOut` result), never as a hung test run. The suite-level
+/// `.timeLimit` is the outer backstop, not the mechanism.
 @Suite("Unix-domain socket transport teardown", .timeLimit(.minutes(1)))
 struct UnixSocketTransportTeardownTests {
-  /// Waits on a teardown latch for at most `seconds`, off the cooperative executor (a
-  /// `DispatchSemaphore.wait` must never park a cooperative thread). Returns `.timedOut`
-  /// rather than hanging, so the caller can FAIL instead of wedging the run.
+  /// Waits on a teardown latch under a bound, off the cooperative executor (the latch's wait
+  /// blocks a real thread). ``TeardownLatch`` re-raises itself on success, so waiting here can
+  /// never disarm a later wait or an ``UnixSocketTransport/awaitClosed()``.
   private func awaitTeardown(
-    _ latch: DispatchSemaphore, within seconds: Int = 5
+    _ latch: TeardownLatch, within seconds: Int = 5
   ) async -> DispatchTimeoutResult {
     typealias Waiter = CheckedContinuation<DispatchTimeoutResult, Never>
     return await withCheckedContinuation { (waiter: Waiter) in
       DispatchQueue.global().async {
-        waiter.resume(returning: latch.wait(timeout: .now() + .seconds(seconds)))
+        waiter.resume(returning: latch.wait(within: .seconds(seconds)))
       }
     }
-  }
-
-  /// Runs `operation` with a bound. The work is DETACHED rather than a structured child: a
-  /// child task would be awaited at scope exit, so an `operation` that never returns would
-  /// hang the test despite the bound — the exact self-defeating shape this suite must avoid.
-  private func awaitBounded(
-    within seconds: Int = 5, _ operation: @escaping @Sendable () async -> Void
-  ) async -> DispatchTimeoutResult {
-    let done = DispatchSemaphore(value: 0)
-    Task.detached {
-      await operation()
-      done.signal()
-    }
-    return await awaitTeardown(done, within: seconds)
   }
 
   @Test("teardown completes even when the transport is released the instant close() returns")
   func teardownCompletesWhenTransportReleasedImmediately() async throws {
     // THE #94 INTERLEAVING. `close()` hands the fd's release to a rendezvous between the
-    // read thread's exit and the write queue's drain. The read thread is started from `init`
-    // and the transport's ONLY strong reference is the caller's — so if the caller closes and
-    // releases the transport before the freshly-`start()`ed read thread has been scheduled,
-    // the read arm has to still arrive. Batching the create/close/release makes that window
-    // wide (N pthreads queued behind a tight N-iteration loop), which is precisely why the
-    // hang was load-dependent. Every latch must still be signalled.
+    // read thread's exit and the write queue's drain. The read thread is started from `init`,
+    // so if the caller closes and releases the transport before that freshly-`start()`ed
+    // thread has been scheduled, the read arm has to still arrive. Batching the
+    // create/close/release makes that window wide (N pthreads queued behind a tight
+    // N-iteration loop), which is precisely why the hang was load-dependent. Every latch must
+    // still be raised.
+    //
+    // The test holds the DETACHED latch, not the transport, on purpose: dropping the only
+    // caller-side reference is what makes the window real, and it is what makes reverting the
+    // read thread's `[self]` capture to `[weak self]` fail here instead of passing.
     let batch = 32
-    var latches: [DispatchSemaphore] = []
+    var latches: [TeardownLatch] = []
     var peers: [RawSocketPeer] = []
     for _ in 0..<batch {
       let (transport, peer) = try RawSocketPeer.pair()
@@ -109,17 +99,30 @@ struct UnixSocketTransportTeardownTests {
     let (transport, peer) = try RawSocketPeer.pair()
     defer { peer.close() }
     transport.close()
-    let concurrent = await awaitBounded {
+    let concurrent = await runBounded {
       await withTaskGroup(of: Void.self) { group in
         for _ in 0..<8 { group.addTask { await transport.awaitClosed() } }
       }
     }
     #expect(concurrent == .success, "a concurrent awaitClosed() never returned (#94)")
-    let repeated = await awaitBounded {
+    let repeated = await runBounded {
       await transport.awaitClosed()
       await transport.awaitClosed()
     }
     #expect(repeated == .success, "a repeated awaitClosed() never returned (#94)")
+  }
+
+  @Test("waiting on the teardown latch leaves it raised for a later awaitClosed()")
+  func teardownLatchStaysRaised() async throws {
+    let (transport, peer) = try RawSocketPeer.pair()
+    defer { peer.close() }
+    transport.close()
+    #expect(await awaitTeardown(transport.teardownLatch) == .success, "no teardown (#94)")
+    // The latch must RE-ARM. A bare semaphore `wait()` would consume the one signal teardown
+    // ever sends and park this `awaitClosed()` forever — reintroducing exactly the unbounded
+    // wait #94 is about, from the observation side.
+    let after = await runBounded { await transport.awaitClosed() }
+    #expect(after == .success, "a teardown probe disarmed the latch for awaitClosed() (#94)")
   }
 
   @Test("awaitClosed() before any close() is a no-op rather than an unbounded wait")
@@ -128,10 +131,10 @@ struct UnixSocketTransportTeardownTests {
     defer { peer.close() }
     // Never closed: nothing to drain, so this must return rather than wait on a latch that
     // nothing will ever signal.
-    let beforeClose = await awaitBounded { await transport.awaitClosed() }
+    let beforeClose = await runBounded { await transport.awaitClosed() }
     #expect(beforeClose == .success, "awaitClosed() blocked with no close() initiated (#94)")
     transport.close()
-    let afterClose = await awaitBounded { await transport.awaitClosed() }
+    let afterClose = await runBounded { await transport.awaitClosed() }
     #expect(afterClose == .success, "awaitClosed() never returned after close() (#94)")
   }
 

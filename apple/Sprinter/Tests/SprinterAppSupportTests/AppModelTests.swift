@@ -25,6 +25,31 @@ struct AppModelTests {
     #expect(await waitUntil { fake.wasClosed })
   }
 
+  /// A dial that RESOLVES AFTER `stop()` must still be closed. The dial's continuation is
+  /// not cancellation-aware (a cancelled `UnixSocketTransport.connect` still resumes with a
+  /// live transport), and `stop()` has already inspected `backend`, so if the loop simply
+  /// broke out here nothing would ever close this connection — abandoning a transport whose
+  /// read thread stays parked in `read(2)`, holding its fd, for the life of the process.
+  @Test("a dial that resolves after stop() is closed, not abandoned")
+  func lateDialIsClosedNotAbandoned() async throws {
+    let fake = FakeBackend(snapshot: AppSupportFixtures.snapshot)
+    let dial = HeldDial()
+    let model = AppModel(
+      daemon: DaemonConnection(connect: {
+        await dial.park()
+        return fake
+      }))
+
+    model.start()
+    #expect(await waitUntil { dial.didStart })
+    // Cancel the loop while the dial is still in flight, THEN let it resolve.
+    model.stop()
+    dial.release()
+
+    #expect(await waitUntil { fake.wasClosed })
+    #expect(model.backend == nil)
+  }
+
   /// A failed connect surfaces as `.failed` with no backend, so the shell can render the
   /// reason rather than crash — the connect step never force-unwraps a connection.
   @Test("a failed connect surfaces as .failed with no backend")

@@ -110,6 +110,34 @@ private final class EventFeeds: @unchecked Sendable {
   }
 }
 
+/// A connect seam a test can HOLD OPEN: the dial reports that it started, then parks until
+/// the test releases it. That makes the "dial resolves after `stop()`" window — which is
+/// otherwise a race — deterministic. The park is a semaphore hopped onto a global queue, so
+/// it never occupies a cooperative executor thread.
+final class HeldDial: @unchecked Sendable {
+  private let lock = NSLock()
+  private var started = false
+  private let gate = DispatchSemaphore(value: 0)
+
+  var didStart: Bool { lock.withLock { started } }
+
+  /// Called from inside the connect seam: mark the dial in flight, then park.
+  func park() async {
+    lock.withLock { started = true }
+    await withCheckedContinuation { (resume: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async {
+        self.gate.wait()
+        resume.resume()
+      }
+    }
+  }
+
+  /// Lets the parked dial resolve.
+  func release() {
+    gate.signal()
+  }
+}
+
 /// A lock-guarded counter of connect-seam calls, so a test can fail the first N dials and
 /// succeed afterward — exercising the ``AppModel`` reconnect loop's retry-with-backoff.
 final class DialCounter: @unchecked Sendable {

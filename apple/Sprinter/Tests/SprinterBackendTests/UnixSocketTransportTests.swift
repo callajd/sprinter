@@ -220,7 +220,7 @@ struct UnixSocketTransportTests {
 
   @Test("connect to an over-long socket path throws socketPathTooLong")
   func connectWithOverLongPathThrows() async throws {
-    let path = String(repeating: "a", count: unixSocketPathCapacity + 16)
+    let path = String(repeating: "a", count: UnixSocketPosix.pathCapacity + 16)
     do {
       _ = try await UnixSocketTransport.connect(toUnixSocketPath: path)
       Issue.record("expected connect to throw")

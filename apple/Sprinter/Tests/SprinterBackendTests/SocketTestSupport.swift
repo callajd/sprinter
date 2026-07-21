@@ -43,7 +43,7 @@ final class RawSocketPeer: @unchecked Sendable {
     // Mirror production: the client-side descriptor gets `SO_NOSIGPIPE` (exactly as the
     // real dial does), so a broken-pipe `write(2)` surfaces as EPIPE/`writeFailed` instead
     // of a process-terminating SIGPIPE — the test proves production needs no SIG_IGN.
-    let noSigPipe = setNoSigPipe(descriptors[0])
+    let noSigPipe = UnixSocketPosix.setNoSigPipe(descriptors[0])
     guard noSigPipe == 0 else {
       _ = Darwin.close(descriptors[0])
       _ = Darwin.close(descriptors[1])
@@ -139,8 +139,8 @@ final class LoopbackSocketServer: @unchecked Sendable {
   static func makeSocketPath() -> String {
     let name = "sprinter-\(UUID().uuidString.prefix(8)).sock"
     let candidate = (NSTemporaryDirectory() as NSString).appendingPathComponent(name)
-    // `unixSocketPathCapacity` includes the terminating NUL, so require a strict `<`.
-    return candidate.utf8.count < unixSocketPathCapacity ? candidate : "/tmp/\(name)"
+    // `UnixSocketPosix.pathCapacity` includes the terminating NUL, so require a strict `<`.
+    return candidate.utf8.count < UnixSocketPosix.pathCapacity ? candidate : "/tmp/\(name)"
   }
 
   init() throws {
@@ -148,7 +148,7 @@ final class LoopbackSocketServer: @unchecked Sendable {
     let listenDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
     guard listenDescriptor >= 0 else { throw LoopbackError.setupFailed("socket errno \(errno)") }
     self.listenDescriptor = listenDescriptor
-    guard let bound = withUnixSocketAddress(path: path, { bind(listenDescriptor, $0, $1) }),
+    guard let bound = UnixSocketPosix.withAddress(path: path, { bind(listenDescriptor, $0, $1) }),
       bound == 0
     else {
       _ = Darwin.close(listenDescriptor)

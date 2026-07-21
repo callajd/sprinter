@@ -97,20 +97,25 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
   /// Raised once the fd has been released — i.e. the read loop has exited AND the write
   /// queue has drained AND `close(2)` has run. ``awaitClosed()`` waits on it so a reconnect
   /// can gate the new dial on the OLD transport being FULLY torn down (the CE2.1 carried
-  /// teardown constraint). Used as a LATCH, not a one-shot ticket: every waiter re-signals
-  /// after waking, so repeated or concurrent ``awaitClosed()`` callers all proceed instead
-  /// of the first one consuming the signal and stranding the rest.
-  private let closeCompleted = DispatchSemaphore(value: 0)
+  /// teardown constraint). A ``TeardownLatch``, not a bare semaphore: teardown signals ONCE,
+  /// and every wait re-raises it, so repeated or concurrent observers all proceed instead of
+  /// the first one consuming the signal and stranding the rest.
+  private let closeCompleted = TeardownLatch()
   /// `true` once ``close()`` has actually initiated teardown (guards ``awaitClosed()``
   /// from waiting on a `closeCompleted` that will never be signalled).
   private var closeInitiated = false
 
-  /// The teardown latch itself, reachable WITHOUT retaining the transport. ``awaitClosed()``
-  /// is the production way to observe teardown, but it necessarily keeps `self` alive for the
-  /// duration of the wait — which is exactly the lifetime the deadlock in #94 lived outside of.
-  /// Tests take the latch first and drop the transport, so they can observe that teardown still
-  /// completes once every strong reference is gone.
-  var teardownLatch: DispatchSemaphore { closeCompleted }
+  /// The teardown latch itself — an observation handle DETACHED from the transport, so a
+  /// holder need not keep `self` alive to wait on it. That is what lets the regression tests
+  /// take the handle and then drop their only reference to the transport, which is exactly
+  /// the interleaving #94 died on and the reason reverting the read thread's `[self]` capture
+  /// to `[weak self]` still fails those tests fast.
+  ///
+  /// This is NOT a claim that the transport deallocates while teardown is pending: the read
+  /// thread's strong capture owns it until the read loop returns. It is only that observing
+  /// teardown does not ITSELF have to hold a reference. Every wait on the handle re-arms it
+  /// (``TeardownLatch``), so taking it can never disarm ``awaitClosed()``.
+  var teardownLatch: TeardownLatch { closeCompleted }
 
   /// Wraps an already-connected socket descriptor and starts pumping inbound bytes.
   /// Internal so tests can drive the framing seam over a `socketpair(2)` peer without
@@ -147,21 +152,22 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     // whose default disposition TERMINATES the process. The daemon closing/restarting is
     // EXPECTED (WorkGraphResync reconnects on drops), so the broken-pipe write must
     // return -1/EPIPE (→ ``UnixSocketTransportError/writeFailed``), never a signal.
-    let noSigPipe = setNoSigPipe(descriptor)
+    let noSigPipe = UnixSocketPosix.setNoSigPipe(descriptor)
     guard noSigPipe == 0 else {
-      closeDescriptor(descriptor)
+      UnixSocketPosix.closeDescriptor(descriptor)
       throw UnixSocketTransportError.socketOptionFailed(errno: noSigPipe)
     }
-    let connectResult = withUnixSocketAddress(path: path) { addr, length in
-      connectSocket(descriptor, addr, length)
+    let connectResult = UnixSocketPosix.withAddress(path: path) { addr, length in
+      UnixSocketPosix.connectSocket(descriptor, addr, length)
     }
     guard let outcome = connectResult else {
-      closeDescriptor(descriptor)
-      throw UnixSocketTransportError.socketPathTooLong(maxBytes: unixSocketPathCapacity - 1)
+      UnixSocketPosix.closeDescriptor(descriptor)
+      throw UnixSocketTransportError.socketPathTooLong(
+        maxBytes: UnixSocketPosix.pathCapacity - 1)
     }
     guard outcome == 0 else {
       let failure = errno
-      closeDescriptor(descriptor)
+      UnixSocketPosix.closeDescriptor(descriptor)
       throw UnixSocketTransportError.connectionFailed(errno: failure)
     }
     return UnixSocketTransport(connectedDescriptor: descriptor)
@@ -199,7 +205,7 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
           return
         }
         do {
-          try writeAll(descriptor, bytes)
+          try UnixSocketPosix.writeAll(descriptor, bytes)
           resume.resume()
         } catch {
           resume.resume(throwing: error)
@@ -221,11 +227,10 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     guard initiated else { return }
     await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
       Self.dialQueue.async { [closeCompleted] in
+        // ``TeardownLatch/wait()`` leaves the latch raised for the next waiter (a retried
+        // teardown, a second caller, a concurrent one) rather than consuming a signal that
+        // is only ever sent once.
         closeCompleted.wait()
-        // Re-arm: `closeCompleted` is a latch on a terminal state, so waking on it must
-        // leave it raised for the next waiter (a retried teardown, a second caller, a
-        // concurrent one) rather than consuming a signal that is only ever sent once.
-        closeCompleted.signal()
         continuation.resume()
       }
     }
@@ -235,8 +240,13 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     let descriptor: Int32 = lock.withLock {
       guard !isClosed else { return -1 }
       isClosed = true
-      closeInitiated = true
       let current = self.descriptor
+      // `closeInitiated` is flipped ONLY on the branch that actually arms the rendezvous
+      // below. With no descriptor to release there is nothing to signal `closeCompleted`,
+      // so claiming teardown was initiated would send ``awaitClosed()`` past its guard and
+      // onto a latch nothing will ever raise.
+      guard current >= 0 else { return -1 }
+      closeInitiated = true
       self.descriptor = -1
       // Hand the fd to the rendezvous: from here it is released by whichever teardown arm
       // arrives second, never by this caller.
@@ -252,7 +262,7 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
     // `isClosed` on the same serial queue, so a write enqueued after this point is skipped
     // rather than landing on the closed fd. The block captures `self` strongly on purpose:
     // dispatch will always run it, so the arm can never go missing (#94).
-    shutdownDescriptor(descriptor)
+    UnixSocketPosix.shutdownDescriptor(descriptor)
     writeQueue.async {
       self.arriveAtTeardown(.writeQueueDrain)
     }
@@ -293,7 +303,7 @@ public final class UnixSocketTransport: RpcTransport, @unchecked Sendable {
       return descriptor
     }
     guard releasable >= 0 else { return }
-    closeDescriptor(releasable)
+    UnixSocketPosix.closeDescriptor(releasable)
     // The fd is now released and neither a queued write nor the read thread can touch it:
     // a reconnect awaiting `awaitClosed()` may safely dial the new socket.
     closeCompleted.signal()
