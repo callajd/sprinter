@@ -63,12 +63,12 @@ const jobMinimal = {
 const jobFull = {
   ...jobMinimal,
   status: "succeeded",
-  executionId: "sess-1",
-  transcriptRef: "transcripts/sess-1.jsonl",
+  executionId: "exe-1",
+  transcriptRef: "transcripts/exe-1.jsonl",
   pr: { number: 42, url: "https://github.com/callajd/sprinter/pull/42", merged: false },
 };
 
-const execution = { id: "sess-1", jobId: "job-1", status: "active" };
+const execution = { id: "exe-1", jobId: "job-1", status: "active" };
 
 it.effect("round-trips the whole read model (with and without optional keys)", () =>
   Effect.gen(function* () {

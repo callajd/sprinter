@@ -44,7 +44,7 @@ import {
   EXECUTION_RESOLVE_TIMEOUT,
   layerWith as layerExecutionRegistry,
 } from "./execution-registry.ts";
-import { layerRegisterExecutions } from "./execution-runner.ts";
+import { layerRegisterExecutions } from "./register-executions.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 import { layer as layerWorkGraphEvents } from "./work-graph-events.ts";
 
@@ -83,12 +83,24 @@ export interface DaemonConfig {
  * a token-less daemon would silently never observe any Issue as landed. This FAILS
  * FAST AND LOUDLY at boot — throwing a clear, actionable error before the graph is
  * built — rather than constructing a token-less config that dies quietly per-call.
+ *
+ * The RETIRED `SPRINTER_SESSION_RESOLVE_TIMEOUT_MS` (DE2.1 renamed it to
+ * {@link EXECUTION_RESOLVE_TIMEOUT_ENV}) fails the same way. An operator who still
+ * exports the old name would otherwise get the DEFAULT bound with no signal — the
+ * knob silently stops working, which is exactly the misconfiguration the boot-time
+ * check exists to prevent. Pre-release, a permanent alias is cruft: refuse and name
+ * the replacement.
  */
 export const configFromEnv = (env: Readonly<Record<string, string | undefined>>): DaemonConfig => {
   const token = env["GITHUB_TOKEN"];
   if (token === undefined || token.trim() === "") {
     throw new Error(
       "GITHUB_TOKEN is required: the daemon needs an authenticated GitHub token (GitHub's GraphQL API rejects unauthenticated requests with 401). Set GITHUB_TOKEN and restart.",
+    );
+  }
+  if (env[RETIRED_RESOLVE_TIMEOUT_ENV] !== undefined) {
+    throw new Error(
+      `${RETIRED_RESOLVE_TIMEOUT_ENV} is retired: the process-level Session is now the Execution (DE2.1). Rename it to ${EXECUTION_RESOLVE_TIMEOUT_ENV} and restart.`,
     );
   }
   return {
@@ -100,11 +112,22 @@ export const configFromEnv = (env: Readonly<Record<string, string | undefined>>)
       repo: env["SPRINTER_REPO_NAME"] ?? "sprinter",
       token,
     },
-    executionResolveTimeout: executionResolveTimeoutFrom(
-      env["SPRINTER_EXECUTION_RESOLVE_TIMEOUT_MS"],
-    ),
+    executionResolveTimeout: executionResolveTimeoutFrom(env[EXECUTION_RESOLVE_TIMEOUT_ENV]),
   };
 };
+
+/**
+ * The operator-facing knob that overrides {@link EXECUTION_RESOLVE_TIMEOUT}, in
+ * milliseconds.
+ */
+export const EXECUTION_RESOLVE_TIMEOUT_ENV = "SPRINTER_EXECUTION_RESOLVE_TIMEOUT_MS";
+
+/**
+ * The pre-DE2.1 spelling of {@link EXECUTION_RESOLVE_TIMEOUT_ENV}. Retired, NOT aliased:
+ * boot refuses if it is set, so a stale export is a loud error rather than a silent
+ * fallback to the default bound.
+ */
+export const RETIRED_RESOLVE_TIMEOUT_ENV = "SPRINTER_SESSION_RESOLVE_TIMEOUT_MS";
 
 /**
  * Resolve the execution-resolve bound from an optional millisecond env override,
@@ -137,7 +160,7 @@ export const stateStoreLayer = (config: DaemonConfig) =>
 /**
  * The real {@link ExecutionRunner}: CE1.1's `LocalPi` adapter over a per-Job
  * worktree router (CE1.1-F2), DECORATED so every started execution is registered in
- * the {@link ExecutionRegistry} (CE4.1, `./execution-runner.ts`) — the wire that makes a
+ * the {@link ExecutionRegistry} (CE4.1, `./register-executions.ts`) — the wire that makes a
  * dispatched execution reachable over the contract's execution channel. Requires the
  * `ChildProcessSpawner`, the `FileSystem`/`Path` the router uses (the daemon edge
  * `BunServices` provides them; a test substitutes a fake spawner), and the

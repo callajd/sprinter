@@ -46,7 +46,7 @@ struct BoardProjectionTests {
         == IssueActivity(
           jobId: JobId(rawValue: "job-a"),
           kind: .implement,
-          executionId: ExecutionId(rawValue: "sess-a")))
+          executionId: ExecutionId(rawValue: "exe-a")))
 
     let idle = board.last?.epics.first?.issues.first
     #expect(idle?.hasLiveAgent == false)
@@ -62,14 +62,14 @@ struct BoardProjectionTests {
       issueIds: ["iss-run", "iss-q", "iss-idle"],
       jobs: [
         BoardFixtures.job("job-run", issue: "iss-run", status: .running, execution: nil),
-        BoardFixtures.job("job-q", issue: "iss-q", status: .queued, execution: "sess-q"),
-        BoardFixtures.job("job-idle", issue: "iss-idle", status: .queued, execution: "sess-idle")
+        BoardFixtures.job("job-q", issue: "iss-q", status: .queued, execution: "exe-q"),
+        BoardFixtures.job("job-idle", issue: "iss-idle", status: .queued, execution: "exe-idle")
       ],
       executions: [
         Execution(
-          id: ExecutionId(rawValue: "sess-q"), jobId: JobId(rawValue: "job-q"), status: .active),
+          id: ExecutionId(rawValue: "exe-q"), jobId: JobId(rawValue: "job-q"), status: .active),
         Execution(
-          id: ExecutionId(rawValue: "sess-idle"), jobId: JobId(rawValue: "job-idle"), status: .idle)
+          id: ExecutionId(rawValue: "exe-idle"), jobId: JobId(rawValue: "job-idle"), status: .idle)
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
@@ -92,10 +92,10 @@ struct BoardProjectionTests {
       ],
       executions: [
         Execution(
-          id: ExecutionId(rawValue: "sess-done"), jobId: JobId(rawValue: "job-done"),
+          id: ExecutionId(rawValue: "exe-done"), jobId: JobId(rawValue: "job-done"),
           status: .active),
         Execution(
-          id: ExecutionId(rawValue: "sess-fb"), jobId: JobId(rawValue: "job-fb"), status: .active)
+          id: ExecutionId(rawValue: "exe-fb"), jobId: JobId(rawValue: "job-fb"), status: .active)
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
@@ -105,7 +105,7 @@ struct BoardProjectionTests {
     // N1: a job live via its active execution (declared executionId nil) names it.
     let fallback = byId[IssueId(rawValue: "iss-fb")]
     #expect(fallback?.hasLiveAgent == true)
-    #expect(fallback?.activity?.executionId == ExecutionId(rawValue: "sess-fb"))
+    #expect(fallback?.activity?.executionId == ExecutionId(rawValue: "exe-fb"))
   }
 
   /// A child id listed by its parent but absent from the snapshot is skipped, not

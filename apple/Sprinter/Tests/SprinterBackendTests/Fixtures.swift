@@ -131,7 +131,7 @@ enum Fixtures {
 
   // ── Execution channel ─────────────────────────────────────────────────────────
 
-  static let executionId = ExecutionId(rawValue: "sess-1")
+  static let executionId = ExecutionId(rawValue: "exe-1")
 
   static let executionInput = ExecutionInput(text: "ship it", images: nil, mode: .prompt)
 

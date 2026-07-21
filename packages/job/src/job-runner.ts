@@ -47,6 +47,13 @@ type DispatchError = ExecutionRunnerError | StateStoreError | PiRpcError | PiTra
  * persists — notably the daemon's execution-registry wiring (CE4.1), which registers
  * the live `ExecutionHandle` under exactly this id so the execution channel resolves it
  * — derives it identically rather than re-deriving (and risking drift from) it.
+ *
+ * DE2.1 changed the derived VALUE, not just the names: the prefix was `session-`, and
+ * {@link transcriptRefFor} therefore emits `transcript://execution-…` where it once
+ * emitted `transcript://session-…`. That is safe only because `INV-FRESH` holds — the
+ * `SCHEMA_VERSION` bump drops and recreates the store, so no `session-`-prefixed id
+ * survives a restart to mismatch a freshly derived one. There is no migration and none
+ * is needed; a future prefix change carries the same obligation.
  */
 export const executionIdFor = (job: Job): Effect.Effect<ExecutionId> =>
   job.executionId !== undefined

@@ -68,7 +68,7 @@ export class ExecutionEvents extends Context.Service<
     readonly publish: (item: ExecutionFeedItem) => Effect.Effect<void>;
     /**
      * A scoped subscription to the feed. Resolving this effect establishes the
-     * subscription EAGERLY, so a `executionEvents` handler can subscribe and only then read
+     * subscription EAGERLY, so an `executionEvents` handler can subscribe and only then read
      * the durable log without racing the producer (subscribe-before-replay).
      */
     readonly subscribe: Effect.Effect<PubSub.Subscription<ExecutionFeedItem>, never, Scope>;

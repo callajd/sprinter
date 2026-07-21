@@ -19,7 +19,7 @@ import { Job, ExecutionId } from "@sprinter/domain";
 import { ExecutionRunner, executionIdFor } from "@sprinter/job";
 import { type ExecutionHandle, ExecutionResult } from "@sprinter/runner";
 import { layerExecutionRegistry, ExecutionRegistry } from "./index.ts";
-import { layerRegisterExecutions } from "./execution-runner.ts";
+import { layerRegisterExecutions } from "./register-executions.ts";
 
 /** A canned neutral {@link ExecutionHandle} — never driven; identity is all the test needs. */
 const cannedHandle: ExecutionHandle = {

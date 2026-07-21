@@ -261,7 +261,7 @@ struct MissionControlInboxTests {
   @Test("activeExecutionIds extracts each issue's live-agent execution")
   func activeExecutionIdsExtracts() {
     let board = BoardProjection.project(BoardFixtures.snapshot)
-    #expect(MissionControlInbox.activeExecutionIds(in: board) == [ExecutionId(rawValue: "sess-a")])
+    #expect(MissionControlInbox.activeExecutionIds(in: board) == [ExecutionId(rawValue: "exe-a")])
   }
 
   /// `syncTrackedExecutions` is the live-tracking diff: syncing to a new active set

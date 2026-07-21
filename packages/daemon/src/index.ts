@@ -46,7 +46,7 @@ export { handlers } from "./rpc-handlers.ts";
 export type { ExecutionFeedItem } from "./execution-events.ts";
 export { layer as layerExecutionEvents, ExecutionEvents } from "./execution-events.ts";
 export { layer as layerExecutionRegistry, ExecutionRegistry } from "./execution-registry.ts";
-export { layerRegisterExecutions } from "./execution-runner.ts";
+export { layerRegisterExecutions } from "./register-executions.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";
 export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";

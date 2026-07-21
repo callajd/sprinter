@@ -60,12 +60,12 @@ enum BoardFixtures {
     issueId: IssueId(rawValue: "iss-a"),
     kind: .implement,
     status: .running,
-    executionId: ExecutionId(rawValue: "sess-a"),
+    executionId: ExecutionId(rawValue: "exe-a"),
     transcriptRef: nil,
     pullRequest: nil)
 
   static let activeExecution = Execution(
-    id: ExecutionId(rawValue: "sess-a"),
+    id: ExecutionId(rawValue: "exe-a"),
     jobId: JobId(rawValue: "job-a"),
     status: .active)
 

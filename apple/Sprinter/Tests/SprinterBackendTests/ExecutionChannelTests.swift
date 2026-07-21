@@ -63,7 +63,7 @@ struct ExecutionChannelTests {
     }
     let id = try #require(try await nextSent(&outbound).id)
     transport.emit(
-      Wire.exitFail(requestId: id, error: #"{"_tag":"ExecutionNotFound","id":"sess-1"}"#))
+      Wire.exitFail(requestId: id, error: #"{"_tag":"ExecutionNotFound","id":"exe-1"}"#))
 
     await #expect(throws: ContractError.executionNotFound(id: Fixtures.executionId)) {
       _ = try await collector.value
@@ -127,7 +127,7 @@ struct ExecutionChannelTests {
 
   @Test("each out verb surfaces the mirrored ExecutionNotFound off a Fail cause")
   func executionNotFound() async throws {
-    let notFound = #"{"_tag":"ExecutionNotFound","id":"sess-1"}"#
+    let notFound = #"{"_tag":"ExecutionNotFound","id":"exe-1"}"#
     let expected = ContractError.executionNotFound(id: Fixtures.executionId)
 
     try await expectFailure(expected, forFail: notFound) { backend in
