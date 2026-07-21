@@ -34,8 +34,14 @@ final class RawSocketPeer: @unchecked Sendable {
   /// A `socketpair`: the client transport plus the raw daemon-side peer.
   /// `receiveBufferLimit` bounds the transport's inbound stream (tests of the bound pass a
   /// small value; the rest take the production default).
+  ///
+  /// `raisesShutdownOnClose: false` reproduces #107's lost wakeup DETERMINISTICALLY: the
+  /// transport's `close()` skips its `shutdown(2)`, which is precisely the state the real race
+  /// leaves behind (a `shutdown(2)` that landed in the reader's syscall-entry window woke
+  /// nothing), and the peer here stays open, so nothing but the wake pipe can end the read
+  /// loop. See ``UnixSocketTransport/init(connectedDescriptor:receiveBufferLimit:raisesShutdownOnClose:)``.
   static func pair(
-    receiveBufferLimit: Int = 1024
+    receiveBufferLimit: Int = 1024, raisesShutdownOnClose: Bool = true
   ) throws -> (transport: UnixSocketTransport, peer: RawSocketPeer) {
     var descriptors: [Int32] = [-1, -1]
     let result = socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors)
@@ -51,7 +57,8 @@ final class RawSocketPeer: @unchecked Sendable {
     }
     return (
       transport: UnixSocketTransport(
-        connectedDescriptor: descriptors[0], receiveBufferLimit: receiveBufferLimit),
+        connectedDescriptor: descriptors[0], receiveBufferLimit: receiveBufferLimit,
+        raisesShutdownOnClose: raisesShutdownOnClose),
       peer: RawSocketPeer(descriptor: descriptors[1])
     )
   }

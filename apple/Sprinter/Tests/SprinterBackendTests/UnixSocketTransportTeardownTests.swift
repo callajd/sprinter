@@ -88,6 +88,45 @@ struct UnixSocketTransportTeardownTests {
     }
   }
 
+  @Test("teardown completes when close()'s shutdown wakes no one")
+  func teardownCompletesWhenShutdownWakesNobody() async throws {
+    // #107, DETERMINISTICALLY. The flake this pins was a ~1-in-3000 kernel-level race:
+    // `close()`'s `shutdown(2)` landing in the window where the read loop is ENTERING its
+    // socket wait rather than already parked in it. The wakeup went to nobody, the wait that
+    // started microseconds later had no remaining wakeup source, `.readLoopExit` never
+    // arrived, and every `awaitClosed()` suspended forever. Reproducing that timing is
+    // hopeless in a test; reproducing its RESULT is trivial and total — suppress the
+    // `shutdown(2)` entirely and keep the peer's end open, so the socket offers the read loop
+    // nothing at all. Teardown must still complete, which it can only do if the wake is
+    // carried by durable state (the wake pipe) rather than by that one edge.
+    //
+    // Falsification: drop the `raiseWake` from `close()` (or the wake fd from the read loop's
+    // `poll`) and this test hangs to its bound and FAILS, on every run.
+    for _ in 0..<8 {
+      let (transport, peer) = try RawSocketPeer.pair(raisesShutdownOnClose: false)
+      let latch = transport.teardownLatch
+      // Park the read loop for real, and PROVE it: feed a chunk and consume it off
+      // `receive()`, so the loop has demonstrably pumped and gone back round to its wait. A
+      // close landing before that would be caught by the loop's own `isClosed` re-check —
+      // which is not the state under test, and would pass with or without the fix.
+      let received = Task { () -> Bool in
+        var chunks = transport.receive().makeAsyncIterator()
+        do { return try await chunks.next() != nil } catch { return false }
+      }
+      try await peer.write(Data("{\"k\":\"v\"}\n".utf8))
+      #expect(await boundedValue(of: received) == true, "the read loop never pumped the chunk")
+      try await Task.sleep(for: .milliseconds(50))  // ≫ the microseconds to re-enter the wait.
+
+      transport.close()
+      #expect(
+        await awaitTeardown(latch) == .success,
+        "teardown depended on shutdown(2) waking a reader that was not yet parked (#107)")
+      // The peer is closed only AFTER the assertion: an early close would supply the very EOF
+      // this test exists to withhold.
+      peer.close()
+    }
+  }
+
   @Test("awaitClosed() returns for repeated and concurrent callers")
   func awaitClosedIsRepeatableAndConcurrent() async throws {
     // `closeCompleted` is a LATCH, not a one-shot ticket: a second `awaitClosed()` (a retry, a

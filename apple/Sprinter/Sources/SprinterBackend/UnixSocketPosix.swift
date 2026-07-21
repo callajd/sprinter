@@ -92,6 +92,15 @@ enum UnixSocketPosix {
     _ = shutdown(descriptor, Int32(SHUT_RDWR))
   }
 
+  /// A single NON-BLOCKING `recv(2)` (`MSG_DONTWAIT` — per-call, so the descriptor's blocking
+  /// mode is left alone and ``writeAll(_:_:)`` keeps its simple blocking form). Returns the
+  /// byte count, `0` on EOF, or `-1` with `errno` set.
+  static func receiveWithoutBlocking(
+    _ descriptor: Int32, into buffer: UnsafeMutableRawBufferPointer
+  ) -> Int {
+    recv(descriptor, buffer.baseAddress, buffer.count, MSG_DONTWAIT)
+  }
+
   static func closeDescriptor(_ descriptor: Int32) {
     _ = close(descriptor)
   }

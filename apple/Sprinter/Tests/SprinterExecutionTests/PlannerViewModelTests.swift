@@ -73,8 +73,15 @@ struct PlannerViewModelTests {
     let planner = PlannerViewModel(backend: backend, planningExecutionId: Self.execution)
 
     // First call: enters materialize, sets `.materializing`, then suspends on the gate.
+    // Wait for the SUBMISSION, not just the state: `materialize` sets `.materializing`
+    // *before* it awaits the port, so `.materializing` alone leaves the first call possibly
+    // still short of `createWorkstreamFromPlan`. Asserting `submissionCount == 1` off that
+    // weaker signal reads the counter mid-flight and fails whenever the first task's
+    // continuation is scheduled late — a flake, not a defect (seen under CPU oversubscription
+    // while stress-reproducing #107).
     let first = Task { try await planner.materialize(Self.plan) }
-    #expect(await waitUntil { planner.outcome == .materializing })
+    #expect(await waitUntil { backend.submissionCount == 1 })
+    #expect(planner.outcome == .materializing)
 
     // Second call WHILE the first is in flight — the guard makes it a no-op (no
     // second port call, `outcome` untouched).
