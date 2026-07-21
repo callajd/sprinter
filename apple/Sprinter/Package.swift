@@ -21,7 +21,6 @@ let package = Package(
   name: "Sprinter",
   platforms: [.macOS(.v14)],
   products: [
-    .library(name: "SprinterCore", targets: ["SprinterCore"]),
     // The platform-neutral RPC-contract mirror (FE2.4). No AppKit/UIKit — client
     // shells (macOS, later iOS) consume it as a plain SwiftPM library.
     .library(name: "SprinterContract", targets: ["SprinterContract"]),
@@ -56,15 +55,6 @@ let package = Package(
     .package(url: "https://github.com/SimplyDanny/SwiftLintPlugins", exact: "0.65.0")
   ],
   targets: [
-    .target(
-      name: "SprinterCore",
-      swiftSettings: swiftSettings
-    ),
-    .testTarget(
-      name: "SprinterCoreTests",
-      dependencies: ["SprinterCore"],
-      swiftSettings: swiftSettings
-    ),
     // The RPC-contract mirror — hand-written `Codable` DTOs, platform-neutral
     // (Foundation only, no AppKit/UIKit). Foreign consumer of the TS contract
     // (D10): it decodes the SAME wire bytes the contract emits (INV-CONTRACT).
