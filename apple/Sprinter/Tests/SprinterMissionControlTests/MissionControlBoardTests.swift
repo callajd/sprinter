@@ -48,7 +48,8 @@ struct MissionControlBoardTests {
       issues: [BoardFixtures.issueB],
       jobs: [],
       sessions: [],
-      agents: [])
+      agents: [],
+      generation: StoreGenerationId(rawValue: "gen-test"))
     board.apply(onlyB)
     #expect(board.workstreams.map(\.id) == [WorkstreamId(rawValue: "ws-b")])
     #expect(board.workstreams.first?.status == .complete)

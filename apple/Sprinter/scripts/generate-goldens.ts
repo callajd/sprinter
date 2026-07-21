@@ -172,6 +172,13 @@ const workstream = {
 
 // ── Snapshot (hydration) ─────────────────────────────────────────────────────
 
+/**
+ * A fixed STORE GENERATION for the fixtures. The real one is minted per store
+ * (a UUID from `createSchema`); the goldens pin the SHAPE, so a stable literal keeps
+ * them byte-reproducible — the property `check-goldens.ts` gates on.
+ */
+const generation = "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b";
+
 write("snapshot", Snapshot, {
   workstreams: [workstream],
   epics: [epic],
@@ -183,6 +190,10 @@ write("snapshot", Snapshot, {
   // It is presentational (a client upserts by id); a lineage is read off
   // `supersedes`, never off this order.
   agents: [agentOriginal, agentRevised, agentRetired],
+  // The coordinate space these offsets live in. A client retains it with the state and
+  // hands it back on every cursor-bearing request, so a cursor from a destroyed
+  // generation is refused rather than silently resumed (INV-FRESH).
+  generation,
 });
 
 // Individual owned nodes (exercise every DTO + optional-key present/absent).
@@ -364,14 +375,18 @@ const encodedErrors = [
   Schema.encodeUnknownSync(PlanRejected)(
     Schema.decodeUnknownSync(PlanRejected)({ _tag: "PlanRejected", reason: "empty spec" }),
   ),
-  // The `events` stream's one error: the client's resume cursor cannot belong to the
-  // daemon's current store generation (the store was dropped and recreated under it),
-  // so the client must discard its retained state and re-hydrate from `snapshot`.
+  // The resume refusal, shared by BOTH cursor-bearing feeds (`events` and
+  // `sessionEvents`): the client's cursor is not from the daemon's current store
+  // generation, so it must discard its retained state and re-hydrate from `snapshot`.
+  // NOTE the cursor here is WITHIN the log's extent (2 <= 3) — the case an offset-only
+  // rule cannot detect, and the reason the generation is an explicit identity. The
+  // `generation` field names the daemon's CURRENT one.
   Schema.encodeUnknownSync(ResyncRequired)(
     Schema.decodeUnknownSync(ResyncRequired)({
       _tag: "ResyncRequired",
-      sinceOffset: 999,
-      maxOffset: 2,
+      sinceOffset: 2,
+      maxOffset: 3,
+      generation,
     }),
   ),
 ];
@@ -385,7 +400,8 @@ writeFileSync(
 // The `events` request cursor is OPTIONAL (CE2.0): both wire forms
 // are captured — present (`sinceOffset` key set) and absent (key omitted, the
 // backward-compatible origin replay) — so the Swift mirror decodes each.
-write("payload-events", events.payloadSchema, { sinceOffset: 12 });
+// A cursor never travels alone: the generation it was minted in rides with it.
+write("payload-events", events.payloadSchema, { sinceOffset: 12, generation });
 write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
   plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
@@ -398,6 +414,7 @@ write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
 write("payload-session-events", sessionEvents.payloadSchema, {
   sessionId: "ses-1",
   sinceOffset: 12,
+  generation,
 });
 write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
 write("payload-session-send", sessionSend.payloadSchema, {
@@ -431,4 +448,7 @@ write("json-values", Schema.Array(Schema.Unknown), [
 // `createWorkstreamFromPlan` answers with a bare `WorkstreamId` (a JSON string).
 write("response-workstream-id", createWorkstreamFromPlan.successSchema, "ws-1");
 
-console.log(`Wrote goldens to ${goldensDir}`);
+// `process.stdout.write`, not `console.log`: this script is inside the lint gate
+// (`check:lint` covers `apple/Sprinter/scripts`), and it matches how `check-goldens.ts`
+// already reports — one way of writing to the terminal across both scripts.
+process.stdout.write(`Wrote goldens to ${goldensDir}\n`);

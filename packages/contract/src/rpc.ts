@@ -32,6 +32,7 @@ import {
   SessionEvent,
   SessionId,
   SessionInput,
+  StoreGenerationId,
   UiResponse,
   Workstream,
   WorkstreamId,
@@ -61,16 +62,16 @@ export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanR
 }) {}
 
 /**
- * An `events` request's `sinceOffset` cursor CANNOT belong to the daemon's current
- * store generation, so there is no incremental resume from it: the client must throw
- * away everything it retained and re-hydrate from `snapshot`.
+ * A resume cursor (`events`' or `sessionEvents`' `sinceOffset`) does NOT belong to
+ * the daemon's current store generation, so there is no incremental resume from it:
+ * the client must throw away everything it retained and re-hydrate from `snapshot`.
  *
  * The daemon's store never migrates (INV-FRESH): bumping its schema version DROPS
- * the database and recreates it, which restarts the durable `event_log`'s offsets at
- * `1` and destroys every row the client's retained state was built from. The local
- * app and the local daemon run together, so this happens UNDER a live client — one
- * that reconnects holding a cursor from the previous generation and a retained
- * snapshot full of entities that no longer exist.
+ * the database and recreates it, which restarts the durable `event_log` /
+ * `session_event_log` offsets at `1` and destroys every row the client's retained
+ * state was built from. The local app and the local daemon run together, so this
+ * happens UNDER a live client — one that reconnects holding a cursor from the
+ * previous generation and a retained snapshot full of entities that no longer exist.
  *
  * Neither of the two things a daemon could do WITHOUT this error is correct, which
  * is why it is a contract error rather than an inference:
@@ -90,14 +91,29 @@ export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanR
  * dropping its retained state and cursor and taking the subscribe-around-`snapshot`
  * path it uses on a first connect.
  *
+ * **The detection is an IDENTITY comparison, not an offset inference.** A cursor
+ * beyond the log's extent is a SUFFICIENT symptom but never a NECESSARY one: once a
+ * new generation's log outgrows a stale cursor, `sinceOffset <= maxOffset` holds and
+ * an extent check sees nothing wrong. So every cursor-bearing request carries the
+ * {@link StoreGenerationId} it was minted under — the one the client read off
+ * {@link Snapshot.generation} — and the daemon refuses any request whose generation
+ * is absent or differs from its own. The extent check remains as a cheap secondary
+ * (a cursor ahead of the log is impossible even WITHIN one generation).
+ *
  * - `sinceOffset` — the cursor the client sent, echoed back so the failure is
  *   self-describing in a log.
  * - `maxOffset` — the highest offset the daemon's log currently holds (`0` when it is
- *   empty), i.e. the extent the cursor exceeded.
+ *   empty). For an extent refusal this is what the cursor exceeded; for a generation
+ *   refusal it is simply the current log's extent.
+ * - `generation` — the daemon's CURRENT {@link StoreGenerationId}. A client cannot
+ *   adopt it as a cursor context (its retained state is from the dead generation, so
+ *   there is nothing valid to pair it with); it is what makes the failure diagnosable
+ *   and lets a client confirm the generation moved rather than guess.
  */
 export class ResyncRequired extends Schema.TaggedErrorClass<ResyncRequired>()("ResyncRequired", {
   sinceOffset: NonNegativeInt,
   maxOffset: NonNegativeInt,
+  generation: StoreGenerationId,
 }) {}
 
 // ── Aggregate contract schemas (composed only of owned domain types) ────────
@@ -113,6 +129,14 @@ export class ResyncRequired extends Schema.TaggedErrorClass<ResyncRequired>()("R
  * a fold a client computes over that repo's executions — never a list carried here
  * (INV-DERIVED). Retired and superseded revisions are included, because a
  * historical node may still resolve to one.
+ *
+ * `generation` is the identity of the STORE GENERATION this state was read from —
+ * the coordinate space its durable offsets live in. It is carried here because a
+ * snapshot is where a client's resume context BEGINS: the client retains it and
+ * hands it back on every cursor-bearing `events` / `sessionEvents` request, so the
+ * daemon can refuse a cursor from a generation it destroyed instead of resuming the
+ * client incrementally against a log the cursor never belonged to (see
+ * {@link ResyncRequired}). Nothing may parse or order it — equality only.
  */
 export const Snapshot = Schema.Struct({
   workstreams: Schema.Array(Workstream),
@@ -121,6 +145,7 @@ export const Snapshot = Schema.Struct({
   jobs: Schema.Array(Job),
   sessions: Schema.Array(Session),
   agents: Schema.Array(Agent),
+  generation: StoreGenerationId,
 });
 export type Snapshot = (typeof Snapshot)["Type"];
 
@@ -250,13 +275,23 @@ export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 // request. The success offset and the request cursor are the SAME coordinate: a
 // client feeds a streamed item's `offset` straight back as the next `sinceOffset`.
 //
-// The one error is {@link ResyncRequired}: the cursor cannot belong to the daemon's
+// A cursor is meaningful ONLY inside the store generation it was minted in, so a
+// request that carries `sinceOffset` must ALSO carry `generation` — the
+// `Snapshot.generation` the client retained alongside the state it is resuming onto.
+// Both are `optionalKey` because an ORIGIN request (a first connect) has neither;
+// the daemon requires the pair, refusing a cursor sent without a generation exactly
+// as it refuses one sent with a stale generation.
+//
+// The one error is {@link ResyncRequired}: the cursor does not belong to the daemon's
 // CURRENT store generation (the store was dropped and recreated under the client),
 // so no incremental resume exists and the client must discard its retained state and
 // re-hydrate from `snapshot`. It is a typed contract error precisely because the
 // daemon cannot repair it alone — see `ResyncRequired`'s docstring.
 export const events = Rpc.make("events", {
-  payload: { sinceOffset: Schema.optionalKey(NonNegativeInt) },
+  payload: {
+    sinceOffset: Schema.optionalKey(NonNegativeInt),
+    generation: Schema.optionalKey(StoreGenerationId),
+  },
   success: OffsetEvent,
   error: ResyncRequired,
   stream: true,
@@ -295,10 +330,21 @@ export const retryIssue = Rpc.make("retryIssue", {
 // live handle) is `SessionNotFound`. Only `sessionEvents` gains durable replay —
 // `sessionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled session is read-only,
 // so they still fail `SessionNotFound`).
+//
+// `session_event_log` is dropped and restarted at offset `1` by a schema-version bump
+// exactly as `event_log` is, so a per-session cursor is a generation-scoped coordinate
+// too — and it gets the SAME guard, not a weaker one because today's client happens not
+// to resume: `generation` accompanies `sinceOffset`, and a cursor without it (or with a
+// stale one) is refused with {@link ResyncRequired}. Hence the two-error channel — the
+// existence question (`SessionNotFound`) and the generation question are independent.
 export const sessionEvents = Rpc.make("sessionEvents", {
-  payload: { sessionId: SessionId, sinceOffset: Schema.optionalKey(NonNegativeInt) },
+  payload: {
+    sessionId: SessionId,
+    sinceOffset: Schema.optionalKey(NonNegativeInt),
+    generation: Schema.optionalKey(StoreGenerationId),
+  },
   success: OffsetSessionEvent,
-  error: SessionNotFound,
+  error: Schema.Union([SessionNotFound, ResyncRequired]),
   stream: true,
 });
 export const sessionSend = Rpc.make("sessionSend", {

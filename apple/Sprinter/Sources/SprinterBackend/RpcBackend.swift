@@ -45,7 +45,7 @@ public struct RpcBackend: Backend {
 
   public func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
     // The port's bare feed is the origin-replay offset feed with the offset dropped.
-    let offsetEvents = events(sinceOffset: nil)
+    let offsetEvents = events(sinceOffset: nil, generation: nil)
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
@@ -61,7 +61,7 @@ public struct RpcBackend: Backend {
     }
   }
 
-  public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
+  public func events(sinceOffset: Int?, generation: StoreGenerationId?) -> OffsetEventStream {
     // FLOW CONTROL NOTE: this interposes an UNBOUNDED ``AsyncThrowingStream`` over the
     // bounded ``AckGatedStream`` and drains it as fast as it can, so the gate's deferred
     // ack fires on arrival — it is NOT a live demand signal that throttles the daemon on
@@ -78,12 +78,17 @@ public struct RpcBackend: Backend {
           // to resume STRICTLY AFTER the last-applied offset on reconnect. An unknown
           // inner `_tag` still surfaces as a decode failure, never a silent drop.
           //
-          // Send a PRESENT ``EventsPayload`` (the `sinceOffset` KEY is omitted when `nil`
-          // → origin replay; present → incremental resume) so the request encodes a
-          // payload object, matching the canonical Effect client (INV-CONTRACT). The
-          // payload schema is a `Struct`, so an OMITTED payload key would decode to
-          // `undefined` and fail — a present object decodes correctly.
-          let payload = try toJSONValue(EventsPayload(sinceOffset: sinceOffset))
+          // Send a PRESENT ``EventsPayload`` (the `sinceOffset` and `generation` KEYS are
+          // omitted when `nil` → origin replay; present → incremental resume) so the
+          // request encodes a payload object, matching the canonical Effect client
+          // (INV-CONTRACT). The payload schema is a `Struct`, so an OMITTED payload key
+          // would decode to `undefined` and fail — a present object decodes correctly.
+          //
+          // The cursor and the generation are sent as a PAIR: the daemon refuses a cursor
+          // without its generation, because a bare offset cannot be told apart from a
+          // stale one once the new log outgrows it.
+          let payload = try toJSONValue(
+            EventsPayload(sinceOffset: sinceOffset, generation: generation))
           for try await value in await connection.stream(tag: "events", payload: payload) {
             continuation.yield(try fromJSONValue(OffsetEvent.self, value))
           }

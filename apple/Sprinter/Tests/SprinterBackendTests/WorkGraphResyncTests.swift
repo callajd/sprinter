@@ -58,7 +58,9 @@ struct WorkGraphResyncTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
-    #expect(resumeRequest.payload == (try toJSONValue(EventsPayload(sinceOffset: 1))))
+    // The resume sends the cursor WITH the generation the retained baseline was
+    // hydrated in — one resume context, never a bare offset.
+    #expect(resumeRequest.payload == (try Fixtures.resumePayload(1)))
 
     // A new delta folds onto the RETAINED baseline (issue still in_review) — proving no
     // fresh snapshot was fetched (a re-derive would have replaced the issue list).
@@ -120,7 +122,7 @@ struct WorkGraphResyncTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
-    #expect(resumeRequest.payload == (try toJSONValue(EventsPayload(sinceOffset: 2))))
+    #expect(resumeRequest.payload == (try Fixtures.resumePayload(2)))
 
     // The daemon re-sends from 3: offset 3 (the recovered gap) advances the issue to
     // in_review, offset 4 re-applies idempotently. No event is lost.

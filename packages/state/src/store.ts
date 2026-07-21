@@ -43,6 +43,7 @@ import {
   type Session,
   SessionEvent,
   SessionId,
+  type StoreGenerationId,
   type Workstream,
   WorkstreamId,
 } from "@sprinter/domain";
@@ -175,6 +176,10 @@ export type AgentWrite = "appended" | "unchanged";
  *   operations indistinguishable in the history. Checkable only when the superseded
  *   revision is actually stored — a dangling `supersedes` is the writer's problem,
  *   as it already is for acyclicity.
+ * - a RETIRING revision may not retire an ALREADY-RETIRED revision. A lineage goes
+ *   out of service once; a second retiring append would leave two revisions each
+ *   carrying a `retiredAt` and no way to say which instant the lineage stopped. This
+ *   is NOT caught by the rule above, which ignores the lifecycle columns by design.
  *
  * DURABILITY SCOPE: "nothing is ever removed" holds for the life of a STORE
  * GENERATION. `SCHEMA_VERSION` ({@link ./sqlite.ts}) never migrates — bumping it
@@ -182,6 +187,19 @@ export type AgentWrite = "appended" | "unchanged";
  * history. `putAgent` is the sole source of truth for its content (there is no
  * manifest to re-seed from), so that is accepted, permanent data loss — see
  * INV-FRESH's rationale in the adapter.
+ *
+ * GROWTH IS UNBOUNDED, and that same reset is its ONLY bound. Every revision ever
+ * appended stays: superseded and retired ones are exactly what the append-only model
+ * exists to keep, so there is no pruning, no compaction, no retention window, and no
+ * delete anywhere on this path. {@link AgentStore.listAgents} materialises the WHOLE
+ * table, the daemon's `snapshot` ships all of it on every connect, and every client
+ * retains all of it — the cost of one revision is paid on three surfaces at once,
+ * forever, until a `SCHEMA_VERSION` bump discards the generation. That is acceptable
+ * at pre-release scale (a registry grows by human edits, not by execution volume) and
+ * is RECORDED here rather than solved. If it ever stops being acceptable, the remedy
+ * is a bounded READ (a lineage-scoped or head-only list), never a delete — deleting
+ * would strand the executions that ran on a revision, the one thing this table
+ * promises not to do.
  */
 export interface AgentStore {
   /**
@@ -189,8 +207,9 @@ export interface AgentStore {
    * written ({@link AgentWrite}). A byte-identical re-append of an already stored id
    * is an idempotent no-op and answers `"unchanged"`; a DIFFERING re-append of that
    * id fails with {@link StateStoreError}, as does a revision whose `supersedes`
-   * names itself or a RETIRING revision that rewrites the superseded revision's
-   * content. It never rewrites or removes a stored revision.
+   * names itself, a RETIRING revision that rewrites the superseded revision's
+   * content, and a RETIRING revision that retires an already-retired revision. It
+   * never rewrites or removes a stored revision.
    */
   readonly putAgent: (agent: Agent) => Effect.Effect<AgentWrite, StateStoreError>;
   /** Read one {@link Agent} revision by id, if present. */
@@ -391,6 +410,28 @@ export class StateStore extends Context.Service<
     readonly events: EventLogStore;
     /** The durable per-session transcript-log capability group. */
     readonly sessionLog: SessionLogStore;
+    /**
+     * The identity of the STORE GENERATION this instance is open on — minted when
+     * the schema was CREATED and destroyed with it.
+     *
+     * It is a PLAIN VALUE, not an effect, and that is a statement about the model
+     * rather than an optimisation: a generation cannot change while a `StateStore`
+     * exists. The schema is applied once, at layer construction (INV-FRESH's
+     * drop-and-recreate is part of building the adapter), so starting a new
+     * generation means building a new store — in practice, restarting the daemon.
+     * Nothing can observe it changing under a live consumer, so nothing needs to
+     * re-read it.
+     *
+     * It is what makes a durable OFFSET interpretable. Offsets (`EventLogStore` /
+     * `SessionLogStore`) are positions in THIS generation's logs and restart at `1`
+     * when a generation is replaced, so an offset alone cannot say which coordinate
+     * space it belongs to. Pairing an offset with this id is what lets the daemon
+     * refuse a client's cursor from a destroyed generation instead of resuming it
+     * against a log it never belonged to. The port exposes the IDENTITY only — no
+     * SQL, no file, no version number (INV-PORT); it is opaque, and equality is its
+     * only defined operation.
+     */
+    readonly generation: StoreGenerationId;
     /**
      * Run `effect` in a SINGLE durable transaction: every `put*`/`append` write
      * it performs commits together or rolls back together (nested transactions

@@ -56,6 +56,66 @@ struct RegistryTests {
     #expect(try Golden.roundTrip(agent) == agent)
   }
 
+  /// The LINEAGE question — the one a UI actually means by "is this agent still in
+  /// service", and the one ``Agent/isRetired`` deliberately does not answer.
+  @Test("isLineageRetired answers the lineage question that isRetired cannot")
+  func lineageRetirement() throws {
+    let original = try Golden.decode(Agent.self, from: "agent-original")
+    let revised = try Golden.decode(Agent.self, from: "agent-revised")
+    let retirement = try Golden.decode(Agent.self, from: "agent-retired")
+    let registry = [original, revised, retirement]
+
+    // The trap this exists to close: NOT ONE of the two earlier revisions carries a
+    // stamp — they are immutable and were never rewritten — so a view keyed on
+    // `isRetired` renders a retired lineage as live.
+    #expect(!original.isRetired)
+    #expect(!revised.isRetired)
+    // Walking FORWARD along the reverse `supersedes` link reaches the stamp from any
+    // revision of the lineage, which is the actual answer.
+    #expect(isLineageRetired(original, in: registry))
+    #expect(isLineageRetired(revised, in: registry))
+    #expect(isLineageRetired(retirement, in: registry))
+
+    // WITHOUT the retiring revision, the same lineage is live — the predicate reads the
+    // collection it is handed, never a hidden global.
+    #expect(!isLineageRetired(original, in: [original, revised]))
+    // A lone revision with no successors is live.
+    #expect(!isLineageRetired(original, in: [original]))
+  }
+
+  @Test("isLineageRetired ignores other lineages and terminates on a cyclic history")
+  func lineageIsolationAndTermination() throws {
+    let original = try Golden.decode(Agent.self, from: "agent-original")
+    let revised = try Golden.decode(Agent.self, from: "agent-revised")
+    let retirement = try Golden.decode(Agent.self, from: "agent-retired")
+
+    // A retired revision of a DIFFERENT lineage says nothing about this one: the walk
+    // follows `supersedes` links, not mere co-membership of the registry.
+    let other = Agent(
+      id: AgentId(rawValue: "agt-other-2"),
+      name: "reviewer",
+      model: "claude-opus-4-8",
+      version: "1.0.0",
+      tools: ["read"],
+      supersedes: AgentId(rawValue: "agt-other-1"),
+      retiredAt: "2026-07-20T12:00:00.000Z")
+    #expect(!isLineageRetired(original, in: [original, revised, other]))
+
+    // A CYCLE is excluded by the writer's precondition, but the walk must still
+    // terminate if it is ever handed one (it visits each revision at most once).
+    let cyclicOne = Agent(
+      id: AgentId(rawValue: "agt-a"),
+      name: "a", model: "m", version: "1", tools: [],
+      supersedes: AgentId(rawValue: "agt-b"), retiredAt: nil)
+    let cyclicTwo = Agent(
+      id: AgentId(rawValue: "agt-b"),
+      name: "b", model: "m", version: "1", tools: [],
+      supersedes: AgentId(rawValue: "agt-a"), retiredAt: nil)
+    #expect(!isLineageRetired(cyclicOne, in: [cyclicOne, cyclicTwo]))
+    // And the mirror agrees with the TS helper on the retired-lineage case above.
+    #expect(isLineageRetired(retirement, in: [original, revised, retirement]))
+  }
+
   @Test("builds an agent through its memberwise initializer")
   func buildsAgent() throws {
     let built = Agent(

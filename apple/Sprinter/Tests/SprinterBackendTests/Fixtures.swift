@@ -1,6 +1,8 @@
 import Foundation
 import SprinterContract
 
+@testable import SprinterBackend
+
 /// Representative owned-DTO values used to drive the fake-transport tests.
 enum Fixtures {
   static let workstream = Workstream(
@@ -19,6 +21,14 @@ enum Fixtures {
     dependsOn: [],
     pullRequest: nil)
 
+  /// The store generation the FIRST connect hydrates in — the context every cursor this
+  /// baseline produces is a coordinate in.
+  static let generation = StoreGenerationId(rawValue: "gen-1")
+  /// The generation of a daemon that has been DROPPED AND RECREATED under the client (a
+  /// schema-version bump). Distinct from ``generation`` by construction: that difference
+  /// is the whole detection mechanism, so the fixtures must not share one.
+  static let generationAfterReset = StoreGenerationId(rawValue: "gen-2")
+
   static let snapshot = Snapshot(
     workstreams: [workstream],
     epics: [
@@ -32,7 +42,22 @@ enum Fixtures {
     issues: [issue],
     jobs: [],
     sessions: [],
-    agents: [])
+    agents: [],
+    generation: generation)
+
+  /// The wire payload of a RESUME `events` request: the cursor PLUS the generation the
+  /// retained baseline was hydrated in. They are one resume context — the daemon refuses a
+  /// cursor sent without its generation — so the tests assert the pair, never a bare offset.
+  static func resumePayload(_ sinceOffset: Int) throws -> JSONValue {
+    try toJSONValue(EventsPayload(sinceOffset: sinceOffset, generation: generation))
+  }
+
+  /// The daemon's refusal AFTER a drop-and-recreate. Note the cursor is WITHIN the new
+  /// log's extent, so nothing about the offsets is suspicious — only the generation
+  /// identity distinguishes this from a perfectly ordinary resume.
+  static func resyncRefusal(sinceOffset: Int) -> ContractError {
+    .resyncRequired(sinceOffset: sinceOffset, maxOffset: 2, generation: generationAfterReset)
+  }
 
   static let plan = WorkstreamPlan(
     name: "Foundation", repo: "callajd/sprinter", spec: "build the thing")
@@ -81,7 +106,8 @@ enum Fixtures {
     issues: [issueInReview],
     jobs: [],
     sessions: [],
-    agents: [])
+    agents: [],
+    generation: generationAfterReset)
 
   // ── Session channel ─────────────────────────────────────────────────────────
 

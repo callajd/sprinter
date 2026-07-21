@@ -35,9 +35,16 @@
  * The reset is also not free for a LIVE client: the local app and the local daemon
  * run together, so a bump can drop the database underneath a connected client that
  * still holds the pre-reset state and a durable resume cursor. That is a real
- * hazard, not bookkeeping, and it is why the `events` RPC carries an explicit
- * `ResyncRequired` contract error rather than leaving a stale cursor to be inferred
- * from offsets (see `packages/contract/src/rpc.ts`).
+ * hazard, not bookkeeping, and it is why a generation IDENTITY is minted here (see
+ * {@link createSchema}), carried on `Snapshot` and on every cursor-bearing request,
+ * and enforced by the `ResyncRequired` contract error — rather than leaving a stale
+ * cursor to be INFERRED from offsets, which cannot work once a new generation's log
+ * outgrows the stale mark (see `packages/contract/src/rpc.ts`).
+ *
+ * A bump only ever takes effect across a daemon RESTART: {@link applySchema} runs at
+ * layer construction, so a live store keeps the generation it opened with and the
+ * reset is observed by a client at its next reconnect. That bounds WHEN the hazard
+ * can be met, not whether it must be handled.
  *
  * **{@link SCHEMA_VERSION} is the guard.** Any change to the persisted shape —
  * a new table, a new column, a changed column — is landed by editing
@@ -84,6 +91,7 @@ import {
   SessionEvent,
   SessionId,
   SessionStatus,
+  StoreGenerationId,
   Timestamp,
   WorkstreamId,
   WorkStatus,
@@ -255,6 +263,15 @@ const SessionEventRow = Schema.Struct({
 const OffsetRow = Schema.Struct({ offset: NonNegativeInt });
 const CountRow = Schema.Struct({ n: NonNegativeInt });
 
+/**
+ * The `store_meta` row holding this generation's identity. `store_meta` is a
+ * single-purpose key/value table; the only key today is {@link GENERATION_KEY}.
+ */
+const GenerationRow = Schema.Struct({ value: StoreGenerationId });
+
+/** The `store_meta` key the generation identity is stored under. */
+const GENERATION_KEY = "generation";
+
 // ============================================================================
 // Schema (DDL) — ONE versioned definition; drop-and-recreate, never migrate
 // ============================================================================
@@ -274,12 +291,19 @@ const CountRow = Schema.Struct({ n: NonNegativeInt });
  * shape change while `DMR` treats the store as greenfield pre-release — not a
  * cost-free cache eviction.
  *
- * Version 1 is the greenfield reset that REPLACED the previous incremental
+ * Version 1 was the greenfield reset that REPLACED the previous incremental
  * migration ladder (`1_initial` / `2_session_event_log`). A database left by that
  * ladder has `user_version = 0`, so it mismatches and is reset like any other
- * stale store.
+ * stale store. Version 2 adds `store_meta` and the generation identity minted into
+ * it (see {@link createSchema}).
+ *
+ * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
+ * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
+ * a bump reaches a client at its next reconnect, never mid-connection. That bounds
+ * WHEN the stale-cursor hazard can occur; it does not reduce it, which is why the
+ * generation identity below is on the wire.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -333,9 +357,29 @@ const dropSchema = Effect.gen(function* () {
  * The COMPLETE schema at {@link SCHEMA_VERSION} — one definition, not a ladder.
  * Every table lands here (the `agent` registry included); nothing is expressed as
  * an incremental step off a previous version.
+ *
+ * It also MINTS this generation's identity. `createSchema` runs exactly once per
+ * store generation — it is the second half of the drop-and-recreate — so it is the
+ * one place that can mint an id which is fresh by construction: a new generation
+ * cannot come into existence without passing through here, and re-running it means
+ * the previous generation's tables have just been dropped. A random UUID is
+ * sufficient (the only defined operation on the id is equality, so it needs
+ * uniqueness, not order or meaning).
  */
 const createSchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  // Store-wide metadata as key/value, so a future scalar needs no new table (and no
+  // new shape for the reset to sweep). Its ONLY key today is the generation identity.
+  yield* sql`CREATE TABLE store_meta (
+      key TEXT PRIMARY KEY NOT NULL,
+      value TEXT NOT NULL
+    )`;
+  // Minted HERE, from the platform CSPRNG, and never rewritten afterwards: the row
+  // lives and dies with the schema that created it, so "a fresh generation on every
+  // drop-and-recreate" holds by construction rather than by a caller remembering to
+  // rotate it. `crypto` is the Web-standard global (Bun-native, never `node:*`).
+  const generation = yield* Effect.sync(() => globalThis.crypto.randomUUID());
+  yield* sql`INSERT INTO store_meta ${sql.insert({ key: GENERATION_KEY, value: generation })}`;
   // The append-only Agent REGISTRY: owned, global, scoped to NO repository — hence
   // no repositoryId/workstreamId column and no per-repo join table ("agents used in
   // this repo" is a fold over that repo's executions, INV-DERIVED). `retiredAt` is a
@@ -460,6 +504,29 @@ const applySchema = Effect.gen(function* () {
 const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
+  // ── the store generation ────────────────────────────────────────────────
+  //
+  // Read ONCE, here, and exposed as a plain value: {@link applySchema} has already
+  // run (the schema layer is provided beneath this one), so the row exists and its
+  // value cannot change while this service lives — a new generation is a new
+  // `createSchema`, hence a new layer build. Reading it eagerly is therefore not a
+  // cache but a statement of the model, and it means a missing/corrupt row fails the
+  // store's CONSTRUCTION rather than some later resume request.
+  const generationRows =
+    yield* sql`SELECT value FROM store_meta WHERE key = ${GENERATION_KEY}`.pipe(
+      Effect.mapError(fail("generation")),
+    );
+  const generation = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(GenerationRow))(
+    generationRows,
+  ).pipe(
+    Effect.mapError(() =>
+      fail("generation")({
+        message: `store_meta has no "${GENERATION_KEY}" row; the store generation is minted by createSchema and cannot be reconstructed`,
+      }),
+    ),
+    Effect.map((rows) => rows[0].value),
+  );
+
   // ── AgentStore ──────────────────────────────────────────────────────────
   //
   // Append + read only: there is no DELETE and no UPDATE statement here, by design.
@@ -489,9 +556,21 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Enforce the LIFECYCLE-ONLY retirement rule: a revision that carries both
-   * `supersedes` and `retiredAt` must repeat the superseded revision's
-   * non-lifecycle columns verbatim.
+   * Enforce the two rules a RETIRING revision (one carrying both `supersedes` and
+   * `retiredAt`) must satisfy against the revision it retires:
+   *
+   * 1. LIFECYCLE-ONLY — it must repeat the superseded revision's non-lifecycle
+   *    columns verbatim (retirement sets `retiredAt`, never content).
+   * 2. NOT ALREADY RETIRED — the revision it supersedes must not itself carry a
+   *    `retiredAt`. Retiring a retired head is not idempotence: it appends a SECOND
+   *    stamp, under a new id, at a different instant, to a lineage that already went
+   *    out of service — leaving two revisions each claiming to be the retirement and
+   *    no way to say which instant the lineage actually stopped. Rule 1 cannot catch
+   *    it, because it deliberately ignores the lifecycle columns, so it is checked
+   *    here alongside it. (A retiring revision naming a MID-lineage revision that was
+   *    later superseded is a different, un-checkable shape: the store cannot see
+   *    forward along the chain from one append — that stays the writer's obligation,
+   *    exactly as acyclicity does.)
    *
    * Compared on the STORED BYTES (`tools` stays the encoded JSON string, as
    * {@link AgentColumns} models it), so "same content" is decided exactly as the
@@ -504,7 +583,7 @@ const make = Effect.gen(function* () {
    * the caller's transaction, so the row it reads is the one the insert commits
    * against.
    */
-  const assertRetirementPreservesContent = (
+  const assertRetirementIsWellFormed = (
     supersedes: AgentId,
     row: AgentColumns,
   ): Effect.Effect<void, StateStoreError> =>
@@ -516,16 +595,24 @@ const make = Effect.gen(function* () {
           onSome: (found) =>
             Schema.decodeUnknownEffect(AgentColumns)(found).pipe(
               Effect.mapError(fail("putAgent")),
-              Effect.flatMap((head) =>
-                isSameAgentContent(head, row)
+              Effect.flatMap((head) => {
+                if (head.retiredAt !== null) {
+                  return Effect.fail(
+                    new StateStoreError({
+                      operation: "putAgent",
+                      detail: `agent "${row.id}" retires "${supersedes}", which is ALREADY retired (at ${head.retiredAt}); a lineage goes out of service once, so there is nothing left to retire`,
+                    }),
+                  );
+                }
+                return isSameAgentContent(head, row)
                   ? Effect.void
                   : Effect.fail(
                       new StateStoreError({
                         operation: "putAgent",
                         detail: `agent "${row.id}" retires "${supersedes}" but changes its content; a retirement sets retiredAt ONLY — append the edit as its own revision first, then retire that revision`,
                       }),
-                    ),
-              ),
+                    );
+              }),
             ),
         }),
       ),
@@ -595,11 +682,14 @@ const make = Effect.gen(function* () {
             // was edited, retired, or both, and the retired head's content would
             // appear to have changed at the moment it went out of service. So a
             // revision carrying BOTH `supersedes` and `retiredAt` must match the
-            // revision it supersedes on every non-lifecycle column. Checkable only
-            // when that revision is actually stored; a dangling `supersedes` is the
-            // same writer obligation the acyclicity precondition already carries.
+            // revision it supersedes on every non-lifecycle column — AND that
+            // revision must not already be retired, since a lineage goes out of
+            // service once and a second stamp would leave two revisions each
+            // claiming to be the retirement. Checkable only when the superseded
+            // revision is actually stored; a dangling `supersedes` is the same
+            // writer obligation the acyclicity precondition already carries.
             if (agent.retiredAt !== undefined && agent.supersedes !== undefined) {
-              yield* assertRetirementPreservesContent(agent.supersedes, row);
+              yield* assertRetirementIsWellFormed(agent.supersedes, row);
             }
             yield* sql`INSERT INTO agent ${sql.insert(row)}`.pipe(
               Effect.mapError(fail("putAgent")),
@@ -926,6 +1016,7 @@ const make = Effect.gen(function* () {
     jobs,
     events,
     sessionLog,
+    generation,
     withTransaction,
   });
 });

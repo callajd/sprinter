@@ -8,7 +8,7 @@
   "type": "module",
   "scripts": {
     "check:format": "oxfmt --check .",
-    "check:lint": "oxlint --deny-warnings packages",
+    "check:lint": "oxlint --deny-warnings packages apple/Sprinter/scripts",
     "check:types": "tsc --noEmit",
     "check:test": "bun --bun vitest run --coverage",
     "check:goldens": "bun run apple/Sprinter/scripts/check-goldens.ts",

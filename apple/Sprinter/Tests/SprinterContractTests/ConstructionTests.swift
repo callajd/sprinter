@@ -109,7 +109,8 @@ struct ConstructionTests {
       issues: decoded.issues,
       jobs: decoded.jobs,
       sessions: decoded.sessions,
-      agents: decoded.agents)
+      agents: decoded.agents,
+      generation: decoded.generation)
     #expect(built == decoded)
     // The registry is a REQUIRED parameter like every other collection: the wire
     // always carries the key, so there is no default to let a construction site
@@ -164,7 +165,11 @@ struct ConstructionTests {
     #expect(retry == (try Golden.decode(RetryIssuePayload.self, from: "payload-retry-issue")))
 
     // The `sessionEvents` resume cursor — both wire forms (present + absent origin replay).
-    let subscribe = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"), sinceOffset: 12)
+    // A present cursor carries the STORE GENERATION it was minted in; an origin request
+    // carries neither key.
+    let subscribe = SessionEventsPayload(
+      sessionId: SessionId(rawValue: "ses-1"), sinceOffset: 12,
+      generation: StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
     #expect(
       subscribe == (try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")))
     let subscribeFromOrigin = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"))
@@ -177,7 +182,9 @@ struct ConstructionTests {
     #expect(interrupt == (try Golden.decode(InterruptPayload.self, from: "payload-interrupt")))
 
     // The `events` resume cursor — both wire forms (present + absent origin replay).
-    let events = EventsPayload(sinceOffset: 12)
+    let events = EventsPayload(
+      sinceOffset: 12,
+      generation: StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
     #expect(events == (try Golden.decode(EventsPayload.self, from: "payload-events")))
     let eventsFromOrigin = EventsPayload()
     #expect(

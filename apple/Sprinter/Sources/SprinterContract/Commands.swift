@@ -28,17 +28,31 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
 }
 
 /// Payload of `events` (streams the ``OffsetEvent`` envelope) — the OPTIONAL
-/// `sinceOffset` resume cursor (CE2.0). A request with no `sinceOffset`
-/// (`nil`) replays from the log ORIGIN; present resumes STRICTLY AFTER that offset.
-/// The wire is `Schema.optionalKey(NonNegativeInt)`, so the KEY is OMITTED when `nil`
-/// (never `null`) — Swift synthesized `Codable` matches this exactly. The payload
-/// OBJECT itself is still sent PRESENT (an empty `{}` when there is no cursor):
+/// `sinceOffset` resume cursor (CE2.0) and the STORE GENERATION it was minted in.
+/// A request with no `sinceOffset` (`nil`) replays from the log ORIGIN; present
+/// resumes STRICTLY AFTER that offset.
+///
+/// The two travel TOGETHER. A durable offset is a coordinate in one generation's log,
+/// and the daemon's store never migrates — a schema bump drops it and restarts offsets
+/// at `1` — so a cursor without its generation cannot be validated at all (once the new
+/// log outgrows the stale mark, the numbers alone look perfectly resumable). A resume
+/// therefore sends the ``Snapshot/generation`` it retained alongside the state it is
+/// folding onto; the daemon refuses any cursor whose generation is absent or stale with
+/// ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)``.
+///
+/// Both wire fields are `Schema.optionalKey`, so each KEY is OMITTED when `nil` (never
+/// `null`) — Swift synthesized `Codable` matches this exactly. The payload OBJECT itself
+/// is still sent PRESENT (an empty `{}` on a first connect, which has neither):
 /// ``RpcBackend/events()`` encodes an empty ``EventsPayload`` so the request carries
 /// `"payload": {}`, matching the canonical Effect client — the payload
 /// schema is a `Struct`, so an omitted `payload` key would fail to decode.
 public struct EventsPayload: Codable, Equatable, Sendable {
   public let sinceOffset: Int?
-  public init(sinceOffset: Int? = nil) { self.sinceOffset = sinceOffset }
+  public let generation: StoreGenerationId?
+  public init(sinceOffset: Int? = nil, generation: StoreGenerationId? = nil) {
+    self.sinceOffset = sinceOffset
+    self.generation = generation
+  }
 }
 
 /// Payload of `createWorkstreamFromPlan` (success: ``WorkstreamId``; error:
@@ -66,17 +80,25 @@ public struct RetryIssuePayload: Codable, Equatable, Sendable {
 }
 
 /// Payload of `sessionEvents` (streams the ``OffsetSessionEvent`` envelope) — the session
-/// id plus the OPTIONAL `sinceOffset` resume cursor. A request with no
-/// `sinceOffset` (`nil`) replays the session's durable transcript from the ORIGIN; present
-/// resumes STRICTLY AFTER that durable per-session offset. The wire is
-/// `Schema.optionalKey(NonNegativeInt)`, so the KEY is OMITTED when `nil` (never `null`) —
-/// Swift synthesized `Codable` matches this exactly (mirrors ``EventsPayload``).
+/// id plus the OPTIONAL `sinceOffset` resume cursor and the STORE GENERATION it was minted
+/// in. A request with no `sinceOffset` (`nil`) replays the session's durable transcript
+/// from the ORIGIN; present resumes STRICTLY AFTER that durable per-session offset.
+///
+/// The per-session transcript log is dropped and restarted by a schema-version bump
+/// exactly as the work-graph log is, so its cursor is generation-scoped in exactly the
+/// same way and carries the same pairing as ``EventsPayload`` — no weaker guard for the
+/// session channel. Both optional wire keys are OMITTED when `nil` (never `null`), which
+/// Swift synthesized `Codable` matches exactly.
 public struct SessionEventsPayload: Codable, Equatable, Sendable {
   public let sessionId: SessionId
   public let sinceOffset: Int?
-  public init(sessionId: SessionId, sinceOffset: Int? = nil) {
+  public let generation: StoreGenerationId?
+  public init(
+    sessionId: SessionId, sinceOffset: Int? = nil, generation: StoreGenerationId? = nil
+  ) {
     self.sessionId = sessionId
     self.sinceOffset = sinceOffset
+    self.generation = generation
   }
 }
 
@@ -116,24 +138,33 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
   case issueNotFound(id: IssueId)
   case sessionNotFound(id: SessionId)
   case planRejected(reason: String)
-  /// The `events` request's `sinceOffset` cursor cannot belong to the daemon's
+  /// A resume cursor (`events`' or `sessionEvents`') does NOT belong to the daemon's
   /// CURRENT store generation, so there is no incremental resume from it.
   ///
   /// The daemon's store never migrates: a schema-version bump DROPS the database and
-  /// recreates it, restarting the durable event log's offsets at `1` and destroying
-  /// every row the client's retained state was built from. The app and the daemon run
-  /// together locally, so this lands on a LIVE client — one holding a cursor from the
-  /// previous generation and a snapshot full of entities that no longer exist. The
-  /// delta stream cannot repair that: deltas are upsert-only (there is no `*Removed`),
-  /// so nothing streamed can ever REMOVE a stale entity.
+  /// recreates it, restarting the durable log offsets at `1` and destroying every row
+  /// the client's retained state was built from. The app and the daemon run together
+  /// locally, so this lands on a LIVE client — one holding a cursor from the previous
+  /// generation and a snapshot full of entities that no longer exist. The delta stream
+  /// cannot repair that: deltas are upsert-only (there is no `*Removed`), so nothing
+  /// streamed can ever REMOVE a stale entity.
+  ///
+  /// The daemon detects it by IDENTITY, not by arithmetic: a cursor beyond the log's
+  /// extent is a symptom, but once a new generation's log outgrows a stale cursor the
+  /// numbers alone look perfectly resumable. So every cursor-bearing request carries the
+  /// ``StoreGenerationId`` it was minted under (read off ``Snapshot/generation``), and a
+  /// request whose generation is absent or stale is refused — whatever the offsets say.
   ///
   /// The only correct response is to throw the retained state away and re-hydrate:
   /// ``WorkGraphResync`` clears its retained snapshot AND its resume cursor and falls
   /// back to the subscribe-around-`snapshot` path it uses on a first connect.
   ///
   /// - `sinceOffset`: the cursor the client sent, echoed back.
-  /// - `maxOffset`: the extent of the daemon's log (`0` when empty) that it exceeded.
-  case resyncRequired(sinceOffset: Int, maxOffset: Int)
+  /// - `maxOffset`: the extent of the daemon's log (`0` when empty). NOT necessarily
+  ///   exceeded — a generation refusal can carry a cursor well within it.
+  /// - `generation`: the daemon's CURRENT generation, so the failure is diagnosable
+  ///   rather than merely a refusal.
+  case resyncRequired(sinceOffset: Int, maxOffset: Int, generation: StoreGenerationId)
 
   private enum CodingKeys: String, CodingKey {
     case tag = "_tag"
@@ -141,6 +172,7 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     case reason
     case sinceOffset
     case maxOffset
+    case generation
   }
 
   public init(from decoder: any Decoder) throws {
@@ -158,7 +190,8 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     case "ResyncRequired":
       self = .resyncRequired(
         sinceOffset: try container.decode(Int.self, forKey: .sinceOffset),
-        maxOffset: try container.decode(Int.self, forKey: .maxOffset))
+        maxOffset: try container.decode(Int.self, forKey: .maxOffset),
+        generation: try container.decode(StoreGenerationId.self, forKey: .generation))
     default:
       throw DecodingError.dataCorruptedError(
         forKey: .tag,
@@ -183,10 +216,11 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     case .planRejected(let reason):
       try container.encode("PlanRejected", forKey: .tag)
       try container.encode(reason, forKey: .reason)
-    case .resyncRequired(let sinceOffset, let maxOffset):
+    case .resyncRequired(let sinceOffset, let maxOffset, let generation):
       try container.encode("ResyncRequired", forKey: .tag)
       try container.encode(sinceOffset, forKey: .sinceOffset)
       try container.encode(maxOffset, forKey: .maxOffset)
+      try container.encode(generation, forKey: .generation)
     }
   }
 }

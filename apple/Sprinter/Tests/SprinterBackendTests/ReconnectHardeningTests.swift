@@ -170,7 +170,7 @@ struct ReconnectHardeningTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resume = try await nextSent(&out2)
     #expect(resume.rpcTag == "events")
-    #expect(resume.payload == (try toJSONValue(EventsPayload(sinceOffset: 1))))
+    #expect(resume.payload == (try Fixtures.resumePayload(1)))
 
     await engine.stop()
     first.close()
@@ -276,7 +276,7 @@ struct ReconnectHardeningTests {
     var out = transport.outbound.makeAsyncIterator()
     let resume = try await nextSent(&out)
     #expect(resume.rpcTag == "events")
-    #expect(resume.payload == (try toJSONValue(EventsPayload(sinceOffset: offset))))
+    #expect(resume.payload == (try Fixtures.resumePayload(offset)))
     return transport
   }
 }

@@ -131,7 +131,8 @@ struct BoardProjectionTests {
       issues: [],
       jobs: [],
       sessions: [],
-      agents: [])
+      agents: [],
+      generation: StoreGenerationId(rawValue: "gen-test"))
 
     let board = BoardProjection.project(snapshot)
     #expect(board.first?.epics.map(\.id) == [EpicId(rawValue: "ep")])

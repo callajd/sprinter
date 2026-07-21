@@ -63,6 +63,17 @@
  * destroyed. DE2.2 must therefore treat the referent as possibly-absent and must not
  * assume resolution succeeds.
  *
+ * That generation boundary is also the ONLY bound on the registry's SIZE. Append-only
+ * with no delete means every revision ever written stays — superseded and retired ones
+ * are precisely what the model exists to keep — and there is no pruning, no compaction
+ * and no retention window anywhere on the path: the store's `listAgents` reads the
+ * whole table, the daemon's `snapshot` ships all of it on every connect, and every
+ * client retains all of it. Growth is therefore unbounded within a generation, and a
+ * `SCHEMA_VERSION` bump is the only thing that ever shrinks it (by discarding it
+ * entirely). Accepted at pre-release scale — a registry grows by human edits, not by
+ * execution volume — and recorded here so it is a known cost rather than a surprise.
+ * If it ever needs bounding, the remedy is a narrower READ, never a delete.
+ *
  * PRECONDITION on `supersedes` (the port rejects the self-reference case; the rest
  * is the writer's obligation): the `supersedes` chain must be an ACYCLIC path
  * ending at an original revision. A revision may not supersede itself, and may not
@@ -152,11 +163,24 @@ export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes ==
  * `Snapshot.agents` hand over — and walks FORWARD from `agent` along it until it
  * reaches a stamped revision or the head of the lineage.
  *
- * `all` is read as an unordered set; `listAgents`'s id order is presentational and
- * is deliberately not relied on here. Revisions in `all` that belong to other
- * lineages are ignored. A revision superseded by TWO revisions is a malformed
- * history the writer's precondition already excludes; this walk follows the first
- * such successor it encounters and still terminates.
+ * Revisions in `all` that belong to other lineages are ignored. On a WELL-FORMED
+ * history the answer does not depend on `all`'s order: each revision has at most one
+ * successor, so there is exactly one forward path. On a MALFORMED one — a revision
+ * superseded by TWO revisions, which the writer's precondition already excludes — it
+ * DOES: the reverse index keeps the first successor it encounters and the walk follows
+ * that branch only, so a differently-ordered `all` can reach a different revision and
+ * return a different answer. That is stated rather than smoothed over, because the
+ * input this reads (`listAgents` / `Snapshot.agents`) is ordered by id, which is
+ * presentational: the answer is deterministic for a given input, well-defined for a
+ * well-formed history, and order-dependent only for a history that is already invalid.
+ *
+ * COST: this rebuilds the reverse index on EVERY call — O(n) in `all` per agent, and
+ * therefore O(n²) for a fold over the whole registry (e.g. a UI listing live agents by
+ * calling this once per revision). That is fine for one lookup and fine at the scale
+ * the registry is bounded to, and it is why the index is not cached here: caching it
+ * would tie a pure predicate to a lifetime it cannot see. If a caller ever folds this
+ * across the registry, the remedy is to build the successor index ONCE at the call
+ * site and pass it in (a sibling taking a prepared index), not to memoize inside.
  *
  * Termination: the walk visits each revision at most once (it stops on re-visiting
  * one), so it terminates even if a caller hands it the cyclic `supersedes` structure

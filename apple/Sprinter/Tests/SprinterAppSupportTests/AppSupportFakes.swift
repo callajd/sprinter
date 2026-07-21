@@ -208,5 +208,6 @@ enum AppSupportFixtures {
     ],
     jobs: [],
     sessions: [],
-    agents: [])
+    agents: [],
+    generation: StoreGenerationId(rawValue: "gen-test"))
 }

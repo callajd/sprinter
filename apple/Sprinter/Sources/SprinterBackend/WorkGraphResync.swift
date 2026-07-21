@@ -28,11 +28,14 @@ import SprinterContract
 ///
 /// **A DEAD resume point — `ResyncRequired` (the store-generation boundary).** The
 /// incremental resume is only valid while the daemon's durable log is the SAME log the
-/// cursor came from. It is not forever: the daemon's store never migrates, so a schema
-/// bump DROPS and recreates it, restarting offsets at `1` and destroying every entity
-/// the retained baseline describes. The app and the daemon run together locally, so
-/// that lands on a live client. The daemon says so explicitly — the `events` request
-/// fails with ``ContractError/resyncRequired(sinceOffset:maxOffset:)`` — and this engine
+/// cursor came from — which the client asserts EXPLICITLY, by sending the
+/// ``Snapshot/generation`` its retained baseline came from alongside the cursor, rather
+/// than leaving the daemon to infer staleness from offsets it cannot distinguish. It is
+/// not forever: the daemon's store never migrates, so a schema bump DROPS and recreates
+/// it, restarting offsets at `1` and destroying every entity the retained baseline
+/// describes. The app and the daemon run together locally, so that lands on a live
+/// client. The daemon says so explicitly — the `events` request fails with
+/// ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)`` — and this engine
 /// answers by discarding BOTH the retained baseline and the cursor and falling back to
 /// subscribe-around-snapshot. It has to discard both: deltas are upsert-only (there is
 /// no `*Removed`), so no stream of deltas can remove an entity the reset destroyed —
@@ -282,7 +285,12 @@ public actor WorkGraphResync {
     // the connection's serialized send path this issues the `events` Request ahead of
     // `snapshot`. On a reconnect there is no snapshot: the daemon replays strictly after
     // `resume.offset`.
-    let events = backend.events(sinceOffset: resume?.offset)
+    // The resume sends the cursor WITH the generation it was minted in — the one carried
+    // on the retained baseline's ``Snapshot/generation``. They are one resume context: a
+    // cursor handed over without it (or with a stale one) is refused, which is exactly the
+    // behaviour this engine wants when the daemon's store was dropped underneath it.
+    let events = backend.events(
+      sinceOffset: resume?.offset, generation: resume?.state.generation)
     do {
       try await withThrowingTaskGroup(of: Void.self) { group in
         // Reader: buffer live deltas (with their durable offsets) into the bounded queue.

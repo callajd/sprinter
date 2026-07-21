@@ -8,7 +8,7 @@
  * offline (INV-PORT).
  */
 import { it } from "@effect/vitest";
-import { Context, Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
+import { Context, Effect, Fiber, Layer, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
 import { type OffsetEvent, ResyncRequired } from "@sprinter/contract";
 import {
@@ -19,6 +19,7 @@ import {
   type SessionEvent,
   SessionId,
   Session,
+  StoreGenerationId,
   Workstream,
 } from "@sprinter/domain";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
@@ -27,6 +28,15 @@ import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts"
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
+
+/**
+ * A generation id that is NOT the store's — a cursor context minted by a store
+ * generation that no longer exists. Decoded through the owned schema (never cast),
+ * so the test speaks the same type the wire does (INV-NOCAST).
+ */
+const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
+  "00000000-dead-4000-8000-000000000000",
+);
 
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
@@ -353,7 +363,7 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
 
     // Attach with a cursor PAST the first entry (offset 1): the resync must replay
     // only the second durable delta (strictly-after semantics), not re-send offset 1.
-    const collecting = yield* resyncEvents(store, feed, 1).pipe(
+    const collecting = yield* resyncEvents(store, feed, 1, store.generation).pipe(
       Stream.take(1),
       Stream.runCollect,
       Effect.forkChild,
@@ -388,7 +398,7 @@ it.live("resyncEvents fails a cursor BEYOND the log's extent with ResyncRequired
     // back leaves its contiguous cursor stale so it discards everything — so the
     // generation is made EXPLICIT and the request FAILS.
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 999).pipe(Stream.take(2), Stream.runCollect),
+      resyncEvents(store, feed, 999, store.generation).pipe(Stream.take(2), Stream.runCollect),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
     // Self-describing: the rejected cursor and the extent it exceeded.
@@ -414,7 +424,7 @@ it.live("resyncEvents fails a non-zero cursor against an EMPTY log — the post-
     // client reconnects holding a cursor from the destroyed generation. `maxOffset` is
     // `0` (the empty-log sentinel), which every non-zero cursor exceeds.
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 7).pipe(Stream.take(1), Stream.runCollect),
+      resyncEvents(store, feed, 7, store.generation).pipe(Stream.take(1), Stream.runCollect),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
     expect(failure.maxOffset).toBe(0);
@@ -462,7 +472,7 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
     // The boundary the stale-epoch rule must NOT swallow: a fully caught-up client
     // (cursor == max offset) is not stale, so it replays nothing and only streams
     // the live tail — it is never re-sent history it already acknowledged.
-    const collecting = yield* resyncEvents(store, feed, 2).pipe(
+    const collecting = yield* resyncEvents(store, feed, 2, store.generation).pipe(
       Stream.take(1),
       Stream.runCollect,
       Effect.forkChild,
@@ -480,6 +490,91 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
     Effect.provide(layerWorkGraphEvents),
     Effect.provide(layerSessionEvents),
   ),
+);
+
+it.live("resyncEvents REFUSES a cursor WITHIN the log's extent but from a PRIOR generation", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // The case an extent check CANNOT see, and the reason the generation is an explicit
+    // identity rather than an inference. After a schema-version bump the database is
+    // dropped and recreated, `event_log` restarts at offset 1, and `StartupReconcile`
+    // journals boot deltas — so the NEW log quickly grows PAST a client's stale cursor.
+    // Here the log reaches offset 3 while the client reconnects with cursor 2: the
+    // extent test (`sinceOffset <= maxOffset`) is satisfied, and a daemon relying on it
+    // would resume the client incrementally against a coordinate space its cursor never
+    // belonged to — never re-sending the new generation's offsets 1..2, and leaving the
+    // client's retained baseline holding every entity the reset destroyed, forever
+    // (deltas are upsert-only, so nothing streamed can remove them). Undetectable from
+    // either side. The generation identity is what makes it detectable — and refused.
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+    yield* store.workGraph.putIssue(issue);
+    const maxOffset = yield* store.events.maxOffset;
+    expect(maxOffset).toBe(3);
+
+    const failure = yield* Effect.flip(
+      resyncEvents(store, feed, 2, deadGeneration).pipe(Stream.take(1), Stream.runCollect),
+    );
+    expect(failure).toBeInstanceOf(ResyncRequired);
+    // The cursor is WITHIN the extent — this refusal is the identity check, not the
+    // extent check, which is exactly what the previous inference-only rule could not do.
+    expect(failure.sinceOffset <= failure.maxOffset).toBe(true);
+    expect({ sinceOffset: failure.sinceOffset, maxOffset: failure.maxOffset }).toStrictEqual({
+      sinceOffset: 2,
+      maxOffset: 3,
+    });
+    // And it names the daemon's CURRENT generation, so the failure says which context
+    // the client is now expected to hydrate into rather than merely "no".
+    expect(failure.generation).toBe(store.generation);
+    expect(failure.generation).not.toBe(deadGeneration);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("resyncEvents REFUSES a cursor carrying NO generation at all", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+
+    // A cursor with no generation has no context to be valid IN, so it is exactly as
+    // un-resumable as one from the wrong context. Accepting it would make the guard
+    // trivially bypassable — a client (or an older build) that simply omits the key
+    // would be resumed against a log its cursor may never have belonged to.
+    const failure = yield* Effect.flip(
+      resyncEvents(store, feed, 1).pipe(Stream.take(1), Stream.runCollect),
+    );
+    expect(failure).toBeInstanceOf(ResyncRequired);
+    expect(failure.generation).toBe(store.generation);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("the journaling decorator reports the BASE store's generation unchanged", () =>
+  Effect.gen(function* () {
+    // The decorator adds a live fan-out over the same durable tables; it does not open a
+    // new store. If it minted (or dropped) a generation of its own, the offsets it
+    // publishes would belong to a context no client's cursor could ever match, and every
+    // resume would be refused forever.
+    const base = yield* StateStore;
+    const decorated = yield* StateStore.pipe(
+      Effect.provide(layerJournaling(Layer.succeed(StateStore, base))),
+      Effect.provide(layerWorkGraphEvents),
+      Effect.provide(layerSessionEvents),
+    );
+    expect(decorated.generation).toBe(base.generation);
+  }).pipe(Effect.scoped, Effect.provide(layerMemory)),
 );
 
 it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () =>

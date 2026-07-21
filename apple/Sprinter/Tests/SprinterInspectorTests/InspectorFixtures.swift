@@ -46,7 +46,8 @@ enum InspectorFixtures {
       issues: [issue],
       jobs: [jobWithPullRequest(pullRequest)],
       sessions: [session],
-      agents: [])
+      agents: [],
+      generation: StoreGenerationId(rawValue: "gen-test"))
   }
 
   /// A snapshot where the job has NO PR but its issue does — the transitive
@@ -67,6 +68,7 @@ enum InspectorFixtures {
       ],
       jobs: [jobWithPullRequest(nil)],
       sessions: [session],
-      agents: [])
+      agents: [],
+      generation: StoreGenerationId(rawValue: "gen-test"))
   }
 }

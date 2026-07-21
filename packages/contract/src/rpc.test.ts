@@ -25,6 +25,7 @@ import {
   IssueNotFound,
   OffsetSessionEvent,
   PlanRejected,
+  ResyncRequired,
   retryIssue,
   SessionNotFound,
   sessionEvents,
@@ -97,6 +98,7 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
     jobs: [job],
     sessions: [session],
     agents: [agent, { ...agent, id: "agt-2", supersedes: "agt-1" }],
+    generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
   };
   const decoded = Schema.decodeUnknownSync(snapshot.successSchema)(full);
 
@@ -155,6 +157,76 @@ it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)"
 
   // A negative offset is not a non-negative int and is rejected.
   expect(() => Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: -1 })).toThrow();
+});
+
+it("pairs a resume cursor with the STORE GENERATION it was minted in", () => {
+  const generation = "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b";
+
+  // A cursor is a coordinate in ONE generation's log, so the resume request carries the
+  // generation alongside it — the value the client read off `Snapshot.generation`.
+  const resume = Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: 12, generation });
+  expect(resume.generation).toBe(generation);
+  // The SAME pairing on the session channel: its per-session log is dropped by a schema
+  // bump exactly as the work-graph log is, so its cursor is generation-scoped too.
+  const sessionResume = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
+    sessionId: "ses-1",
+    sinceOffset: 4,
+    generation,
+  });
+  expect(sessionResume.generation).toBe(generation);
+
+  // Both keys are OPTIONAL because an ORIGIN request (a first connect) has neither.
+  expect(Schema.decodeUnknownSync(events.payloadSchema)({}).generation).toBeUndefined();
+  // An empty generation is not a non-empty string and is rejected.
+  expect(() =>
+    Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: 1, generation: "" }),
+  ).toThrow();
+
+  // The snapshot is where the generation ORIGINATES, so it is REQUIRED there — a snapshot
+  // without one would hand a client state it could never construct a valid resume from.
+  expect(() =>
+    Schema.decodeUnknownSync(snapshot.successSchema)({
+      workstreams: [],
+      epics: [],
+      issues: [],
+      jobs: [],
+      sessions: [],
+      agents: [],
+    }),
+  ).toThrow();
+
+  // And ResyncRequired names the daemon's CURRENT generation, so the refusal says which
+  // context the client must re-hydrate into — not merely that its cursor is bad.
+  // A streaming RPC's error rides the `RpcSchema.Stream` envelope, so the channel under
+  // test is `successSchema.error` (its `errorSchema` is the non-streaming one, `never`).
+  const refusal = Schema.decodeUnknownSync(events.successSchema.error)({
+    _tag: "ResyncRequired",
+    sinceOffset: 2,
+    maxOffset: 3,
+    generation,
+  });
+  expect(refusal).toBeInstanceOf(ResyncRequired);
+  expect(refusal.generation).toBe(generation);
+  // The refusal is expressible even when the cursor is WITHIN the log's extent — the case
+  // an offset-only rule could not detect at all.
+  expect(refusal.sinceOffset).toBeLessThanOrEqual(refusal.maxOffset);
+
+  // `sessionEvents` therefore has a TWO-error channel: the existence question and the
+  // generation question are independent, and both must be expressible on it.
+  expect(
+    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
+      _tag: "SessionNotFound",
+      id: "ses-9",
+    }),
+  ).toBeInstanceOf(SessionNotFound);
+  expect(
+    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
+      _tag: "ResyncRequired",
+      sinceOffset: 2,
+      maxOffset: 3,
+      generation,
+    }),
+  ).toBeInstanceOf(ResyncRequired);
 });
 
 it("decodes the events request through the wire JSON codec — {} replays from origin (CE2.0 B1)", () => {
@@ -325,6 +397,7 @@ it("rejects a payload that is not an owned domain value", () => {
       jobs: [],
       sessions: [],
       agents: [],
+      generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
     }),
   ).toThrow();
   // And a malformed agent (an unparseable `retiredAt`) fails the same way.
@@ -336,6 +409,7 @@ it("rejects a payload that is not an owned domain value", () => {
       jobs: [],
       sessions: [],
       agents: [{ ...agent, retiredAt: "yesterday" }],
+      generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
     }),
   ).toThrow();
 });

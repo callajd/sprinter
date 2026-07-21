@@ -1,4 +1,8 @@
 {
   "extends": "./tsconfig.base.json",
-  "include": ["packages/*/src/**/*.ts"]
+  // The gate covers every hand-written `.ts` in the repo, NOT only the packages. The
+  // golden GENERATOR and the golden-freshness CHECKER live under `apple/Sprinter/scripts`
+  // and are what INV-MIRROR's guard is made of — an unchecked guard is not a guard, so
+  // they are type-checked and linted exactly like production code.
+  "include": ["packages/*/src/**/*.ts", "apple/Sprinter/scripts/**/*.ts"]
 }

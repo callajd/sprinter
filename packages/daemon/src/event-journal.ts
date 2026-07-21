@@ -40,10 +40,13 @@
  *
  * A durable cursor outlives a STORE GENERATION, though, and the store never migrates
  * (INV-FRESH): a schema-version bump drops the database, restarting the log's offsets
- * at `1`. That is what {@link requireLiveCursor} exists for — a cursor beyond the
- * log's extent cannot belong to this generation, so the request fails with the
- * contract's `ResyncRequired` and the client re-hydrates from `snapshot` instead of
- * being silently mis-resumed.
+ * at `1`. That is what {@link requireLiveCursor} exists for. It compares the
+ * GENERATION IDENTITY the request carries against `StateStore.generation` — an
+ * equality on an explicit id, not an inference from offsets, because a stale cursor
+ * stops being detectable from the numbers the moment the new log outgrows it — and
+ * fails with the contract's `ResyncRequired` so the client re-hydrates from `snapshot`
+ * instead of being silently mis-resumed. The extent check survives as a cheap
+ * secondary.
  */
 import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import {
@@ -52,7 +55,13 @@ import {
   ResyncRequired,
   WorkGraphEvent,
 } from "@sprinter/contract";
-import type { Agent, NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
+import type {
+  Agent,
+  NonNegativeInt,
+  SessionEvent,
+  SessionId,
+  StoreGenerationId,
+} from "@sprinter/domain";
 import {
   type AgentWrite,
   type PersistedEvent,
@@ -254,6 +263,11 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       // A pure read — no live fan-out — so it delegates straight to the base store.
       countEntries: base.sessionLog.countEntries,
     },
+    // The generation is a property of the DURABLE store, not of journaling: this
+    // decorator adds a live fan-out over the same tables, so it reports the base
+    // store's identity unchanged (a decorator that minted its own would make the
+    // offsets it publishes belong to a generation no cursor could ever match).
+    generation: base.generation,
     withTransaction: base.withTransaction,
   });
 
@@ -319,8 +333,8 @@ const decodedReplay = (
   );
 
 /**
- * Decide whether `sinceOffset` can belong to THIS store generation, failing with the
- * contract's {@link ResyncRequired} when it cannot.
+ * Decide whether `sinceOffset` belongs to THIS store generation, failing with the
+ * contract's {@link ResyncRequired} when it does not.
  *
  * `EventLogStore.tail` is a strict `> offset` slice, which is exactly right while the
  * log's offset space is monotonic — but that space is not eternal. Bumping
@@ -334,28 +348,46 @@ const decodedReplay = (
  * (the client goes quiet until the new log outgrows the stale mark) nor by replaying
  * from the origin behind the client's back (the client's contiguous cursor is still
  * stale, so it discards the whole replay AND every subsequent live event, and re-reads
- * the log on every reconnect — unbounded and undetectable). It makes the generation
- * EXPLICIT: a cursor beyond the log's current extent is impossible in this generation,
- * so the request fails with {@link ResyncRequired} and the client re-hydrates from
- * `snapshot`, dropping its stale retained state along with its stale cursor.
+ * the log on every reconnect — unbounded and undetectable).
  *
- * The comparison is against {@link EventLogStore.maxOffset} — the log's extent, read
- * from the backing's index rather than by materialising the feed. `sinceOffset === 0`
- * (or absent) is the ORIGIN request and is valid against every generation, including
- * an empty log, so it never trips this.
+ * The generation is therefore EXPLICIT — an IDENTITY the request carries, not a
+ * property inferred from the numbers. That distinction is the whole point. An extent
+ * check (`sinceOffset > maxOffset`) is SUFFICIENT to catch a stale cursor but never
+ * NECESSARY: the moment a new generation's log grows past the stale mark, the stale
+ * cursor is `<= maxOffset` and an extent check sees nothing at all — the daemon would
+ * resume the client incrementally against a coordinate space its cursor never belonged
+ * to, silently and undetectably from either side. So a cursor-bearing request must
+ * carry the {@link StoreGenerationId} it was minted under (read off
+ * `Snapshot.generation`), and this refuses:
+ *
+ * - a cursor whose generation DIFFERS from `store.generation` — the store was dropped
+ *   and recreated under the client;
+ * - a cursor with NO generation at all — a cursor with no context is exactly as
+ *   un-resumable as one from the wrong context, and accepting it would leave a
+ *   trivially bypassable guard;
+ * - a cursor beyond {@link EventLogStore.maxOffset} — kept as a cheap SECONDARY check,
+ *   since a cursor ahead of the log is impossible even within one generation (a client
+ *   that mangled its own cursor, or a replayed request against a truncated log).
+ *
+ * `sinceOffset === 0` (or absent) is the ORIGIN request: it names no coordinate, so it
+ * is valid against every generation — including an empty log — and never trips this,
+ * with or without a `generation`.
  */
 const requireLiveCursor = (
   store: Store,
   sinceOffset: number,
+  generation: StoreGenerationId | undefined,
 ): Effect.Effect<void, ResyncRequired> =>
   sinceOffset === 0
     ? Effect.void
     : store.events.maxOffset.pipe(
         Effect.orDie,
         Effect.flatMap((maxOffset) =>
-          sinceOffset <= maxOffset
+          generation === store.generation && sinceOffset <= maxOffset
             ? Effect.void
-            : Effect.fail(new ResyncRequired({ sinceOffset, maxOffset })),
+            : Effect.fail(
+                new ResyncRequired({ sinceOffset, maxOffset, generation: store.generation }),
+              ),
         ),
       );
 
@@ -387,9 +419,10 @@ export const resyncEvents = (
   store: Store,
   feed: Feed,
   sinceOffset?: number,
+  generation?: StoreGenerationId,
 ): Stream.Stream<OffsetEvent, ResyncRequired> =>
   Stream.unwrap(
-    requireLiveCursor(store, sinceOffset ?? 0).pipe(
+    requireLiveCursor(store, sinceOffset ?? 0, generation).pipe(
       Effect.andThen(feed.subscribe),
       Effect.map((subscription) =>
         Stream.concat(resyncFrom(store, sinceOffset ?? 0), Stream.fromSubscription(subscription)),

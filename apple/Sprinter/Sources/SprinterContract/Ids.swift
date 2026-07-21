@@ -69,3 +69,22 @@ public struct AgentId: StringIdentifier {
   public let rawValue: String
   public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+/// Identifies one STORE GENERATION — the lifetime of a single durable daemon store,
+/// from the moment its schema is created to the moment it is dropped and recreated.
+///
+/// The daemon's store NEVER migrates: bumping its schema version drops the database
+/// and recreates it, restarting every durable offset at `1`. A durable offset is
+/// therefore only meaningful WITHIN the generation it was minted in, and this id is
+/// what makes that context explicit on the wire: the client reads it off
+/// ``Snapshot/generation``, retains it with the state, and hands it back with every
+/// resume cursor. A cursor whose generation the daemon no longer has is refused
+/// (``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)``) instead of
+/// being resumed against a log it never belonged to.
+///
+/// It is OPAQUE. Equality is the only defined operation — nothing may parse it,
+/// order it, or infer age or version from it.
+public struct StoreGenerationId: StringIdentifier {
+  public let rawValue: String
+  public init(rawValue: String) { self.rawValue = rawValue }
+}

@@ -198,6 +198,48 @@ it.effect("rejects a RETIRING revision that also rewrites the content it retires
   }).pipe(Effect.provide(layerMemory)),
 );
 
+it.effect("rejects a RETIRING revision that retires an ALREADY-RETIRED revision", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const head = yield* agent({ id: "agt-2" });
+    yield* store.agents.putAgent(head);
+    const retirement = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-2",
+      retiredAt: "2026-07-20T12:00:00.000Z",
+    });
+    yield* store.agents.putAgent(retirement);
+
+    // A lineage goes out of service ONCE. This second retiring revision preserves the
+    // content perfectly, so the lifecycle-only rule — which ignores the lifecycle
+    // columns by design — cannot see it; it is exactly the append that rule leaves
+    // through. Allowing it would leave TWO revisions each carrying a `retiredAt`, at
+    // two different instants, with nothing to say which one the lineage actually
+    // stopped at.
+    const error = yield* store.agents
+      .putAgent(
+        yield* agent({
+          id: "agt-4",
+          supersedes: "agt-3",
+          retiredAt: "2026-07-21T12:00:00.000Z",
+        }),
+      )
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    // Nothing was written — the history still holds exactly one retirement.
+    expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
+      "agt-2",
+      "agt-3",
+    ]);
+
+    // And the retirement itself stays IDEMPOTENT: a byte-identical re-append of the
+    // SAME retiring revision is the crash-retry case and is still a no-op, not a
+    // second stamp. The rule rejects a NEW retirement, never a replayed one.
+    expect(yield* store.agents.putAgent(retirement)).toBe("unchanged");
+  }).pipe(Effect.provide(layerMemory)),
+);
+
 it.effect("lets a NON-retiring revision change content freely — that is what an edit IS", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

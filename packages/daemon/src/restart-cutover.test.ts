@@ -233,10 +233,14 @@ it.effect(
       // ── PHASE 1 — build + write: dispatch the Job to a mid-flight `running`, held LIVE,
       //    persisted to the file; then TEAR DOWN the daemon (the process kill). ─────────
       const piA = yield* makeScriptedPi;
-      const runningOffset = yield* Effect.gen(function* () {
+      const resumePoint = yield* Effect.gen(function* () {
         return yield* Effect.gen(function* () {
           const client = yield* RpcClient.make(SprinterRpc);
 
+          // The app hydrates FIRST, and what it retains is the pair: the state and the
+          // STORE GENERATION it was read in. The generation is the context every later
+          // cursor is interpreted in, so a resume hands back both.
+          const generation = (yield* client.snapshot()).generation;
           yield* client.control({ workstreamId: seedWorkstream.id, action: "start" });
           // The scripted pi spawns; drive a live turn + a transcript entry, held open (no
           // `agent_settled`), so the Job is durably `running` when the daemon is killed.
@@ -256,7 +260,7 @@ it.effect(
             Effect.map(Option.getOrThrow),
             Effect.orDie,
           );
-          return running.offset;
+          return { offset: running.offset, generation };
         }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
       }).pipe(Effect.provide(harnessDaemon(config, piA)), Effect.scoped);
 
@@ -265,7 +269,8 @@ it.effect(
 
       // ── PHASE 2 — restart + read: a FRESH daemon on the SAME file + socket. Its boot
       //    `StartupReconcile` re-dispatches the persisted `running` Job; a fresh client (the
-      //    app re-dialing) resumes the events feed from `runningOffset` and observes the Job
+      //    app re-dialing) resumes the events feed from the retained resume point (offset +
+      //    generation) and observes the Job
       //    settle — strictly AFTER the cursor (no dup) and reaching `succeeded` (no loss). ──
       const piB = yield* makeScriptedPi;
       yield* Effect.gen(function* () {
@@ -279,24 +284,31 @@ it.effect(
           const client = yield* RpcClient.make(SprinterRpc);
 
           // The app resyncs: snapshot hydrates, and the offset-resumed events feed carries
-          // the post-restart deltas. Collect every delta strictly after the cursor up to the
-          // terminal `succeeded` — asserting monotonic, all `> runningOffset` (no dup).
-          const resumed = yield* client.events({ sinceOffset: runningOffset }).pipe(
-            Stream.takeUntil(
-              (offsetEvent) =>
-                offsetEvent.event._tag === "JobChanged" &&
-                offsetEvent.event.job.id === "job-seed" &&
-                offsetEvent.event.job.status === "succeeded",
-            ),
-            Stream.runCollect,
-            Effect.timeout(HARD_TIMEOUT),
-            Effect.orDie,
-          );
+          // the post-restart deltas. Collect every delta strictly after the cursor up to
+          // the terminal `succeeded` — asserting monotonic, all past the cursor (no dup).
+          // The resume carries the generation retained in PHASE 1. A restart on the SAME
+          // database at the SAME schema version does NOT start a new generation (the
+          // identity is minted by `createSchema`, and no reset happened), so this cursor
+          // is genuinely live and the daemon must resume it incrementally — the guard
+          // must refuse dead cursors WITHOUT refusing this one.
+          const resumed = yield* client
+            .events({ sinceOffset: resumePoint.offset, generation: resumePoint.generation })
+            .pipe(
+              Stream.takeUntil(
+                (offsetEvent) =>
+                  offsetEvent.event._tag === "JobChanged" &&
+                  offsetEvent.event.job.id === "job-seed" &&
+                  offsetEvent.event.job.status === "succeeded",
+              ),
+              Stream.runCollect,
+              Effect.timeout(HARD_TIMEOUT),
+              Effect.orDie,
+            );
 
           // No duplication: every replayed delta is STRICTLY AFTER the resume cursor…
           expect(resumed.length).toBeGreaterThan(0);
           for (const offsetEvent of resumed)
-            expect(offsetEvent.offset).toBeGreaterThan(runningOffset);
+            expect(offsetEvent.offset).toBeGreaterThan(resumePoint.offset);
           // …and monotonically increasing (a gap-free contiguous resume, no reordering loss).
           const offsets = resumed.map((oe) => oe.offset);
           expect([...offsets]).toStrictEqual([...offsets].sort((a, b) => a - b));

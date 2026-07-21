@@ -13,9 +13,11 @@ import Testing
 /// — and the delta model cannot repair it, because deltas are upsert-only (there is no
 /// `*Removed`), so nothing streamed can remove an entity the reset destroyed.
 ///
-/// The daemon therefore makes the generation EXPLICIT: the `events` request fails with
-/// ``ContractError/resyncRequired(sinceOffset:maxOffset:)``. This suite pins the
-/// client's half of that contract.
+/// The daemon therefore makes the generation EXPLICIT — an IDENTITY the client sends with
+/// its cursor and the daemon compares, not a staleness inferred from offsets (which stops
+/// working the moment the new log outgrows the stale cursor). A mismatch fails the request
+/// with ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)``. This suite
+/// pins the client's half of that contract.
 @Suite("Store-generation resync (ResyncRequired)")
 struct StoreGenerationResyncTests {
   /// A client that reconnected with a stale `sinceOffset` would either be handed nothing
@@ -62,11 +64,15 @@ struct StoreGenerationResyncTests {
     var out2 = second.outbound.makeAsyncIterator()
     let refused = try await nextSent(&out2)
     #expect(refused.rpcTag == "events")
-    #expect(refused.payload == (try toJSONValue(EventsPayload(sinceOffset: 1))))
+    // The resume carries the cursor AND the generation the retained baseline was hydrated
+    // in — the pair the daemon needs to decide whether the cursor is live at all.
+    #expect(refused.payload == (try Fixtures.resumePayload(1)))
+    // The daemon has been reset: its generation is now a DIFFERENT one, and it says so —
+    // with the cursor WITHIN the new log's extent, the case no offset rule can see.
     second.emit(
       Wire.exitFail(
         requestId: try #require(refused.id),
-        error: try Wire.encoded(ContractError.resyncRequired(sinceOffset: 1, maxOffset: 0))))
+        error: try Wire.encoded(Fixtures.resyncRefusal(sinceOffset: 1))))
     second.close()
 
     // ── Attempt 3: NOT a resume. The client subscribes around a FRESH snapshot. ──

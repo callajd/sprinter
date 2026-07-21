@@ -43,8 +43,16 @@ public struct Agent: Codable, Equatable, Sendable {
   /// The ISO-8601 UTC instant the agent was retired; `nil` while it is in service.
   public let retiredAt: String?
 
-  /// True when the agent has been retired — i.e. it carries a ``retiredAt`` stamp.
-  /// The ONLY expression of retired-ness (INV-SUM).
+  /// True when THIS RECORD carries a ``retiredAt`` stamp. The only expression of a
+  /// record's retired-ness (INV-SUM).
+  ///
+  /// - Important: this is deliberately NOT the question "is this agent still in
+  ///   service". Under append-only semantics, retiring `agt-2` appends a NEW revision
+  ///   `agt-3` carrying `supersedes: agt-2` and the stamp; `agt-2` is immutable and
+  ///   stays un-stamped forever, so `agt-2.isRetired` is `false` even though its
+  ///   lineage is retired — correctly, because the RECORD never was. UI that means
+  ///   "still in service" must ask ``isLineageRetired(_:in:)`` instead; reaching for
+  ///   this one renders a retired lineage as live.
   public var isRetired: Bool { retiredAt != nil }
 
   /// True when this is the FIRST revision of its lineage — it replaces nothing.
@@ -67,4 +75,49 @@ public struct Agent: Codable, Equatable, Sendable {
     self.supersedes = supersedes
     self.retiredAt = retiredAt
   }
+}
+
+/// True when `agent`'s LINEAGE has been retired — i.e. `agent` itself carries a
+/// ``Agent/retiredAt`` stamp, or some revision in `all` retires it, directly or
+/// through a chain of later revisions. Mirror of `@sprinter/domain`'s
+/// `isLineageRetired`.
+///
+/// This is the "is this agent still in service" question, and it is the one a UI
+/// almost always means. ``Agent/isRetired`` answers a question about ONE RECORD, and
+/// under append-only semantics the two differ: a retirement is a NEW revision carrying
+/// the stamp, so the revision it retires stays un-stamped forever and reads as live.
+///
+/// Answering it needs the REVERSE of the ``Agent/supersedes`` link, which no single
+/// revision carries. This derives that reverse index from a whole-registry collection
+/// — superseded and retired revisions included, exactly what ``Snapshot/agents``
+/// hands over — and walks FORWARD from `agent` until it reaches a stamped revision or
+/// the head of the lineage. Revisions belonging to other lineages are ignored.
+///
+/// On a WELL-FORMED history the answer does not depend on `all`'s order: each revision
+/// has at most one successor, so there is exactly one forward path. On a MALFORMED one
+/// (a revision superseded by two revisions, which the writer's precondition excludes)
+/// it does: the index keeps the first successor it encounters and the walk follows that
+/// branch only.
+///
+/// - Complexity: O(n) in `all` per call — the reverse index is rebuilt each time, so
+///   folding this over a whole registry is O(n²). Fine for a lookup; if a view ever
+///   folds it across every revision, build the successor index once at the call site.
+///
+/// The walk visits each revision at most once, so it terminates even on the cyclic
+/// `supersedes` structure the precondition forbids.
+public func isLineageRetired(_ agent: Agent, in all: some Sequence<Agent>) -> Bool {
+  var successors: [AgentId: Agent] = [:]
+  for revision in all {
+    if let supersedes = revision.supersedes, successors[supersedes] == nil {
+      successors[supersedes] = revision
+    }
+  }
+  var seen: Set<AgentId> = []
+  var current: Agent? = agent
+  while let revision = current, !seen.contains(revision.id) {
+    if revision.isRetired { return true }
+    seen.insert(revision.id)
+    current = successors[revision.id]
+  }
+  return false
 }

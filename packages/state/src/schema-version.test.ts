@@ -64,6 +64,7 @@ const withStore = <A>(
  */
 const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   1: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
+  2: "4fe63e6cce2cfabc2382c99d73347aec6a08fdbf58e42791be6cfeb93f960eac",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */
@@ -88,11 +89,15 @@ it.effect("pins the emitted schema to SCHEMA_VERSION — a shape change must bum
     const digest = createHash("sha256").update(ddl).digest("hex");
 
     const fix =
-      "The persisted schema changed. THE FIX IS TO BUMP `SCHEMA_VERSION` in " +
-      "packages/state/src/sqlite.ts (existing stores must drop and recreate — " +
-      "INV-FRESH never migrates), and then ADD a row to SCHEMA_LEDGER in this test " +
-      "for the new version. Do NOT rewrite an existing row: re-using a version for a " +
-      `different shape is the exact failure this guards. Emitted schema was:\n${ddl}`;
+      "The persisted schema changed. A bump touches EXACTLY TWO FILES — both, or " +
+      "neither:\n" +
+      "  1. packages/state/src/sqlite.ts — increment `SCHEMA_VERSION` (existing " +
+      "stores must drop and recreate; INV-FRESH never migrates).\n" +
+      "  2. packages/state/src/schema-version.test.ts (THIS FILE) — ADD a row to " +
+      "`SCHEMA_LEDGER` mapping the NEW version to the digest below.\n" +
+      "Do NOT rewrite an existing ledger row: re-using a version for a different " +
+      `shape is the exact failure this guards. Digest of the emitted schema: ${digest}` +
+      `\nEmitted schema was:\n${ddl}`;
 
     // The current version must be LEDGERED, and its ledgered digest must be the one
     // the adapter just emitted. Editing `createSchema` without bumping therefore fails
@@ -182,6 +187,33 @@ it.effect("drops and recreates the store on a version mismatch — it never migr
       .all();
     probe.close();
     expect(ghosts).toStrictEqual([]);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("mints a FRESH generation on every drop-and-recreate, and only then", () =>
+  Effect.gen(function* () {
+    const filename = yield* dbFile;
+
+    // The identity is minted by `createSchema`, so it is born with the schema and dies
+    // with it. Two properties have to hold together, and neither alone is enough:
+    const first = yield* withStore(filename, (store) => Effect.succeed(store.generation));
+
+    // (1) STABLE across a reopen at the SAME version. A store that re-minted on every
+    // open would refuse every legitimate reconnect — the cursor guard would be a
+    // permanent "resync", i.e. exactly the snapshot-on-connect regression it exists to
+    // avoid — and it would be indistinguishable from a real reset.
+    const reopened = yield* withStore(filename, (store) => Effect.succeed(store.generation));
+    expect(reopened).toBe(first);
+
+    // (2) DIFFERENT after a version mismatch drops and recreates the database. This is
+    // the whole mechanism: the offsets restart at 1, so the new coordinate space MUST
+    // be distinguishable from the old one, or a client's stale cursor stays silently
+    // resumable the moment the new log outgrows it.
+    const stale = new Database(filename);
+    stale.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+    stale.close();
+    const afterReset = yield* withStore(filename, (store) => Effect.succeed(store.generation));
+    expect(afterReset).not.toBe(first);
   }).pipe(Effect.scoped),
 );
 

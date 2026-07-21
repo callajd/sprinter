@@ -52,8 +52,12 @@
  * the `events` offset-resync, so a SETTLED session's transcript is viewable in the Inspector
  * rather than a `SessionNotFound`. It streams off the durable log + `SessionEvents` feed,
  * never a poll (INV-REACTIVE). The handle's infrastructure failures (`PiTransportError` /
- * `PiRpcError`) are NOT contract errors, so they are turned into defects: the
- * contract's error channel is exactly `SessionNotFound`.
+ * `PiRpcError`) are NOT contract errors, so they are turned into defects and the
+ * contract's error channel carries only genuine contract outcomes: `SessionNotFound`
+ * for `sessionSend`/`interrupt`/`answerUiRequest`, and `SessionNotFound |
+ * ResyncRequired` for `sessionEvents` — whose `sinceOffset` is a per-session durable
+ * coordinate and therefore scoped to a STORE GENERATION exactly as the work-graph
+ * cursor is (both logs are dropped by a schema-version bump).
  *
  * Likewise the concrete LocalPi `ExecutionRunner` adapter is deferred (AE4.2/AE5):
  * these handlers drive the `JobRunner` PORT, which a runtime backs with either the
@@ -66,6 +70,7 @@ import {
   IssueNotFound,
   type OffsetSessionEvent,
   PlanRejected,
+  ResyncRequired,
   SessionNotFound,
   type Snapshot,
   SprinterRpc,
@@ -80,6 +85,7 @@ import {
   type Session,
   type SessionId,
   type SessionInput,
+  type StoreGenerationId,
   type UiResponse,
   type WorkStatus,
   type Workstream,
@@ -98,6 +104,14 @@ type Runner = Context.Service.Shape<typeof JobRunner>;
 type Registry = Context.Service.Shape<typeof SessionRegistry>;
 type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
 
+/**
+ * The `sessionEvents` error channel: two INDEPENDENT refusals — the session is not
+ * one this daemon knows ({@link SessionNotFound}), or the client's resume cursor is
+ * not from this store generation ({@link ResyncRequired}). Named so the stream's
+ * failures widen to the whole channel rather than being inferred one branch at a time.
+ */
+type SessionEventsError = SessionNotFound | ResyncRequired;
+
 // ── snapshot ────────────────────────────────────────────────────────────────
 
 /**
@@ -110,6 +124,12 @@ type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
  * per-workstream read — because an `Agent` is global and carries no repository:
  * "the agents used in this repo" is a fold the client computes over that repo's
  * executions, never a slice the daemon stores or ships (INV-DERIVED).
+ *
+ * The snapshot also carries the store's GENERATION — the coordinate space the state
+ * was read from. This is where a client's resume context is established: it retains
+ * the generation with the state and hands it back on every cursor-bearing request, so
+ * a cursor minted before a drop-and-recreate is REFUSED rather than silently resumed
+ * against a log it never belonged to (see `requireLiveCursor` in `./event-journal.ts`).
  */
 const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   Effect.gen(function* () {
@@ -135,7 +155,15 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
         }
       }
     }
-    return { workstreams, epics, issues, jobs, sessions, agents } satisfies Snapshot;
+    return {
+      workstreams,
+      epics,
+      issues,
+      jobs,
+      sessions,
+      agents,
+      generation: store.generation,
+    } satisfies Snapshot;
   }).pipe(Effect.orDie);
 
 // ── createWorkstreamFromPlan ──────────────────────────────────────────────────
@@ -450,10 +478,12 @@ const resolveLive = (
  *   stream COMPLETES (never a spurious `SessionNotFound` for a settled session, the gap this
  *   closes).
  *
- * The stream's error channel is exactly `SessionNotFound`: the durable read is `orDie`'d and
- * the liveness gate turns its transient store failures into DEFECTS (#76) — never a
- * `SessionNotFound` that `succeedNone` would silently collapse into a settled replay,
- * dropping a live session's tail — so no store hiccup leaks past the frozen contract.
+ * The stream's error channel is exactly `SessionNotFound | ResyncRequired`, two INDEPENDENT
+ * questions: does this session exist, and is the client's cursor from THIS store generation.
+ * The durable read is `orDie`'d and the liveness gate turns its transient store failures into
+ * DEFECTS (#76) — never a `SessionNotFound` that `succeedNone` would silently collapse into a
+ * settled replay, dropping a live session's tail — so no store hiccup leaks past the frozen
+ * contract.
  */
 const resyncSessionEvents = (
   store: Store,
@@ -461,7 +491,8 @@ const resyncSessionEvents = (
   registry: Registry,
   sessionId: SessionId,
   sinceOffset?: number,
-): Stream.Stream<OffsetSessionEvent, SessionNotFound> =>
+  generation?: StoreGenerationId,
+): Stream.Stream<OffsetSessionEvent, SessionEventsError> =>
   Stream.unwrap(
     Effect.gen(function* () {
       // Subscribe BEFORE the durable read (subscribe-before-replay), so a durable entry
@@ -478,6 +509,28 @@ const resyncSessionEvents = (
       // SAME snapshot the replay is built from so the two agree (no split-read race).
       const fromOffset = sinceOffset ?? 0;
       const durable = yield* store.sessionLog.read(sessionId).pipe(Effect.orDie);
+      // GENERATION GATE — the same guard the work-graph `events` feed applies, for the
+      // same reason: `session_event_log` is `AUTOINCREMENT` too, and a schema-version
+      // bump DROPS it, restarting per-session offsets at `1`. A cursor is therefore a
+      // coordinate in ONE generation's space, and an extent check alone cannot say so
+      // (once a new generation's transcript outgrows the stale mark, `sinceOffset <=
+      // max` holds and the resume looks perfectly valid). So a cursor-bearing request
+      // must carry the generation it was minted under, and a MISMATCHED or ABSENT one
+      // is refused — with the extent as a cheap secondary. This runs BEFORE the
+      // existence verdict: a dropped store's session is a resync, not a "never existed".
+      // An ORIGIN request (no cursor) names no coordinate and is valid in any generation.
+      if (fromOffset > 0) {
+        const maxOffset = durable.at(-1)?.offset ?? 0;
+        if (generation !== store.generation || fromOffset > maxOffset) {
+          return Stream.fail<SessionEventsError>(
+            new ResyncRequired({
+              sinceOffset: fromOffset,
+              maxOffset,
+              generation: store.generation,
+            }),
+          );
+        }
+      }
       // Existence: a session is viewable if it is LIVE, has a durable transcript, OR has a
       // SETTLED (terminal) Session row — the last lets a settled session that emitted ZERO
       // durable events replay an EMPTY transcript and COMPLETE (not error). A NON-terminal row
@@ -485,7 +538,7 @@ const resyncSessionEvents = (
       // registered → `SessionNotFound` (a transient the client retries), NOT a settled empty.
       const settledRow = Option.isSome(session) && !isLiveSessionRow(session.value.status);
       if (Option.isNone(live) && durable.length === 0 && !settledRow) {
-        return Stream.fail(new SessionNotFound({ id: sessionId }));
+        return Stream.fail<SessionEventsError>(new SessionNotFound({ id: sessionId }));
       }
       const replayEntries = durable.filter((entry) => entry.offset > fromOffset);
       const maxReplayedOffset = replayEntries.at(-1)?.offset ?? fromOffset;
@@ -605,7 +658,10 @@ export const handlers = SprinterRpc.toLayer(
       // after that offset, over the same `resyncFrom` primitive. The strict
       // `> sinceOffset` ordering is scoped to that resume; within one stream the
       // subscribe-before-replay boundary can overlap (harmless under upsert).
-      events: ({ sinceOffset }) => resyncEvents(store, feed, sinceOffset),
+      // The cursor is refused unless it carries the CURRENT store generation
+      // (`Snapshot.generation`), so a cursor minted before a drop-and-recreate can
+      // never be resumed incrementally against the new log — `ResyncRequired`.
+      events: ({ sinceOffset, generation }) => resyncEvents(store, feed, sinceOffset, generation),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
@@ -621,8 +677,11 @@ export const handlers = SprinterRpc.toLayer(
       // COMPLETES (viewable transcript, no `SessionNotFound`), an absent one is
       // `SessionNotFound`. Each item is an `OffsetSessionEvent` carrying its durable offset
       // (INV-REACTIVE — no poll loop).
-      sessionEvents: ({ sessionId, sinceOffset }) =>
-        resyncSessionEvents(store, sessionFeed, sessions, sessionId, sinceOffset),
+      // Its `sinceOffset` is guarded by the SAME generation check as `events` — the
+      // per-session log is dropped by a schema bump too — so the error channel is
+      // `SessionNotFound | ResyncRequired`.
+      sessionEvents: ({ sessionId, sinceOffset, generation }) =>
+        resyncSessionEvents(store, sessionFeed, sessions, sessionId, sinceOffset, generation),
       sessionSend: ({ sessionId, input }) => driveInput(store, sessions, sessionId, input),
       interrupt: ({ sessionId }) => abortTurn(store, sessions, sessionId),
       answerUiRequest: ({ sessionId, response }) => answerUi(store, sessions, sessionId, response),

@@ -33,6 +33,7 @@ import { expect } from "vitest";
 import {
   IssueNotFound,
   PlanRejected,
+  ResyncRequired,
   SessionNotFound,
   SprinterRpc,
   WorkstreamNotFound,
@@ -47,6 +48,7 @@ import {
   type SessionEvent,
   type SessionId,
   type SessionInput,
+  StoreGenerationId,
   type UiResponse,
   Workstream,
   WorkstreamId,
@@ -208,7 +210,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
 );
 
 it.effect("snapshot of an empty daemon is empty", () =>
-  harness(({ client }) =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
       const snapshot = yield* client.snapshot();
       expect(snapshot).toEqual({
@@ -218,6 +220,10 @@ it.effect("snapshot of an empty daemon is empty", () =>
         jobs: [],
         sessions: [],
         agents: [],
+        // Empty of DATA, but never of CONTEXT: the generation is what tells a client
+        // which coordinate space the (currently empty) offset log belongs to, so an
+        // empty snapshot is still a valid resume context.
+        generation: store.generation,
       });
     }),
   ),
@@ -454,7 +460,7 @@ it.effect("events streams a work-graph delta produced by a command", () =>
       // not a replayed one: `events` replays `event_log.tail(sinceOffset)` first.
       const seeded = yield* store.events.read;
       const collector = yield* client
-        .events({ sinceOffset: seeded.length })
+        .events({ sinceOffset: seeded.length, generation: store.generation })
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
       // Drive a REPEATABLE command until the (lazily-subscribing) events stream
       // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
@@ -486,7 +492,7 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
       // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
       const replay = yield* client
-        .events({ sinceOffset: 2 })
+        .events({ sinceOffset: 2, generation: store.generation })
         .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
         .pipe(Effect.flatMap(Fiber.join));
 
@@ -582,10 +588,63 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
       // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
       const cursor = offsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .sessionEvents({ sessionId, sinceOffset: cursor, generation: store.generation })
         .pipe(Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
+    }),
+  ),
+);
+
+// The SESSION channel carries the identical stale-generation hazard as the work-graph feed
+// — `session_event_log` is `AUTOINCREMENT` too, and a schema-version bump drops it — so it
+// gets the identical guard, not a weaker one. These pin BOTH halves of it.
+it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      yield* store.jobs.putSession(session);
+      yield* store.jobs.putJob(orphanedJob);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.append(sessionId, noticeEvent);
+
+      // A cursor WITHIN this transcript's extent — an extent check alone would wave it
+      // through — but minted under a generation this store never had. Resuming it would
+      // tail a transcript the cursor's coordinates never indexed.
+      const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
+        "00000000-dead-4000-8000-000000000000",
+      );
+      const failure = yield* client
+        .sessionEvents({ sessionId, sinceOffset: 1, generation: deadGeneration })
+        .pipe(Stream.runCollect, Effect.flip);
+      expect(failure).toBeInstanceOf(ResyncRequired);
+      if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+      expect(failure.sinceOffset).toBe(1);
+      // WITHIN the extent — so this refusal is the identity check, not the extent check.
+      expect(failure.sinceOffset).toBeLessThanOrEqual(failure.maxOffset);
+      expect(failure.generation).toBe(store.generation);
+    }),
+  ),
+);
+
+it.effect("sessionEvents REFUSES a cursor carrying NO generation, and admits the ORIGIN", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      yield* store.jobs.putSession(session);
+      yield* store.jobs.putJob(orphanedJob);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      // A cursor with no generation has no context to be valid in — refused, exactly as a
+      // wrong one is, so the guard cannot be bypassed by omitting the key.
+      const failure = yield* client
+        .sessionEvents({ sessionId, sinceOffset: 1 })
+        .pipe(Stream.runCollect, Effect.flip);
+      expect(failure).toBeInstanceOf(ResyncRequired);
+
+      // The ORIGIN request names no coordinate, so it is valid in EVERY generation and is
+      // never refused — a first connect (and today's client, which sends no cursor) is
+      // untouched by the guard.
+      const replayed = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      expect(replayed.map((i) => i.event)).toEqual([entryAppended]);
     }),
   ),
 );
@@ -685,7 +744,7 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
       // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
       const cursor = durableOffsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .sessionEvents({ sessionId, sinceOffset: cursor, generation: store.generation })
         .pipe(Stream.take(1), Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);

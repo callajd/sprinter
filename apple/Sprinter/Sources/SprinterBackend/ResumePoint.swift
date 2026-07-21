@@ -6,7 +6,9 @@ import SprinterContract
 ///
 /// The two are ONE value because they are only ever meaningful together. The offset
 /// is a cursor INTO the daemon's durable log, and the snapshot is the state produced
-/// by applying everything up to it; resuming means asking for the deltas strictly
+/// by applying everything up to it — and it is also what CARRIES the store generation
+/// the cursor is a coordinate in (``Snapshot/generation``), which a resume must send
+/// with the cursor for the daemon to validate it at all; resuming means asking for the deltas strictly
 /// after the cursor and folding them onto that snapshot. Either one alone is not a
 /// resume point — a cursor with no baseline has nothing to fold onto, and a baseline
 /// with no cursor cannot say where to continue from — so ``resumable`` yields a point
@@ -14,9 +16,10 @@ import SprinterContract
 /// published) falls back to subscribe-around-snapshot.
 ///
 /// Keeping them together is also what makes ``discard()`` correct by construction.
-/// When the daemon reports ``ContractError/resyncRequired(sinceOffset:maxOffset:)``
-/// its store was dropped and recreated, so the cursor names a coordinate space that
-/// no longer exists AND the baseline describes entities the reset destroyed. BOTH
+/// When the daemon reports
+/// ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)`` its store was
+/// dropped and recreated, so the cursor names a coordinate space that no longer exists
+/// AND the baseline describes entities the reset destroyed. BOTH
 /// must go: clearing only the cursor would leave the engine folding fresh deltas onto
 /// a phantom baseline it can never correct, because the delta model is upsert-only
 /// (there is no `*Removed` variant) — nothing the daemon can send removes a stale

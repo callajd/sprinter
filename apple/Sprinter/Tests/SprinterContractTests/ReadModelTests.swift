@@ -18,6 +18,12 @@ struct ReadModelTests {
     // the lexicographic-by-id order the daemon's `listAgents` pins.
     #expect(snapshot.agents.count == 3)
     #expect(snapshot.agents.map(\.id.rawValue) == ["agt-1", "agt-2", "agt-3"])
+    // And the STORE GENERATION — the coordinate space this state's durable offsets live
+    // in. A client retains it with the state and hands it back on every resume, so a
+    // snapshot that dropped it would leave the client unable to resume at all.
+    #expect(
+      snapshot.generation
+        == StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
     #expect(try Golden.roundTrip(snapshot) == snapshot)
   }
 

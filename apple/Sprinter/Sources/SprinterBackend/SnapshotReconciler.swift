@@ -58,6 +58,11 @@ extension Snapshot {
   /// Returns a copy with the given collections swapped in; an omitted argument
   /// keeps the current value. Keeps ``SnapshotReconciler`` free of the full
   /// initializer boilerplate at each case.
+  ///
+  /// The ``Snapshot/generation`` is deliberately NOT replaceable: it is the coordinate
+  /// space this baseline was hydrated in, and folding a delta never moves the baseline to
+  /// a different one. A delta from another generation cannot reach here at all — the
+  /// daemon refuses the resume that would have carried it.
   fileprivate func replacing(
     workstreams: [Workstream]? = nil,
     epics: [Epic]? = nil,
@@ -72,6 +77,7 @@ extension Snapshot {
       issues: issues ?? self.issues,
       jobs: jobs ?? self.jobs,
       sessions: sessions ?? self.sessions,
-      agents: agents ?? self.agents)
+      agents: agents ?? self.agents,
+      generation: generation)
   }
 }
