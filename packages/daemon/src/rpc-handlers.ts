@@ -619,13 +619,13 @@ const retry = (
  * non-terminal statuses so any future status defaults to fail-fast (never
  * re-introducing a spurious multi-second stall on a settled/unknown state).
  *
- * The gate keys on the JOB, not the durable `Execution` row, ON PURPOSE (CE4.1 FIX A):
- * `startup-reconcile` settles a stale `running` Job it cannot resume by writing ONLY
- * the Job row (its `putJob` → terminal), and NEVER settles the Execution row. So after a
- * crash + restart a settled-not-resumed job leaves its Execution row NON-TERMINAL
- * (`starting`/`active`) while its Job is terminal. Gating on the Execution row would
- * mistake that crash-orphaned state for mid-dispatch and stall the full resolve bound;
- * the Job — the dispatch unit reconcile maintains — is the authoritative signal.
+ * This is HALF the gate, and deliberately the coarser half (CE4.1 FIX A). It keys on the
+ * JOB — the dispatch unit `startup-reconcile` maintains — so a job that a crash left
+ * behind and reconcile then settled fails fast no matter what shape its Execution rows are
+ * in. It is NOT sufficient alone: reconcile settles a paused Workstream's Job to `queued`,
+ * which IS mid-dispatch, so this predicate says "wait" on a run that is over. The
+ * Execution-side half below (a LIVE transcript) is what fails that case fast — see the
+ * note there; the two are read TOGETHER in `resolveLive`, and neither is the whole gate.
  */
 const isMidDispatchJob = (status: Job["status"]): boolean =>
   status === "queued" || status === "running";
@@ -637,12 +637,14 @@ const isMidDispatchJob = (status: Job["status"]): boolean =>
 // is now ONE value rather than an enum a settle path and a gate had to keep agreeing
 // about, so there is no longer a status this predicate could fail to classify.
 //
-// It remains the belt to `isMidDispatchJob`'s braces (CE4.1-R4): `startup-reconcile`
-// can settle a stale `running` Job to `queued` under a paused Workstream — `queued` IS
-// mid-dispatch, so a Job-only gate would bounded-WAIT on that orphan and stall the full
-// resolve bound. Reconcile SEALS the execution's transcript alongside, so gating on
-// BOTH (mid-dispatch Job AND live Execution) fails that `queued`-orphan fast while
-// still bridging a genuine mid-dispatch (running Job + live Execution).
+// It is the belt to `isMidDispatchJob`'s braces (CE4.1-R4), and it is the half that
+// carries the `queued`-orphan case: `startup-reconcile` settles a stale `running` Job to
+// `queued` under a paused Workstream — `queued` IS mid-dispatch, so a Job-only gate would
+// bounded-WAIT on that orphan and stall the full resolve bound. Reconcile SEALS the
+// transcript of EVERY execution the job owns alongside that write, so gating on BOTH
+// (mid-dispatch Job AND live Execution) fails the `queued`-orphan fast while still
+// bridging a genuine mid-dispatch (running Job + live Execution). The two comments
+// describe the SAME gate from its two sides; neither predicate decides it alone.
 
 /**
  * Resolve the live {@link ExecutionHandle} for a `executionId`, choosing wait-vs-fail-fast
@@ -650,7 +652,8 @@ const isMidDispatchJob = (status: Job["status"]): boolean =>
  * resolves execution → job → job-status and gates on the JOB:
  *
  * - read the durable `Execution` row from the {@link StateStore} to recover the `jobId`
- *   it belongs to (1 Job = 1 execution); ABSENT → nothing is or will be registered, fail
+ *   it belongs to (every execution names exactly one job; a job owns a TREE of them, and
+ *   the edge cannot cross jobs); ABSENT → nothing is or will be registered, fail
  *   fast through `ExecutionRegistry.get`. A row that is itself TERMINAL (not
  *   {@link isExecutionLive live}) also fails fast — it covers the reconcile
  *   `queued`-orphan (CE4.1-R4) whose Job stays mid-dispatch but whose Execution was settled;
@@ -662,8 +665,8 @@ const isMidDispatchJob = (status: Job["status"]): boolean =>
  *   `ExecutionRegistry.get`, which FAILS FAST with {@link ExecutionNotFound} — no
  *   multi-second stall on a registration that will never land. This covers the Inspector
  *   opening channels for SETTLED jobs (BE4.1), the crash-orphaned case (a terminal Job
- *   whose Execution row an older reconcile left NON-TERMINAL), and — via the Execution-row
- *   check above — the `queued`-orphan the Job gate alone would miss.
+ *   whose Execution row an older reconcile left with an OPEN transcript), and — via the
+ *   Execution-row check above — the `queued`-orphan the Job gate alone would miss.
  *
  * FIX B (CE4.1, revised #76): a transient `StateStoreError` from either durable read is
  * a DEFECT (`Effect.die`), never folded into `ExecutionNotFound`. Conflating a store

@@ -16,8 +16,10 @@ public enum Transcript: Codable, Equatable, Sendable {
   /// stay current must tail it.
   case live(LiveTranscript)
   /// The run has ended — `[0, lastOffset]` is a final, immutable PREFIX of the
-  /// transcript, so it is cacheable once read. `lastOffset` is a LOWER BOUND on the
-  /// extent, not a claim that nothing exists beyond it (see ``SealedTranscript``).
+  /// transcript, so entries already read within it are cacheable. `lastOffset` is a LOWER
+  /// BOUND on the extent, not a claim that nothing exists beyond it, so a reader that
+  /// wants the whole transcript must still ask the daemon how far the log goes (see
+  /// ``SealedTranscript``).
   case sealed(SealedTranscript)
 
   private enum CodingKeys: String, CodingKey {
@@ -66,14 +68,22 @@ public struct LiveTranscript: Codable, Equatable, Sendable {
 /// produced no durable entry at all, which is a valid, EMPTY sealed transcript.
 ///
 /// CONTRACT — `lastOffset` is a LOWER BOUND on the extent, mirroring the daemon's
-/// `SealedTranscript`. `[0, lastOffset]` is guaranteed COMPLETE and IMMUTABLE, which is
-/// the entire cacheability claim and is unconditionally true: entries never change and
-/// per-execution offsets never reset, so a cached prefix can never be invalidated. It is
-/// NOT a guarantee that the daemon's durable log holds nothing beyond it — the seal
-/// falls back to `0` on a transient extent read, an append in flight when the run
-/// terminates can land after the extent is read, and a re-dispatch appends to the same
-/// log. A client may therefore cache what it has read and must still be prepared to be
-/// handed more; it must never treat a sealed transcript as proof of the whole.
+/// `SealedTranscript` (`packages/domain/src/read-model.ts`). The ONLY claim it makes is
+/// about the PREFIX `[0, lastOffset]`: that range is complete and immutable, so entries a
+/// client has already read within it can be cached and never re-fetched. It says NOTHING
+/// about the transcript as a whole. The daemon's own log may hold entries beyond it — the
+/// seal falls back to `0` on a transient extent read, an append in flight when the run
+/// terminates can land after the extent is read, a per-append store error is absorbed and
+/// leaves a gap the extent never reflects, and a re-dispatch re-attaches the same execution
+/// id and APPENDS to the same log, so a sealed transcript can even become live again with a
+/// strictly greater extent.
+///
+/// So a client must NOT treat this value as "the transcript is this long" and must not use
+/// it to decide it has everything. Reading a sealed transcript to completion still means
+/// asking the daemon for the log's CURRENT extent (`maxOffset` behind
+/// `executionEvents`/replay) and reading forward from whatever it has cached; `lastOffset`
+/// is a floor to start from, not a total. What it does buy is real and unconditional:
+/// nothing already read can be invalidated, so re-reading is always append-only work.
 ///
 /// It has no tail, and that is expressed by it NOT being a ``LiveTranscript`` rather
 /// than by a runtime refusal.

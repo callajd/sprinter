@@ -425,8 +425,9 @@ it.effect("fails and persists a failed terminal when the runner cannot start the
     const error = yield* runner.dispatch(job).pipe(Effect.flip);
     expect(error._tag).toBe("ExecutionRunnerError");
 
-    // The initial persist wrote running/starting; a run failure must not leave that
-    // limbo — the durable rows are moved to a failed terminal.
+    // The initial persist wrote a `running` Job and an execution with an OPEN transcript
+    // (there is no `starting` status — DE2.2 deleted `ExecutionStatus`); a run failure
+    // must not leave that limbo — the durable rows are moved to a failed terminal.
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
     // …and the execution is no longer LIVE: its transcript is sealed, so no liveness

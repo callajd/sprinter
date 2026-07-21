@@ -474,6 +474,16 @@ const GENERATION_KEY = "generation";
  * called it deterministic. The partial index refuses the second root outright, so a tree
  * has one root by construction and the read has exactly one row it can return.
  *
+ * Version 9 closes the tree at the JOB boundary: `execution` gains `UNIQUE (id, "jobId")`
+ * and its `parent` edge becomes COMPOSITE — `FOREIGN KEY (parent, "jobId") REFERENCES
+ * execution (id, "jobId")`. Version 8's single-column key constrained only that the parent
+ * ROW exists; nothing required it to belong to the SAME job, so a CROSS-JOB edge was an
+ * ordinary write and it recreated the very state version 8 closed — a job owning an
+ * execution while holding no `parent IS NULL` row, hence `getExecutionForJob` → `None` and
+ * a `startup-reconcile.settle` that silently skips sealing. With the composite key a
+ * child's `"jobId"` must MATCH its parent's, so "one job owns one tree, and that tree has
+ * exactly one root" is enforced by the engine (INV-ENFORCE).
+ *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
@@ -481,7 +491,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -686,6 +696,17 @@ const createSchema = Effect.gen(function* () {
       "dependsOn" TEXT NOT NULL,
       PRIMARY KEY ("issueId", seq)
     )`;
+  // KNOWN ASYMMETRY — `job."executionId"` is NOT a foreign key, while `execution."jobId"`
+  // is. That is deliberate, and it is the one place this schema does not reach INV-ENFORCE:
+  // the two tables reference each OTHER, so a plain key is unwritable in EITHER order. A
+  // job's execution cannot be stored before the job (its own `"jobId"` key refuses it), and
+  // a job naming an execution cannot be stored before that execution — the pair is only
+  // insertable as a cycle, which SQLite admits solely through DEFERRABLE INITIALLY DEFERRED
+  // constraints inside an explicit transaction, a mechanism nothing else on this path uses.
+  // The surviving consequence, stated rather than hidden: a job may name an `"executionId"`
+  // that was never stored, and no engine check will say so. Every read that matters resolves
+  // the other way (`execution."jobId"`, which IS enforced), so the dangling direction is
+  // presentational, not structural.
   yield* sql`CREATE TABLE job (
       id TEXT PRIMARY KEY NOT NULL,
       "issueId" TEXT NOT NULL,
@@ -726,6 +747,22 @@ const createSchema = Effect.gen(function* () {
   //   version holds only because `putAgent` is a bare INSERT, which is the same property
   //   (3) restores here.
   //
+  //   The `parent` edge is COMPOSITE — `(parent, "jobId")` → `(id, "jobId")`, backed by
+  //   the `UNIQUE (id, "jobId")` below — because "ONE JOB OWNS ONE TREE" is the model
+  //   (Point B: `Session 1:∗ Execution`, the tree formed by `parent`), and a single-column
+  //   key expresses only "the parent row exists". Nothing required it to belong to the
+  //   SAME job, so a CROSS-JOB edge was an ordinary write — and it reproduced the exact
+  //   no-root state (3) was added to close: store `exe-a` rootless under `job-A`, store
+  //   `exe-b` under `job-B` naming `exe-a` as its parent, and `job-B` owns an execution
+  //   while having NO `parent IS NULL` row of its own. `getExecutionForJob(job-B)` then
+  //   answers `None`, `startup-reconcile`'s `settle` (guarded on that `Option`) silently
+  //   skips sealing, and the CE4.1-R4 live-orphan stall is back. With the composite key
+  //   the child's `"jobId"` must MATCH its parent's, so a job's executions are closed
+  //   under `parent` and "a job owns a tree, and that tree has exactly one root" is a
+  //   property of the store rather than a claim about its writers (INV-ENFORCE). A
+  //   ROOTLESS row still passes: SQLite's default MATCH SIMPLE satisfies a composite key
+  //   whenever ANY of its referencing columns is NULL, which is exactly the root case.
+  //
   // There is NO `status` column: liveness IS the transcript variant (`Transcript`,
   // `@sprinter/domain`), and a status enum beside it would be a second field that must
   // agree with the first (INV-SUM / INV-ENFORCE). `transcript` is stored as ONE JSON
@@ -737,9 +774,10 @@ const createSchema = Effect.gen(function* () {
       parent TEXT,
       mode TEXT NOT NULL,
       transcript TEXT NOT NULL,
+      UNIQUE (id, "jobId"),
       FOREIGN KEY ("jobId") REFERENCES job (id),
       FOREIGN KEY ("agentId") REFERENCES agent (id),
-      FOREIGN KEY (parent) REFERENCES execution (id)
+      FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")
     )`;
   // PLAIN, not UNIQUE (DE2.2). It was `UNIQUE` while the model was 1 Job = 1 execution;
   // a job now owns a TREE of executions, so uniqueness would refuse the model rather

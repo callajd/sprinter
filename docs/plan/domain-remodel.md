@@ -381,8 +381,22 @@ DE1 ──► DE2 ──► DE3 ──► DE4
     has**, and a write attempting one is refused by the engine inside the same statement
     (`INV-ENFORCE` — unconstructible, not walked for).
   - **A job has exactly ONE root**, enforced by a partial `UNIQUE (jobId) WHERE parent IS
-    NULL` index (`SCHEMA_VERSION` 8). `getExecutionForJob`'s "the root" was previously
-    undefined for two parentless rows and picked between them by id collation.
+    NULL` index. `getExecutionForJob`'s "the root" was previously undefined for two
+    parentless rows and picked between them by id collation.
+  - **ONE JOB OWNS ONE TREE**, enforced by a COMPOSITE `parent` edge — `UNIQUE (id,
+    "jobId")` plus `FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")`
+    (`SCHEMA_VERSION` 9). The single-column key constrained only that the parent ROW
+    exists; nothing required it to belong to the same job, so a CROSS-JOB edge was an
+    ordinary write and it recreated the very state the single-root index closed — a job
+    owning an execution while holding no rootless row, hence `getExecutionForJob` → `None`
+    and a `startup-reconcile.settle` that silently skipped sealing. With the edge scoped to
+    the job a job's executions are closed under `parent`, so `None` now genuinely means
+    "this job owns no executions" (`INV-ENFORCE`).
+  - **`settle` seals EVERY execution a job owns**, iterating `listExecutionsForJob` rather
+    than sealing `getExecutionForJob`'s root. A job owns a tree; a sibling left with a
+    `LiveTranscript` kept `isExecutionLive` true and made `resolveLive` bounded-WAIT on it
+    while the job was still `queued`/`running` — the CE4.1-R4 stall moved off the root
+    rather than closed. Each is sealed at ITS OWN `executionLog.maxOffset`.
   - **The snapshot carries the whole TREE**, via a new `listExecutionsForJob` read.
     `putExecution` journals `ExecutionChanged` for *every* execution, so a snapshot built
     from the root alone shipped strictly less than the deltas that follow it and a
@@ -408,6 +422,22 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   - **`registerAgent` appends ORIGINAL revisions only**, so editing an agent definition
     starts a new unlinked lineage rather than extending one; `Snapshot.agents` accumulates
     single-revision lineages the helpers correctly treat as unrelated agents.
+  - **A RETIREMENT is a no-op on the dispatch path**, a consequence of content-addressed
+    ids. Retiring a lineage appends a new revision with `supersedes` + `retiredAt`, but the
+    local `pi` content is unchanged, so the next dispatch re-derives the ORIGINAL id,
+    `putAgent` answers "unchanged", and the execution is attributed to a retired lineage's
+    head. Dispatch never consults `isLineageRetired`. Recorded, not fixed: honouring a
+    retirement is a decision about what one MEANS operationally (refuse? run the
+    successor's content? warn?) and no task on this workstream takes it.
+  - **`Job.executionId` is deliberately NOT a foreign key** while `execution."jobId"` is.
+    The tables reference each other, so a plain key is unwritable in either order without
+    deferred constraints; the surviving consequence — a job may name an execution never
+    stored — is stated in the DDL rather than hidden. Every read that matters resolves the
+    enforced direction.
+  - **`indexedPreferringLive` is a PROJECTION, not an index.** Now that the snapshot ships
+    a job's whole tree, it reduces N executions per job to one. Correct for the board's
+    boolean question; anything that needs to say something *about* the tree must read
+    `snapshot.executions` directly.
 - **Depends on:** `DE2.1`
 
 ### DE2.3 — `PullRequest` as an entity

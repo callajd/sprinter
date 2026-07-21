@@ -29,6 +29,7 @@ import {
   Agent,
   Epic,
   Execution,
+  ExecutionEvent,
   isExecutionLive,
   Issue,
   Job,
@@ -463,6 +464,65 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       // execution-resolve gate. A later resume re-attaches this same id and re-opens it.
       const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
       expect(isExecutionLive(s1)).toBe(false);
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
+
+it.effect("seals EVERY execution a settled Job owns, not just the tree's ROOT", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
+      yield* store.workGraph.putEpic(epic({ status: "blocked" }));
+      yield* store.workGraph.putIssue(issue(1));
+      // A job owning a TREE: the root and a CHILD (a subagent), both LIVE. A settle that
+      // read `getExecutionForJob` saw only the root — so the child kept its
+      // `LiveTranscript` forever, `isExecutionLive` stayed true on it, and `resolveLive`
+      // bounded-WAITED on it every time the (now `queued`, i.e. still mid-dispatch) job
+      // was resolved. That is the CE4.1-R4 stall the seal exists to prevent, merely moved
+      // off the root and onto a sibling.
+      yield* seedRun(store, job(), execution());
+      yield* store.jobs.putExecution(
+        execution({ id: "execution-child", parent: "execution-job-1" }),
+      );
+      // Distinct per-execution extents, so a seal that reused ONE offset for the whole
+      // tree would be visible rather than coincidentally right.
+      const entry = decode(ExecutionEvent, { _tag: "ExecutionIdle" });
+      yield* store.executionLog.append(execution().id, entry);
+      yield* store.executionLog.append(execution({ id: "execution-child" }).id, entry);
+      yield* store.executionLog.append(execution({ id: "execution-child" }).id, entry);
+
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+
+      // BOTH executions are sealed — the whole tree, not the root alone.
+      const all = yield* store.jobs.listExecutionsForJob(job().id);
+      expect(all.map((e) => e.id)).toStrictEqual(["execution-child", "execution-job-1"]);
+      expect(all.every((e) => !isExecutionLive(e))).toBe(true);
+      // …and each at ITS OWN log's extent, not a shared one.
+      const sealedAt = new Map(
+        all.map((e) => [
+          e.id,
+          e.transcript._tag === "SealedTranscript" ? e.transcript.lastOffset : -1,
+        ]),
+      );
+      expect(sealedAt.get(execution().id)).toBe(
+        yield* store.executionLog.maxOffset(execution().id),
+      );
+      expect(sealedAt.get(execution({ id: "execution-child" }).id)).toBe(
+        yield* store.executionLog.maxOffset(execution({ id: "execution-child" }).id),
+      );
+      expect(sealedAt.get(execution().id)).not.toBe(
+        sealedAt.get(execution({ id: "execution-child" }).id),
+      );
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),

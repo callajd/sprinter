@@ -386,7 +386,9 @@ export interface WorkGraphStore {
  * execution (and back).
  *
  * A job is advanced by a TREE of executions (DE2.2), not by exactly one: `putExecution`
- * accepts many per job, and `getExecutionForJob` answers with the tree's ROOT.
+ * accepts many per job, and `getExecutionForJob` answers with the tree's ROOT. ONE JOB
+ * OWNS ONE TREE — the `parent` edge may not cross jobs, so a job's executions are closed
+ * under `parent` and exactly one of them is rootless.
  */
 export interface JobStore {
   /** Upsert a {@link Job} (with its optional execution / transcript / PR links). */
@@ -412,16 +414,31 @@ export interface JobStore {
    * - a `parent` DIFFERENT from the one the execution was first stored with. `parent`
    *   is fixed at insert: RE-PARENTING is not an operation an execution has, and the
    *   upsert leaves the column out of its updated set rather than checking a tree
-   *   invariant afterwards (INV-ENFORCE).
+   *   invariant afterwards (INV-ENFORCE);
+   * - a `parent` belonging to a DIFFERENT `jobId`. ONE JOB OWNS ONE TREE, so an edge
+   *   that crosses jobs is not a tree edge at all; the adapter's `parent` key is
+   *   COMPOSITE — `(parent, jobId)` → `(id, jobId)` — so a child's job must match its
+   *   parent's and the engine refuses the write.
    *
-   * That third rule is what makes the relation ACYCLIC — the other two do not get there
-   * on their own. A foreign key constrains the row a write REFERENCES, never the
-   * re-pointing of an existing row, so while `parent` was mutable a 2-cycle was
-   * constructible out of three writes each of which satisfied the key and neither of
-   * which was a self-parent (insert `a` rootless, insert `b` under `a`, upsert `a` under
-   * `b`). With `parent` frozen, closing any cycle requires naming a row that does not
-   * exist yet — which the key refuses — so acyclicity is structural rather than a
+   * A SECOND ROOT for one job is refused too, by a partial `UNIQUE (jobId) WHERE parent
+   * IS NULL` index — see {@link getExecutionForJob}.
+   *
+   * The last three rules are what make the relation a FOREST OF TREES, one per job — the
+   * first two do not get there on their own. A foreign key constrains the row a write
+   * REFERENCES, never the re-pointing of an existing row, so while `parent` was mutable a
+   * 2-cycle was constructible out of three writes each of which satisfied the key and
+   * neither of which was a self-parent (insert `a` rootless, insert `b` under `a`, upsert
+   * `a` under `b`). With `parent` frozen, closing any cycle requires naming a row that
+   * does not exist yet — which the key refuses — so acyclicity is structural rather than a
    * precondition callers owe or a walk someone remembers to run.
+   *
+   * Acyclicity alone was still not the model, which is what the job-scoping rule adds: a
+   * CROSS-JOB parent is acyclic and perfectly storable under a single-column key, and it
+   * left the child's job owning an execution with NO rootless row of its own — so
+   * `getExecutionForJob` answered `None` for a job that plainly had executions, and every
+   * caller guarded on that `Option` (notably `startup-reconcile`'s seal) silently did
+   * nothing. Scoping the edge to the job makes that state unconstructible rather than
+   * detected.
    *
    * A restart re-attaches by upserting the SAME execution id, not a new one — which is
    * unaffected: a re-attach carries the parent it already had.
@@ -440,6 +457,13 @@ export interface JobStore {
    * index, so a second root is unstorable and this read has exactly one candidate row
    * rather than a collation-ordered pick among several (INV-ENFORCE). DE2.4 removes the
    * lookup: a `Session` names its `root` outright.
+   *
+   * `None` means the job owns NO executions AT ALL — not merely "no rootless one". That
+   * is the composite `parent` key's doing (see {@link putExecution}): an edge cannot cross
+   * jobs, so a job's executions are closed under `parent`, and a finite acyclic relation
+   * closed under a parent edge always has a rootless member. A caller may therefore treat
+   * `None` as "nothing to do", which is exactly what `startup-reconcile`'s seal did while
+   * a cross-job edge could make it lie.
    */
   readonly getExecutionForJob: (
     jobId: JobId,

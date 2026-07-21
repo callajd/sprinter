@@ -111,6 +111,16 @@ public enum BoardProjection {
   /// a tree of executions (DE2.2), so "the execution for this job" must not be decided
   /// by snapshot order. Among equals the last wins, as before (never a trap,
   /// INV-NOFORCE).
+  ///
+  /// LOSSY BY DESIGN, and the snapshot genuinely exercises it: since the daemon's
+  /// `buildSnapshot` ships a job's WHOLE tree (not just its root), a job with N executions
+  /// arrives with N entries here and this reduces them to ONE. That is correct for the
+  /// board's question — "does this issue have a live agent?" is a BOOLEAN, and one live
+  /// execution answers it — but it is a real projection, not an index: the siblings it
+  /// drops are not available downstream, and `IssueActivity.executionId` names the kept
+  /// one. Any future board affordance that needs to say something ABOUT the tree (a count,
+  /// a subagent list, a per-execution row) must read `snapshot.executions` directly rather
+  /// than reaching for this dictionary.
   private static func indexedPreferringLive(_ executions: [Execution]) -> [JobId: Execution] {
     Dictionary(
       executions.map { ($0.jobId, $0) },

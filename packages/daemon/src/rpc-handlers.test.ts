@@ -1589,10 +1589,10 @@ it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   ),
 );
 
-// A durable NON-TERMINAL execution row (`starting`) — the register-after-dispatch window
-// state: `JobRunner.dispatch` persists this BEFORE `run` registers the handle, so a
-// client reacting to the `running` delta arrives with the row already durable but the
-// handle not yet registered.
+// A durable LIVE execution row (an OPEN transcript — there is no `starting` status, DE2.2
+// deleted `ExecutionStatus`) — the register-after-dispatch window state: `JobRunner.dispatch`
+// persists this BEFORE `run` registers the handle, so a client reacting to the `running`
+// delta arrives with the row already durable but the handle not yet registered.
 const startingExecution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
@@ -1600,8 +1600,10 @@ const startingExecution = Schema.decodeUnknownSync(Execution)({
   mode: "autonomous",
   transcript: { _tag: "LiveTranscript" },
 });
-// A LIVE Execution row whose Job has since settled — the crash-orphaned limbo
-// `startup-reconcile` leaves (Job-only settle). Pairs with {@link orphanedJob}.
+// A LIVE Execution row whose Job has since settled — the crash-orphaned limbo an OLDER,
+// Job-only `startup-reconcile` settle left behind (it now seals every execution the job
+// owns, but a store written before that fix can still hold this). Pairs with
+// {@link orphanedJob}: the gate must fail it FAST rather than wait out the bound.
 const activeExecution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
@@ -1610,7 +1612,7 @@ const activeExecution = Schema.decodeUnknownSync(Execution)({
   transcript: { _tag: "LiveTranscript" },
 });
 
-// The register-after-dispatch window: `JobRunner.dispatch` persists the `starting`
+// The register-after-dispatch window: `JobRunner.dispatch` persists the LIVE-transcript
 // Execution + `running` Job BEFORE `run` registers the execution handle, so a client
 // reacting to the `running` delta can open the execution channel before registration.
 // Because the durable JOB is `running` (NON-TERMINAL) at that point, the handler's

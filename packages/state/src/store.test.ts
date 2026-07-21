@@ -23,6 +23,7 @@ import {
   Issue,
   isLineageRetired,
   Job,
+  JobId,
   Repository,
   RepositoryId,
   RepositoryKey,
@@ -138,6 +139,8 @@ const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
  * tests below assert that skipping it is REJECTED rather than quietly stored.
  */
 const executionId = (raw: string) => decode(ExecutionId, raw);
+
+const jobIdOf = (raw: string) => decode(JobId, raw);
 
 const seedExecutionRefs = (store: Context.Service.Shape<typeof StateStore>) =>
   Effect.gen(function* () {
@@ -1067,6 +1070,46 @@ it.effect("refuses a SECOND ROOT for one job, and lists the job's whole tree", (
     const empty = yield* job({ id: "job-2" });
     yield* store.jobs.putJob(empty);
     expect(yield* store.jobs.listExecutionsForJob(empty.id)).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses a CROSS-JOB parent — one job owns one tree, so it always has a root", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    yield* store.jobs.putJob(yield* job({ id: "job-2" }));
+    // The falsifying sequence a SINGLE-COLUMN `parent` key accepted. Every write below is
+    // ordinary: the parent row exists, the edge is not a self-edge, nothing is re-parented,
+    // and neither job gets a second root. The single-column key constrained only that the
+    // REFERENCED ROW EXISTS — nothing said it had to belong to the SAME job — so `job-2`
+    // ended up owning an execution while holding no `parent IS NULL` row of its own, which
+    // is the exact no-root state the `execution_root` index and the frozen `parent` were
+    // added to close: `getExecutionForJob("job-2")` answered `None`, and every caller
+    // guarded on that `Option` — `startup-reconcile`'s seal above all — silently did
+    // nothing, re-opening the CE4.1-R4 live-orphan stall.
+    const rootOfA = yield* execution({ id: "exe-a", jobId: "job-1" });
+    yield* store.jobs.putExecution(rootOfA);
+    const crossJob = yield* store.jobs
+      .putExecution(yield* execution({ id: "exe-b", jobId: "job-2", parent: "exe-a" }))
+      .pipe(Effect.flip);
+    expect(crossJob).toBeInstanceOf(StateStoreError);
+    expect(crossJob.operation).toBe("putExecution");
+    // Nothing landed, so `job-2` owns no executions at all — and `None` therefore means
+    // "no executions", which is what makes it safe for a caller to skip on.
+    expect(yield* store.jobs.listExecutionsForJob(yield* jobIdOf("job-2"))).toStrictEqual([]);
+    expect(yield* store.jobs.getExecutionForJob(yield* jobIdOf("job-2"))).toStrictEqual(
+      Option.none(),
+    );
+    // POSITIVE CONTROL, and the property stated directly: the SAME child under its OWN job
+    // is stored, and `job-2` then has a root. A job that owns any execution owns a rootless
+    // one, because its tree cannot reach outside itself.
+    yield* store.jobs.putExecution(yield* execution({ id: "exe-b", jobId: "job-2" }));
+    yield* store.jobs.putExecution(
+      yield* execution({ id: "exe-c", jobId: "job-2", parent: "exe-b" }),
+    );
+    expect(
+      Option.getOrThrow(yield* store.jobs.getExecutionForJob(yield* jobIdOf("job-2"))).id,
+    ).toBe("exe-b");
   }).pipe(Effect.provide(layerMemory)),
 );
 

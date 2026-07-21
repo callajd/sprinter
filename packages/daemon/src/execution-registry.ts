@@ -21,8 +21,9 @@
  *
  * ## Ordering guarantee — the register-after-dispatch window ({@link resolve})
  *
- * `JobRunner.dispatch` persists the `running`/`starting` Job/execution rows — fanning
- * out the `JobChanged`/`ExecutionChanged` deltas the app reacts to — BEFORE
+ * `JobRunner.dispatch` persists the `running` Job row and the execution row with its OPEN
+ * (`LiveTranscript`) transcript — fanning out the `JobChanged`/`ExecutionChanged` deltas
+ * the app reacts to — BEFORE
  * `ExecutionRunner.run(job)` returns the live {@link ExecutionHandle} that
  * {@link register}s it (the `pi` spawn + handshake happen inside `run`). So a
  * `running` delta does NOT yet imply the execution is registered: a client that reacts
@@ -40,16 +41,18 @@
  * ## Who decides wait-vs-fail-fast — the durable-state gate lives in the CALLER
  *
  * `resolve` is INTENTIONALLY unconditional: on a miss it always waits out the bound.
- * A registry entry only lives for its execution's run scope, so a SETTLED
- * (completed/failed/interrupted) execution — or one that never existed — is absent from
- * the map, and waiting the full bound on it would be a spurious multi-second stall
- * (the Inspector opens channels for SETTLED jobs by design, BE4.1). So the
- * execution-channel handlers gate the choice on DURABLE state (`StateStore`): an execution
- * whose durable `Execution` row is still NON-TERMINAL (`starting`/`active`/`idle` — genuinely
- * mid-dispatch) resolves through {@link resolve} (bridging the window); an execution whose
- * row is TERMINAL or ABSENT resolves through {@link get} (fail fast, no wait). The
- * registry stays a pure map + wait primitive; the durable read that distinguishes the
- * two cases belongs to the caller that already holds the `StateStore`.
+ * A registry entry only lives for its execution's run scope, so a SETTLED execution — one
+ * whose transcript is SEALED — or one that never existed is absent from the map, and
+ * waiting the full bound on it would be a spurious multi-second stall (the Inspector opens
+ * channels for SETTLED jobs by design, BE4.1). So the execution-channel handlers gate the
+ * choice on DURABLE state (`StateStore`): an execution whose durable `Execution` row is
+ * still LIVE — its transcript OPEN (`isExecutionLive`, `@sprinter/domain`; DE2.2 deleted
+ * the `ExecutionStatus` enum, so liveness is the transcript variant and nothing else) —
+ * and whose Job is still mid-dispatch resolves through {@link resolve} (bridging the
+ * window); an execution whose transcript is SEALED, or whose Job is terminal or ABSENT,
+ * resolves through {@link get} (fail fast, no wait). The registry stays a pure map + wait
+ * primitive; the durable read that distinguishes the two cases belongs to the caller that
+ * already holds the `StateStore`.
  */
 import { Context, Deferred, Duration, Effect, HashMap, Layer, Option, Ref } from "effect";
 import type { Scope } from "effect/Scope";

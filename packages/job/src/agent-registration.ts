@@ -37,6 +37,23 @@
  * lineages is the registry surface's job, not the dispatcher's; recording the exact
  * revision that ran is this one's, and it is complete on its own (a historical
  * execution resolves to its agent regardless of any lineage link).
+ *
+ * KNOWN CONSEQUENCE — content-addressing makes a RETIREMENT a no-op on the dispatch path.
+ * Retiring a lineage means appending a NEW revision that `supersedes` the old one and
+ * carries a `retiredAt` stamp. But this writer derives its id from the CONTENT it is about
+ * to run, and the local `pi` content is unchanged by that human act — so the next dispatch
+ * re-derives the ORIGINAL id, `putAgent` answers `"unchanged"`, and the execution is
+ * attributed to a revision whose lineage head is retired. Nothing here consults
+ * `isLineageRetired` (`registry.ts`), so a retirement changes what the registry SAYS
+ * without changing what dispatch DOES.
+ *
+ * That is a gap in the dispatch path, not in the registry: honouring a retirement means
+ * dispatch resolving the lineage HEAD for the content it holds and refusing (or
+ * re-pointing) when that head is retired — which is a decision about what a retirement
+ * MEANS operationally (refuse the run? run the successor's content? warn?) and nothing on
+ * this workstream has taken it. Recorded here so it is a known consequence of the identity
+ * scheme rather than a surprise the first time someone retires a lineage and watches
+ * dispatch ignore it.
  */
 import { type Context, Effect, Encoding, Schema } from "effect";
 import { type Agent, AgentContent, AgentId } from "@sprinter/domain";
