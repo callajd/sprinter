@@ -26,6 +26,18 @@ import SprinterContract
 /// re-derive-on-every-reconnect path. Only a first connect (or a drop before any
 /// baseline was retained) falls back to subscribe-around-snapshot.
 ///
+/// **A DEAD resume point — `ResyncRequired` (the store-generation boundary).** The
+/// incremental resume is only valid while the daemon's durable log is the SAME log the
+/// cursor came from. It is not forever: the daemon's store never migrates, so a schema
+/// bump DROPS and recreates it, restarting offsets at `1` and destroying every entity
+/// the retained baseline describes. The app and the daemon run together locally, so
+/// that lands on a live client. The daemon says so explicitly — the `events` request
+/// fails with ``ContractError/resyncRequired(sinceOffset:maxOffset:)`` — and this engine
+/// answers by discarding BOTH the retained baseline and the cursor and falling back to
+/// subscribe-around-snapshot. It has to discard both: deltas are upsert-only (there is
+/// no `*Removed`), so no stream of deltas can remove an entity the reset destroyed —
+/// only a fresh `snapshot()` can.
+///
 /// **Contiguous prefix, not max-seen.** The live feed can publish out of durable-offset
 /// order under concurrent daemon writers, so the resume cursor is the highest offset
 /// whose entire prefix has been applied — never the max — else a reconnect could skip an
@@ -84,12 +96,9 @@ public actor WorkGraphResync {
   private var driver: Task<Void, Never>?
   private var started = false
 
-  /// The latest published baseline-consistent state, retained so a reconnect resumes
-  /// incrementally by folding onto it (never re-deriving from a fresh snapshot).
-  private var retainedState: Snapshot?
-  /// The last-applied contiguous-prefix offset — the `sinceOffset` cursor a reconnect
-  /// resumes strictly after.
-  private var resumeOffset: Int?
+  /// What the next attempt would resume FROM — the retained baseline plus the
+  /// last-applied contiguous-prefix cursor (see ``ResumePoint``).
+  private var resumePoint = ResumePoint()
   /// Whether the CURRENT attempt has seen a successful read yet (a published snapshot on a
   /// first connect, or an applied delta on a resume). Reset at each attempt's start; part of
   /// the health assessment at teardown (see ``assessHealth(establishedFor:)``).
@@ -183,7 +192,7 @@ public actor WorkGraphResync {
         // only when the connection proved healthy — it made a successful read OR stayed
         // established at least ``minHealthyDuration``. An accept-then-immediately-drop flap
         // (no read, dropped before the threshold) is scored a failure and the backoff widens.
-        let resume = resumePoint()
+        let resume = resumePoint.resumable
         await runAttempt(backend, resume: resume, continuation)
         // Fully drain the OLD transport BEFORE the loop dials the next one (the CE2.1
         // carried teardown constraint): `close()` awaits the socket's read-loop exit and
@@ -198,20 +207,16 @@ public actor WorkGraphResync {
     continuation.finish()
   }
 
-  /// The incremental-resume point for the next attempt: the retained baseline plus the
-  /// last-applied contiguous offset, or `nil` on a first connect (nothing retained yet).
-  private func resumePoint() -> (state: Snapshot, offset: Int)? {
-    guard let retainedState, let resumeOffset else { return nil }
-    return (retainedState, resumeOffset)
-  }
-
   /// Records the applied state and contiguous-prefix cursor so they survive to the next
   /// attempt. Called BEFORE publishing so a stalled observer cannot lose the cursor.
   private func record(state: Snapshot, contiguous: Int?) {
-    retainedState = state
-    if let contiguous {
-      resumeOffset = contiguous
-    }
+    resumePoint.record(state: state, contiguous: contiguous)
+  }
+
+  /// True when `error` is the daemon telling this client its resume point is dead.
+  private func isResyncRequired(_ error: any Error) -> Bool {
+    guard case ContractError.resyncRequired = error else { return false }
+    return true
   }
 
   /// Records that the current attempt made a successful read (a published snapshot on a
@@ -309,7 +314,15 @@ public actor WorkGraphResync {
         group.cancelAll()
       }
     } catch {
-      // Reconnect: the next attempt re-dials and resumes incrementally from the cursor.
+      // Reconnect: the next attempt re-dials and resumes incrementally from the cursor —
+      // UNLESS the daemon said that cursor is dead. `ResyncRequired` means the store was
+      // dropped and recreated (a schema-version bump never migrates), so both the cursor
+      // and the retained baseline belong to a generation that no longer exists; drop them
+      // so the next attempt subscribes around a FRESH `snapshot()` instead of folding
+      // deltas onto state the reset destroyed.
+      if isResyncRequired(error) {
+        resumePoint.discard()
+      }
     }
     // Assess connection health for THIS attempt before the loop draws the next reconnect
     // delay: reset the backoff if the connection made a read or stayed established long

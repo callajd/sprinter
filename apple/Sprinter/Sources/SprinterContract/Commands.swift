@@ -108,7 +108,7 @@ public struct AnswerUiRequestPayload: Codable, Equatable, Sendable {
   }
 }
 
-/// The contract's owned, neutral error channel — mirror of the four
+/// The contract's owned, neutral error channel — mirror of the five
 /// `Schema.TaggedErrorClass` errors. Each carries the same `_tag` discriminant the
 /// TS contract emits, so the mirror decodes the RPC error payloads directly.
 public enum ContractError: Codable, Equatable, Sendable, Error {
@@ -116,11 +116,31 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
   case issueNotFound(id: IssueId)
   case sessionNotFound(id: SessionId)
   case planRejected(reason: String)
+  /// The `events` request's `sinceOffset` cursor cannot belong to the daemon's
+  /// CURRENT store generation, so there is no incremental resume from it.
+  ///
+  /// The daemon's store never migrates: a schema-version bump DROPS the database and
+  /// recreates it, restarting the durable event log's offsets at `1` and destroying
+  /// every row the client's retained state was built from. The app and the daemon run
+  /// together locally, so this lands on a LIVE client — one holding a cursor from the
+  /// previous generation and a snapshot full of entities that no longer exist. The
+  /// delta stream cannot repair that: deltas are upsert-only (there is no `*Removed`),
+  /// so nothing streamed can ever REMOVE a stale entity.
+  ///
+  /// The only correct response is to throw the retained state away and re-hydrate:
+  /// ``WorkGraphResync`` clears its retained snapshot AND its resume cursor and falls
+  /// back to the subscribe-around-`snapshot` path it uses on a first connect.
+  ///
+  /// - `sinceOffset`: the cursor the client sent, echoed back.
+  /// - `maxOffset`: the extent of the daemon's log (`0` when empty) that it exceeded.
+  case resyncRequired(sinceOffset: Int, maxOffset: Int)
 
   private enum CodingKeys: String, CodingKey {
     case tag = "_tag"
     case id
     case reason
+    case sinceOffset
+    case maxOffset
   }
 
   public init(from decoder: any Decoder) throws {
@@ -135,6 +155,10 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
       self = .sessionNotFound(id: try container.decode(SessionId.self, forKey: .id))
     case "PlanRejected":
       self = .planRejected(reason: try container.decode(String.self, forKey: .reason))
+    case "ResyncRequired":
+      self = .resyncRequired(
+        sinceOffset: try container.decode(Int.self, forKey: .sinceOffset),
+        maxOffset: try container.decode(Int.self, forKey: .maxOffset))
     default:
       throw DecodingError.dataCorruptedError(
         forKey: .tag,
@@ -159,6 +183,10 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     case .planRejected(let reason):
       try container.encode("PlanRejected", forKey: .tag)
       try container.encode(reason, forKey: .reason)
+    case .resyncRequired(let sinceOffset, let maxOffset):
+      try container.encode("ResyncRequired", forKey: .tag)
+      try container.encode(sinceOffset, forKey: .sinceOffset)
+      try container.encode(maxOffset, forKey: .maxOffset)
     }
   }
 }

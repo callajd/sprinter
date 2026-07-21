@@ -1,5 +1,5 @@
 /**
- * One-off golden generator for the Swift contract mirror (issue FE2.4).
+ * The golden generator for the Swift contract mirror (issue FE2.4).
  *
  * Encodes REPRESENTATIVE values of every contract message schema through the
  * MERGED TypeScript contract (`@sprinter/contract` over `@sprinter/domain`),
@@ -9,13 +9,18 @@
  * against REAL contract output rather than hand-typed JSON that could drift in
  * the same direction as the mirror (INV-CONTRACT).
  *
- * This script is NOT part of any gate: `make check` only DECODES the committed
- * goldens (no bun dependency inside the Swift gate). It is re-run by a human when
- * the contract changes — see `docs/contract-mirror.md` (the INV-CONTRACT ripple
- * procedure).
+ * `make check` only DECODES the committed goldens (no bun dependency inside the
+ * Swift gate), so the SWIFT side alone cannot notice a stale fixture. The ROOT gate
+ * closes that hole: `bun run check:goldens` (`./check-goldens.ts`) re-runs this
+ * generator into a temporary directory and diffs, so a contract change that was not
+ * re-frozen fails CI rather than waiting to be caught by review — see
+ * `docs/contract-mirror.md` (the INV-CONTRACT ripple procedure).
  *
  * Run from anywhere in the repo:
- *   bun run apple/Sprinter/scripts/generate-goldens.ts
+ *   bun run apple/Sprinter/scripts/generate-goldens.ts [outputDir]
+ *
+ * `outputDir` defaults to the committed `Tests/SprinterContractTests/Goldens`; the
+ * freshness check passes a temp directory so it never touches the working tree.
  *
  * `Schema.encodeUnknownSync` VALIDATES its input against the schema before
  * encoding, so every representative value below is proven contract-valid as a
@@ -50,6 +55,7 @@ import {
   OffsetEvent,
   OffsetSessionEvent,
   PlanRejected,
+  ResyncRequired,
   retryIssue,
   sessionEvents,
   sessionSend,
@@ -61,7 +67,9 @@ import {
 } from "../../../packages/contract/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const goldensDir = join(here, "..", "Tests", "SprinterContractTests", "Goldens");
+/** Where the committed goldens live — the default target, and what the gate diffs against. */
+export const COMMITTED_GOLDENS_DIR = join(here, "..", "Tests", "SprinterContractTests", "Goldens");
+const goldensDir = process.argv[2] ?? COMMITTED_GOLDENS_DIR;
 mkdirSync(goldensDir, { recursive: true });
 
 /** Encode a value through its schema (validating it) and write the wire JSON. */
@@ -134,12 +142,15 @@ const agentRevised = {
   tools: ["read", "edit", "bash", "web_search"],
   supersedes: "agt-1",
 };
+// A retirement is LIFECYCLE-ONLY: it carries the SAME name/model/version/tools as
+// the head it retires, and differs ONLY in `id`, `supersedes` and `retiredAt`. So
+// this fixture is `agentRevised`'s content verbatim plus the stamp — spelled as a
+// spread so it CANNOT drift. (It is also what the `StateStore` port now enforces: a
+// retiring revision that rewrote content would be rejected, so a fixture showing one
+// would teach a wire shape the daemon will not produce.)
 const agentRetired = {
+  ...agentRevised,
   id: "agt-3",
-  name: "implementer",
-  model: "claude-opus-4-8",
-  version: "1.1.0",
-  tools: [],
   supersedes: "agt-2",
   retiredAt: "2026-07-20T12:00:00.000Z",
 };
@@ -167,7 +178,8 @@ write("snapshot", Snapshot, {
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
   sessions: [session],
-  // Lexicographic by id — the order `listAgents` pins and the daemon hydrates in.
+  // BYTE order by id (SQLite's default BINARY collation) — the order `listAgents`
+  // pins and the daemon hydrates in.
   // It is presentational (a client upserts by id); a lineage is read off
   // `supersedes`, never off this order.
   agents: [agentOriginal, agentRevised, agentRetired],
@@ -351,6 +363,16 @@ const encodedErrors = [
   ),
   Schema.encodeUnknownSync(PlanRejected)(
     Schema.decodeUnknownSync(PlanRejected)({ _tag: "PlanRejected", reason: "empty spec" }),
+  ),
+  // The `events` stream's one error: the client's resume cursor cannot belong to the
+  // daemon's current store generation (the store was dropped and recreated under it),
+  // so the client must discard its retained state and re-hydrate from `snapshot`.
+  Schema.encodeUnknownSync(ResyncRequired)(
+    Schema.decodeUnknownSync(ResyncRequired)({
+      _tag: "ResyncRequired",
+      sinceOffset: 999,
+      maxOffset: 2,
+    }),
   ),
 ];
 writeFileSync(

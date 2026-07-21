@@ -56,14 +56,27 @@ Notes threaded to the contract's own decisions:
   `AgentRemoved`, and a client folds `AgentChanged` as an upsert by id.
   Retired-ness is
   read off `retiredAt`'s presence; there is deliberately no `AgentStatus` enum
-  (INV-SUM). `retiredAt` is the domain's `Timestamp` — an ISO-8601 UTC string on the
-  wire, so the mirror models it as `String`.
+  (INV-SUM). A **retirement is lifecycle-only**: the retiring revision repeats the
+  retired revision's `name`/`model`/`version`/`tools` verbatim and differs only in
+  `id`, `supersedes` and `retiredAt` (the `StateStore` port enforces it), so the
+  mirror never sees a retirement that rewrote content. `retiredAt` is the domain's
+  `Timestamp` — a **canonical** ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SS.sssZ`,
+  always three fractional digits, always `Z`), normalised on decode so string order is
+  instant order; the mirror models it as `String` and may compare two stamps directly.
 - The streamed `events` **success is the `OffsetEvent` envelope** — `{ "offset":
   12, "event": { "_tag": "IssueChanged", … } }` — not the bare `WorkGraphEvent`
   (CE2.0). Each item pairs the delta with its durable `event_log`
   offset (a `NonNegativeInt`, so a bare JSON integer → Swift `Int`), so a client can
   hand a streamed item's offset back as the request's `sinceOffset` cursor to resume
   strictly after it. Existing consumers that only need the delta unwrap `.event`.
+- The streamed `events` **error is `ResyncRequired`** — the only error on that feed.
+  It says the request's `sinceOffset` cannot belong to the daemon's current store
+  GENERATION (the store never migrates; a schema-version bump drops and recreates it,
+  restarting offsets at `1`). It carries the rejected `sinceOffset` and the log's
+  `maxOffset`. The client's obligation is not to retry the resume but to discard
+  **both** its retained state and its cursor and re-hydrate from `snapshot` —
+  `WorkGraphResync` does exactly that. It has to be both: the delta model is
+  upsert-only, so no stream of deltas can remove an entity the reset destroyed.
 - The streamed `sessionEvents` **success is the `OffsetSessionEvent` envelope** — `{
   "offset": 7, "event": { "_tag": "EntryAppended", … } }` — not the bare `SessionEvent`,
   the session-channel mirror of `OffsetEvent`. Each durable, transcript-grade session event
@@ -77,12 +90,22 @@ Notes threaded to the contract's own decisions:
 
 ## What the gate checks
 
+Two gates, each covering what the other cannot.
+
 `make check` (run from `apple/Sprinter/`) **only DECODES the committed goldens** —
 there is no `bun`/Node dependency inside the Swift gate. The decode tests
 (`Tests/SprinterContractTests/`) cover: every DTO decodes; every tagged-union
 variant (and both optional-present / optional-absent forms) decodes; every value
 round-trips (decode → encode → decode); and every public initializer builds a
 value equal to the decoded golden (the send direction).
+
+`bun run check` (repo root) adds the **golden-freshness** stage
+(`check:goldens` → `apple/Sprinter/scripts/check-goldens.ts`): it re-runs the
+generator into a temporary directory and diffs against the committed fixtures,
+failing on any stale, missing, or orphaned golden. Without it the goldens could go
+stale silently — the Swift gate would keep validating the mirror against a wire
+shape the contract no longer emits, and INV-MIRROR's guard would guard nothing. The
+check never writes into the working tree.
 
 ## Regenerating the goldens (the INV-CONTRACT ripple procedure)
 
@@ -111,5 +134,6 @@ composes) changes, the Swift mirror and its goldens must ripple:
    cd apple/Sprinter && make check
    ```
 
-The generator is a one-off developer tool; it is **not** part of `make check` and
-never runs in the Swift CI job.
+The generator does not run inside `make check` (the Swift gate stays `bun`-free), but
+forgetting step 1 is no longer silent: the root gate's `check:goldens` stage re-runs it
+and fails on any difference.

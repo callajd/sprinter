@@ -34,12 +34,25 @@ struct RegistryTests {
     #expect(try Golden.roundTrip(agent) == agent)
   }
 
-  @Test("reads retired-ness off the retiredAt stamp — there is no status enum")
+  /// A retirement is LIFECYCLE-ONLY: it repeats the revision it retires verbatim and
+  /// differs ONLY in `id`, `supersedes` and `retiredAt`. The fixture is generated as
+  /// exactly that (the revised agent's content plus the stamp), and this asserts the
+  /// difference field by field against `agent-revised` — so a fixture that quietly
+  /// rewrote content while retiring would fail here rather than teach the mirror a
+  /// shape the daemon's `StateStore` now refuses to write.
+  @Test("reads retired-ness off the retiredAt stamp, and retirement preserves content")
   func decodesRetired() throws {
     let agent = try Golden.decode(Agent.self, from: "agent-retired")
+    let retires = try Golden.decode(Agent.self, from: "agent-revised")
     #expect(agent.retiredAt == "2026-07-20T12:00:00.000Z")
     #expect(agent.isRetired)
-    #expect(agent.tools.isEmpty)
+    #expect(agent.supersedes == retires.id)
+    // Content is carried over unchanged — only the lifecycle fields differ.
+    #expect(agent.name == retires.name)
+    #expect(agent.model == retires.model)
+    #expect(agent.version == retires.version)
+    #expect(agent.tools == retires.tools)
+    #expect(agent.id != retires.id)
     #expect(try Golden.roundTrip(agent) == agent)
   }
 

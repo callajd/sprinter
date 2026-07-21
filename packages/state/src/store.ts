@@ -124,6 +124,20 @@ export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
 // ============================================================================
 
 /**
+ * The outcome of an {@link AgentStore.putAgent} append: whether a row was actually
+ * written, or the revision was already stored byte-identically.
+ *
+ * `putAgent` succeeds in both cases — it is idempotent by design — but the two are
+ * NOT interchangeable to a decorator of this port. The daemon's journaling layer
+ * must emit exactly one `AgentChanged` delta per REAL append: journaling an
+ * `"unchanged"` no-op too would make a crash-retry loop grow the durable event log
+ * (and fan out redundant deltas) without bound, contradicting the very no-op
+ * semantics that make the retry safe. Reporting the outcome is what lets the
+ * decorator tell them apart without re-reading the row it just wrote.
+ */
+export type AgentWrite = "appended" | "unchanged";
+
+/**
  * Persist and read the append-only {@link Agent} REGISTRY — owned, global, scoped
  * to NO repository (there is deliberately no repository- or workstream-scoped read
  * here: "the agents used in this repo" is a FOLD over that repo's executions,
@@ -143,26 +157,56 @@ export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
  * neither silently replace a revision's content nor un-retire a retired agent.
  * There is no edit path here at all, because an edit mints a new id.
  *
- * It also rejects `supersedes === id` — a revision cannot supersede itself, which
- * is the one `supersedes` cycle a single write can create (`registry.ts` states the
- * full acyclicity precondition the writer owns).
+ * Because "appended" and "already there" are genuinely different events for a
+ * DECORATOR of this port — the daemon's journaling layer must emit an
+ * `AgentChanged` delta for the first and NOTHING for the second, or a retry loop
+ * grows the durable log without bound — `putAgent` REPORTS which happened
+ * ({@link AgentWrite}) rather than collapsing both to `void`.
+ *
+ * Two writer obligations from `registry.ts` are ENFORCED here rather than left to
+ * review, because both are checkable from a single append plus the stored rows:
+ *
+ * - `supersedes !== id` — a revision cannot supersede itself, the one `supersedes`
+ *   cycle a single write can create (the full acyclicity precondition stays the
+ *   writer's).
+ * - a RETIRING revision (one carrying BOTH `supersedes` and `retiredAt`) must carry
+ *   the SAME `name` / `model` / `version` / `tools` as the revision it supersedes.
+ *   Retirement is LIFECYCLE-ONLY; fusing a content edit into it would make the two
+ *   operations indistinguishable in the history. Checkable only when the superseded
+ *   revision is actually stored — a dangling `supersedes` is the writer's problem,
+ *   as it already is for acyclicity.
+ *
+ * DURABILITY SCOPE: "nothing is ever removed" holds for the life of a STORE
+ * GENERATION. `SCHEMA_VERSION` ({@link ./sqlite.ts}) never migrates — bumping it
+ * drops the database and starts a new generation, discarding this registry's whole
+ * history. `putAgent` is the sole source of truth for its content (there is no
+ * manifest to re-seed from), so that is accepted, permanent data loss — see
+ * INV-FRESH's rationale in the adapter.
  */
 export interface AgentStore {
   /**
-   * Append an {@link Agent} revision. A byte-identical re-append of an already
-   * stored id is an idempotent no-op; a DIFFERING re-append of that id fails with
-   * {@link StateStoreError}, as does a revision whose `supersedes` names itself. It
-   * never rewrites or removes a stored revision.
+   * Append an {@link Agent} revision, reporting whether the row was actually
+   * written ({@link AgentWrite}). A byte-identical re-append of an already stored id
+   * is an idempotent no-op and answers `"unchanged"`; a DIFFERING re-append of that
+   * id fails with {@link StateStoreError}, as does a revision whose `supersedes`
+   * names itself or a RETIRING revision that rewrites the superseded revision's
+   * content. It never rewrites or removes a stored revision.
    */
-  readonly putAgent: (agent: Agent) => Effect.Effect<void, StateStoreError>;
+  readonly putAgent: (agent: Agent) => Effect.Effect<AgentWrite, StateStoreError>;
   /** Read one {@link Agent} revision by id, if present. */
   readonly getAgent: (id: AgentId) => Effect.Effect<Option.Option<Agent>, StateStoreError>;
   /**
-   * Every persisted {@link Agent} revision — retired and superseded included — in
-   * LEXICOGRAPHIC ORDER BY ID. That order is the PINNED contract of this read, but
-   * it is PRESENTATIONAL, not semantic: it is neither insertion order nor lineage
-   * order, and consumers upsert by id, so nothing may depend on it to reconstruct a
-   * lineage (walk `supersedes` for that).
+   * Every persisted {@link Agent} revision — retired and superseded included —
+   * ordered by `id` under SQLite's default `BINARY` collation, i.e. by the BYTE
+   * sequence of the id (a `TEXT` column with no `COLLATE` clause compares
+   * `memcmp`-style over UTF-8 bytes). It is deliberately NOT a locale-aware or
+   * human "alphabetical" order: `"agt-10"` precedes `"agt-2"`, and any non-ASCII id
+   * orders by its UTF-8 encoding.
+   *
+   * That byte-order is the PINNED contract of this read, but it is PRESENTATIONAL,
+   * not semantic: it is neither insertion order nor lineage order, and consumers
+   * upsert by id, so nothing may depend on it to reconstruct a lineage (walk
+   * `supersedes` for that, or fold with `isLineageRetired`).
    */
   readonly listAgents: Effect.Effect<ReadonlyArray<Agent>, StateStoreError>;
 }
@@ -245,7 +289,9 @@ export interface JobStore {
  * `tail(offset)` is the INCREMENTAL primitive and the one to reach for on a live
  * or large feed; `read` materialises the ENTIRE feed in memory and is intended for
  * bounded snapshot use (e.g. AE4's snapshot-on-connect), not for streaming an
- * unbounded log.
+ * unbounded log. `maxOffset` answers "how far does this log go?" WITHOUT
+ * materialising it — the cheap read a caller needs to validate a client's resume
+ * cursor against this log's extent.
  */
 export interface EventLogStore {
   /** Append an event, returning it stamped with its assigned {@link PersistedEvent.offset}. */
@@ -254,6 +300,13 @@ export interface EventLogStore {
   readonly read: Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
   /** Every entry with an offset strictly greater than `offset`, ordered ascending. */
   readonly tail: (offset: number) => Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
+  /**
+   * The highest offset this log currently holds, or `0` when it is EMPTY (durable
+   * offsets are strictly `> 0`, so `0` is unambiguously "no entries"). The extent of
+   * the log, computed by the backing rather than by reading every entry — so a
+   * caller validating a resume cursor never has to materialise the feed to do it.
+   */
+  readonly maxOffset: Effect.Effect<NonNegativeInt, StateStoreError>;
 }
 
 /**

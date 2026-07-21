@@ -11,14 +11,33 @@
  *
  * ## The schema version is the ONLY schema-evolution mechanism (INV-FRESH)
  *
- * This store holds DERIVED, re-derivable daemon state, so it is treated as
- * GREENFIELD: **it never migrates**. There is no migration ladder and no
- * `SqliteMigrator` — there is exactly ONE constant, {@link SCHEMA_VERSION}, and one
- * DDL definition ({@link createSchema}) describing the schema AT that version.
- * On open, the adapter compares the database's `PRAGMA user_version` against the
- * constant; on ANY mismatch it DROPS every table and recreates the schema from
- * scratch, then stamps the new version. No data is preserved and no migration is
- * ever written.
+ * This store is treated as GREENFIELD: **it never migrates**. There is no migration
+ * ladder and no `SqliteMigrator` — there is exactly ONE constant,
+ * {@link SCHEMA_VERSION}, and one DDL definition ({@link createSchema}) describing
+ * the schema AT that version. On open, the adapter compares the database's
+ * `PRAGMA user_version` against the constant; on ANY mismatch it DROPS every schema
+ * object and recreates the schema from scratch, then stamps the new version. No data
+ * is preserved and no migration is ever written.
+ *
+ * **What that costs, stated plainly.** Most of what this store holds IS derived,
+ * re-derivable daemon state (the work graph is re-observed from GitHub; the event
+ * log is a replayable journal of it). The `agent` REGISTRY is NOT: `Agent` is an
+ * OWNED entity and `putAgent` is its SOLE source of truth — there is no manifest, no
+ * config file, and no upstream system to re-derive a registry from. So a version
+ * bump is not merely a cache eviction: it is PERMANENT DATA LOSS of every agent
+ * revision, and of the lineage history the append-only design exists to preserve.
+ * That loss is ACCEPTED, not overlooked — `DMR` treats the store as greenfield
+ * pre-release, and this constant is exactly the switch that says so. The
+ * corresponding downstream obligation is recorded in `@sprinter/domain`'s
+ * `registry.ts`: `Execution.agentId` (DE2.2) can DANGLE across a reset, so nothing
+ * may assume its referent survives.
+ *
+ * The reset is also not free for a LIVE client: the local app and the local daemon
+ * run together, so a bump can drop the database underneath a connected client that
+ * still holds the pre-reset state and a durable resume cursor. That is a real
+ * hazard, not bookkeeping, and it is why the `events` RPC carries an explicit
+ * `ResyncRequired` contract error rather than leaving a stale cursor to be inferred
+ * from offsets (see `packages/contract/src/rpc.ts`).
  *
  * **{@link SCHEMA_VERSION} is the guard.** Any change to the persisted shape —
  * a new table, a new column, a changed column — is landed by editing
@@ -154,13 +173,22 @@ const AgentColumns = Schema.Struct({
 });
 type AgentColumns = (typeof AgentColumns)["Type"];
 
-/** True when a stored `agent` row is byte-identical to the row about to be written. */
-const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
-  stored.id === next.id &&
+/**
+ * True when two `agent` rows agree on every NON-LIFECYCLE column — the content a
+ * revision describes (`name` / `model` / `version` / `tools`), as opposed to its
+ * place in the lineage (`id` / `supersedes`) and its lifecycle stamp (`retiredAt`).
+ * This is the equality a RETIREMENT must satisfy against the revision it retires.
+ */
+const isSameAgentContent = (stored: AgentColumns, next: AgentColumns): boolean =>
   stored.name === next.name &&
   stored.model === next.model &&
   stored.version === next.version &&
-  stored.tools === next.tools &&
+  stored.tools === next.tools;
+
+/** True when a stored `agent` row is byte-identical to the row about to be written. */
+const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
+  stored.id === next.id &&
+  isSameAgentContent(stored, next) &&
   stored.supersedes === next.supersedes &&
   stored.retiredAt === next.retiredAt;
 
@@ -239,9 +267,12 @@ const CountRow = Schema.Struct({ n: NonNegativeInt });
  *
  * **Bump this in the same change as any edit to {@link createSchema}.** A new
  * table, a new column, a changed column type, a changed index — all of them are a
- * new version. This constant is the guard the rest of the domain remodel bumps;
- * the store holds derived, re-derivable daemon state, so resetting it is the
- * intended cost of a shape change.
+ * new version. This constant is the guard the rest of the domain remodel bumps.
+ *
+ * Bumping it DESTROYS the store, including the OWNED, non-re-derivable `agent`
+ * registry (see the module docstring): that is the accepted, deliberate cost of a
+ * shape change while `DMR` treats the store as greenfield pre-release — not a
+ * cost-free cache eviction.
  *
  * Version 1 is the greenfield reset that REPLACED the previous incremental
  * migration ladder (`1_initial` / `2_session_event_log`). A database left by that
@@ -250,30 +281,52 @@ const CountRow = Schema.Struct({ n: NonNegativeInt });
  */
 export const SCHEMA_VERSION = 1;
 
-/** A row of `sqlite_master` naming one existing table. */
-const TableNameRow = Schema.Struct({ name: Schema.NonEmptyString });
+/**
+ * A row of `sqlite_master` naming one existing schema object and its kind. The kind
+ * selects the `DROP` verb — SQLite has no polymorphic drop.
+ */
+const SchemaObjectRow = Schema.Struct({
+  type: Schema.Literals(["table", "view", "trigger"]),
+  name: Schema.NonEmptyString,
+});
+
+/** The `DROP` verb for each droppable `sqlite_master` object kind. */
+const DROP_VERB = { table: "TABLE", view: "VIEW", trigger: "TRIGGER" } as const;
 
 /**
- * Drop EVERY table in the database — the first half of a version reset.
+ * Drop EVERY schema object in the database — the first half of a version reset.
  *
  * The list is read from `sqlite_master` rather than hardcoded, so the reset needs
- * no maintenance when {@link createSchema} gains, renames, or drops a table (a
- * hardcoded list that fell out of step would silently leave a stale table behind,
+ * no maintenance when {@link createSchema} gains, renames, or drops an object (a
+ * hardcoded list that fell out of step would silently leave a stale object behind,
  * which is precisely the failure INV-FRESH exists to prevent). It also sweeps
- * tables this schema does not own — notably `effect_sql_migrations`, the
+ * objects this schema does not own — notably `effect_sql_migrations`, the
  * bookkeeping the RETIRED migration ladder left behind — with no special case.
- * SQLite's internal `sqlite_%` tables (e.g. `sqlite_sequence`) are excluded because
+ *
+ * It sweeps TABLES, VIEWS and TRIGGERS, because those are the three droppable kinds
+ * `sqlite_master` can hold: a table-only sweep would claim to clear "whatever the
+ * database actually holds" while leaving a view or a standalone trigger from a
+ * previous version behind, and the recreated schema would then collide with it (or,
+ * worse, keep firing it). `index` is deliberately absent from that list, not
+ * missed: an index is always attached to a table and SQLite drops it with its
+ * table, and the auto-indexes backing `PRIMARY KEY`/`UNIQUE` are not droppable at
+ * all. Triggers are dropped FIRST for the same reason in reverse — a trigger
+ * attached to a table about to be dropped goes with it, and dropping it explicitly
+ * up front keeps the sweep independent of the order `sqlite_master` returns.
+ * SQLite's internal `sqlite_%` objects (e.g. `sqlite_sequence`) are excluded because
  * they are not droppable; the engine maintains them, and dropping the AUTOINCREMENT
  * tables clears their `sqlite_sequence` rows for us.
  */
 const dropSchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const rows =
-    yield* sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`;
-  const tables = yield* Schema.decodeUnknownEffect(Schema.Array(TableNameRow))(rows);
-  // Table names come from the database's own catalogue, never from user input, and
-  // `DROP TABLE` takes no bound parameters — hence `unsafe` with a quoted identifier.
-  for (const table of tables) yield* sql.unsafe(`DROP TABLE IF EXISTS "${table.name}"`);
+    yield* sql`SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 ELSE 2 END`;
+  const objects = yield* Schema.decodeUnknownEffect(Schema.Array(SchemaObjectRow))(rows);
+  // Names come from the database's own catalogue, never from user input, and `DROP`
+  // takes no bound parameters — hence `unsafe` with a quoted identifier.
+  for (const object of objects) {
+    yield* sql.unsafe(`DROP ${DROP_VERB[object.type]} IF EXISTS "${object.name}"`);
+  }
 });
 
 /**
@@ -435,6 +488,49 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail(operation)),
     );
 
+  /**
+   * Enforce the LIFECYCLE-ONLY retirement rule: a revision that carries both
+   * `supersedes` and `retiredAt` must repeat the superseded revision's
+   * non-lifecycle columns verbatim.
+   *
+   * Compared on the STORED BYTES (`tools` stays the encoded JSON string, as
+   * {@link AgentColumns} models it), so "same content" is decided exactly as the
+   * column stores it rather than by a looser re-decoded comparison — the same basis
+   * {@link isSameAgentRow} uses for the idempotent re-append.
+   *
+   * A superseded revision that is NOT stored is not a failure here: the rule is
+   * unverifiable without it, and a dangling `supersedes` is already the writer's
+   * obligation under `registry.ts`'s acyclicity precondition. The check runs inside
+   * the caller's transaction, so the row it reads is the one the insert commits
+   * against.
+   */
+  const assertRetirementPreservesContent = (
+    supersedes: AgentId,
+    row: AgentColumns,
+  ): Effect.Effect<void, StateStoreError> =>
+    sql`SELECT * FROM agent WHERE id = ${supersedes}`.pipe(
+      Effect.mapError(fail("putAgent")),
+      Effect.flatMap((rows) =>
+        Option.match(Arr.head(rows), {
+          onNone: () => Effect.void,
+          onSome: (found) =>
+            Schema.decodeUnknownEffect(AgentColumns)(found).pipe(
+              Effect.mapError(fail("putAgent")),
+              Effect.flatMap((head) =>
+                isSameAgentContent(head, row)
+                  ? Effect.void
+                  : Effect.fail(
+                      new StateStoreError({
+                        operation: "putAgent",
+                        detail: `agent "${row.id}" retires "${supersedes}" but changes its content; a retirement sets retiredAt ONLY — append the edit as its own revision first, then retire that revision`,
+                      }),
+                    ),
+              ),
+            ),
+        }),
+      ),
+    );
+
   const agents: AgentStore = {
     putAgent: (agent) =>
       sql
@@ -484,7 +580,7 @@ const make = Effect.gen(function* () {
               const current = yield* Schema.decodeUnknownEffect(AgentColumns)(stored.value).pipe(
                 Effect.mapError(fail("putAgent")),
               );
-              if (isSameAgentRow(current, row)) return;
+              if (isSameAgentRow(current, row)) return "unchanged" as const;
               return yield* Effect.fail(
                 new StateStoreError({
                   operation: "putAgent",
@@ -492,9 +588,23 @@ const make = Effect.gen(function* () {
                 }),
               );
             }
+            // A RETIREMENT is LIFECYCLE-ONLY: it may set `retiredAt` and nothing
+            // else. Fusing a content edit into it would collapse two distinct
+            // operations into one indistinguishable append — a reader walking back
+            // from the retiring revision could no longer tell whether the lineage
+            // was edited, retired, or both, and the retired head's content would
+            // appear to have changed at the moment it went out of service. So a
+            // revision carrying BOTH `supersedes` and `retiredAt` must match the
+            // revision it supersedes on every non-lifecycle column. Checkable only
+            // when that revision is actually stored; a dangling `supersedes` is the
+            // same writer obligation the acyclicity precondition already carries.
+            if (agent.retiredAt !== undefined && agent.supersedes !== undefined) {
+              yield* assertRetirementPreservesContent(agent.supersedes, row);
+            }
             yield* sql`INSERT INTO agent ${sql.insert(row)}`.pipe(
               Effect.mapError(fail("putAgent")),
             );
+            return "appended" as const;
           }),
         )
         .pipe(
@@ -513,6 +623,11 @@ const make = Effect.gen(function* () {
           }),
         ),
       ),
+    // `id` is a `TEXT` column with NO `COLLATE` clause, so `ORDER BY id` is SQLite's
+    // default BINARY collation: a `memcmp` over the UTF-8 bytes. That BYTE order —
+    // not a locale-aware alphabetical one — is what the port pins (`"agt-10"` sorts
+    // before `"agt-2"`), and it is presentational: a lineage is read off
+    // `supersedes`, never off this order.
     listAgents: sql`SELECT * FROM agent ORDER BY id`.pipe(
       Effect.mapError(fail("listAgents")),
       Effect.flatMap((rows) => Effect.forEach(rows, (row) => hydrateAgent(row, "listAgents"))),
@@ -734,6 +849,16 @@ const make = Effect.gen(function* () {
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(EventRow))),
         Effect.mapError(fail("tail")),
       ),
+    // `MAX("offset")` is answered by the backing from the PRIMARY KEY index — the
+    // whole point of exposing it rather than reading the feed and taking the last
+    // entry. `COALESCE` turns the SQL `NULL` an empty table yields into `0`, which is
+    // below every durable offset (they are strictly `> 0`), so "empty" needs no
+    // separate shape.
+    maxOffset: sql`SELECT COALESCE(MAX("offset"), 0) AS n FROM event_log`.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
+      Effect.map((rows) => rows[0].n),
+      Effect.mapError(fail("maxOffset")),
+    ),
   };
 
   // ── SessionLogStore ─────────────────────────────────────────────────────────

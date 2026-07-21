@@ -10,7 +10,7 @@
 import { it } from "@effect/vitest";
 import { Context, Effect, Fiber, Option, PubSub, Schema, Stream } from "effect";
 import { expect } from "vitest";
-import type { OffsetEvent } from "@sprinter/contract";
+import { type OffsetEvent, ResyncRequired } from "@sprinter/contract";
 import {
   Agent,
   Epic,
@@ -113,6 +113,36 @@ it.effect("journals every persisted mutation to the durable offset log, in order
     const offsets = entries.map((e) => e.offset);
     expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
     expect(new Set(offsets).size).toBe(offsets.length);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.effect("journals an agent append ONCE — an idempotent re-append adds no second delta", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    const subscription = yield* feed.subscribe;
+
+    // The crash-retry case: the SAME revision appended twice. The registry write is a
+    // genuine no-op the second time (the row is byte-identical and already stored), so
+    // the journal must record ONE `AgentChanged` — not one per attempt. Journaling
+    // unconditionally would let a retry loop grow the durable log without bound and
+    // re-fan a delta nothing changed.
+    expect(yield* store.agents.putAgent(agent)).toBe("appended");
+    expect(yield* store.agents.putAgent(agent)).toBe("unchanged");
+
+    const entries = yield* store.events.read;
+    expect(entries.map((e) => e.kind)).toEqual(["AgentChanged"]);
+    // And the LIVE fan-out is skipped on the no-op too, not merely the durable append:
+    // the only published item is the first one (the second `take` would block, so a
+    // second publish is proven absent by driving a DIFFERENT delta through after it).
+    yield* store.workGraph.putWorkstream(workstream);
+    const published = [yield* PubSub.take(subscription), yield* PubSub.take(subscription)];
+    expect(published.map((e) => e.event._tag)).toEqual(["AgentChanged", "WorkstreamChanged"]);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
@@ -342,23 +372,78 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
   ),
 );
 
-it.live("resyncEvents treats a cursor BEYOND the log's max offset as an origin replay", () =>
+it.live("resyncEvents fails a cursor BEYOND the log's extent with ResyncRequired", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
 
-    // Two mutations, journaled at offsets 1 and 2 — the WHOLE log of this epoch.
+    // Two mutations, journaled at offsets 1 and 2 — the WHOLE log of this generation.
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
-    // A cursor from a STALE EPOCH: bumping SCHEMA_VERSION drops and recreates
-    // `event_log`, whose AUTOINCREMENT offsets restart at 1, so a client's durable
-    // cursor can sit far beyond the new log's maximum. A strict `> offset` tail
-    // would hand it NOTHING and report no error, leaving it silently blind until
-    // the new log grew past 999. It must re-hydrate from the ORIGIN instead.
-    const replayed = yield* resyncEvents(store, feed, 999).pipe(Stream.take(2), Stream.runCollect);
-    expect(replayed.map((e) => e.event._tag)).toEqual(["WorkstreamChanged", "EpicChanged"]);
-    expect(replayed.map((e) => e.offset)).toEqual([1, 2]);
+    // A cursor from a DEAD STORE GENERATION: bumping SCHEMA_VERSION drops and
+    // recreates `event_log`, whose AUTOINCREMENT offsets restart at 1, so a client's
+    // durable cursor can sit far beyond the new log's extent. Neither silent repair
+    // works — honouring it strands the client, replaying from the origin behind its
+    // back leaves its contiguous cursor stale so it discards everything — so the
+    // generation is made EXPLICIT and the request FAILS.
+    const failure = yield* Effect.flip(
+      resyncEvents(store, feed, 999).pipe(Stream.take(2), Stream.runCollect),
+    );
+    expect(failure).toBeInstanceOf(ResyncRequired);
+    // Self-describing: the rejected cursor and the extent it exceeded.
+    expect({ sinceOffset: failure.sinceOffset, maxOffset: failure.maxOffset }).toStrictEqual({
+      sinceOffset: 999,
+      maxOffset: 2,
+    });
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("resyncEvents fails a non-zero cursor against an EMPTY log — the post-reset case", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // The EXACT shape of a freshly reset daemon: the schema version was bumped, the
+    // database was dropped and recreated, and NOTHING has been journaled yet — while a
+    // client reconnects holding a cursor from the destroyed generation. `maxOffset` is
+    // `0` (the empty-log sentinel), which every non-zero cursor exceeds.
+    const failure = yield* Effect.flip(
+      resyncEvents(store, feed, 7).pipe(Stream.take(1), Stream.runCollect),
+    );
+    expect(failure).toBeInstanceOf(ResyncRequired);
+    expect(failure.maxOffset).toBe(0);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("resyncEvents accepts the ORIGIN cursor against an empty log — it is never stale", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // `sinceOffset: 0` (and an absent cursor) asks for the whole log, which is a valid
+    // request against EVERY generation including an empty one — a first connect must
+    // never be told to resync. It replays nothing and streams the live tail.
+    const collecting = yield* resyncEvents(store, feed, 0).pipe(
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+    yield* Effect.sleep("20 millis");
+    yield* store.workGraph.putWorkstream(workstream);
+
+    const received = yield* Fiber.join(collecting);
+    expect(received[0]?.event._tag).toBe("WorkstreamChanged");
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),

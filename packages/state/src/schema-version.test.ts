@@ -46,19 +46,25 @@ const withStore = <A>(
   }).pipe(Effect.provide(layer({ filename, disableWAL: true })), Effect.orDie);
 
 /**
- * The PIN that binds the emitted schema to {@link SCHEMA_VERSION}: the SHA-256 of
- * the DDL SQLite actually stores for every object the adapter creates, paired with
- * the version it belongs to. Changing `createSchema` without bumping the constant
- * changes the digest and fails the test below — which is the whole point, because
- * every other guard in this file only proves the RESET works, not that the version
- * was bumped when the shape changed.
+ * The LEDGER that binds every emitted schema to the version it belongs to: a
+ * `version → SHA-256 of the DDL SQLite actually stores` table, appended to (never
+ * edited) as {@link SCHEMA_VERSION} advances.
  *
- * Update BOTH fields, together, in the same change as the schema edit.
+ * A ledger rather than a single `{ version, sha256 }` pair, because the pair could
+ * be defeated by the exact mistake this guard exists to catch: edit `createSchema`,
+ * leave the version at 1, and update the ONE digest in place — both fields still
+ * agree, the test passes, and an existing store at `user_version = 1` is silently
+ * left holding the OLD shape (INV-FRESH's whole failure mode). A version that has
+ * already shipped a digest cannot be re-used for a different one here: rewriting an
+ * existing row is the failure, and the only clean way forward is a NEW row under a
+ * NEW version — which is exactly the bump.
+ *
+ * When the schema changes: bump {@link SCHEMA_VERSION} and ADD a row. Do not edit an
+ * existing row.
  */
-const SCHEMA_PIN = {
-  version: 1,
-  sha256: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
-} as const;
+const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
+  1: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
+};
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */
 const emittedSchema = (filename: string): string => {
@@ -84,13 +90,31 @@ it.effect("pins the emitted schema to SCHEMA_VERSION — a shape change must bum
     const fix =
       "The persisted schema changed. THE FIX IS TO BUMP `SCHEMA_VERSION` in " +
       "packages/state/src/sqlite.ts (existing stores must drop and recreate — " +
-      "INV-FRESH never migrates), and then update SCHEMA_PIN in this test to the " +
-      `new version and digest. Emitted schema was:\n${ddl}`;
+      "INV-FRESH never migrates), and then ADD a row to SCHEMA_LEDGER in this test " +
+      "for the new version. Do NOT rewrite an existing row: re-using a version for a " +
+      `different shape is the exact failure this guards. Emitted schema was:\n${ddl}`;
 
-    expect(SCHEMA_VERSION, fix).toBe(SCHEMA_PIN.version);
-    expect(digest, fix).toBe(SCHEMA_PIN.sha256);
+    // The current version must be LEDGERED, and its ledgered digest must be the one
+    // the adapter just emitted. Editing `createSchema` without bumping therefore fails
+    // on the digest of an ALREADY-CLAIMED version — and the only way to make it pass is
+    // to add a new row under a new version, i.e. to bump.
+    expect(Object.keys(SCHEMA_LEDGER).map(Number), fix).toContain(SCHEMA_VERSION);
+    expect(SCHEMA_LEDGER[SCHEMA_VERSION], fix).toBe(digest);
   }).pipe(Effect.scoped),
 );
+
+it("ledgers each schema version exactly once, under a distinct digest", () => {
+  // The ledger's own well-formedness — what makes the pin above un-defeatable. A
+  // JS object cannot hold a duplicate key, so uniqueness of the VERSION is
+  // structural; what has to be asserted is the other direction: no two versions may
+  // claim the same DDL (that would mean a bump with no shape change, i.e. a pin
+  // rewritten rather than appended), and the current version may never exceed the
+  // highest ledgered one (a bump with no row added).
+  const versions = Object.keys(SCHEMA_LEDGER).map(Number);
+  const digests = Object.values(SCHEMA_LEDGER);
+  expect(new Set(digests).size).toBe(digests.length);
+  expect(Math.max(...versions)).toBe(SCHEMA_VERSION);
+});
 
 it.effect("stamps the schema version on a fresh store and preserves data across reopen", () =>
   Effect.gen(function* () {
@@ -131,6 +155,14 @@ it.effect("drops and recreates the store on a version mismatch — it never migr
     // renames or drops looks exactly like this to the reset. The drop list is read
     // from `sqlite_master`, not hardcoded, so it is swept with no special case.
     stale.run(`CREATE TABLE IF NOT EXISTS retired_from_a_future_version (id TEXT PRIMARY KEY)`);
+    // And the OTHER droppable kinds `sqlite_master` can hold. A table-only sweep
+    // would leave these behind while claiming to clear whatever the database holds:
+    // the standalone view survives, and the trigger keeps FIRING on the recreated
+    // `agent` table — a stale object silently mutating the new schema's writes.
+    stale.run(`CREATE VIEW IF NOT EXISTS stale_view AS SELECT id FROM agent`);
+    stale.run(
+      `CREATE TRIGGER IF NOT EXISTS stale_trigger AFTER INSERT ON agent BEGIN INSERT INTO retired_from_a_future_version (id) VALUES (NEW.id); END`,
+    );
     stale.close();
 
     const after = yield* withStore(filename, (store) => store.agents.listAgents.pipe(Effect.orDie));
@@ -141,9 +173,11 @@ it.effect("drops and recreates the store on a version mismatch — it never migr
     expect(probe.query("PRAGMA user_version").get()).toStrictEqual({
       user_version: SCHEMA_VERSION,
     });
+    // Nothing the previous version left behind survives, of ANY droppable kind —
+    // table, view, or trigger.
     const ghosts = probe
       .query(
-        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('effect_sql_migrations', 'retired_from_a_future_version')`,
+        `SELECT name FROM sqlite_master WHERE name IN ('effect_sql_migrations', 'retired_from_a_future_version', 'stale_view', 'stale_trigger')`,
       )
       .all();
     probe.close();

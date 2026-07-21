@@ -7,11 +7,15 @@
  * repository/workstream scope and NO `observedAt` (INV-DERIVED / INV-OBSERVED) —
  * asserted structurally, so re-adding one of those fields fails a test rather than
  * only a review.
+ *
+ * It also pins the LINEAGE-level read `isLineageRetired`, which is a genuinely
+ * different question from the per-record `isRetired` under append-only semantics —
+ * retiring a revision stamps a NEW record, never the one being retired.
  */
 import { it } from "@effect/vitest";
 import { Effect, Exit, Schema } from "effect";
 import { expect } from "vitest";
-import { Agent, isOriginalRevision, isRetired } from "./registry.ts";
+import { Agent, isLineageRetired, isOriginalRevision, isRetired } from "./registry.ts";
 
 const decode = (raw: (typeof Agent)["Encoded"]) =>
   Schema.decodeUnknownEffect(Agent)(raw).pipe(Effect.orDie);
@@ -57,6 +61,53 @@ it.effect("identifies the first revision of a lineage by an absent `supersedes`"
   Effect.gen(function* () {
     expect(isOriginalRevision(yield* decode(original))).toBe(true);
     expect(isOriginalRevision(yield* decode({ ...original, supersedes: "agt-0" }))).toBe(false);
+  }),
+);
+
+it.effect("answers lineage-level retirement, which per-record `isRetired` cannot", () =>
+  Effect.gen(function* () {
+    // A three-revision lineage: agt-1 --superseded by--> agt-2 --retired by--> agt-3.
+    // Only agt-3 carries the stamp; agt-1 and agt-2 are immutable and un-stamped
+    // forever, which is exactly why the per-record read is not the lineage read.
+    const first = yield* decode(original);
+    const second = yield* decode({ ...original, id: "agt-2", supersedes: "agt-1" });
+    const retirement = yield* decode({
+      ...original,
+      id: "agt-3",
+      supersedes: "agt-2",
+      retiredAt: "2026-01-01T00:00:00Z",
+    });
+    const all = [first, second, retirement];
+
+    // The distinction the helper exists for: the record says no, the lineage says yes.
+    expect(isRetired(second)).toBe(false);
+    expect(isLineageRetired(second, all)).toBe(true);
+    // It walks FORWARD across an arbitrary number of hops, from any revision.
+    expect(isLineageRetired(first, all)).toBe(true);
+    // And a stamped revision is retired without needing any successor at all.
+    expect(isLineageRetired(retirement, all)).toBe(true);
+
+    // A live lineage (nothing retires it) is not retired at any revision …
+    const live = [first, second];
+    expect(isLineageRetired(first, live)).toBe(false);
+    expect(isLineageRetired(second, live)).toBe(false);
+    // … and a retirement in a DIFFERENT lineage does not leak across.
+    const otherLineage = yield* decode({
+      ...original,
+      id: "agt-9",
+      retiredAt: "2026-01-01T00:00:00Z",
+    });
+    expect(isLineageRetired(first, [first, second, otherLineage])).toBe(false);
+  }),
+);
+
+it.effect("terminates on a malformed cyclic supersedes chain rather than looping", () =>
+  Effect.gen(function* () {
+    // The writer's acyclicity precondition forbids this, but a lineage read handed a
+    // cycle must still RETURN — the walk visits each revision at most once.
+    const a = yield* decode({ ...original, id: "agt-a", supersedes: "agt-b" });
+    const b = yield* decode({ ...original, id: "agt-b", supersedes: "agt-a" });
+    expect(isLineageRetired(a, [a, b])).toBe(false);
   }),
 );
 

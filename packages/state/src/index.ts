@@ -10,6 +10,7 @@
  */
 export type {
   AgentStore,
+  AgentWrite,
   EventLogStore,
   JobStore,
   SessionLogStore,

@@ -259,21 +259,6 @@ struct WorkGraphResyncTests {
   private func offsetDelta(_ offset: Int) throws -> String {
     try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: offset))
   }
-
-  /// Reads the two requests one attempt issues (`events` + `snapshot`, order not
-  /// wire-guaranteed) and indexes them by rpc tag.
-  private func requestsByTag(
-    _ outbound: inout AsyncStream<Data>.Iterator
-  ) async throws -> [String: SentFrame] {
-    var byTag: [String: SentFrame] = [:]
-    for _ in 0..<2 {
-      let frame = try await nextSent(&outbound)
-      if let tag = frame.rpcTag {
-        byTag[tag] = frame
-      }
-    }
-    return byTag
-  }
 }
 
 /// A ``Backend`` for the teardown-ordering test. When `tearsDown` is `true` its

@@ -14,6 +14,8 @@
  * - **Edit** ⇒ append a NEW revision, under a NEW id, whose `supersedes` names the
  *   current head of the lineage. The record being replaced is untouched, so every
  *   historical execution keeps resolving to the exact agent revision that ran it.
+ *   An edit MAY change any of `name` / `model` / `version` / `tools` — that is what
+ *   an edit IS.
  * - **Retire** ⇒ ALSO a NEW revision under a NEW id, carrying BOTH `supersedes`
  *   (naming the head it retires) AND a `retiredAt` stamp. Retirement is NEVER a
  *   same-id stamp on an existing row — that would be a mutation, and it would make
@@ -23,6 +25,43 @@
  *
  * Nothing is ever removed, so NO delete is exposed anywhere on the path — not on
  * the `StateStore` port, not on the contract.
+ *
+ * ## A retirement is LIFECYCLE-ONLY — it may not rewrite content
+ *
+ * A retiring revision MUST carry the SAME `name`, `model`, `version` and `tools` as
+ * the head it retires; ONLY `supersedes` and `retiredAt` differ. Retirement says
+ * "this lineage is out of service", not "this lineage is out of service AND its
+ * tools were always empty". A retirement that also changed content would be an
+ * EDIT and a retirement fused into one indistinguishable append: a reader walking
+ * back from the retiring revision could no longer tell which of the two things
+ * happened, and the retired head's content would appear to have changed at the
+ * moment it stopped being used. Do BOTH by appending the edit first and retiring
+ * the edited revision.
+ *
+ * This is not a convention — the `StateStore` port ENFORCES it on `putAgent` (it
+ * reads the superseded revision and rejects a retiring append whose non-lifecycle
+ * fields differ). The port can only check it when the superseded revision is
+ * actually stored; a retiring revision naming an ABSENT `supersedes` is the same
+ * dangling-chain case the acyclicity precondition already leaves to the writer.
+ *
+ * ## Durability is scoped to a STORE GENERATION
+ *
+ * "Nothing is ever removed" is a property of the REGISTRY's operations, and it holds
+ * for the life of a store generation: within one generation, revisions are immutable
+ * and the whole history is preserved, so a past execution resolves to the exact
+ * revision that ran it. It is NOT an eternal guarantee. `SCHEMA_VERSION`
+ * (`packages/state/src/sqlite.ts`) is the store's ONLY evolution mechanism and it
+ * never migrates: bumping it DROPS the database and recreates it, starting a NEW
+ * generation and discarding the previous one entirely. `putAgent` is the sole source
+ * of truth for registry content — there is no manifest and no config to re-seed from
+ * — so that reset is real, permanent data loss, ACCEPTED because `DMR` treats the
+ * store as greenfield pre-release.
+ *
+ * The consequence a downstream task must plan for: `Execution.agentId` (DE2.2) can
+ * DANGLE across a generation boundary — an execution retained by a client (or
+ * re-observed from an external system) may name an `Agent` revision the reset
+ * destroyed. DE2.2 must therefore treat the referent as possibly-absent and must not
+ * assume resolution succeeds.
  *
  * PRECONDITION on `supersedes` (the port rejects the self-reference case; the rest
  * is the writer's obligation): the `supersedes` chain must be an ACYCLIC path
@@ -60,9 +99,11 @@ import { Timestamp } from "./time.ts";
  *   precondition.
  * - `retiredAt` — the instant the agent was retired, absent while it is in
  *   service. Retirement is a stamp, NOT a status enum (INV-SUM), and NOT a delete:
- *   a retired agent's record stays readable so past executions still resolve. A
- *   RETIRING revision carries `supersedes` as well — it is a new revision that
- *   retires the lineage head, never a stamp applied to an existing row.
+ *   a retired agent's record stays readable — for the life of the store generation
+ *   — so past executions still resolve. A RETIRING revision carries `supersedes` as
+ *   well, and carries the SAME `name`/`model`/`version`/`tools` as the head it
+ *   retires: it is a new LIFECYCLE-ONLY revision, never a stamp applied to an
+ *   existing row and never a content rewrite (see the module docstring).
  */
 export const Agent = Schema.Struct({
   id: AgentId,
@@ -90,3 +131,50 @@ export const isRetired = (agent: Agent): boolean => agent.retiredAt !== undefine
  * one revision and cannot observe the chain.
  */
 export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes === undefined;
+
+/**
+ * True when `agent`'s LINEAGE has been retired — i.e. `agent` itself carries a
+ * `retiredAt` stamp, or some revision in `all` retires it, directly or through a
+ * chain of later revisions.
+ *
+ * {@link isRetired} answers a question about ONE RECORD, and under append-only
+ * semantics that is deliberately NOT the same question as "is this agent still in
+ * service". Retiring `agt-2` appends a NEW revision `agt-3` that carries
+ * `supersedes: "agt-2"` and the stamp; `agt-2` itself is immutable and stays
+ * un-stamped forever. So `isRetired(agt-2)` is `false` even after the lineage is
+ * retired, and it is correct that it is: the record really was never retired — its
+ * LINEAGE was.
+ *
+ * Answering the lineage question needs the REVERSE of the `supersedes` link, which
+ * no single revision carries and no store read exposes. This helper derives that
+ * reverse index from a `listAgents`-shaped collection — the whole registry,
+ * superseded and retired revisions included, which is exactly what `listAgents` and
+ * `Snapshot.agents` hand over — and walks FORWARD from `agent` along it until it
+ * reaches a stamped revision or the head of the lineage.
+ *
+ * `all` is read as an unordered set; `listAgents`'s id order is presentational and
+ * is deliberately not relied on here. Revisions in `all` that belong to other
+ * lineages are ignored. A revision superseded by TWO revisions is a malformed
+ * history the writer's precondition already excludes; this walk follows the first
+ * such successor it encounters and still terminates.
+ *
+ * Termination: the walk visits each revision at most once (it stops on re-visiting
+ * one), so it terminates even if a caller hands it the cyclic `supersedes` structure
+ * the module docstring's precondition forbids.
+ */
+export const isLineageRetired = (agent: Agent, all: Iterable<Agent>): boolean => {
+  const successors = new Map<AgentId, Agent>();
+  for (const revision of all) {
+    if (revision.supersedes !== undefined && !successors.has(revision.supersedes)) {
+      successors.set(revision.supersedes, revision);
+    }
+  }
+  const seen = new Set<AgentId>();
+  let current: Agent | undefined = agent;
+  while (current !== undefined && !seen.has(current.id)) {
+    if (isRetired(current)) return true;
+    seen.add(current.id);
+    current = successors.get(current.id);
+  }
+  return false;
+};

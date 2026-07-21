@@ -106,11 +106,14 @@ struct CommandTests {
   @Test("decodes every contract error variant")
   func decodesContractErrors() throws {
     let errors = try Golden.decode([ContractError].self, from: "contract-errors")
-    #expect(errors.count == 4)
+    #expect(errors.count == 5)
     #expect(errors[0] == .workstreamNotFound(id: WorkstreamId(rawValue: "ws-9")))
     #expect(errors[1] == .issueNotFound(id: IssueId(rawValue: "iss-9")))
     #expect(errors[2] == .sessionNotFound(id: SessionId(rawValue: "ses-9")))
     #expect(errors[3] == .planRejected(reason: "empty spec"))
+    // The `events` stream's one error: the client's resume cursor belongs to a store
+    // generation the daemon dropped, so it must re-hydrate from `snapshot` (B2).
+    #expect(errors[4] == .resyncRequired(sinceOffset: 999, maxOffset: 2))
     for error in errors {
       #expect(try Golden.roundTrip(error) == error)
     }

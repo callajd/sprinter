@@ -60,6 +60,46 @@ export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanR
   reason: Schema.String,
 }) {}
 
+/**
+ * An `events` request's `sinceOffset` cursor CANNOT belong to the daemon's current
+ * store generation, so there is no incremental resume from it: the client must throw
+ * away everything it retained and re-hydrate from `snapshot`.
+ *
+ * The daemon's store never migrates (INV-FRESH): bumping its schema version DROPS
+ * the database and recreates it, which restarts the durable `event_log`'s offsets at
+ * `1` and destroys every row the client's retained state was built from. The local
+ * app and the local daemon run together, so this happens UNDER a live client — one
+ * that reconnects holding a cursor from the previous generation and a retained
+ * snapshot full of entities that no longer exist.
+ *
+ * Neither of the two things a daemon could do WITHOUT this error is correct, which
+ * is why it is a contract error rather than an inference:
+ *
+ * - Honour the cursor as a strict `> sinceOffset` tail ⇒ the client receives nothing
+ *   and reports no error, staying silently blind until the new log grows past its
+ *   stale high-water mark.
+ * - Quietly replay from the origin instead ⇒ the client's contiguous-offset cursor is
+ *   still at the stale value, so it discards every replayed offset as "already seen",
+ *   never advances (not even for new live events), and re-reads the whole log on every
+ *   reconnect — a worse failure than the stall, and one the client cannot detect.
+ *
+ * Neither can be fixed on the daemon side alone, because the real damage is the
+ * CLIENT's retained state: the delta model is upsert-only (there is no `*Removed`),
+ * so no stream of deltas can ever remove an entity the reset destroyed. The epoch
+ * must therefore be EXPLICIT — the daemon says "resync", and the client answers by
+ * dropping its retained state and cursor and taking the subscribe-around-`snapshot`
+ * path it uses on a first connect.
+ *
+ * - `sinceOffset` — the cursor the client sent, echoed back so the failure is
+ *   self-describing in a log.
+ * - `maxOffset` — the highest offset the daemon's log currently holds (`0` when it is
+ *   empty), i.e. the extent the cursor exceeded.
+ */
+export class ResyncRequired extends Schema.TaggedErrorClass<ResyncRequired>()("ResyncRequired", {
+  sinceOffset: NonNegativeInt,
+  maxOffset: NonNegativeInt,
+}) {}
+
 // ── Aggregate contract schemas (composed only of owned domain types) ────────
 
 /**
@@ -209,9 +249,16 @@ export const snapshot = Rpc.make("snapshot", { success: Snapshot });
 // an omitted `payload` key on the wire (decoding to `undefined`) is NOT a valid events
 // request. The success offset and the request cursor are the SAME coordinate: a
 // client feeds a streamed item's `offset` straight back as the next `sinceOffset`.
+//
+// The one error is {@link ResyncRequired}: the cursor cannot belong to the daemon's
+// CURRENT store generation (the store was dropped and recreated under the client),
+// so no incremental resume exists and the client must discard its retained state and
+// re-hydrate from `snapshot`. It is a typed contract error precisely because the
+// daemon cannot repair it alone — see `ResyncRequired`'s docstring.
 export const events = Rpc.make("events", {
   payload: { sinceOffset: Schema.optionalKey(NonNegativeInt) },
   success: OffsetEvent,
+  error: ResyncRequired,
   stream: true,
 });
 

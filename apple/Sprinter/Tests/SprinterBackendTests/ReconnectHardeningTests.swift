@@ -245,21 +245,6 @@ struct ReconnectHardeningTests {
     try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: offset))
   }
 
-  /// Reads the two requests one attempt issues (`events` + `snapshot`, order not
-  /// wire-guaranteed) and indexes them by rpc tag.
-  private func requestsByTag(
-    _ outbound: inout AsyncStream<Data>.Iterator
-  ) async throws -> [String: SentFrame] {
-    var byTag: [String: SentFrame] = [:]
-    for _ in 0..<2 {
-      let frame = try await nextSent(&outbound)
-      if let tag = frame.rpcTag {
-        byTag[tag] = frame
-      }
-    }
-    return byTag
-  }
-
   /// Attempt 1 for the idle-health test: answer the snapshot, apply delta@1 (recording resume
   /// cursor 1), drain both observed states, then drop — a healthy first connect that leaves a
   /// resume cursor for the following attempt.

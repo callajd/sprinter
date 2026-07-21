@@ -145,11 +145,90 @@ it.effect("re-appending a byte-identical Agent revision is an idempotent no-op",
     const store = yield* StateStore;
     const first = yield* agent();
     // The crash-retry case: the same write replayed must SUCCEED (so a retry is not
-    // an error) without appending a second row or altering the stored one.
-    yield* store.agents.putAgent(first);
-    yield* store.agents.putAgent(yield* agent());
+    // an error) without appending a second row or altering the stored one. The two
+    // calls are REPORTED apart, though — a decorator that journals a delta per append
+    // needs to know which one actually wrote, or a retry loop grows the event log
+    // without bound.
+    expect(yield* store.agents.putAgent(first)).toBe("appended");
+    expect(yield* store.agents.putAgent(yield* agent())).toBe("unchanged");
 
     expect(yield* store.agents.listAgents).toStrictEqual([first]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("rejects a RETIRING revision that also rewrites the content it retires", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const head = yield* agent({ id: "agt-2", tools: ["read", "edit"] });
+    yield* store.agents.putAgent(head);
+
+    // A retirement is LIFECYCLE-ONLY. This append retires `agt-2` while also blanking
+    // its `tools`, fusing an EDIT and a RETIREMENT into one indistinguishable record:
+    // a reader walking back from it could no longer tell which happened, and the
+    // retired head's content would appear to have changed as it went out of service.
+    const error = yield* store.agents
+      .putAgent(
+        yield* agent({
+          id: "agt-3",
+          supersedes: "agt-2",
+          tools: [],
+          retiredAt: "2026-07-20T12:00:00.000Z",
+        }),
+      )
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    // Nothing was written: the registry still holds only the head.
+    expect(yield* store.agents.listAgents).toStrictEqual([head]);
+
+    // The SAME retirement, content-preserving, is accepted — the rule constrains
+    // retirement only, and there is a legitimate way to express the intent: append
+    // the edit as its OWN revision, then retire that.
+    const retirement = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-2",
+      tools: ["read", "edit"],
+      retiredAt: "2026-07-20T12:00:00.000Z",
+    });
+    expect(yield* store.agents.putAgent(retirement)).toBe("appended");
+    expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
+      "agt-2",
+      "agt-3",
+    ]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("lets a NON-retiring revision change content freely — that is what an edit IS", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.agents.putAgent(yield* agent({ id: "agt-2", tools: ["read"] }));
+    // An EDIT supersedes without retiring, so the content-preservation rule does not
+    // apply to it: changing `tools`/`version` is precisely its purpose.
+    const edited = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-2",
+      version: "2.0.0",
+      tools: ["read", "edit", "bash"],
+    });
+    expect(yield* store.agents.putAgent(edited)).toBe("appended");
+    expect(Option.getOrThrow(yield* store.agents.getAgent(edited.id))).toStrictEqual(edited);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("accepts a retiring revision whose superseded revision is not stored", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // The content rule is only CHECKABLE against a stored revision. A dangling
+    // `supersedes` is the same writer obligation the acyclicity precondition already
+    // carries, so the append succeeds rather than inventing a referential constraint
+    // the append-only registry does not have.
+    const retirement = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-absent",
+      retiredAt: "2026-07-20T12:00:00.000Z",
+    });
+    expect(yield* store.agents.putAgent(retirement)).toBe("appended");
+    expect(yield* store.agents.listAgents).toStrictEqual([retirement]);
   }).pipe(Effect.provide(layerMemory)),
 );
 
@@ -209,7 +288,7 @@ it.effect("rejects an Agent revision that supersedes itself", () =>
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("lists the registry in lexicographic id order — the pinned contract order", () =>
+it.effect("lists the registry in BYTE order by id — the pinned contract order", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     // Appended out of order, and NOT in lineage order: `agt-b` supersedes `agt-c`.
@@ -220,13 +299,34 @@ it.effect("lists the registry in lexicographic id order — the pinned contract 
     yield* store.agents.putAgent(b);
     yield* store.agents.putAgent(a);
 
-    // The pinned order is lexicographic BY ID — neither insertion nor lineage
-    // order. It is presentational: consumers upsert by id, and a lineage is
-    // reconstructed by walking `supersedes`, never by reading this order.
+    // The pinned order is BY ID — neither insertion nor lineage order. It is
+    // presentational: consumers upsert by id, and a lineage is reconstructed by
+    // walking `supersedes`, never by reading this order.
     expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
       "agt-a",
       "agt-b",
       "agt-c",
+    ]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("orders ids by BYTE sequence, not by a human alphabetical reading", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // The distinction the port docstring pins: `id` is a `TEXT` column with no
+    // `COLLATE`, so SQLite compares UTF-8 BYTES. `"agt-10"` therefore sorts BEFORE
+    // `"agt-2"` ("1" < "2" byte-wise), and a non-ASCII id sorts by its encoding —
+    // neither is what "alphabetical" would suggest. Documenting it vaguely would
+    // invite a consumer to assume numeric or locale ordering; this pins the real one.
+    for (const id of ["agt-2", "agt-10", "agt-Z", "agt-a", "agt-é"]) {
+      yield* store.agents.putAgent(yield* agent({ id }));
+    }
+    expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
+      "agt-10",
+      "agt-2",
+      "agt-Z",
+      "agt-a",
+      "agt-é",
     ]);
   }).pipe(Effect.provide(layerMemory)),
 );
@@ -393,6 +493,11 @@ it.effect("appends events, reads the feed in order, and tails from an offset", (
     const tail = yield* store.events.tail(first.offset);
     expect(tail.map((e) => e.kind)).toStrictEqual(["JobDispatched", "PrOpened"]);
 
+    // `maxOffset` is the log's EXTENT — the same coordinate the last entry carries,
+    // answered from the backing's index rather than by materialising the feed. It is
+    // what a resume cursor is validated against, so it must agree with `read` exactly.
+    expect(yield* store.events.maxOffset).toBe(Option.getOrThrow(Arr.last(appended)).offset);
+
     // The append return value is itself a well-formed PersistedEvent.
     const roundTrip = yield* Schema.decodeUnknownEffect(PersistedEvent)(first).pipe(Effect.orDie);
     expect(roundTrip).toStrictEqual(first);
@@ -423,6 +528,9 @@ it.effect("returns None for every missing node", () =>
     expect(yield* store.jobs.listJobsForIssue(iss.id)).toStrictEqual([]);
     expect(yield* store.events.read).toStrictEqual([]);
     expect(yield* store.events.tail(0)).toStrictEqual([]);
+    // `0` is the empty-log sentinel: durable offsets are strictly `> 0`, so it is
+    // below every real entry and needs no separate "no entries" shape.
+    expect(yield* store.events.maxOffset).toBe(0);
     expect(yield* store.agents.getAgent((yield* agent()).id)).toStrictEqual(Option.none());
     expect(yield* store.agents.listAgents).toStrictEqual([]);
   }).pipe(Effect.provide(layerMemory)),

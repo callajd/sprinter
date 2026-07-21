@@ -14,5 +14,10 @@
   {
     "_tag": "PlanRejected",
     "reason": "empty spec"
+  },
+  {
+    "_tag": "ResyncRequired",
+    "sinceOffset": 999,
+    "maxOffset": 2
   }
 ]

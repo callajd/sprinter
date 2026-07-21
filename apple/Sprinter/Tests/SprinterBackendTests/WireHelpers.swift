@@ -91,3 +91,21 @@ func nextSent(_ iterator: inout AsyncStream<Data>.Iterator) async throws -> Sent
   }
   return try JSONDecoder().decode(SentFrame.self, from: data)
 }
+
+/// Reads the two requests ONE subscribe-around-snapshot attempt issues (`events` +
+/// `snapshot`) and indexes them by rpc tag. The two are sent on the connection's
+/// serialized path but their ARRIVAL order is not wire-guaranteed, so a test that
+/// asserted a fixed order would be asserting an implementation detail; indexing by tag
+/// asserts only what the contract fixes — that both were issued.
+func requestsByTag(
+  _ outbound: inout AsyncStream<Data>.Iterator
+) async throws -> [String: SentFrame] {
+  var byTag: [String: SentFrame] = [:]
+  for _ in 0..<2 {
+    let frame = try await nextSent(&outbound)
+    if let tag = frame.rpcTag {
+      byTag[tag] = frame
+    }
+  }
+  return byTag
+}
