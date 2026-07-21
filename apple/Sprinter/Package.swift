@@ -62,13 +62,17 @@ let package = Package(
       name: "SprinterContract",
       swiftSettings: swiftSettings
     ),
-    // Decode tests over committed goldens generated FROM the TS contract
-    // (`scripts/generate-goldens.ts`). The gate only DECODES the goldens — no bun
-    // dependency inside `make check`.
+    // Decode + ENCODE-AGREEMENT tests over committed goldens generated FROM the TS
+    // contract (`scripts/generate-goldens.ts`). The gate only reads the committed
+    // bytes — no bun dependency inside `make check`. `NegativeFixtures` carries the
+    // deliberately WRONG documents that prove the encode-agreement guard rejects what
+    // it claims to (#89); it is a SEPARATE resource directory so the root gate's
+    // `check:goldens` stage — which regenerates and diffs `Goldens` — never tries to
+    // reconcile a file that must stay wrong.
     .testTarget(
       name: "SprinterContractTests",
       dependencies: ["SprinterContract"],
-      resources: [.copy("Goldens")],
+      resources: [.copy("Goldens"), .copy("NegativeFixtures")],
       swiftSettings: swiftSettings
     ),
     // The RPC client + `Backend` port (BE1.1). Speaks the `effect/unstable/rpc`
