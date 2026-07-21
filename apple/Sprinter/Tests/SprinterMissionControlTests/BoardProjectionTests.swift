@@ -130,7 +130,8 @@ struct BoardProjectionTests {
       ],
       issues: [],
       jobs: [],
-      sessions: [])
+      sessions: [],
+      agents: [])
 
     let board = BoardProjection.project(snapshot)
     #expect(board.first?.epics.map(\.id) == [EpicId(rawValue: "ep")])

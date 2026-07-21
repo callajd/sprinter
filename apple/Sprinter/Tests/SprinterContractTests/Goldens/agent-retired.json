@@ -1,8 +1,9 @@
 {
-  "id": "agt-0",
-  "name": "scout",
-  "model": "claude-haiku-4-5",
-  "version": "0.9.0",
+  "id": "agt-3",
+  "name": "implementer",
+  "model": "claude-opus-4-8",
+  "version": "1.1.0",
   "tools": [],
+  "supersedes": "agt-2",
   "retiredAt": "2026-07-20T12:00:00.000Z"
 }

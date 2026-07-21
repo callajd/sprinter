@@ -112,9 +112,11 @@ const session = { id: "ses-1", jobId: "job-1", status: "active" };
 
 // ── Registry fixtures (DE1.1) ────────────────────────────────────────────────
 //
-// The registry is APPEND-ONLY and GLOBAL: `agentRevised` is a NEW revision linked
-// to the one it replaced by `supersedes`, and `agentRetired` carries a `retiredAt`
-// stamp (retired-ness is the stamp's presence — there is no status enum, INV-SUM).
+// The registry is APPEND-ONLY and GLOBAL, and a stored revision is IMMUTABLE, so
+// BOTH mutating operations are an append of a NEW id: `agentRevised` is an EDIT —
+// a new revision linked to the one it replaced by `supersedes` — and `agentRetired`
+// is a RETIREMENT — a new revision carrying `supersedes` AND the `retiredAt` stamp
+// (retired-ness is the stamp's presence; there is no status enum, INV-SUM).
 // `agentOriginal` exercises BOTH optional keys ABSENT. No agent names a repository:
 // "agents used in this repo" is a fold over that repo's executions (INV-DERIVED).
 const agentOriginal = {
@@ -133,11 +135,12 @@ const agentRevised = {
   supersedes: "agt-1",
 };
 const agentRetired = {
-  id: "agt-0",
-  name: "scout",
-  model: "claude-haiku-4-5",
-  version: "0.9.0",
+  id: "agt-3",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
   tools: [],
+  supersedes: "agt-2",
   retiredAt: "2026-07-20T12:00:00.000Z",
 };
 
@@ -164,7 +167,10 @@ write("snapshot", Snapshot, {
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
   sessions: [session],
-  agents: [agentRetired, agentOriginal, agentRevised],
+  // Lexicographic by id — the order `listAgents` pins and the daemon hydrates in.
+  // It is presentational (a client upserts by id); a lineage is read off
+  // `supersedes`, never off this order.
+  agents: [agentOriginal, agentRevised, agentRetired],
 });
 
 // Individual owned nodes (exercise every DTO + optional-key present/absent).

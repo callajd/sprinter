@@ -342,6 +342,61 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
   ),
 );
 
+it.live("resyncEvents treats a cursor BEYOND the log's max offset as an origin replay", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+
+    // Two mutations, journaled at offsets 1 and 2 — the WHOLE log of this epoch.
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+
+    // A cursor from a STALE EPOCH: bumping SCHEMA_VERSION drops and recreates
+    // `event_log`, whose AUTOINCREMENT offsets restart at 1, so a client's durable
+    // cursor can sit far beyond the new log's maximum. A strict `> offset` tail
+    // would hand it NOTHING and report no error, leaving it silently blind until
+    // the new log grew past 999. It must re-hydrate from the ORIGIN instead.
+    const replayed = yield* resyncEvents(store, feed, 999).pipe(Stream.take(2), Stream.runCollect);
+    expect(replayed.map((e) => e.event._tag)).toEqual(["WorkstreamChanged", "EpicChanged"]);
+    expect(replayed.map((e) => e.offset)).toEqual([1, 2]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max offset", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    yield* store.workGraph.putWorkstream(workstream);
+    yield* store.workGraph.putEpic(epic);
+
+    // The boundary the stale-epoch rule must NOT swallow: a fully caught-up client
+    // (cursor == max offset) is not stale, so it replays nothing and only streams
+    // the live tail — it is never re-sent history it already acknowledged.
+    const collecting = yield* resyncEvents(store, feed, 2).pipe(
+      Stream.take(1),
+      Stream.runCollect,
+      Effect.forkChild,
+    );
+    yield* Effect.sleep("20 millis");
+    yield* store.workGraph.putIssue(issue);
+
+    const received = yield* Fiber.join(collecting);
+    const only: OffsetEvent | undefined = received[0];
+    expect(only?.event._tag).toBe("IssueChanged");
+    expect((only?.offset ?? 0) > 2).toBe(true);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
 it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

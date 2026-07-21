@@ -31,7 +31,8 @@ enum Fixtures {
     ],
     issues: [issue],
     jobs: [],
-    sessions: [])
+    sessions: [],
+    agents: [])
 
   static let plan = WorkstreamPlan(
     name: "Foundation", repo: "callajd/sprinter", spec: "build the thing")
@@ -79,7 +80,8 @@ enum Fixtures {
     ],
     issues: [issueInReview],
     jobs: [],
-    sessions: [])
+    sessions: [],
+    agents: [])
 
   // ── Session channel ─────────────────────────────────────────────────────────
 

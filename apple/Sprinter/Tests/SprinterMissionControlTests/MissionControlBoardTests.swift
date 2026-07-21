@@ -47,7 +47,8 @@ struct MissionControlBoardTests {
       epics: [BoardFixtures.epicB],
       issues: [BoardFixtures.issueB],
       jobs: [],
-      sessions: [])
+      sessions: [],
+      agents: [])
     board.apply(onlyB)
     #expect(board.workstreams.map(\.id) == [WorkstreamId(rawValue: "ws-b")])
     #expect(board.workstreams.first?.status == .complete)

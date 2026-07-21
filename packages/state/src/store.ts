@@ -130,21 +130,40 @@ export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
  * never a stored per-repo list — INV-DERIVED).
  *
  * The surface is APPEND + READ, and there is deliberately **no delete** — not
- * here, and not on the contract. An agent's record is immutable history: editing
- * appends a NEW revision whose `supersedes` names the one it replaces, and
- * retiring appends a revision carrying `retiredAt`. Removing a record would strand
- * every past execution that ran on it.
+ * here, and not on the contract. A stored revision is IMMUTABLE history: editing
+ * appends a NEW revision, under a NEW id, whose `supersedes` names the current head
+ * of the lineage; retiring appends one carrying BOTH `supersedes` AND `retiredAt`.
+ * Removing — or rewriting — a record would strand every past execution that ran on
+ * it.
  *
- * `putAgent` is an upsert BY ID so a re-append of the same revision is idempotent
- * (a crash-retry re-writes the identical row); it is not an edit path, because an
- * edit mints a new id.
+ * `putAgent` is therefore an APPEND, not an upsert. It is idempotent for a
+ * BYTE-IDENTICAL re-append of an id already stored (the crash-retry case: the write
+ * is a no-op and succeeds), and it FAILS with {@link StateStoreError} when the id
+ * is already stored with DIFFERENT content. It never rewrites a column, so it can
+ * neither silently replace a revision's content nor un-retire a retired agent.
+ * There is no edit path here at all, because an edit mints a new id.
+ *
+ * It also rejects `supersedes === id` — a revision cannot supersede itself, which
+ * is the one `supersedes` cycle a single write can create (`registry.ts` states the
+ * full acyclicity precondition the writer owns).
  */
 export interface AgentStore {
-  /** Append an {@link Agent} revision (idempotent by id). Never removes a prior revision. */
+  /**
+   * Append an {@link Agent} revision. A byte-identical re-append of an already
+   * stored id is an idempotent no-op; a DIFFERING re-append of that id fails with
+   * {@link StateStoreError}, as does a revision whose `supersedes` names itself. It
+   * never rewrites or removes a stored revision.
+   */
   readonly putAgent: (agent: Agent) => Effect.Effect<void, StateStoreError>;
   /** Read one {@link Agent} revision by id, if present. */
   readonly getAgent: (id: AgentId) => Effect.Effect<Option.Option<Agent>, StateStoreError>;
-  /** Every persisted {@link Agent} revision — retired and superseded included — ordered by id. */
+  /**
+   * Every persisted {@link Agent} revision — retired and superseded included — in
+   * LEXICOGRAPHIC ORDER BY ID. That order is the PINNED contract of this read, but
+   * it is PRESENTATIONAL, not semantic: it is neither insertion order nor lineage
+   * order, and consumers upsert by id, so nothing may depend on it to reconstruct a
+   * lineage (walk `supersedes` for that).
+   */
   readonly listAgents: Effect.Effect<ReadonlyArray<Agent>, StateStoreError>;
 }
 

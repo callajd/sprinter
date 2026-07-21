@@ -47,7 +47,8 @@ struct SessionPullRequestResolverTests {
   /// crash.
   @Test("a session with no job in the snapshot is unresolved")
   func unresolvedSession() {
-    let empty = Snapshot(workstreams: [], epics: [], issues: [], jobs: [], sessions: [])
+    let empty = Snapshot(
+      workstreams: [], epics: [], issues: [], jobs: [], sessions: [], agents: [])
     let pane = SessionPullRequestResolver.resolve(
       sessionId: InspectorFixtures.sessionId, in: empty)
 
@@ -65,7 +66,8 @@ struct SessionPullRequestResolverTests {
       epics: [],
       issues: [InspectorFixtures.issue],
       jobs: [InspectorFixtures.jobWithPullRequest(InspectorFixtures.jobPullRequest)],
-      sessions: [])  // no session record — resolve via the job's back-reference
+      sessions: [],  // no session record — resolve via the job's back-reference
+      agents: [])
 
     let pane = SessionPullRequestResolver.resolve(
       sessionId: InspectorFixtures.sessionId, in: snapshot)

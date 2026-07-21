@@ -14,9 +14,10 @@ struct ReadModelTests {
     #expect(snapshot.jobs.count == 2)
     #expect(snapshot.sessions.count == 1)
     // The REGISTRY layer rides the snapshot whole — every revision, retired included
-    // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED).
+    // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED), in
+    // the lexicographic-by-id order the daemon's `listAgents` pins.
     #expect(snapshot.agents.count == 3)
-    #expect(snapshot.agents.map(\.id.rawValue) == ["agt-0", "agt-1", "agt-2"])
+    #expect(snapshot.agents.map(\.id.rawValue) == ["agt-1", "agt-2", "agt-3"])
     #expect(try Golden.roundTrip(snapshot) == snapshot)
   }
 

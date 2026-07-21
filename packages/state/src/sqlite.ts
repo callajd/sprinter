@@ -24,7 +24,10 @@
  * a new table, a new column, a changed column — is landed by editing
  * {@link createSchema} AND bumping {@link SCHEMA_VERSION}. Bumping it is what makes
  * existing stores reset; forgetting to bump it is the one way to get a stale
- * database, so the bump is part of every schema change, not an afterthought.
+ * database, so the bump is part of every schema change, not an afterthought. That
+ * pairing is MECHANICALLY GUARDED: `schema-version.test.ts` pins a digest of the
+ * emitted DDL alongside the version, so editing {@link createSchema} without
+ * bumping {@link SCHEMA_VERSION} fails the gate.
  *
  * Persistence strategy (all reads decode raw driver rows back through `Schema` —
  * never `as` / `!` / `any`, INV-NOCAST):
@@ -133,6 +136,34 @@ const AgentRow = Schema.Struct({
   retiredAt: Schema.NullOr(Timestamp),
 });
 
+/**
+ * The RAW columns of an `agent` row, exactly as stored — `tools` stays the encoded
+ * JSON string rather than a decoded list. This is the shape the append-only write
+ * path compares against, so "already stored with identical content" is decided on
+ * the STORED BYTES (both sides are produced by the same encoder), never on a
+ * re-decoded value whose comparison could be looser than the column's.
+ */
+const AgentColumns = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  model: Schema.String,
+  version: Schema.String,
+  tools: Schema.String,
+  supersedes: Schema.NullOr(Schema.String),
+  retiredAt: Schema.NullOr(Schema.String),
+});
+type AgentColumns = (typeof AgentColumns)["Type"];
+
+/** True when a stored `agent` row is byte-identical to the row about to be written. */
+const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
+  stored.id === next.id &&
+  stored.name === next.name &&
+  stored.model === next.model &&
+  stored.version === next.version &&
+  stored.tools === next.tools &&
+  stored.supersedes === next.supersedes &&
+  stored.retiredAt === next.retiredAt;
+
 /** A session row — no optional or JSON columns. */
 const SessionRow = Schema.Struct({
   id: SessionId,
@@ -219,30 +250,30 @@ const CountRow = Schema.Struct({ n: NonNegativeInt });
  */
 export const SCHEMA_VERSION = 1;
 
-/**
- * Every table this schema owns, in DROP order (children before parents — SQLite
- * has no FK constraints declared here, so the order is purely for readability).
- * `effect_sql_migrations` is the bookkeeping table the RETIRED migration ladder
- * left behind: dropping it is what makes a pre-INV-FRESH database reset cleanly
- * rather than keep a ghost of the old mechanism.
- */
-const TABLES = [
-  "agent",
-  "issue_dependency",
-  "issue",
-  "epic",
-  "workstream",
-  "session_event_log",
-  "session",
-  "job",
-  "event_log",
-  "effect_sql_migrations",
-] as const;
+/** A row of `sqlite_master` naming one existing table. */
+const TableNameRow = Schema.Struct({ name: Schema.NonEmptyString });
 
-/** Drop every table this schema owns — the first half of a version reset. */
+/**
+ * Drop EVERY table in the database — the first half of a version reset.
+ *
+ * The list is read from `sqlite_master` rather than hardcoded, so the reset needs
+ * no maintenance when {@link createSchema} gains, renames, or drops a table (a
+ * hardcoded list that fell out of step would silently leave a stale table behind,
+ * which is precisely the failure INV-FRESH exists to prevent). It also sweeps
+ * tables this schema does not own — notably `effect_sql_migrations`, the
+ * bookkeeping the RETIRED migration ladder left behind — with no special case.
+ * SQLite's internal `sqlite_%` tables (e.g. `sqlite_sequence`) are excluded because
+ * they are not droppable; the engine maintains them, and dropping the AUTOINCREMENT
+ * tables clears their `sqlite_sequence` rows for us.
+ */
 const dropSchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  for (const table of TABLES) yield* sql.unsafe(`DROP TABLE IF EXISTS "${table}"`);
+  const rows =
+    yield* sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`;
+  const tables = yield* Schema.decodeUnknownEffect(Schema.Array(TableNameRow))(rows);
+  // Table names come from the database's own catalogue, never from user input, and
+  // `DROP TABLE` takes no bound parameters — hence `unsafe` with a quoted identifier.
+  for (const table of tables) yield* sql.unsafe(`DROP TABLE IF EXISTS "${table.name}"`);
 });
 
 /**
@@ -378,9 +409,10 @@ const make = Effect.gen(function* () {
 
   // ── AgentStore ──────────────────────────────────────────────────────────
   //
-  // Append + read only: there is no DELETE statement here, by design. An edit
-  // appends a NEW revision (a new id linked by `supersedes`) and a retirement
-  // appends one carrying `retiredAt`, so the table is immutable history.
+  // Append + read only: there is no DELETE and no UPDATE statement here, by design.
+  // An edit appends a NEW revision (a new id linked by `supersedes`) and a
+  // retirement appends one carrying `supersedes` AND `retiredAt`, so the table is
+  // immutable history — a stored row's columns are never rewritten.
 
   /**
    * Reconstruct one {@link Agent} from its row, dropping SQL `NULL`s to absent
@@ -405,21 +437,72 @@ const make = Effect.gen(function* () {
 
   const agents: AgentStore = {
     putAgent: (agent) =>
-      Effect.gen(function* () {
-        const tools = yield* Schema.encodeEffect(
-          Schema.fromJsonString(Schema.Array(Schema.NonEmptyString)),
-        )(agent.tools);
-        const row = {
-          id: agent.id,
-          name: agent.name,
-          model: agent.model,
-          version: agent.version,
-          tools,
-          supersedes: agent.supersedes ?? null,
-          retiredAt: agent.retiredAt ?? null,
-        };
-        yield* sql`INSERT INTO agent ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`;
-      }).pipe(Effect.mapError(fail("putAgent"))),
+      sql
+        .withTransaction(
+          Effect.gen(function* () {
+            // A revision that supersedes ITSELF is the one `supersedes` cycle a
+            // single append can create, and it would make a consumer's backwards
+            // walk of the chain non-terminating — so it is rejected at the port
+            // (`registry.ts` states the full acyclicity precondition).
+            if (agent.supersedes === agent.id) {
+              return yield* Effect.fail(
+                new StateStoreError({
+                  operation: "putAgent",
+                  detail: `agent "${agent.id}" supersedes itself; a revision must supersede a DIFFERENT revision`,
+                }),
+              );
+            }
+            const tools = yield* Schema.encodeEffect(
+              Schema.fromJsonString(Schema.Array(Schema.NonEmptyString)),
+            )(agent.tools).pipe(Effect.mapError(fail("putAgent")));
+            const row = {
+              id: agent.id,
+              name: agent.name,
+              model: agent.model,
+              version: agent.version,
+              tools,
+              supersedes: agent.supersedes ?? null,
+              retiredAt: agent.retiredAt ?? null,
+            };
+            // The registry is APPEND-ONLY, so this is an INSERT with no `ON
+            // CONFLICT ... DO UPDATE`: a stored row is immutable and is never
+            // rewritten. The stored row is read first so the two legitimate
+            // outcomes stay distinguishable — a byte-identical re-append is the
+            // crash-retry case and succeeds as a no-op, while a DIFFERING append
+            // under an existing id is a mutation attempt and fails. Without that,
+            // an upsert would silently replace a revision's content or drop a
+            // `retiredAt` stamp (un-retiring an agent) and then fan that mutation
+            // out to every client as `AgentChanged`. Read-then-insert runs inside
+            // the transaction, so a concurrent racing append cannot slip between
+            // them; and if one did, the PRIMARY KEY conflict fails the write
+            // rather than rewriting the row.
+            const existing = yield* sql`SELECT * FROM agent WHERE id = ${agent.id}`.pipe(
+              Effect.mapError(fail("putAgent")),
+            );
+            const stored = Arr.head(existing);
+            if (Option.isSome(stored)) {
+              const current = yield* Schema.decodeUnknownEffect(AgentColumns)(stored.value).pipe(
+                Effect.mapError(fail("putAgent")),
+              );
+              if (isSameAgentRow(current, row)) return;
+              return yield* Effect.fail(
+                new StateStoreError({
+                  operation: "putAgent",
+                  detail: `agent "${agent.id}" is already stored with different content; the registry is append-only, so an edit or a retirement appends a NEW revision whose supersedes names "${agent.id}"`,
+                }),
+              );
+            }
+            yield* sql`INSERT INTO agent ${sql.insert(row)}`.pipe(
+              Effect.mapError(fail("putAgent")),
+            );
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            (error): StateStoreError =>
+              SqlError.isSqlError(error) ? fail("putAgent")(error) : error,
+          ),
+        ),
     getAgent: (id) =>
       sql`SELECT * FROM agent WHERE id = ${id}`.pipe(
         Effect.mapError(fail("getAgent")),

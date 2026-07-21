@@ -48,9 +48,13 @@ Notes threaded to the contract's own decisions:
   §events); a terminal status is an ordinary change.
 - The **registry layer** (`Agent`, mirrored in `Sources/SprinterContract/Registry.swift`)
   rides the same two surfaces as the read model: `Snapshot.agents` and the
-  `AgentChanged` delta. It is **append-only**, so the upsert-only rule is exact —
-  an edit is a new revision linked by `supersedes` and a retirement is a `retiredAt`
-  stamp, so there is no delete on the contract and no `AgentRemoved`. Retired-ness is
+  `AgentChanged` delta. It is **append-only** and a stored revision is
+  **immutable**, so the upsert-only rule is exact: BOTH mutating operations are an
+  append under a **new id** — an edit is a new revision linked by `supersedes`, and
+  a retirement is a new revision carrying **`supersedes` AND `retiredAt`** (never
+  the same id restamped). There is no delete on the contract and no
+  `AgentRemoved`, and a client folds `AgentChanged` as an upsert by id.
+  Retired-ness is
   read off `retiredAt`'s presence; there is deliberately no `AgentStatus` enum
   (INV-SUM). `retiredAt` is the domain's `Timestamp` — an ISO-8601 UTC string on the
   wire, so the mirror models it as `String`.

@@ -12,10 +12,18 @@
 /// agents used in this repo" is a fold the client computes over that repo's
 /// executions rather than a list carried on the agent (INV-DERIVED).
 ///
-/// The registry is APPEND-ONLY: editing an agent mints a NEW revision whose
-/// ``supersedes`` names the one it replaced, and retiring stamps ``retiredAt``.
-/// Nothing is ever removed, so the contract exposes no delete and no
-/// `AgentRemoved` delta.
+/// The registry is APPEND-ONLY and a stored revision is IMMUTABLE, so BOTH
+/// mutating operations arrive as an append under a NEW id:
+///
+/// - an EDIT is a new revision whose ``supersedes`` names the lineage head it
+///   replaces;
+/// - a RETIREMENT is a new revision carrying BOTH ``supersedes`` AND a
+///   ``retiredAt`` stamp — never the same id restamped, because the revision it
+///   retires must stay resolvable for the executions that ran on it.
+///
+/// Nothing is ever removed or rewritten, so the contract exposes no delete and no
+/// `AgentRemoved` delta, and a client folds every ``AgentChanged`` as an
+/// upsert-by-id that in practice always appends.
 ///
 /// Retired-ness is read off ``retiredAt``'s presence (``isRetired``) — there is
 /// deliberately no `AgentStatus` enum to keep in sync with it (INV-SUM).

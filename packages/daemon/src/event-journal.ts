@@ -243,18 +243,66 @@ const decodeDelta = (entry: PersistedEvent): Effect.Effect<Option.Option<OffsetE
  * channel empty (matching the frozen contract's `events` success/never shape).
  */
 export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEvent> =>
+  decodedReplay(store.events.tail(offset).pipe(Effect.orDie));
+
+/** Turn a read of durable entries into the stream of the owned deltas they decode to. */
+const decodedReplay = (
+  entries: Effect.Effect<ReadonlyArray<PersistedEvent>>,
+): Stream.Stream<OffsetEvent> =>
   Stream.unwrap(
-    store.events.tail(offset).pipe(
-      Effect.orDie,
-      Effect.flatMap((entries) => Effect.forEach(entries, decodeDelta)),
+    entries.pipe(
+      Effect.flatMap((read) => Effect.forEach(read, decodeDelta)),
       Effect.map((decoded) => Stream.fromIterable(Arr.getSomes(decoded))),
+    ),
+  );
+
+/**
+ * Replay the durable log for a client resuming at `sinceOffset`, treating a cursor
+ * from a STALE EPOCH as an ORIGIN replay.
+ *
+ * `EventLogStore.tail` is a strict `> offset` slice, which is exactly right while
+ * the log's offset space is monotonic — but that space is not eternal. Bumping
+ * `SCHEMA_VERSION` drops and recreates `event_log` (INV-FRESH never migrates), and
+ * a recreated `AUTOINCREMENT` table restarts at offset 1. A client holding a
+ * DURABLE cursor from the previous epoch then resumes past the whole new log: it
+ * receives nothing, reports no error, and stays silently blind until the new log
+ * grows past its stale high-water mark.
+ *
+ * So a cursor BEYOND the log's current maximum offset cannot be a resume — no such
+ * event was ever emitted in this epoch — and is treated as an ORIGIN replay: the
+ * client re-hydrates the whole log. Deltas are upsert-idempotent (D8), so replaying
+ * from origin is always safe; the only cost is re-sending history the client may
+ * already hold. The whole-log read happens ONLY on that stale path (an empty tail
+ * with a non-zero cursor); the ordinary caught-up client reads the empty tail and
+ * the maximum, and replays nothing.
+ */
+const replayEntries = (
+  store: Store,
+  sinceOffset: number,
+): Effect.Effect<ReadonlyArray<PersistedEvent>> =>
+  store.events.tail(sinceOffset).pipe(
+    Effect.orDie,
+    Effect.flatMap((ahead) =>
+      ahead.length > 0 || sinceOffset === 0
+        ? Effect.succeed(ahead)
+        : store.events.read.pipe(
+            Effect.orDie,
+            Effect.map((all) =>
+              Option.match(Arr.last(all), {
+                // An empty log has nothing to replay under either reading.
+                onNone: () => all,
+                onSome: (latest) => (latest.offset < sinceOffset ? all : ahead),
+              }),
+            ),
+          ),
     ),
   );
 
 /**
  * The `events` RPC feed: EAGERLY subscribe to the live work-graph feed, THEN replay
  * the durable log from `sinceOffset` (the client's resume cursor — CE2.0; absent →
- * `0`, replay from the ORIGIN), THEN stream the live tail. Every
+ * `0`, and a cursor from a stale epoch → the origin, see {@link replayEntries}),
+ * THEN stream the live tail. Every
  * streamed item is an {@link OffsetEvent} carrying its durable offset; replay and
  * live offsets share one coordinate space (the journaling decorator mints and
  * publishes the same offset it appended), so a reconnecting request with
@@ -277,7 +325,10 @@ export const resyncEvents = (
   Stream.unwrap(
     feed.subscribe.pipe(
       Effect.map((subscription) =>
-        Stream.concat(resyncFrom(store, sinceOffset ?? 0), Stream.fromSubscription(subscription)),
+        Stream.concat(
+          decodedReplay(replayEntries(store, sinceOffset ?? 0)),
+          Stream.fromSubscription(subscription),
+        ),
       ),
     ),
   );

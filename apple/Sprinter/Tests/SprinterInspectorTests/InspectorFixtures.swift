@@ -45,7 +45,8 @@ enum InspectorFixtures {
       epics: [],
       issues: [issue],
       jobs: [jobWithPullRequest(pullRequest)],
-      sessions: [session])
+      sessions: [session],
+      agents: [])
   }
 
   /// A snapshot where the job has NO PR but its issue does — the transitive
@@ -65,6 +66,7 @@ enum InspectorFixtures {
           pullRequest: pullRequest)
       ],
       jobs: [jobWithPullRequest(nil)],
-      sessions: [session])
+      sessions: [session],
+      agents: [])
   }
 }

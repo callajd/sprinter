@@ -38,6 +38,7 @@ import {
   WorkstreamNotFound,
 } from "@sprinter/contract";
 import {
+  Agent,
   Epic,
   Issue,
   Job,
@@ -97,6 +98,17 @@ const session = Schema.decodeUnknownSync(Session)({
   id: "ses-1",
   jobId: "job-1",
   status: "completed",
+});
+// A RETIRING registry revision: a new id carrying BOTH `supersedes` (the head it
+// retires) and the `retiredAt` stamp — the only shape a retirement takes.
+const agent = Schema.decodeUnknownSync(Agent)({
+  id: "agt-2",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit"],
+  supersedes: "agt-1",
+  retiredAt: "2026-07-20T12:00:00.000Z",
 });
 // A durable RUNNING Job for `job-1` — genuinely mid-dispatch. The session-channel
 // gate keys on the JOB status (CE4.1 FIX A), so a running Job routes to the bounded
@@ -178,6 +190,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
       yield* store.jobs.putSession(session);
+      yield* store.agents.putAgent(agent);
 
       const snapshot = yield* client.snapshot();
       expect(snapshot.workstreams).toEqual([workstream]);
@@ -185,6 +198,11 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       expect(snapshot.issues).toEqual([issue]);
       expect(snapshot.jobs).toEqual([queuedJob]);
       expect(snapshot.sessions).toEqual([session]);
+      // The REGISTRY layer hydrates too, whole and flat (never a per-repo slice),
+      // and a persisted revision round-trips through the wire schema with both of
+      // its optional keys intact — a retired, superseding revision is exactly what
+      // a client must be able to resolve a historical execution against.
+      expect(snapshot.agents).toEqual([agent]);
     }),
   ),
 );

@@ -219,10 +219,9 @@ public struct Session: Codable, Equatable, Sendable {
 /// ``agents`` is the WHOLE append-only registry, not a per-repository slice — an
 /// ``Agent`` is global, so the per-repo view is a fold over that repo's executions
 /// (INV-DERIVED). Retired and superseded revisions are included, because a
-/// historical node may still resolve to one. It defaults to empty in the
-/// memberwise initializer so a caller building a read-model-only baseline (test
-/// fixtures, an empty starting snapshot) need not name it; decoding always requires
-/// the wire key, exactly as the contract emits it.
+/// historical node may still resolve to one. Like every other collection here it is
+/// a REQUIRED initializer parameter: the wire always carries the key, so a default
+/// would let a construction site quietly omit a collection the contract guarantees.
 public struct Snapshot: Codable, Equatable, Sendable {
   public let workstreams: [Workstream]
   public let epics: [Epic]
@@ -237,7 +236,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
     issues: [Issue],
     jobs: [Job],
     sessions: [Session],
-    agents: [Agent] = []
+    agents: [Agent]
   ) {
     self.workstreams = workstreams
     self.epics = epics

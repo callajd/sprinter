@@ -27,8 +27,11 @@ public struct SnapshotReconciler: Sendable {
       return snapshot.replacing(jobs: Self.upsert(job, into: snapshot.jobs, by: \.id))
     case .sessionChanged(let session):
       return snapshot.replacing(sessions: Self.upsert(session, into: snapshot.sessions, by: \.id))
-    // The registry folds under the SAME upsert rule: an append-only registry only
-    // ever produces a new revision or a `retiredAt` stamp, never a removal.
+    // The registry folds under the SAME upsert rule, and in practice the upsert is
+    // always an APPEND: a stored revision is immutable, so both an edit and a
+    // retirement arrive as a NEW id linked by `supersedes` (the retirement also
+    // carrying `retiredAt`). A registry delta is never a removal, and never a
+    // rewrite of a revision already in the baseline.
     case .agentChanged(let agent):
       return snapshot.replacing(agents: Self.upsert(agent, into: snapshot.agents, by: \.id))
     }

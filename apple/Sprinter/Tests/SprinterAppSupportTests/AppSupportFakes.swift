@@ -207,5 +207,6 @@ enum AppSupportFixtures {
         pullRequest: nil)
     ],
     jobs: [],
-    sessions: [])
+    sessions: [],
+    agents: [])
 }

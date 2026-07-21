@@ -3,9 +3,10 @@
  * against an in-memory database (deterministic, offline, no filesystem). Every
  * test provides {@link layerMemory}, so each runs on a fresh `:memory:` database.
  *
- * The suite proves the capability groups round-trip the OWNED domain
- * schemas: the append-only `Agent` registry (append + read, no delete), the work graph (`Workstream ⊃ Epic ⊃ Issue`), the dependency DAG
- * (`Issue.dependsOn`) as real replaceable edges, the `Job` model and the
+ * The suite proves the capability groups round-trip the OWNED domain schemas: the
+ * append-only `Agent` registry (append + read, no delete, and no rewrite of a
+ * stored revision), the work graph (`Workstream ⊃ Epic ⊃ Issue`), the dependency
+ * DAG (`Issue.dependsOn`) as real replaceable edges, the `Job` model and the
  * `Issue → Job → session → PR` mapping, and the append-only event feed
  * (append / ordered read / tail-from-offset). It also covers absent-optional
  * elision, missing-node `Option.none`, and upsert idempotency.
@@ -109,7 +110,7 @@ it.effect("round-trips an Agent revision and lists the registry", () =>
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("elides an Agent's absent optional keys, and retirement is a stamp not a delete", () =>
+it.effect("elides an Agent's absent optional keys, and retirement is a NEW revision", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const plain = yield* agent();
@@ -118,14 +119,115 @@ it.effect("elides an Agent's absent optional keys, and retirement is a stamp not
     expect("supersedes" in read).toBe(false);
     expect("retiredAt" in read).toBe(false);
 
-    // Retiring stamps `retiredAt` on a NEW revision; the registry only ever grows.
-    const retired = yield* agent({ id: "agt-3", retiredAt: "2026-07-20T12:00:00.000Z" });
+    // Retiring appends a NEW id carrying BOTH `supersedes` (naming the head it
+    // retires) AND the `retiredAt` stamp — never a stamp applied to the existing
+    // row. Carrying `supersedes` is what makes it a RETIREMENT of `agt-1` rather
+    // than a brand-new lineage that was born retired.
+    const retired = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-1",
+      retiredAt: "2026-07-20T12:00:00.000Z",
+    });
     yield* store.agents.putAgent(retired);
     const all = yield* store.agents.listAgents;
     expect(all).toHaveLength(2);
-    expect(Option.getOrThrow(yield* store.agents.getAgent(retired.id)).retiredAt).toBe(
-      "2026-07-20T12:00:00.000Z",
-    );
+    const stored = Option.getOrThrow(yield* store.agents.getAgent(retired.id));
+    expect(stored.retiredAt).toBe("2026-07-20T12:00:00.000Z");
+    expect(stored.supersedes).toBe("agt-1");
+    // The revision it retires is untouched — still readable, still not retired, so
+    // a past execution that ran on it still resolves.
+    expect(Option.getOrThrow(yield* store.agents.getAgent(plain.id))).toStrictEqual(plain);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("re-appending a byte-identical Agent revision is an idempotent no-op", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const first = yield* agent();
+    // The crash-retry case: the same write replayed must SUCCEED (so a retry is not
+    // an error) without appending a second row or altering the stored one.
+    yield* store.agents.putAgent(first);
+    yield* store.agents.putAgent(yield* agent());
+
+    expect(yield* store.agents.listAgents).toStrictEqual([first]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses to rewrite a stored Agent revision with different content", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const first = yield* agent();
+    yield* store.agents.putAgent(first);
+
+    // A stored revision is IMMUTABLE: an append under an existing id with different
+    // content is a mutation attempt, not an edit path, so it FAILS rather than
+    // silently rewriting the revision (and fanning that rewrite out as a delta).
+    const error = yield* store.agents
+      .putAgent(yield* agent({ version: "1.1.0", tools: ["read", "edit", "bash"] }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    expect(error.detail.length).toBeGreaterThan(0);
+
+    // And the stored revision is byte-identical to what was appended.
+    expect(Option.getOrThrow(yield* store.agents.getAgent(first.id))).toStrictEqual(first);
+    expect(yield* store.agents.listAgents).toStrictEqual([first]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("cannot un-retire a retired Agent by re-appending its id", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const retired = yield* agent({
+      id: "agt-3",
+      supersedes: "agt-1",
+      retiredAt: "2026-07-20T12:00:00.000Z",
+    });
+    yield* store.agents.putAgent(retired);
+
+    // Dropping `retiredAt` on the SAME id would resurrect a retired agent. The
+    // append-only write path rejects it; the stamp survives untouched.
+    const error = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-3", supersedes: "agt-1" }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(Option.getOrThrow(yield* store.agents.getAgent(retired.id))).toStrictEqual(retired);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("rejects an Agent revision that supersedes itself", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // The one `supersedes` cycle a single append can create: a consumer walking the
+    // chain backwards would never terminate, so the port refuses the write.
+    const error = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-1", supersedes: "agt-1" }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    expect(yield* store.agents.listAgents).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("lists the registry in lexicographic id order — the pinned contract order", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // Appended out of order, and NOT in lineage order: `agt-b` supersedes `agt-c`.
+    const c = yield* agent({ id: "agt-c" });
+    const b = yield* agent({ id: "agt-b", supersedes: "agt-c" });
+    const a = yield* agent({ id: "agt-a" });
+    yield* store.agents.putAgent(c);
+    yield* store.agents.putAgent(b);
+    yield* store.agents.putAgent(a);
+
+    // The pinned order is lexicographic BY ID — neither insertion nor lineage
+    // order. It is presentational: consumers upsert by id, and a lineage is
+    // reconstructed by walking `supersedes`, never by reading this order.
+    expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
+      "agt-a",
+      "agt-b",
+      "agt-c",
+    ]);
   }).pipe(Effect.provide(layerMemory)),
 );
 

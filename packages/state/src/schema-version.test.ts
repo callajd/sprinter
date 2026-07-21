@@ -12,6 +12,7 @@
  */
 import { it } from "@effect/vitest";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +44,53 @@ const withStore = <A>(
     const store = yield* StateStore;
     return yield* use(store);
   }).pipe(Effect.provide(layer({ filename, disableWAL: true })), Effect.orDie);
+
+/**
+ * The PIN that binds the emitted schema to {@link SCHEMA_VERSION}: the SHA-256 of
+ * the DDL SQLite actually stores for every object the adapter creates, paired with
+ * the version it belongs to. Changing `createSchema` without bumping the constant
+ * changes the digest and fails the test below — which is the whole point, because
+ * every other guard in this file only proves the RESET works, not that the version
+ * was bumped when the shape changed.
+ *
+ * Update BOTH fields, together, in the same change as the schema edit.
+ */
+const SCHEMA_PIN = {
+  version: 1,
+  sha256: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
+} as const;
+
+/** The DDL of every object in the database, canonically ordered — the pinned text. */
+const emittedSchema = (filename: string): string => {
+  const probe = new Database(filename);
+  const rows = probe
+    .query(
+      `SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`,
+    )
+    .all();
+  probe.close();
+  return JSON.stringify(rows, null, 2);
+};
+
+it.effect("pins the emitted schema to SCHEMA_VERSION — a shape change must bump it", () =>
+  Effect.gen(function* () {
+    const filename = yield* dbFile;
+    // Build the schema through the adapter itself, then read back what SQLite
+    // actually stored: every table, every column, every index.
+    yield* withStore(filename, () => Effect.void);
+    const ddl = emittedSchema(filename);
+    const digest = createHash("sha256").update(ddl).digest("hex");
+
+    const fix =
+      "The persisted schema changed. THE FIX IS TO BUMP `SCHEMA_VERSION` in " +
+      "packages/state/src/sqlite.ts (existing stores must drop and recreate — " +
+      "INV-FRESH never migrates), and then update SCHEMA_PIN in this test to the " +
+      `new version and digest. Emitted schema was:\n${ddl}`;
+
+    expect(SCHEMA_VERSION, fix).toBe(SCHEMA_PIN.version);
+    expect(digest, fix).toBe(SCHEMA_PIN.sha256);
+  }).pipe(Effect.scoped),
+);
 
 it.effect("stamps the schema version on a fresh store and preserves data across reopen", () =>
   Effect.gen(function* () {
@@ -79,6 +127,10 @@ it.effect("drops and recreates the store on a version mismatch — it never migr
     const stale = new Database(filename);
     stale.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
     stale.run(`CREATE TABLE IF NOT EXISTS effect_sql_migrations (id INTEGER PRIMARY KEY)`);
+    // A table the CURRENT schema knows nothing about — a table a future version
+    // renames or drops looks exactly like this to the reset. The drop list is read
+    // from `sqlite_master`, not hardcoded, so it is swept with no special case.
+    stale.run(`CREATE TABLE IF NOT EXISTS retired_from_a_future_version (id TEXT PRIMARY KEY)`);
     stale.close();
 
     const after = yield* withStore(filename, (store) => store.agents.listAgents.pipe(Effect.orDie));
@@ -89,13 +141,13 @@ it.effect("drops and recreates the store on a version mismatch — it never migr
     expect(probe.query("PRAGMA user_version").get()).toStrictEqual({
       user_version: SCHEMA_VERSION,
     });
-    const ladder = probe
+    const ghosts = probe
       .query(
-        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'effect_sql_migrations'`,
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('effect_sql_migrations', 'retired_from_a_future_version')`,
       )
       .all();
     probe.close();
-    expect(ladder).toStrictEqual([]);
+    expect(ghosts).toStrictEqual([]);
   }).pipe(Effect.scoped),
 );
 

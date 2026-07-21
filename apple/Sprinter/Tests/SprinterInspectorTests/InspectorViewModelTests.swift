@@ -116,7 +116,8 @@ struct InspectorViewModelTests {
     let model = InspectorViewModel(
       backend: InspectorFakeBackend(
         knownSession: Self.session,
-        snapshot: Snapshot(workstreams: [], epics: [], issues: [], jobs: [], sessions: [])),
+        snapshot: Snapshot(
+          workstreams: [], epics: [], issues: [], jobs: [], sessions: [], agents: [])),
       sessionId: Self.session)
 
     // Before any snapshot the pane is unresolved.
