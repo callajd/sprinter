@@ -480,6 +480,9 @@ const resolveLive = (
  *
  * The stream's error channel is exactly `SessionNotFound | ResyncRequired`, two INDEPENDENT
  * questions: does this session exist, and is the client's cursor from THIS store generation.
+ * A resume is refused on GENERATION before the existence verdict and on EXTENT only after it,
+ * so an unknown session id under the current generation answers `SessionNotFound` rather than
+ * escalating to a whole-store resync.
  * The durable read is `orDie`'d and the liveness gate turns its transient store failures into
  * DEFECTS (#76) — never a `SessionNotFound` that `succeedNone` would silently collapse into a
  * settled replay, dropping a live session's tail — so no store hiccup leaks past the frozen
@@ -510,22 +513,24 @@ const resyncSessionEvents = (
       // there is no numeric one, so a dead generation paired with `sinceOffset: 0`
       // is refused exactly like any other stale resume.
       //
-      // It runs BEFORE the existence verdict (a dropped store's session is a resync,
-      // not a "never existed") AND before the transcript read: the extent comes from
-      // the store's indexed `sessionLog.maxOffset`, so a request that is about to be
-      // REFUSED never decodes a whole durable transcript first — the mirror of what
-      // `EventLogStore.maxOffset` does for the work-graph feed.
-      if (resume !== undefined) {
+      // ONLY the generation half runs before the existence verdict — a dropped store's
+      // session is a resync, not a "never existed", and that verdict does not depend on
+      // the session existing. The extent half is deferred BELOW the existence check,
+      // because unlike the global `event_log` a per-session extent of `0` has a benign
+      // IN-generation meaning: "no such session". Refusing there would answer one
+      // unknown session id with `ResyncRequired` — "discard ALL retained state and
+      // re-hydrate" — when `SessionNotFound` is the honest and far narrower verdict.
+      // The extent read is the store's indexed `sessionLog.maxOffset`, so a request
+      // about to be refused on generation never decodes a transcript first.
+      if (resume !== undefined && resume.generation !== store.generation) {
         const maxOffset = yield* store.sessionLog.maxOffset(sessionId).pipe(Effect.orDie);
-        if (resume.generation !== store.generation || resume.sinceOffset > maxOffset) {
-          return Stream.fail<SessionEventsError>(
-            new ResyncRequired({
-              sinceOffset: resume.sinceOffset,
-              maxOffset,
-              generation: store.generation,
-            }),
-          );
-        }
+        return Stream.fail<SessionEventsError>(
+          new ResyncRequired({
+            sinceOffset: resume.sinceOffset,
+            maxOffset,
+            generation: store.generation,
+          }),
+        );
       }
       const live = yield* resolveLive(store, registry, sessionId).pipe(
         Effect.asSome,
@@ -546,6 +551,20 @@ const resyncSessionEvents = (
       const settledRow = Option.isSome(session) && !isLiveSessionRow(session.value.status);
       if (Option.isNone(live) && durable.length === 0 && !settledRow) {
         return Stream.fail<SessionEventsError>(new SessionNotFound({ id: sessionId }));
+      }
+      // EXTENT half of the resume guard, deferred to here so it speaks only about a
+      // session that EXISTS: a cursor past this transcript's end under the CURRENT
+      // generation is a client holding coordinates the store cannot honour. Taken from
+      // the SAME snapshot the replay is built from (no second read, no split-read race).
+      const durableExtent = durable.at(-1)?.offset ?? 0;
+      if (resume !== undefined && resume.sinceOffset > durableExtent) {
+        return Stream.fail<SessionEventsError>(
+          new ResyncRequired({
+            sinceOffset: resume.sinceOffset,
+            maxOffset: durableExtent,
+            generation: store.generation,
+          }),
+        );
       }
       const replayEntries = durable.filter((entry) => entry.offset > fromOffset);
       const maxReplayedOffset = replayEntries.at(-1)?.offset ?? fromOffset;

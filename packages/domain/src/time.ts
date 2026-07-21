@@ -77,7 +77,8 @@
  * externally-sourced timestamps, must plan for a leap-second stamp arriving as a
  * DECODE FAILURE of the whole observation and decide what that boundary does with it
  * (reject / clamp at the ADAPTER, where the choice is visible) — it must not assume
- * every well-formed upstream instant decodes.
+ * every well-formed upstream instant decodes. That obligation is carried on issue #86
+ * (DE1.2), so it is tracked rather than living only in this comment.
  *
  * `Timestamp` is therefore a decode-side TRANSFORMATION, not a bare filter, and
  * encoding is the identity — the branded value is already canonical, so it goes to

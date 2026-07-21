@@ -589,7 +589,7 @@ const configureConnection = Effect.gen(function* () {
  * drop and recreate the tables underneath a running daemon, which keeps serving from
  * a generation whose rows no longer exist. Concurrent multi-process access at
  * differing schema versions is UNGUARDED; it is out of scope for the greenfield
- * store and is stated here rather than implied away.
+ * store and is stated here rather than implied away (tracked in #91).
  */
 const applySchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -833,10 +833,9 @@ const make = Effect.gen(function* () {
             // content verbatim so an edit and a retirement never fuse into one
             // indistinguishable append. Gating the first on the incoming revision's
             // own `retiredAt` — as this once did — enforced it for the append that
-            // could not do the damage and skipped the one that could. Checkable only
-            // when the superseded revision is actually stored; a dangling
-            // `supersedes` is the same writer obligation the acyclicity precondition
-            // already carries.
+            // could not do the damage and skipped the one that could. The superseded
+            // revision is ALWAYS there to be read — the `supersedes` FOREIGN KEY
+            // guarantees it — so both rules are order-independent.
             if (agent.supersedes !== undefined) {
               yield* assertSupersedesIsWellFormed(agent.supersedes, row);
             }
@@ -1205,19 +1204,34 @@ export interface StateStoreConfig {
  * never a migration, INV-FRESH), and provides the `StateStore` service — all behind
  * a `Layer<StateStore, StateStoreError>` that exposes no backing type (INV-PORT).
  */
+/**
+ * The adapter MINUS its backing connection: the construction-time guards
+ * ({@link configureConnection}, {@link applySchema}) and {@link make}, over whatever
+ * `SqlClient` is provided beneath.
+ *
+ * Foreign-key enforcement is turned on (and verified) BEFORE any schema work runs, on
+ * the same connection: the pragma is per-connection, and `agent.supersedes` is only a
+ * real constraint while it is on.
+ *
+ * NOT part of the package surface — `index.ts` re-exports only the backing-free
+ * {@link layer} (INV-PORT). It is separated here so the construction guards can be
+ * driven over a STUBBED `SqlClient` in tests: each of them refuses to build the store
+ * at all, and a refusal that quietly became a success is only observable by feeding
+ * the client an answer a real SQLite would not give.
+ */
+export const layerOverSqlClient: Layer.Layer<StateStore, StateStoreError, SqlClient.SqlClient> =
+  Layer.effect(StateStore, make).pipe(
+    Layer.provide(
+      Layer.effectDiscard(
+        configureConnection.pipe(Effect.andThen(applySchema), Effect.mapError(fail("applySchema"))),
+      ),
+    ),
+  );
+
 export const layer = (config: StateStoreConfig): Layer.Layer<StateStore, StateStoreError> => {
   const disableWAL = config.disableWAL ?? config.filename === ":memory:";
   const clientLayer = SqliteClient.layer({ filename: config.filename, disableWAL });
-  // Foreign-key enforcement is turned on (and verified) BEFORE any schema work runs,
-  // on the same connection: the pragma is per-connection, and `agent.supersedes` is
-  // only a real constraint while it is on.
-  const schemaLayer = Layer.effectDiscard(
-    configureConnection.pipe(Effect.andThen(applySchema), Effect.mapError(fail("applySchema"))),
-  );
-  return Layer.effect(StateStore, make).pipe(
-    Layer.provide(schemaLayer),
-    Layer.provide(clientLayer),
-  );
+  return layerOverSqlClient.pipe(Layer.provide(clientLayer));
 };
 
 /** Convenience adapter for an ephemeral in-memory database (deterministic, offline — tests). */

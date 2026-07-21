@@ -48,7 +48,13 @@ const scratch = mkdtempSync(join(tmpdir(), "sprinter-goldens-"));
 // after the scratch directory is gone.
 let exitCode = 0;
 try {
-  const generated = Bun.spawnSync(["bun", "run", generator, scratch], { stdout: "pipe" });
+  // `stderr` is piped EXPLICITLY: the failure branch below decodes it, and an unpiped
+  // stream is `undefined` there — the decode would throw and bury the generator's real
+  // diagnostic on exactly the path that exists to surface it.
+  const generated = Bun.spawnSync(["bun", "run", generator, scratch], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   if (generated.exitCode !== 0) {
     process.stderr.write(new TextDecoder().decode(generated.stderr));
     process.stderr.write("FAIL: the golden generator did not run.\n");

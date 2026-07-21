@@ -677,6 +677,46 @@ it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B
   ),
 );
 
+// An UNKNOWN session id under the CURRENT generation is a `SessionNotFound`, NOT a
+// `ResyncRequired`. A never-seen session has a per-session extent of `0`, so an extent check
+// run BEFORE the existence verdict refused every non-zero cursor — and `ResyncRequired` means
+// "discard ALL retained state and re-hydrate the whole store", a wildly over-broad answer to
+// one bad session id. The generation half of the guard is unaffected (the two tests above pin
+// it); only the extent half now waits for the session to be known to exist.
+it.effect(
+  "sessionEvents answers an UNKNOWN session with SessionNotFound, never ResyncRequired",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        const failure = yield* client
+          .sessionEvents({
+            sessionId,
+            resume: { sinceOffset: 7, generation: store.generation },
+          })
+          .pipe(Stream.runCollect, Effect.flip);
+        expect(failure).toBeInstanceOf(SessionNotFound);
+
+        // For a session that DOES exist, a cursor past the transcript's end under the current
+        // generation is still a resync — the extent half is deferred, not dropped.
+        yield* store.jobs.putSession(session);
+        yield* store.jobs.putJob(orphanedJob);
+        yield* store.sessionLog.append(sessionId, entryAppended);
+        const beyond = yield* client
+          .sessionEvents({
+            sessionId,
+            resume: { sinceOffset: 99, generation: store.generation },
+          })
+          .pipe(Stream.runCollect, Effect.flip);
+        expect(beyond).toBeInstanceOf(ResyncRequired);
+        if (!(beyond instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+        expect({ sinceOffset: beyond.sinceOffset, maxOffset: beyond.maxOffset }).toStrictEqual({
+          sinceOffset: 99,
+          maxOffset: 1,
+        });
+      }),
+    ),
+);
+
 // A LIVE session (a registered handle → `resolveLive` resolves it): `sessionEvents` replays
 // the durable transcript so far, THEN tails new durable entries as the fold journals them —
 // replay and live tail one offset coordinate. Uses `it.live` + a settle so the live append
