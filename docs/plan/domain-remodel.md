@@ -536,6 +536,20 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   the exact class DE2.2 spent three rounds closing. **When an FK forces a reorder,
   re-justify every other ordering on that path**, and comment each with the invariant it
   protects.
+  **And re-justify EVERY site, not the ones a reviewer names.** The fix at the two named
+  `job-runner.ts` sites left the SAME inversion standing in `startup-reconcile.ts`'s
+  `settle` — the repair path itself — and it took a fifth round to find. The obligation is
+  therefore an ENUMERATION: `grep` every writer of the affected pair, classify each ordering
+  as **FORCED** (a constraint admits one order) or **FREE** (both legal to the engine), and
+  for every FREE one name the invariant that chose it. A free ordering with no stated reason
+  is a defect. DE2.2's table of the four sites is the template.
+- **Forward constraint — `Snapshot.executions` is UNBOUNDED once a child-execution writer
+  lands.** DE2.2 left `job-runner` writing only ROOTS — one execution per job — so the
+  snapshot's size was unchanged. But the model is a TREE with no arity limit and the
+  snapshot carries every execution unfiltered, so whichever task lands the first
+  child-execution writer (this one, or a subagent path) must land WITH a bound: a
+  depth/count limit, roots-only with children fetched per-execution, or pagination. An
+  unbounded fan-out reaches every connected client on every snapshot.
 - **Mutability:** `Session` is an owned historical record, so its run-facts freeze; see
   [Mutability follows the layer](#mutability-follows-the-layer). `SessionState` is derived
   and never stored, so it is not a column at all.
@@ -704,11 +718,15 @@ The workstream is done when none of these can be constructed:
 23. A row that records a past event and can still be **re-pointed** — see
     [Mutability follows the layer](#mutability-follows-the-layer).
 
-> **21-23 were learned in DE2.2 (#104), at a cost of four review rounds.** 21 and 23 were
+> **21-23 were learned in DE2.2 (#104), at a cost of five review rounds.** 21 and 23 were
 > each found only after the previous fix; 22 was introduced by the FOREIGN KEY the feature
 > itself added — which forced one write order at dispatch start and silently reversed the
-> opposite one at terminal — and was caught only on the fourth pass. They are stated here
-> so DE2.4, DE2.5 and DE3 inherit them.
+> opposite one at terminal — and was caught only on the fourth pass. The fifth pass found 22
+> a THIRD time, in the reconciler's own `settle`, where the order in fact pre-dated the
+> feature: stating the invariant is what made the pre-existing code a violation of it.
+> **Corollary: when a task promotes a behaviour to a stated rule, it owns every existing
+> site that breaks the new rule** — including the ones it did not write. They are stated
+> here so DE2.4, DE2.5 and DE3 inherit them.
 
 > **17-20 were learned, not designed.** They come from DE1.1's implementation
 > (issue #85 / PR #88), where each was initially a runtime check that some other path

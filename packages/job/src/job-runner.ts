@@ -186,8 +186,9 @@ const sealTranscript = (
  * is best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
  * error still propagates to the caller.
  *
- * ORDER IS RECOVERY-ORDERED, and it is the INVERSE of the start order — see the terminal
- * write in {@link dispatch} for the full statement of why.
+ * ORDER IS FREE (both writes are pure updates by this point — no FK to satisfy) and chosen
+ * RECOVERY-ORDERED: the Job goes terminal LAST, the INVERSE of the start order. See the
+ * terminal write in {@link dispatch} for the full statement of why.
  */
 const persistFailedTerminal = (
   store: Context.Service.Shape<typeof StateStore>,
@@ -197,6 +198,7 @@ const persistFailedTerminal = (
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     const transcript = yield* sealTranscript(store, execution.id, yield* Ref.get(highWater));
+    // ORDER: FREE (no FK — both rows exist), chosen RECOVERY-ORDERED. Seal, then Job LAST.
     yield* store.jobs.putExecution({ ...execution, transcript });
     yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
   }).pipe(Effect.orElseSucceed(() => undefined));
@@ -236,6 +238,13 @@ const dispatch = (
     // Failing here leaves the Job NOT `running` and nothing half-written, which is the
     // recoverable state (`startup-reconcile` settles `running` jobs; a job that never
     // started is simply re-dispatchable).
+    //
+    // "Before any durable row is written" is exact for a FIRST dispatch and NOT for a RESUME:
+    // on a `startup-reconcile` resume the Job is ALREADY durably `running` with a LIVE
+    // execution, so a transient `putAgent` failure fails the resume, is swallowed by that
+    // module's per-Job `Effect.catch`, and leaves the pair exactly as it found it. Still
+    // recoverable — `running` is the one status the next boot re-examines — but it is a
+    // no-op retry, not a clean slate.
     const agentId = yield* registerAgent(store, runner.agent);
 
     // Persist the durable Issue→Job→execution mapping BEFORE running. ORDER IS LOAD-
@@ -271,6 +280,8 @@ const dispatch = (
       mode: "autonomous",
       transcript: { _tag: "LiveTranscript" },
     };
+    // ORDER: FORCED. `execution."jobId"` is a FOREIGN KEY onto a job row that does not yet
+    // exist for a first dispatch, so the engine admits exactly one order. No choice to make.
     yield* store.jobs.putJob({ ...job, status: "running", executionId });
     yield* store.jobs.putExecution(startExecution);
 
@@ -419,8 +430,16 @@ const dispatch = (
     //     unsettled row, so a run that produced no durable entries answers `ExecutionNotFound`
     //     forever rather than returning an empty settled transcript.
     //
-    // {@link persistFailedTerminal} holds the same order for the same reason. A test pins
-    // it: failing the seal `putExecution` must leave the Job `running` (still recoverable).
+    // {@link persistFailedTerminal} holds the same order for the same reason, and so does
+    // `startup-reconcile.ts`'s `settle` — the THIRD terminal-write site in the tree, and the
+    // one that had this inverted until round 5. Every terminal write pair in the tree now
+    // carries a comment naming its order (FORCED vs FREE) and the invariant that picked it,
+    // so the next constraint-driven reorder (DE2.4 re-points the FK at `sessionId`) cannot
+    // silently sweep a FREE one along with a FORCED one — which is exactly how round 4's
+    // regression happened. A test pins each: failing the seal `putExecution` must leave the
+    // Job `running` (still recoverable).
+    //
+    // ORDER: FREE (no FK — both rows exist), chosen RECOVERY-ORDERED. Seal, then Job LAST.
     yield* store.jobs.putExecution({
       ...startExecution,
       transcript: yield* sealTranscript(store, executionId, yield* Ref.get(highWater)),

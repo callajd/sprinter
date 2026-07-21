@@ -44,8 +44,8 @@
  *   than resurrected — resume is NARROWED to the genuinely-in-flight (`active`/`pending`)
  *   Workstreams, so every terminal/paused Workstream status settles instead.
  *
- * Every settle path also SEALS the transcript of EVERY Execution the Job owns, alongside
- * the Job row (CE4.1-R4 root fix): a settled Job must never leave a LIVE Execution behind,
+ * Every settle path also SEALS the transcript of EVERY Execution the Job owns — BEFORE it
+ * writes the Job row (CE4.1-R4 root fix): a settled Job must never leave a LIVE Execution behind,
  * or the execution-resolve gate ({@link ./rpc-handlers.ts} `resolveLive`) would mistake
  * that orphan for a mid-dispatch execution and stall the full resolve bound before
  * `ExecutionNotFound`. "Terminal" for an Execution is a `SealedTranscript` and nothing
@@ -259,10 +259,36 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
        * `append` returned; it seals at `max(localHighWater, maxOffset ?? 0)` and is exact
        * in the common case. The LOWER-BOUND contract is written for the path here, where
        * nothing better exists.
+       *
+       * **TERMINAL WRITE ORDER — the seals FIRST, the Job LAST, and it is RECOVERY-ORDERED**
+       * (round 5, B1). Both orders are legal to the engine here — the Job row already
+       * exists, so `putJob` is a pure UPDATE with no foreign key to satisfy — so the order
+       * is FREE and is chosen by asking what an interruption BETWEEN the writes leaves
+       * behind. This is the identical question, and the identical answer, as the terminal
+       * pair in `job-runner.ts`'s `dispatch` (see the full statement there):
+       *
+       * - Job LAST (what this does): an interrupted seal leaves a `running` Job with LIVE
+       *   executions — precisely the state THIS function exists to settle, so the NEXT boot
+       *   repairs it. `run` re-reads the graph from scratch every time, so a resumed settle
+       *   is just a settle.
+       * - Job FIRST (what this used to do): the same interruption leaves a TERMINAL Job with
+       *   a LIVE execution, and NOTHING repairs it — `run` skips every job whose
+       *   `status !== "running"`, and this settle is the only other `SealedTranscript`
+       *   writer in the tree and sits behind that gate. A permanent live orphan that
+       *   survives every restart. Unrepresentable-22 in `docs/plan/domain-remodel.md`.
+       *
+       * The seal loop is deliberately ALL-OR-NOTHING across siblings, and that is only safe
+       * BECAUSE the Job write is last (round 5, B2). A `StateStoreError` on execution *k*
+       * aborts *k+1…n* and fails the boot — but the Job is still `running`, so the next boot
+       * re-lists the tree and re-seals from the top; the already-sealed rows are skipped and
+       * the remainder is reached. Isolating each execution with a log instead would let the
+       * `putJob` run over a PARTIALLY sealed tree, which is the live orphan again, one node
+       * down. A failure here is therefore raised, not swallowed: our own store failing at
+       * boot is a real failure the caller must see, and the durable state it leaves is
+       * repairable.
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {
-          yield* store.jobs.putJob({ ...job, status });
           const executions = yield* store.jobs.listExecutionsForJob(job.id);
           yield* Effect.forEach(executions, (execution) =>
             Effect.gen(function* () {
@@ -276,6 +302,10 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
               });
             }),
           );
+          // ORDER: FREE (no FK — the Job row exists, this is a pure UPDATE), chosen
+          // RECOVERY-ORDERED. The Job goes terminal LAST so any interruption above leaves
+          // the `running` Job this very function is the repair for.
+          yield* store.jobs.putJob({ ...job, status });
         });
 
       const run = Effect.gen(function* () {
