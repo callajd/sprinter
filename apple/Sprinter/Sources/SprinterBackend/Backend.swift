@@ -10,6 +10,12 @@ import SprinterContract
 /// local-daemon vs. remote-daemon is an adapter choice made when the connection's
 /// transport is selected (see ``BackendConnector``), never a distinction the
 /// client surface can observe.
+/// The offset-stamped work-graph feed a ``Backend`` serves: each item pairs a delta with
+/// the DURABLE offset it was journaled at, which is what a reconnecting client resumes
+/// from. Named so the offset feed's signature stays one readable line as it gains the
+/// generation the cursor belongs to.
+public typealias OffsetEventStream = AsyncThrowingStream<OffsetEvent, any Error>
+
 public protocol Backend: Sendable {
   /// Hydrates the full owned read model (snapshot-on-connect, D4).
   func snapshot() async throws -> Snapshot
@@ -31,14 +37,23 @@ public protocol Backend: Sendable {
   func events() -> AsyncThrowingStream<WorkGraphEvent, any Error>
 
   /// The live work-graph subscription **with durable offsets** for reconnect replay
-  /// (CE2.2). `sinceOffset` is the resume cursor: `nil` replays from the log ORIGIN,
-  /// a value resumes STRICTLY AFTER it (an incremental resume, not a snapshot
+  /// (CE2.2). `resume` is the resume context: `nil` replays from the log ORIGIN, a value
+  /// resumes STRICTLY AFTER its `sinceOffset` (an incremental resume, not a snapshot
   /// re-derive). Each item is an ``OffsetEvent`` pairing the delta with the durable
   /// offset it was journaled at, so a reconnecting client can track its last-applied
   /// position (see ``WorkGraphResync``). The daemon replays gaplessly after the cursor,
   /// so no delta is missed across a disconnect. A default adapter implementation wraps
   /// ``events()`` with synthetic offsets; the live ``RpcBackend`` carries real ones.
-  func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error>
+  ///
+  /// The cursor and the ``Snapshot/generation`` it was minted under are ONE value, not
+  /// two parameters that happen to be passed together: a durable offset is only
+  /// meaningful inside one store generation, so the daemon refuses a resume whose
+  /// generation is stale
+  /// (``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)``) instead of
+  /// resuming it against a log it never belonged to — and the ABSENCE of the whole
+  /// context, never a particular offset value, is what makes a request an ORIGIN
+  /// subscription.
+  func events(resume: ResumeContext?) -> OffsetEventStream
 
   // MARK: - Session channel (BE1.2 / D9)
 
@@ -74,23 +89,27 @@ public protocol Backend: Sendable {
 extension Backend {
   /// Default offset-aware feed for adapters WITHOUT durable offsets (the in-memory test
   /// fakes): it wraps the bare ``events()`` stream, assigning synthetic sequential
-  /// offsets starting strictly after `sinceOffset`. Real durable replay is provided by
+  /// offsets starting strictly after `resume.sinceOffset`. Real durable replay is provided by
   /// adapters that override this (``RpcBackend``), so a fake never has to model offsets
   /// yet still satisfies the port — and the offset-driven reconnect logic is exercised
   /// against the real adapter.
   ///
   /// The synthetic sequence honors the SAME offset origin as production: durable offsets
   /// are strictly `> 0` (the daemon's journal starts at 1), so an origin subscription
-  /// (`sinceOffset: nil`) mints its first offset at `1`, not `0`. A `0`-based origin would
+  /// (`resume: nil`) mints its first offset at `1`, not `0`. A `0`-based origin would
   /// contradict that `> 0` invariant AND be silently dropped by ``ContiguousOffsetTracker``
   /// (whose origin prefix seeds at `0`, so an offset of `0` is not `> contiguous` and never
   /// advances the prefix) — so the fake would exercise a different origin boundary than the
   /// real adapter. Starting at `1` keeps the fake faithful to the production invariant.
-  public func events(sinceOffset: Int?) -> AsyncThrowingStream<OffsetEvent, any Error> {
+  ///
+  /// A fake has no durable store and therefore no generation to check, so the context's
+  /// `generation` is ignored here — the port's shape is what the fake satisfies; the real
+  /// guard is the daemon's, exercised against ``RpcBackend``.
+  public func events(resume: ResumeContext?) -> OffsetEventStream {
     let base = events()
     return AsyncThrowingStream { continuation in
       let task = Task {
-        var offset = (sinceOffset ?? 0) + 1
+        var offset = (resume?.sinceOffset ?? 0) + 1
         do {
           for try await event in base {
             continuation.yield(OffsetEvent(offset: offset, event: event))

@@ -28,3 +28,32 @@ export type JobId = (typeof JobId)["Type"];
 /** Identifies a {@link Session} — one agent run executing a {@link Job}. */
 export const SessionId = Schema.NonEmptyString.pipe(Schema.brand("SessionId"));
 export type SessionId = (typeof SessionId)["Type"];
+
+/**
+ * Identifies an {@link Agent} — a member of the REGISTRY layer: owned, global,
+ * and scoped to NO repository. Because the registry is append-only, an `AgentId`
+ * identifies one immutable REVISION: editing an agent mints a NEW id whose record
+ * points back at the previous one through `supersedes`.
+ */
+export const AgentId = Schema.NonEmptyString.pipe(Schema.brand("AgentId"));
+export type AgentId = (typeof AgentId)["Type"];
+
+/**
+ * Identifies one STORE GENERATION — the lifetime of a single durable store, from
+ * the moment its schema is created to the moment it is dropped and recreated.
+ *
+ * It is an OWNED, provider-neutral identifier (no SQL, no file path, no version
+ * number leaks through it), which is what lets it appear on the daemon↔client
+ * contract alongside the rest of the read model (INV-PORT). It is minted FRESH
+ * every time the schema is created, so two generations never share one — that is
+ * the whole point: durable offsets are only comparable WITHIN a generation, so a
+ * cursor is meaningful only when paired with the generation it was minted in.
+ *
+ * A generation ends only by drop-and-recreate (`SCHEMA_VERSION`,
+ * `packages/state/src/sqlite.ts` — INV-FRESH never migrates), and the schema is
+ * applied at store construction, so a new generation is observable only across a
+ * daemon RESTART. It is opaque: nothing may parse it, order it, or infer age from
+ * it — the only defined operation is equality.
+ */
+export const StoreGenerationId = Schema.NonEmptyString.pipe(Schema.brand("StoreGenerationId"));
+export type StoreGenerationId = (typeof StoreGenerationId)["Type"];

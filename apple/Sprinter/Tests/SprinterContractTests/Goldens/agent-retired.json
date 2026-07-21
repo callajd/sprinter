@@ -1,0 +1,14 @@
+{
+  "id": "agt-3",
+  "name": "implementer",
+  "model": "claude-opus-4-8",
+  "version": "1.1.0",
+  "tools": [
+    "read",
+    "edit",
+    "bash",
+    "web_search"
+  ],
+  "supersedes": "agt-2",
+  "retiredAt": "2026-07-20T12:00:00.000Z"
+}

@@ -10,6 +10,7 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
   case issueChanged(Issue)
   case jobChanged(Job)
   case sessionChanged(Session)
+  case agentChanged(Agent)
 
   private enum CodingKeys: String, CodingKey {
     case tag = "_tag"
@@ -18,6 +19,7 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     case issue
     case job
     case session
+    case agent
   }
 
   public init(from decoder: any Decoder) throws {
@@ -34,6 +36,8 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
       self = .jobChanged(try container.decode(Job.self, forKey: .job))
     case "SessionChanged":
       self = .sessionChanged(try container.decode(Session.self, forKey: .session))
+    case "AgentChanged":
+      self = .agentChanged(try container.decode(Agent.self, forKey: .agent))
     default:
       throw DecodingError.dataCorruptedError(
         forKey: .tag,
@@ -61,6 +65,9 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     case .sessionChanged(let value):
       try container.encode("SessionChanged", forKey: .tag)
       try container.encode(value, forKey: .session)
+    case .agentChanged(let value):
+      try container.encode("AgentChanged", forKey: .tag)
+      try container.encode(value, forKey: .agent)
     }
   }
 }

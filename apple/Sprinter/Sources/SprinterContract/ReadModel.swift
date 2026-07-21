@@ -213,25 +213,48 @@ public struct Session: Codable, Equatable, Sendable {
   }
 }
 
-/// The full owned read-model state, hydrated on connect by the `snapshot` RPC.
+/// The full owned state, hydrated on connect by the `snapshot` RPC: the read model
+/// plus the registry layer (``agents``).
+///
+/// ``agents`` is the WHOLE append-only registry, not a per-repository slice — an
+/// ``Agent`` is global, so the per-repo view is a fold over that repo's executions
+/// (INV-DERIVED). Retired and superseded revisions are included, because a
+/// historical node may still resolve to one. Like every other collection here it is
+/// a REQUIRED initializer parameter: the wire always carries the key, so a default
+/// would let a construction site quietly omit a collection the contract guarantees.
+///
+/// ``generation`` is the identity of the daemon's STORE GENERATION — the coordinate
+/// space this state's durable offsets live in. It is REQUIRED for the same reason,
+/// and it is what a client must retain alongside the state: every cursor-bearing
+/// resume (``EventsPayload``/``SessionEventsPayload``) hands it back, and a cursor
+/// whose generation the daemon no longer has is refused with
+/// ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)`` rather than
+/// silently resumed against a log it never belonged to. It is OPAQUE — equality is
+/// the only defined operation; nothing may parse or order it.
 public struct Snapshot: Codable, Equatable, Sendable {
   public let workstreams: [Workstream]
   public let epics: [Epic]
   public let issues: [Issue]
   public let jobs: [Job]
   public let sessions: [Session]
+  public let agents: [Agent]
+  public let generation: StoreGenerationId
 
   public init(
     workstreams: [Workstream],
     epics: [Epic],
     issues: [Issue],
     jobs: [Job],
-    sessions: [Session]
+    sessions: [Session],
+    agents: [Agent],
+    generation: StoreGenerationId
   ) {
     self.workstreams = workstreams
     self.epics = epics
     self.issues = issues
     self.jobs = jobs
     self.sessions = sessions
+    self.agents = agents
+    self.generation = generation
   }
 }

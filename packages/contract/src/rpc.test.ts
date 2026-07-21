@@ -3,6 +3,7 @@ import { Schema } from "effect";
 import { RpcSchema } from "effect/unstable/rpc";
 import { expect } from "vitest";
 import {
+  Agent,
   Issue,
   IssueId,
   Job,
@@ -24,6 +25,7 @@ import {
   IssueNotFound,
   OffsetSessionEvent,
   PlanRejected,
+  ResyncRequired,
   retryIssue,
   SessionNotFound,
   sessionEvents,
@@ -67,6 +69,13 @@ const issue = {
 };
 const job = { id: "job-1", issueId: "iss-1", kind: "implement", status: "running" };
 const session = { id: "ses-1", jobId: "job-1", status: "active" };
+const agent = {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read", "edit"],
+};
 
 it("carries every model of the contract as a procedure", () => {
   expect([...SprinterRpc.requests.keys()].sort()).toEqual([...ALL_TAGS].sort());
@@ -88,6 +97,8 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
     issues: [issue],
     jobs: [job],
     sessions: [session],
+    agents: [agent, { ...agent, id: "agt-2", supersedes: "agt-1" }],
+    generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
   };
   const decoded = Schema.decodeUnknownSync(snapshot.successSchema)(full);
 
@@ -96,11 +107,31 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   expect(decoded).toEqual(Schema.decodeUnknownSync(Snapshot)(full));
   expect(Schema.decodeUnknownSync(Workstream)(workstream).id).toBe("ws-1");
   expect(decoded.issues[0]?.number).toBe(10);
+  // The REGISTRY layer rides the snapshot whole — every revision, no per-repo slice
+  // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED).
+  expect(decoded.agents.map((a) => a.id)).toEqual(["agt-1", "agt-2"]);
+  expect(decoded.agents[1]?.supersedes).toBe("agt-1");
+  expect("retiredAt" in (decoded.agents[0] ?? {})).toBe(false);
+});
+
+it("carries the registry as an upsert-only AgentChanged delta with no removal variant", () => {
+  const retired = { ...agent, retiredAt: "2026-07-20T12:00:00.000Z" };
+  const decoded = Schema.decodeUnknownSync(WorkGraphEvent)({
+    _tag: "AgentChanged",
+    agent: retired,
+  });
+  if (decoded._tag !== "AgentChanged") throw new Error("expected AgentChanged");
+  expect(decoded.agent.retiredAt).toBe("2026-07-20T12:00:00.000Z");
+  // Retirement is a STAMP carried by an ordinary change delta; the append-only
+  // registry has no removal, so there is no `AgentRemoved` variant to decode.
+  expect(() =>
+    Schema.decodeUnknownSync(WorkGraphEvent)({ _tag: "AgentRemoved", id: "agt-1" }),
+  ).toThrow();
 });
 
 it("streams offset-stamped owned work-graph deltas over the events feed (INV-REACTIVE)", () => {
   // The streamed success is the OffsetEvent envelope (CE2.0): the
-  // owned delta PLUS the durable offset the client feeds back as `sinceOffset`.
+  // owned delta PLUS the durable offset the client feeds back as `resume.sinceOffset`.
   const delta = { _tag: "IssueChanged", issue };
   const item = { offset: 7, event: delta };
   const decoded = Schema.decodeUnknownSync(events.successSchema.success)(item);
@@ -114,18 +145,122 @@ it("streams offset-stamped owned work-graph deltas over the events feed (INV-REA
   ).toThrow();
 });
 
-it("carries an OPTIONAL sinceOffset resume cursor on the events request (CE2.0)", () => {
+const generation = "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b";
+
+it("carries an OPTIONAL resume context on the events request (CE2.0)", () => {
   // Present: a non-negative offset resumes strictly after that point.
-  const withCursor = Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: 12 });
-  expect(withCursor.sinceOffset).toBe(12);
+  const withCursor = Schema.decodeUnknownSync(events.payloadSchema)({
+    resume: { sinceOffset: 12, generation },
+  });
+  expect(withCursor.resume?.sinceOffset).toBe(12);
 
   // Absent: the key is optional, so an empty payload decodes (origin replay,
   // backward-compatible with the earlier (pre-cursor) no-field request).
   const noCursor = Schema.decodeUnknownSync(events.payloadSchema)({});
-  expect(noCursor.sinceOffset).toBeUndefined();
+  expect(noCursor.resume).toBeUndefined();
 
   // A negative offset is not a non-negative int and is rejected.
-  expect(() => Schema.decodeUnknownSync(events.payloadSchema)({ sinceOffset: -1 })).toThrow();
+  expect(() =>
+    Schema.decodeUnknownSync(events.payloadSchema)({ resume: { sinceOffset: -1, generation } }),
+  ).toThrow();
+});
+
+it("makes a cursor without its generation UNREPRESENTABLE, at every offset (INV-SUM)", () => {
+  // THE STRUCTURAL PROPERTY. `sinceOffset` and `generation` are ONE value, so the two
+  // states a runtime pairing check would have to reject cannot be built at all: a
+  // resume context missing either half fails to DECODE.
+  expect(() =>
+    Schema.decodeUnknownSync(events.payloadSchema)({ resume: { sinceOffset: 12 } }),
+  ).toThrow();
+  expect(() =>
+    Schema.decodeUnknownSync(events.payloadSchema)({ resume: { generation } }),
+  ).toThrow();
+  // Same on the session channel — no weaker shape for the second feed.
+  expect(() =>
+    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
+      sessionId: "ses-1",
+      resume: { sinceOffset: 4 },
+    }),
+  ).toThrow();
+
+  // And `sinceOffset: 0` is an ORDINARY resume, not a disguised origin request: it is
+  // representable ONLY inside a resume context, so it always carries a generation for
+  // the daemon to compare. The origin request is the ABSENCE of the whole value — the
+  // presence of `resume`, never the value of an offset, is what distinguishes them.
+  const zero = Schema.decodeUnknownSync(events.payloadSchema)({
+    resume: { sinceOffset: 0, generation },
+  });
+  expect(zero.resume).toStrictEqual({ sinceOffset: 0, generation });
+  expect(Schema.decodeUnknownSync(events.payloadSchema)({}).resume).toBeUndefined();
+});
+
+it("pairs a resume cursor with the STORE GENERATION it was minted in", () => {
+  // A cursor is a coordinate in ONE generation's log, so the resume context carries the
+  // generation alongside it — the value the client read off `Snapshot.generation`.
+  const resume = Schema.decodeUnknownSync(events.payloadSchema)({
+    resume: { sinceOffset: 12, generation },
+  });
+  expect(resume.resume?.generation).toBe(generation);
+  // The SAME pairing on the session channel: its per-session log is dropped by a schema
+  // bump exactly as the work-graph log is, so its cursor is generation-scoped too.
+  const sessionResume = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
+    sessionId: "ses-1",
+    resume: { sinceOffset: 4, generation },
+  });
+  expect(sessionResume.resume?.generation).toBe(generation);
+
+  // The whole context is OPTIONAL because an ORIGIN request (a first connect) has none.
+  expect(Schema.decodeUnknownSync(events.payloadSchema)({}).resume).toBeUndefined();
+  // An empty generation is not a non-empty string and is rejected.
+  expect(() =>
+    Schema.decodeUnknownSync(events.payloadSchema)({ resume: { sinceOffset: 1, generation: "" } }),
+  ).toThrow();
+
+  // The snapshot is where the generation ORIGINATES, so it is REQUIRED there — a snapshot
+  // without one would hand a client state it could never construct a valid resume from.
+  expect(() =>
+    Schema.decodeUnknownSync(snapshot.successSchema)({
+      workstreams: [],
+      epics: [],
+      issues: [],
+      jobs: [],
+      sessions: [],
+      agents: [],
+    }),
+  ).toThrow();
+
+  // And ResyncRequired names the daemon's CURRENT generation, so the refusal says which
+  // context the client must re-hydrate into — not merely that its cursor is bad.
+  // A streaming RPC's error rides the `RpcSchema.Stream` envelope, so the channel under
+  // test is `successSchema.error` (its `errorSchema` is the non-streaming one, `never`).
+  const refusal = Schema.decodeUnknownSync(events.successSchema.error)({
+    _tag: "ResyncRequired",
+    sinceOffset: 2,
+    maxOffset: 3,
+    generation,
+  });
+  expect(refusal).toBeInstanceOf(ResyncRequired);
+  expect(refusal.generation).toBe(generation);
+  // The refusal is expressible even when the cursor is WITHIN the log's extent — the case
+  // an offset-only rule could not detect at all.
+  expect(refusal.sinceOffset).toBeLessThanOrEqual(refusal.maxOffset);
+
+  // `sessionEvents` therefore has a TWO-error channel: the existence question and the
+  // generation question are independent, and both must be expressible on it.
+  expect(
+    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
+      _tag: "SessionNotFound",
+      id: "ses-9",
+    }),
+  ).toBeInstanceOf(SessionNotFound);
+  expect(
+    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
+      _tag: "ResyncRequired",
+      sinceOffset: 2,
+      maxOffset: 3,
+      generation,
+    }),
+  ).toBeInstanceOf(ResyncRequired);
 });
 
 it("decodes the events request through the wire JSON codec — {} replays from origin (CE2.0 B1)", () => {
@@ -138,9 +273,9 @@ it("decodes the events request through the wire JSON codec — {} replays from o
 
   // The canonical Effect client (and the fixed Swift client) send a PRESENT empty
   // object `{}` for `.events({})`; it MUST decode to the origin-replay case (no
-  // `sinceOffset`). This is the assertion that would have caught the Swift client
+  // `resume`). This is the assertion that would have caught the Swift client
   // omitting the `payload` key.
-  expect(Schema.decodeUnknownSync(codec)({}).sinceOffset).toBeUndefined();
+  expect(Schema.decodeUnknownSync(codec)({}).resume).toBeUndefined();
 
   // Documents the boundary the omitted-payload bug tripped: an ABSENT payload
   // (`undefined`, an omitted `payload` key on the wire) is NOT a valid events
@@ -201,7 +336,7 @@ it("retries an issue by id, failing with IssueNotFound", () => {
 it("streams the offset-stamped durable transcript over sessionEvents, keyed by session id", () => {
   // The streamed success is the OffsetSessionEvent envelope: a durable,
   // transcript-grade SessionEvent PLUS the durable per-session offset the client feeds back
-  // as `sinceOffset`. It mirrors the `events` feed's OffsetEvent envelope.
+  // as `resume.sinceOffset`. It mirrors the `events` feed's OffsetEvent envelope.
   const payload = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
   expect(payload.sessionId).toBe(Schema.decodeUnknownSync(SessionId)("ses-1"));
 
@@ -228,31 +363,35 @@ it("streams the offset-stamped durable transcript over sessionEvents, keyed by s
   expect(err).toBeInstanceOf(SessionNotFound);
 });
 
-it("carries an OPTIONAL sinceOffset resume cursor on the sessionEvents request", () => {
+it("carries an OPTIONAL resume context on the sessionEvents request", () => {
   // Present cursor: resume STRICTLY AFTER that durable per-session offset.
   const withCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
     sessionId: "ses-1",
-    sinceOffset: 12,
+    resume: { sinceOffset: 12, generation },
   });
-  expect(withCursor.sinceOffset).toBe(12);
+  expect(withCursor.resume?.sinceOffset).toBe(12);
 
   // Absent cursor: the KEY is omitted (present-but-empty beyond `sessionId`) → replay the
   // session's durable transcript from the ORIGIN.
   const noCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
-  expect(noCursor.sinceOffset).toBeUndefined();
+  expect(noCursor.resume).toBeUndefined();
 
   // A negative cursor is rejected (NonNegativeInt).
   expect(() =>
-    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1", sinceOffset: -1 }),
+    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
+      sessionId: "ses-1",
+      resume: { sinceOffset: -1, generation },
+    }),
   ).toThrow();
 
-  // Through the wire JSON codec: a request with sessionId and NO sinceOffset key decodes to
+  // Through the wire JSON codec: a request with sessionId and NO resume key decodes to
   // the origin-replay case (mirrors the `events` B1 seam for the session channel).
   const codec = Schema.toCodecJson(sessionEvents.payloadSchema);
-  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1" }).sinceOffset).toBeUndefined();
-  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1", sinceOffset: 3 }).sinceOffset).toBe(
-    3,
-  );
+  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1" }).resume).toBeUndefined();
+  expect(
+    Schema.decodeUnknownSync(codec)({ sessionId: "ses-1", resume: { sinceOffset: 3, generation } })
+      .resume?.sinceOffset,
+  ).toBe(3);
 });
 
 it("drives input into a session via sessionSend", () => {
@@ -295,6 +434,20 @@ it("rejects a payload that is not an owned domain value", () => {
       issues: [{ id: "iss-1" }],
       jobs: [],
       sessions: [],
+      agents: [],
+      generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
+    }),
+  ).toThrow();
+  // And a malformed agent (an unparseable `retiredAt`) fails the same way.
+  expect(() =>
+    Schema.decodeUnknownSync(snapshot.successSchema)({
+      workstreams: [],
+      epics: [],
+      issues: [],
+      jobs: [],
+      sessions: [],
+      agents: [{ ...agent, retiredAt: "yesterday" }],
+      generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
     }),
   ).toThrow();
 });
@@ -305,4 +458,5 @@ it("uses only owned domain fixtures", () => {
   expect(Schema.decodeUnknownSync(Issue)(issue).epicId).toBe("ep-1");
   expect(Schema.decodeUnknownSync(Job)(job).kind).toBe("implement");
   expect(Schema.decodeUnknownSync(Session)(session).status).toBe("active");
+  expect(Schema.decodeUnknownSync(Agent)(agent).tools).toEqual(["read", "edit"]);
 });

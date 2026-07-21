@@ -1,5 +1,5 @@
 /**
- * One-off golden generator for the Swift contract mirror (issue FE2.4).
+ * The golden generator for the Swift contract mirror (issue FE2.4).
  *
  * Encodes REPRESENTATIVE values of every contract message schema through the
  * MERGED TypeScript contract (`@sprinter/contract` over `@sprinter/domain`),
@@ -9,13 +9,18 @@
  * against REAL contract output rather than hand-typed JSON that could drift in
  * the same direction as the mirror (INV-CONTRACT).
  *
- * This script is NOT part of any gate: `make check` only DECODES the committed
- * goldens (no bun dependency inside the Swift gate). It is re-run by a human when
- * the contract changes — see `docs/contract-mirror.md` (the INV-CONTRACT ripple
- * procedure).
+ * `make check` only DECODES the committed goldens (no bun dependency inside the
+ * Swift gate), so the SWIFT side alone cannot notice a stale fixture. The ROOT gate
+ * closes that hole: `bun run check:goldens` (`./check-goldens.ts`) re-runs this
+ * generator into a temporary directory and diffs, so a contract change that was not
+ * re-frozen fails CI rather than waiting to be caught by review — see
+ * `docs/contract-mirror.md` (the INV-CONTRACT ripple procedure).
  *
  * Run from anywhere in the repo:
- *   bun run apple/Sprinter/scripts/generate-goldens.ts
+ *   bun run apple/Sprinter/scripts/generate-goldens.ts [outputDir]
+ *
+ * `outputDir` defaults to the committed `Tests/SprinterContractTests/Goldens`; the
+ * freshness check passes a temp directory so it never touches the working tree.
  *
  * `Schema.encodeUnknownSync` VALIDATES its input against the schema before
  * encoding, so every representative value below is proven contract-valid as a
@@ -26,6 +31,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
 import {
+  Agent,
   Epic,
   Issue,
   Job,
@@ -49,6 +55,7 @@ import {
   OffsetEvent,
   OffsetSessionEvent,
   PlanRejected,
+  ResyncRequired,
   retryIssue,
   sessionEvents,
   sessionSend,
@@ -60,7 +67,9 @@ import {
 } from "../../../packages/contract/src/index.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const goldensDir = join(here, "..", "Tests", "SprinterContractTests", "Goldens");
+/** Where the committed goldens live — the default target, and what the gate diffs against. */
+export const COMMITTED_GOLDENS_DIR = join(here, "..", "Tests", "SprinterContractTests", "Goldens");
+const goldensDir = process.argv[2] ?? COMMITTED_GOLDENS_DIR;
 mkdirSync(goldensDir, { recursive: true });
 
 /** Encode a value through its schema (validating it) and write the wire JSON. */
@@ -108,6 +117,44 @@ const jobFull = {
 const jobMinimal = { id: "job-2", issueId: "iss-2", kind: "review", status: "queued" };
 
 const session = { id: "ses-1", jobId: "job-1", status: "active" };
+
+// ── Registry fixtures (DE1.1) ────────────────────────────────────────────────
+//
+// The registry is APPEND-ONLY and GLOBAL, and a stored revision is IMMUTABLE, so
+// BOTH mutating operations are an append of a NEW id: `agentRevised` is an EDIT —
+// a new revision linked to the one it replaced by `supersedes` — and `agentRetired`
+// is a RETIREMENT — a new revision carrying `supersedes` AND the `retiredAt` stamp
+// (retired-ness is the stamp's presence; there is no status enum, INV-SUM).
+// `agentOriginal` exercises BOTH optional keys ABSENT. No agent names a repository:
+// "agents used in this repo" is a fold over that repo's executions (INV-DERIVED).
+const agentOriginal = {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read", "edit", "bash"],
+};
+const agentRevised = {
+  id: "agt-2",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit", "bash", "web_search"],
+  supersedes: "agt-1",
+};
+// A retirement is LIFECYCLE-ONLY: it carries the SAME name/model/version/tools as
+// the head it retires, and differs ONLY in `id`, `supersedes` and `retiredAt`. So
+// this fixture is `agentRevised`'s content verbatim plus the stamp — spelled as a
+// spread so it CANNOT drift. (It is also what the `StateStore` port now enforces: a
+// retiring revision that rewrote content would be rejected, so a fixture showing one
+// would teach a wire shape the daemon will not produce.)
+const agentRetired = {
+  ...agentRevised,
+  id: "agt-3",
+  supersedes: "agt-2",
+  retiredAt: "2026-07-20T12:00:00.000Z",
+};
+
 const epic = {
   id: "ep-1",
   workstreamId: "ws-1",
@@ -125,12 +172,28 @@ const workstream = {
 
 // ── Snapshot (hydration) ─────────────────────────────────────────────────────
 
+/**
+ * A fixed STORE GENERATION for the fixtures. The real one is minted per store
+ * (a UUID from `createSchema`); the goldens pin the SHAPE, so a stable literal keeps
+ * them byte-reproducible — the property `check-goldens.ts` gates on.
+ */
+const generation = "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b";
+
 write("snapshot", Snapshot, {
   workstreams: [workstream],
   epics: [epic],
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
   sessions: [session],
+  // BYTE order by id (SQLite's default BINARY collation) — the order `listAgents`
+  // pins and the daemon hydrates in.
+  // It is presentational (a client upserts by id); a lineage is read off
+  // `supersedes`, never off this order.
+  agents: [agentOriginal, agentRevised, agentRetired],
+  // The coordinate space these offsets live in. A client retains it with the state and
+  // hands it back on every cursor-bearing request, so a cursor from a destroyed
+  // generation is refused rather than silently resumed (INV-FRESH).
+  generation,
 });
 
 // Individual owned nodes (exercise every DTO + optional-key present/absent).
@@ -141,6 +204,9 @@ write("issue-no-pr", Issue, issueNoPr);
 write("job-full", Job, jobFull);
 write("job-minimal", Job, jobMinimal);
 write("session", Session, session);
+write("agent-original", Agent, agentOriginal);
+write("agent-revised", Agent, agentRevised);
+write("agent-retired", Agent, agentRetired);
 write("pull-request-ref", PullRequestRef, prMerged);
 
 // The distinct terminal `cancelled` WorkStatus (CE5.1) — a cancelled
@@ -156,13 +222,14 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
   { _tag: "IssueChanged", issue: issueWithPr },
   { _tag: "JobChanged", job: jobFull },
   { _tag: "SessionChanged", session },
+  { _tag: "AgentChanged", agent: agentRevised },
 ]);
 
 // ── OffsetEvent — the streamed `events` success envelope (CE2.0) ──
 //
 // Each streamed item pairs a WorkGraphEvent with its DURABLE offset, so a client
 // can feed the offset back as the request's `sinceOffset` cursor. Real `event_log`
-// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3,4,5)
+// offsets are 1-based (> 0), so the sample resumes from a mid-log position (3…6)
 // rather than the origin — the strict `> sinceOffset` ordering is the durable-replay
 // slice a reconnect resumes from.
 
@@ -170,6 +237,7 @@ write("offset-events", Schema.Array(OffsetEvent), [
   { offset: 3, event: { _tag: "WorkstreamChanged", workstream } },
   { offset: 4, event: { _tag: "IssueChanged", issue: issueWithPr } },
   { offset: 5, event: { _tag: "SessionChanged", session } },
+  { offset: 6, event: { _tag: "AgentChanged", agent: agentRetired } },
 ]);
 
 // ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────
@@ -307,6 +375,20 @@ const encodedErrors = [
   Schema.encodeUnknownSync(PlanRejected)(
     Schema.decodeUnknownSync(PlanRejected)({ _tag: "PlanRejected", reason: "empty spec" }),
   ),
+  // The resume refusal, shared by BOTH cursor-bearing feeds (`events` and
+  // `sessionEvents`): the client's cursor is not from the daemon's current store
+  // generation, so it must discard its retained state and re-hydrate from `snapshot`.
+  // NOTE the cursor here is WITHIN the log's extent (2 <= 3) — the case an offset-only
+  // rule cannot detect, and the reason the generation is an explicit identity. The
+  // `generation` field names the daemon's CURRENT one.
+  Schema.encodeUnknownSync(ResyncRequired)(
+    Schema.decodeUnknownSync(ResyncRequired)({
+      _tag: "ResyncRequired",
+      sinceOffset: 2,
+      maxOffset: 3,
+      generation,
+    }),
+  ),
 ];
 writeFileSync(
   join(goldensDir, "contract-errors.json"),
@@ -315,22 +397,24 @@ writeFileSync(
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
 
-// The `events` request cursor is OPTIONAL (CE2.0): both wire forms
-// are captured — present (`sinceOffset` key set) and absent (key omitted, the
-// backward-compatible origin replay) — so the Swift mirror decodes each.
-write("payload-events", events.payloadSchema, { sinceOffset: 12 });
+// The `events` request RESUME CONTEXT is OPTIONAL (CE2.0): both wire forms are
+// captured — present (a `resume` object carrying BOTH coordinates) and absent (key
+// omitted, the origin replay) — so the Swift mirror decodes each. The cursor and its
+// generation are ONE nested value, so "a cursor without its generation" has no wire
+// form to freeze: absence of `resume` is the only origin request there is.
+write("payload-events", events.payloadSchema, { resume: { sinceOffset: 12, generation } });
 write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
   plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
-// The `sessionEvents` request cursor is OPTIONAL, exactly like `events`:
-// both wire forms are captured — present (`sinceOffset` key set) and absent (key omitted,
-// the origin-replay case) — so the Swift mirror decodes each.
+// The `sessionEvents` request resume context is OPTIONAL, and is the SAME nested
+// value `events` carries: both wire forms are captured — present and absent (the
+// origin-replay case) — so the Swift mirror decodes each.
 write("payload-session-events", sessionEvents.payloadSchema, {
   sessionId: "ses-1",
-  sinceOffset: 12,
+  resume: { sinceOffset: 12, generation },
 });
 write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
 write("payload-session-send", sessionSend.payloadSchema, {
@@ -364,4 +448,7 @@ write("json-values", Schema.Array(Schema.Unknown), [
 // `createWorkstreamFromPlan` answers with a bare `WorkstreamId` (a JSON string).
 write("response-workstream-id", createWorkstreamFromPlan.successSchema, "ws-1");
 
-console.log(`Wrote goldens to ${goldensDir}`);
+// `process.stdout.write`, not `console.log`: this script is inside the lint gate
+// (`check:lint` covers `apple/Sprinter/scripts`), and it matches how `check-goldens.ts`
+// already reports — one way of writing to the terminal across both scripts.
+process.stdout.write(`Wrote goldens to ${goldensDir}\n`);

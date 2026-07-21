@@ -1,7 +1,7 @@
 import { it } from "@effect/vitest";
 import { Effect, Exit, Schema } from "effect";
 import { expect } from "vitest";
-import { EpicId, IssueId, JobId, SessionId, WorkstreamId } from "./ids.ts";
+import { AgentId, EpicId, IssueId, JobId, SessionId, WorkstreamId } from "./ids.ts";
 
 const brands = [
   ["WorkstreamId", WorkstreamId],
@@ -9,6 +9,7 @@ const brands = [
   ["IssueId", IssueId],
   ["JobId", JobId],
   ["SessionId", SessionId],
+  ["AgentId", AgentId],
 ] as const;
 
 it.effect("decodes non-empty strings into each branded id and round-trips", () =>

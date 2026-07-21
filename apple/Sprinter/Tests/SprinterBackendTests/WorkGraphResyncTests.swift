@@ -58,7 +58,9 @@ struct WorkGraphResyncTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
-    #expect(resumeRequest.payload == (try toJSONValue(EventsPayload(sinceOffset: 1))))
+    // The resume sends the cursor WITH the generation the retained baseline was
+    // hydrated in — one resume context, never a bare offset.
+    #expect(resumeRequest.payload == (try Fixtures.resumePayload(1)))
 
     // A new delta folds onto the RETAINED baseline (issue still in_review) — proving no
     // fresh snapshot was fetched (a re-derive would have replaced the issue list).
@@ -120,7 +122,7 @@ struct WorkGraphResyncTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
-    #expect(resumeRequest.payload == (try toJSONValue(EventsPayload(sinceOffset: 2))))
+    #expect(resumeRequest.payload == (try Fixtures.resumePayload(2)))
 
     // The daemon re-sends from 3: offset 3 (the recovered gap) advances the issue to
     // in_review, offset 4 re-applies idempotently. No event is lost.
@@ -190,13 +192,13 @@ struct WorkGraphResyncTests {
         requestId: eventsId, values: [try offsetDelta(2), try offsetDelta(3), try offsetDelta(4)]))
 
     // The overflow tears the attempt down; the engine reconnects and resumes INCREMENTALLY
-    // from the recorded contiguous cursor — a present `sinceOffset`, NOT a fresh snapshot.
+    // from the recorded contiguous cursor — a present `resume`, NOT a fresh snapshot.
     let second = try #require(await transports.next())
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
     let payload = try #require(resumeRequest.payload)
-    #expect(try fromJSONValue(EventsPayload.self, payload).sinceOffset != nil)
+    #expect(try fromJSONValue(EventsPayload.self, payload).resume != nil)
 
     await engine.stop()
     first.close()
@@ -258,21 +260,6 @@ struct WorkGraphResyncTests {
   /// One offset-tagged issue delta for the flood tests.
   private func offsetDelta(_ offset: Int) throws -> String {
     try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: offset))
-  }
-
-  /// Reads the two requests one attempt issues (`events` + `snapshot`, order not
-  /// wire-guaranteed) and indexes them by rpc tag.
-  private func requestsByTag(
-    _ outbound: inout AsyncStream<Data>.Iterator
-  ) async throws -> [String: SentFrame] {
-    var byTag: [String: SentFrame] = [:]
-    for _ in 0..<2 {
-      let frame = try await nextSent(&outbound)
-      if let tag = frame.rpcTag {
-        byTag[tag] = frame
-      }
-    }
-    return byTag
   }
 }
 

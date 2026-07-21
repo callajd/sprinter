@@ -108,8 +108,14 @@ struct ConstructionTests {
       epics: decoded.epics,
       issues: decoded.issues,
       jobs: decoded.jobs,
-      sessions: decoded.sessions)
+      sessions: decoded.sessions,
+      agents: decoded.agents,
+      generation: decoded.generation)
     #expect(built == decoded)
+    // The registry is a REQUIRED parameter like every other collection: the wire
+    // always carries the key, so there is no default to let a construction site
+    // quietly omit it. What the golden carries is a NON-empty registry.
+    #expect(!decoded.agents.isEmpty)
   }
 
   @Test("builds Usage equal to the golden")
@@ -158,8 +164,13 @@ struct ConstructionTests {
     let retry = RetryIssuePayload(issueId: IssueId(rawValue: "iss-1"))
     #expect(retry == (try Golden.decode(RetryIssuePayload.self, from: "payload-retry-issue")))
 
-    // The `sessionEvents` resume cursor — both wire forms (present + absent origin replay).
-    let subscribe = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"), sinceOffset: 12)
+    // The `sessionEvents` resume context — both wire forms (present + absent origin
+    // replay). A present context ALWAYS carries the STORE GENERATION its cursor was
+    // minted in, because they are one value; an origin request omits the whole key.
+    let generation = StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b")
+    let subscribe = SessionEventsPayload(
+      sessionId: SessionId(rawValue: "ses-1"),
+      resume: ResumeContext(sinceOffset: 12, generation: generation))
     #expect(
       subscribe == (try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")))
     let subscribeFromOrigin = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"))
@@ -171,8 +182,9 @@ struct ConstructionTests {
     let interrupt = InterruptPayload(sessionId: SessionId(rawValue: "ses-1"))
     #expect(interrupt == (try Golden.decode(InterruptPayload.self, from: "payload-interrupt")))
 
-    // The `events` resume cursor — both wire forms (present + absent origin replay).
-    let events = EventsPayload(sinceOffset: 12)
+    // The `events` resume context — both wire forms (present + absent origin replay).
+    let events = EventsPayload(
+      resume: ResumeContext(sinceOffset: 12, generation: generation))
     #expect(events == (try Golden.decode(EventsPayload.self, from: "payload-events")))
     let eventsFromOrigin = EventsPayload()
     #expect(

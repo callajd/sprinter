@@ -20,27 +20,46 @@
  *   port), every writer through the port — the command handlers AND the `JobRunner` — journals and
  *   fans out atomically for free, with no consumer knowing (INV-PORT).
  *
- * - {@link resyncEvents} — the stream the `events` RPC returns: it EAGERLY subscribes
- *   to the live feed, THEN replays the durable log from a starting offset via
- *   {@link EventLogStore.tail}, then hands over to the live tail. Each streamed item
+ * - {@link resyncEvents} — the stream the `events` RPC returns: it VALIDATES the
+ *   resume cursor against this store generation, EAGERLY subscribes to the live feed,
+ *   THEN replays the durable log from that offset via {@link EventLogStore.tail}, then
+ *   hands over to the live tail. Each streamed item
  *   is an {@link OffsetEvent} carrying its durable offset. Subscribing before reading
  *   closes the replay/live gap; `WorkGraphEvent` is upsert-idempotent (D8 — the
  *   carried node replaces any prior of the same id), so the small overlap at the
  *   boundary is harmless. A reconnecting client thus catches up on the whole durable
  *   history deterministically, not just the deltas that happen after it attaches.
  *
- * The wire `events` procedure carries an OPTIONAL `sinceOffset` REQUEST cursor and an
+ * The wire `events` procedure carries an OPTIONAL {@link ResumeContext} REQUEST value
+ * (cursor AND generation, inseparably) and an
  * {@link OffsetEvent} RESPONSE envelope (CE2.0, INV-CONTRACT): a request
- * with NO `sinceOffset` (a present but empty `{}` payload) replays from the log ORIGIN
+ * with NO `resume` (a present but empty `{}` payload) replays from the log ORIGIN
  * (`tail(0)`), present resumes STRICTLY AFTER that offset, and each streamed item
  * exposes the durable offset the client feeds back as its next cursor. {@link resyncFrom} is the
  * offset-parameterized primitive both cases drive (CE2.2 layers reconnect/
  * backpressure on top) without re-deriving a snapshot.
+ *
+ * A durable cursor outlives a STORE GENERATION, though, and the store never migrates
+ * (INV-FRESH): a schema-version bump drops the database, restarting the log's offsets
+ * at `1`. That is what {@link requireLiveCursor} exists for. It compares the
+ * GENERATION IDENTITY the request carries against `StateStore.generation` — an
+ * equality on an explicit id, not an inference from offsets, because a stale cursor
+ * stops being detectable from the numbers the moment the new log outgrows it — and
+ * fails with the contract's `ResyncRequired` so the client re-hydrates from `snapshot`
+ * instead of being silently mis-resumed. The extent check survives as a cheap
+ * secondary.
  */
 import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "effect";
-import { type OffsetEvent, type OffsetSessionEvent, WorkGraphEvent } from "@sprinter/contract";
-import type { NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
 import {
+  type OffsetEvent,
+  type OffsetSessionEvent,
+  type ResumeContext,
+  ResyncRequired,
+  WorkGraphEvent,
+} from "@sprinter/contract";
+import type { Agent, NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
+import {
+  type AgentWrite,
   type PersistedEvent,
   type PersistedSessionEvent,
   StateStore,
@@ -100,6 +119,53 @@ const putAndJournal = (
     .pipe(Effect.flatMap((offset) => feed.publish({ offset, event })));
 
 /**
+ * The {@link putAndJournal} variant for the APPEND-ONLY registry: journal and fan out
+ * ONLY when the append actually wrote a row.
+ *
+ * `putAgent` is idempotent — re-appending a byte-identical revision under an id
+ * already stored SUCCEEDS as a no-op, which is exactly what makes a crash-retry safe
+ * — and it reports which of the two happened ({@link AgentWrite}). Journaling
+ * unconditionally would throw that away: every retry of the same append would add
+ * another `AgentChanged` to the durable log and fan another copy out to every client,
+ * so a retry loop grows the log without bound and a "no-op" write is not one. Nothing
+ * changed, so nothing is journaled.
+ *
+ * The decision is made INSIDE the transaction, from the store's own answer, so the
+ * row write and its delta still commit together or not at all (INV-RESTART); the live
+ * publish still happens after the commit, and is skipped entirely on the no-op path.
+ */
+const putAgentAndJournal = (
+  base: Store,
+  feed: Feed,
+  agent: Agent,
+): Effect.Effect<AgentWrite, StateStoreError> =>
+  base
+    .withTransaction(
+      base.agents
+        .putAgent(agent)
+        .pipe(
+          Effect.flatMap((write) =>
+            write === "appended"
+              ? journalDelta(base, { _tag: "AgentChanged", agent }).pipe(
+                  Effect.map((offset) => Option.some(offset)),
+                )
+              : Effect.succeedNone,
+          ),
+        ),
+    )
+    .pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.succeed<AgentWrite>("unchanged"),
+          onSome: (offset) =>
+            feed
+              .publish({ offset, event: { _tag: "AgentChanged", agent } })
+              .pipe(Effect.as<AgentWrite>("appended")),
+        }),
+      ),
+    );
+
+/**
  * Persist one durable, transcript-grade {@link SessionEvent} to the session's durable
  * transcript log (minting its per-session offset), THEN fan it out live on the
  * {@link SessionEvents} feed stamped with that same offset. The session log's `append` is a
@@ -143,6 +209,17 @@ const publishEphemeralLive =
  */
 const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
   StateStore.of({
+    // The REGISTRY layer journals through the SAME seam as the work graph: an
+    // append is durable-plus-live in one transaction, fanned out as `AgentChanged`.
+    // Only the append needs decorating — the registry exposes no delete, so there is
+    // no removal delta to journal (and none on the contract either). It takes its own
+    // helper because it is the one write on the port that can legitimately do
+    // NOTHING: an idempotent re-append must not journal a second delta.
+    agents: {
+      putAgent: (agent) => putAgentAndJournal(base, feed, agent),
+      getAgent: base.agents.getAgent,
+      listAgents: base.agents.listAgents,
+    },
     workGraph: {
       putWorkstream: (workstream) =>
         putAndJournal(base, feed, base.workGraph.putWorkstream(workstream), {
@@ -179,9 +256,15 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       publishEphemeral: publishEphemeralLive(sessionFeed),
       read: base.sessionLog.read,
       tail: base.sessionLog.tail,
-      // A pure read — no live fan-out — so it delegates straight to the base store.
+      // Pure reads — no live fan-out — so they delegate straight to the base store.
       countEntries: base.sessionLog.countEntries,
+      maxOffset: base.sessionLog.maxOffset,
     },
+    // The generation is a property of the DURABLE store, not of journaling: this
+    // decorator adds a live fan-out over the same tables, so it reports the base
+    // store's identity unchanged (a decorator that minted its own would make the
+    // offsets it publishes belong to a generation no cursor could ever match).
+    generation: base.generation,
     withTransaction: base.withTransaction,
   });
 
@@ -233,18 +316,93 @@ const decodeDelta = (entry: PersistedEvent): Effect.Effect<Option.Option<OffsetE
  * channel empty (matching the frozen contract's `events` success/never shape).
  */
 export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEvent> =>
+  decodedReplay(store.events.tail(offset).pipe(Effect.orDie));
+
+/** Turn a read of durable entries into the stream of the owned deltas they decode to. */
+const decodedReplay = (
+  entries: Effect.Effect<ReadonlyArray<PersistedEvent>>,
+): Stream.Stream<OffsetEvent> =>
   Stream.unwrap(
-    store.events.tail(offset).pipe(
-      Effect.orDie,
-      Effect.flatMap((entries) => Effect.forEach(entries, decodeDelta)),
+    entries.pipe(
+      Effect.flatMap((read) => Effect.forEach(read, decodeDelta)),
       Effect.map((decoded) => Stream.fromIterable(Arr.getSomes(decoded))),
     ),
   );
 
 /**
- * The `events` RPC feed: EAGERLY subscribe to the live work-graph feed, THEN replay
- * the durable log from `sinceOffset` (the client's resume cursor — CE2.0; absent →
- * `0`, replay from the ORIGIN), THEN stream the live tail. Every
+ * Decide whether `sinceOffset` belongs to THIS store generation, failing with the
+ * contract's {@link ResyncRequired} when it does not.
+ *
+ * `EventLogStore.tail` is a strict `> offset` slice, which is exactly right while the
+ * log's offset space is monotonic — but that space is not eternal. Bumping
+ * `SCHEMA_VERSION` DROPS and recreates `event_log` (INV-FRESH never migrates), and a
+ * recreated `AUTOINCREMENT` table restarts at offset 1. A client holding a durable
+ * cursor from the previous generation is then holding a coordinate in a space that no
+ * longer exists — AND a retained snapshot full of entities the reset destroyed, which
+ * the upsert-only delta model can never remove (there is no `*Removed` variant).
+ *
+ * So the daemon does not try to repair it silently — neither by honouring the cursor
+ * (the client goes quiet until the new log outgrows the stale mark) nor by replaying
+ * from the origin behind the client's back (the client's contiguous cursor is still
+ * stale, so it discards the whole replay AND every subsequent live event, and re-reads
+ * the log on every reconnect — unbounded and undetectable).
+ *
+ * The generation is therefore EXPLICIT — an IDENTITY the request carries, not a
+ * property inferred from the numbers. That distinction is the whole point. An extent
+ * check (`sinceOffset > maxOffset`) is SUFFICIENT to catch a stale cursor but never
+ * NECESSARY: the moment a new generation's log grows past the stale mark, the stale
+ * cursor is `<= maxOffset` and an extent check sees nothing at all — the daemon would
+ * resume the client incrementally against a coordinate space its cursor never belonged
+ * to, silently and undetectably from either side.
+ *
+ * So the cursor and its generation arrive as ONE inseparable {@link ResumeContext},
+ * and this refuses:
+ *
+ * - a resume whose generation DIFFERS from `store.generation` — the store was dropped
+ *   and recreated under the client. Checked UNCONDITIONALLY, at every offset;
+ * - a resume beyond {@link EventLogStore.maxOffset} — kept as a cheap SECONDARY check,
+ *   since a cursor ahead of the log is impossible even within one generation (a client
+ *   that mangled its own cursor, or a replayed request against a truncated log).
+ *
+ * An ABSENT `resume` is the ORIGIN request: it names no coordinate, so it is valid
+ * against every generation — including an empty log — and never trips this. That
+ * ABSENCE is the ONLY exemption, and it is the one the type system already states.
+ *
+ * There is deliberately no numeric exemption. `sinceOffset === 0` used to be treated
+ * as "the origin" and skip the generation comparison entirely, which made the guard
+ * bypassable by a request carrying a DEAD generation with a zero cursor — a shape a
+ * real client reaches whenever its contiguous prefix never advanced past `0` during an
+ * attempt (an out-of-order first delta is enough). Now `resume: { sinceOffset: 0, … }`
+ * is a RESUME like any other and its generation is compared like any other; only the
+ * absence of the whole value means origin. A cursor with no generation is not rejected
+ * here because it cannot be built (INV-SUM).
+ */
+const requireLiveCursor = (
+  store: Store,
+  resume: ResumeContext | undefined,
+): Effect.Effect<void, ResyncRequired> =>
+  resume === undefined
+    ? Effect.void
+    : store.events.maxOffset.pipe(
+        Effect.orDie,
+        Effect.flatMap((maxOffset) =>
+          resume.generation === store.generation && resume.sinceOffset <= maxOffset
+            ? Effect.void
+            : Effect.fail(
+                new ResyncRequired({
+                  sinceOffset: resume.sinceOffset,
+                  maxOffset,
+                  generation: store.generation,
+                }),
+              ),
+        ),
+      );
+
+/**
+ * The `events` RPC feed: VALIDATE the resume cursor against this store generation,
+ * EAGERLY subscribe to the live work-graph feed, THEN replay the durable log strictly
+ * after `sinceOffset` (the client's resume cursor — CE2.0; absent → `0`, the origin),
+ * THEN stream the live tail. Every
  * streamed item is an {@link OffsetEvent} carrying its durable offset; replay and
  * live offsets share one coordinate space (the journaling decorator mints and
  * publishes the same offset it appended), so a reconnecting request with
@@ -258,16 +416,25 @@ export const resyncFrom = (store: Store, offset: number): Stream.Stream<OffsetEv
  * absorbed by upsert-idempotent deltas, so the boundary overlap is harmless. The
  * result is a deterministic catch-up from durable history, not merely
  * snapshot-on-connect (D17).
+ *
+ * The cursor check runs BEFORE the subscription, so a {@link ResyncRequired} request
+ * fails without ever attaching to the live feed. It is the stream's ONLY error: a
+ * store read failure stays a defect (`orDie`), so the error channel says exactly one
+ * thing — "your cursor is from a dead store generation; re-hydrate".
  */
 export const resyncEvents = (
   store: Store,
   feed: Feed,
-  sinceOffset?: number,
-): Stream.Stream<OffsetEvent> =>
+  resume?: ResumeContext,
+): Stream.Stream<OffsetEvent, ResyncRequired> =>
   Stream.unwrap(
-    feed.subscribe.pipe(
+    requireLiveCursor(store, resume).pipe(
+      Effect.andThen(feed.subscribe),
       Effect.map((subscription) =>
-        Stream.concat(resyncFrom(store, sinceOffset ?? 0), Stream.fromSubscription(subscription)),
+        Stream.concat(
+          resyncFrom(store, resume?.sinceOffset ?? 0),
+          Stream.fromSubscription(subscription),
+        ),
       ),
     ),
   );

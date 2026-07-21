@@ -7,10 +7,14 @@
  * backing store, no SQL, and no running instance — a concrete backing (the
  * SQLite adapter in {@link ./sqlite.ts}) is a `Layer` provided behind this port,
  * and NOTHING outside that adapter module may import `@effect/sql-sqlite-bun`,
- * `effect/unstable/sql`, `bun:sqlite`, or SQL strings.
+ * `effect/unstable/sql`, `bun:sqlite`, or SQL strings. (The adapter's own
+ * white-box tests, which live beside it in this package, may probe the raw
+ * database to assert the schema-version reset — no CONSUMER ever can.)
  *
- * The port is composed of three capability groups (INV-NAMING, `*Store` suffix):
+ * The port is composed of these capability groups (INV-NAMING, `*Store` suffix):
  *
+ * - {@link AgentStore} — the append-only `Agent` REGISTRY: global, scoped to no
+ *   repository, exposing append + read and NO delete.
  * - {@link WorkGraphStore} — the work graph `Workstream ⊃ Epic ⊃ Issue` plus the
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
@@ -27,6 +31,8 @@
  */
 import { Context, Effect, Option, Schema } from "effect";
 import {
+  type Agent,
+  AgentId,
   type Epic,
   EpicId,
   type Issue,
@@ -37,6 +43,7 @@ import {
   type Session,
   SessionEvent,
   SessionId,
+  type StoreGenerationId,
   type Workstream,
   WorkstreamId,
 } from "@sprinter/domain";
@@ -118,6 +125,131 @@ export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
 // ============================================================================
 
 /**
+ * The outcome of an {@link AgentStore.putAgent} append: whether a row was actually
+ * written, or the revision was already stored byte-identically.
+ *
+ * `putAgent` succeeds in both cases — it is idempotent by design — but the two are
+ * NOT interchangeable to a decorator of this port. The daemon's journaling layer
+ * must emit exactly one `AgentChanged` delta per REAL append: journaling an
+ * `"unchanged"` no-op too would make a crash-retry loop grow the durable event log
+ * (and fan out redundant deltas) without bound, contradicting the very no-op
+ * semantics that make the retry safe. Reporting the outcome is what lets the
+ * decorator tell them apart without re-reading the row it just wrote.
+ */
+export type AgentWrite = "appended" | "unchanged";
+
+/**
+ * Persist and read the append-only {@link Agent} REGISTRY — owned, global, scoped
+ * to NO repository (there is deliberately no repository- or workstream-scoped read
+ * here: "the agents used in this repo" is a FOLD over that repo's executions,
+ * never a stored per-repo list — INV-DERIVED).
+ *
+ * The surface is APPEND + READ, and there is deliberately **no delete** — not
+ * here, and not on the contract. A stored revision is IMMUTABLE history: editing
+ * appends a NEW revision, under a NEW id, whose `supersedes` names the current head
+ * of the lineage; retiring appends one carrying BOTH `supersedes` AND `retiredAt`.
+ * Removing — or rewriting — a record would strand every past execution that ran on
+ * it.
+ *
+ * `putAgent` is therefore an APPEND, not an upsert. It is idempotent for a
+ * BYTE-IDENTICAL re-append of an id already stored (the crash-retry case: the write
+ * is a no-op and succeeds), and it FAILS with {@link StateStoreError} when the id
+ * is already stored with DIFFERENT content. It never rewrites a column, so it can
+ * neither silently replace a revision's content nor un-retire a retired agent.
+ * There is no edit path here at all, because an edit mints a new id.
+ *
+ * Because "appended" and "already there" are genuinely different events for a
+ * DECORATOR of this port — the daemon's journaling layer must emit an
+ * `AgentChanged` delta for the first and NOTHING for the second, or a retry loop
+ * grows the durable log without bound — `putAgent` REPORTS which happened
+ * ({@link AgentWrite}) rather than collapsing both to `void`.
+ *
+ * Every `supersedes` rule from `registry.ts` is ENFORCED here rather than left to
+ * review — none of them is a writer obligation any more:
+ *
+ * - `supersedes` must name an ALREADY-STORED revision. This is the load-bearing one,
+ *   because the three rules below are all decided by READING the superseded row: while
+ *   a DANGLING `supersedes` was storable, a writer bypassed all of them for free by
+ *   reversing the write order — append the successor first (nothing to check against)
+ *   and its predecessor second (an ordinary first revision) — and assembled a
+ *   resurrection, a content-rewriting retirement, or a `supersedes` CYCLE out of
+ *   appends each of which this port accepted. Enforced by the adapter as a real
+ *   FOREIGN KEY, so the shape those attacks are built from does not exist and every
+ *   rule below is order-independent.
+ * - `supersedes !== id` — a revision cannot supersede itself. This is the ONE edge a
+ *   referential constraint accepts (a row satisfies a key against itself), and with
+ *   it closed no cycle of any length is constructible: a longer one needs an edge
+ *   naming a revision that does not exist yet. Acyclicity is therefore structural,
+ *   not a precondition anyone owes.
+ * - a RETIRING revision (one carrying BOTH `supersedes` and `retiredAt`) must carry
+ *   the SAME `name` / `model` / `version` / `tools` as the revision it supersedes.
+ *   Retirement is LIFECYCLE-ONLY; fusing a content edit into it would make the two
+ *   operations indistinguishable in the history.
+ * - NOTHING may supersede an ALREADY-RETIRED revision — an edit no more than a
+ *   retirement. A lineage goes out of service ONCE, and `retiredAt` is its terminal
+ *   state. A second RETIRING append would leave two revisions each carrying a
+ *   `retiredAt` and no way to say which instant the lineage stopped; a NON-RETIRING
+ *   one is worse, because it carries no stamp at all, so `isLineageRetired` walks
+ *   forward off the retired revision onto a live head and the lineage reads as back
+ *   in service — un-retiring it, which this port's second paragraph promises cannot
+ *   happen. Neither is caught by the rule above, which ignores the lifecycle columns
+ *   by design, so it is enforced on `supersedes` alone.
+ * - a revision may be superseded AT MOST ONCE. A lineage is a CHAIN; two successors
+ *   are a fork with no defined head, and a fork makes `isLineageRetired`'s answer
+ *   depend on the order of the collection it is handed. Enforced by the adapter's
+ *   `agent_supersedes` UNIQUE index rather than by a read-then-insert check, so it
+ *   holds atomically against a concurrent racing append.
+ *
+ * DURABILITY SCOPE: "nothing is ever removed" holds for the life of a STORE
+ * GENERATION. `SCHEMA_VERSION` ({@link ./sqlite.ts}) never migrates — bumping it
+ * drops the database and starts a new generation, discarding this registry's whole
+ * history. `putAgent` is the sole source of truth for its content (there is no
+ * manifest to re-seed from), so that is accepted, permanent data loss — see
+ * INV-FRESH's rationale in the adapter.
+ *
+ * GROWTH IS UNBOUNDED, and that same reset is its ONLY bound. Every revision ever
+ * appended stays: superseded and retired ones are exactly what the append-only model
+ * exists to keep, so there is no pruning, no compaction, no retention window, and no
+ * delete anywhere on this path. {@link AgentStore.listAgents} materialises the WHOLE
+ * table, the daemon's `snapshot` ships all of it on every connect, and every client
+ * retains all of it — the cost of one revision is paid on three surfaces at once,
+ * forever, until a `SCHEMA_VERSION` bump discards the generation. That is acceptable
+ * at pre-release scale (a registry grows by human edits, not by execution volume) and
+ * is RECORDED here rather than solved. If it ever stops being acceptable, the remedy
+ * is a bounded READ (a lineage-scoped or head-only list), never a delete — deleting
+ * would strand the executions that ran on a revision, the one thing this table
+ * promises not to do.
+ */
+export interface AgentStore {
+  /**
+   * Append an {@link Agent} revision, reporting whether the row was actually
+   * written ({@link AgentWrite}). A byte-identical re-append of an already stored id
+   * is an idempotent no-op and answers `"unchanged"`; a DIFFERING re-append of that
+   * id fails with {@link StateStoreError}, as does a revision whose `supersedes`
+   * names itself or names a revision that is NOT STORED, a RETIRING revision that
+   * rewrites the superseded revision's content, and ANY revision superseding an
+   * already-retired one. It never rewrites or removes a stored revision.
+   */
+  readonly putAgent: (agent: Agent) => Effect.Effect<AgentWrite, StateStoreError>;
+  /** Read one {@link Agent} revision by id, if present. */
+  readonly getAgent: (id: AgentId) => Effect.Effect<Option.Option<Agent>, StateStoreError>;
+  /**
+   * Every persisted {@link Agent} revision — retired and superseded included —
+   * ordered by `id` under SQLite's default `BINARY` collation, i.e. by the BYTE
+   * sequence of the id (a `TEXT` column with no `COLLATE` clause compares
+   * `memcmp`-style over UTF-8 bytes). It is deliberately NOT a locale-aware or
+   * human "alphabetical" order: `"agt-10"` precedes `"agt-2"`, and any non-ASCII id
+   * orders by its UTF-8 encoding.
+   *
+   * That byte-order is the PINNED contract of this read, but it is PRESENTATIONAL,
+   * not semantic: it is neither insertion order nor lineage order, and consumers
+   * upsert by id, so nothing may depend on it to reconstruct a lineage (walk
+   * `supersedes` for that, or fold with `isLineageRetired`).
+   */
+  readonly listAgents: Effect.Effect<ReadonlyArray<Agent>, StateStoreError>;
+}
+
+/**
  * Persist and read the work graph `Workstream ⊃ Epic ⊃ Issue` and its dependency
  * DAG. `put*` upserts a node by id (idempotent); the reads hydrate the owned
  * domain schemas back out, including reconstructing each issue's `dependsOn`
@@ -195,7 +327,9 @@ export interface JobStore {
  * `tail(offset)` is the INCREMENTAL primitive and the one to reach for on a live
  * or large feed; `read` materialises the ENTIRE feed in memory and is intended for
  * bounded snapshot use (e.g. AE4's snapshot-on-connect), not for streaming an
- * unbounded log.
+ * unbounded log. `maxOffset` answers "how far does this log go?" WITHOUT
+ * materialising it — the cheap read a caller needs to validate a client's resume
+ * cursor against this log's extent.
  */
 export interface EventLogStore {
   /** Append an event, returning it stamped with its assigned {@link PersistedEvent.offset}. */
@@ -204,6 +338,13 @@ export interface EventLogStore {
   readonly read: Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
   /** Every entry with an offset strictly greater than `offset`, ordered ascending. */
   readonly tail: (offset: number) => Effect.Effect<ReadonlyArray<PersistedEvent>, StateStoreError>;
+  /**
+   * The highest offset this log currently holds, or `0` when it is EMPTY (durable
+   * offsets are strictly `> 0`, so `0` is unambiguously "no entries"). The extent of
+   * the log, computed by the backing rather than by reading every entry — so a
+   * caller validating a resume cursor never has to materialise the feed to do it.
+   */
+  readonly maxOffset: Effect.Effect<NonNegativeInt, StateStoreError>;
 }
 
 /**
@@ -262,6 +403,15 @@ export interface SessionLogStore {
    * APPENDS), so it matches the transcript the Inspector renders.
    */
   readonly countEntries: (sessionId: SessionId) => Effect.Effect<number, StateStoreError>;
+  /**
+   * The highest offset this session's transcript currently holds (`0` when it has none)
+   * — the per-session mirror of {@link EventLogStore.maxOffset}, and for the same
+   * reason: the `sessionEvents` feed must validate a client's resume cursor BEFORE it
+   * does any work, and reading the whole transcript just to look at its last offset
+   * makes a request that is about to be REFUSED the most expensive one the channel
+   * serves. Answered from the backing's index, without materializing or decoding a row.
+   */
+  readonly maxOffset: (sessionId: SessionId) => Effect.Effect<NonNegativeInt, StateStoreError>;
 }
 
 // ============================================================================
@@ -269,8 +419,8 @@ export interface SessionLogStore {
 // ============================================================================
 
 /**
- * The persistence-agnostic `StateStore` port — the durable spine composed of the
- * three capability groups. The core and every consumer (AE3 Job runner, AE4
+ * The persistence-agnostic `StateStore` port — the durable spine composed of its
+ * capability groups. The core and every consumer (AE3 Job runner, AE4
  * `RpcServer` snapshot) depend on THIS service; a backing is chosen by providing
  * one of its adapter `Layer`s (the SQLite adapter in {@link ./sqlite.ts}). The
  * tag id follows INV-NAMING: `sprinter/<area>/<Name>`.
@@ -278,6 +428,8 @@ export interface SessionLogStore {
 export class StateStore extends Context.Service<
   StateStore,
   {
+    /** The append-only, globally-scoped `Agent` registry capability group. */
+    readonly agents: AgentStore;
     /** The work-graph capability group. */
     readonly workGraph: WorkGraphStore;
     /** The Job / Session / mapping capability group. */
@@ -286,6 +438,28 @@ export class StateStore extends Context.Service<
     readonly events: EventLogStore;
     /** The durable per-session transcript-log capability group. */
     readonly sessionLog: SessionLogStore;
+    /**
+     * The identity of the STORE GENERATION this instance is open on — minted when
+     * the schema was CREATED and destroyed with it.
+     *
+     * It is a PLAIN VALUE, not an effect, and that is a statement about the model
+     * rather than an optimisation: a generation cannot change while a `StateStore`
+     * exists. The schema is applied once, at layer construction (INV-FRESH's
+     * drop-and-recreate is part of building the adapter), so starting a new
+     * generation means building a new store — in practice, restarting the daemon.
+     * Nothing can observe it changing under a live consumer, so nothing needs to
+     * re-read it.
+     *
+     * It is what makes a durable OFFSET interpretable. Offsets (`EventLogStore` /
+     * `SessionLogStore`) are positions in THIS generation's logs and restart at `1`
+     * when a generation is replaced, so an offset alone cannot say which coordinate
+     * space it belongs to. Pairing an offset with this id is what lets the daemon
+     * refuse a client's cursor from a destroyed generation instead of resuming it
+     * against a log it never belonged to. The port exposes the IDENTITY only — no
+     * SQL, no file, no version number (INV-PORT); it is opaque, and equality is its
+     * only defined operation.
+     */
+    readonly generation: StoreGenerationId;
     /**
      * Run `effect` in a SINGLE durable transaction: every `put*`/`append` write
      * it performs commits together or rolls back together (nested transactions

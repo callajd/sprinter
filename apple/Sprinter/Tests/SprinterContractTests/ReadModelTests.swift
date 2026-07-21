@@ -13,6 +13,17 @@ struct ReadModelTests {
     #expect(snapshot.issues.count == 2)
     #expect(snapshot.jobs.count == 2)
     #expect(snapshot.sessions.count == 1)
+    // The REGISTRY layer rides the snapshot whole — every revision, retired included
+    // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED), in
+    // the lexicographic-by-id order the daemon's `listAgents` pins.
+    #expect(snapshot.agents.count == 3)
+    #expect(snapshot.agents.map(\.id.rawValue) == ["agt-1", "agt-2", "agt-3"])
+    // And the STORE GENERATION — the coordinate space this state's durable offsets live
+    // in. A client retains it with the state and hands it back on every resume, so a
+    // snapshot that dropped it would leave the client unable to resume at all.
+    #expect(
+      snapshot.generation
+        == StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
     #expect(try Golden.roundTrip(snapshot) == snapshot)
   }
 
@@ -105,8 +116,9 @@ struct ReadModelTests {
   @Test("decodes every work-graph delta variant")
   func decodesWorkGraphEvents() throws {
     let events = try Golden.decode([WorkGraphEvent].self, from: "work-graph-events")
-    #expect(events.count == 5)
+    #expect(events.count == 6)
     #expect(events[0] == .workstreamChanged(try Golden.decode(Workstream.self, from: "workstream")))
+    #expect(events[5] == .agentChanged(try Golden.decode(Agent.self, from: "agent-revised")))
     for event in events {
       #expect(try Golden.roundTrip(event) == event)
     }
@@ -115,14 +127,14 @@ struct ReadModelTests {
   @Test("decodes the offset-stamped events-stream envelope (CE2.0)")
   func decodesOffsetEvents() throws {
     let items = try Golden.decode([OffsetEvent].self, from: "offset-events")
-    #expect(items.count == 3)
+    #expect(items.count == 4)
     // Each item pairs a delta with its durable offset; unwrapping `.event` gives the
     // bare delta the existing consumers use (RpcBackend / WorkGraphResync).
     let workstream = try Golden.decode(Workstream.self, from: "workstream")
     #expect(items[0].event == .workstreamChanged(workstream))
     // Real `event_log` offsets are 1-based (> 0); the sample resumes from a mid-log
     // position — the durable-replay coordinate the client feeds back as `sinceOffset`.
-    #expect(items.map(\.offset) == [3, 4, 5])
+    #expect(items.map(\.offset) == [3, 4, 5, 6])
     for item in items {
       #expect(try Golden.roundTrip(item) == item)
     }

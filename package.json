@@ -8,10 +8,11 @@
   "type": "module",
   "scripts": {
     "check:format": "oxfmt --check .",
-    "check:lint": "oxlint --deny-warnings packages",
+    "check:lint": "oxlint --deny-warnings packages apple/Sprinter/scripts",
     "check:types": "tsc --noEmit",
     "check:test": "bun --bun vitest run --coverage",
-    "check": "bun run check:format && bun run check:lint && bun run check:types && bun run check:test"
+    "check:goldens": "bun run apple/Sprinter/scripts/check-goldens.ts",
+    "check": "bun run check:format && bun run check:lint && bun run check:types && bun run check:test && bun run check:goldens"
   },
   "devDependencies": {
     "@effect/platform-bun": "4.0.0-beta.97",

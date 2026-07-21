@@ -27,6 +27,13 @@ public struct SnapshotReconciler: Sendable {
       return snapshot.replacing(jobs: Self.upsert(job, into: snapshot.jobs, by: \.id))
     case .sessionChanged(let session):
       return snapshot.replacing(sessions: Self.upsert(session, into: snapshot.sessions, by: \.id))
+    // The registry folds under the SAME upsert rule, and in practice the upsert is
+    // always an APPEND: a stored revision is immutable, so both an edit and a
+    // retirement arrive as a NEW id linked by `supersedes` (the retirement also
+    // carrying `retiredAt`). A registry delta is never a removal, and never a
+    // rewrite of a revision already in the baseline.
+    case .agentChanged(let agent):
+      return snapshot.replacing(agents: Self.upsert(agent, into: snapshot.agents, by: \.id))
     }
   }
 
@@ -49,20 +56,28 @@ public struct SnapshotReconciler: Sendable {
 
 extension Snapshot {
   /// Returns a copy with the given collections swapped in; an omitted argument
-  /// keeps the current value. Keeps ``SnapshotReconciler`` free of the five-field
+  /// keeps the current value. Keeps ``SnapshotReconciler`` free of the full
   /// initializer boilerplate at each case.
+  ///
+  /// The ``Snapshot/generation`` is deliberately NOT replaceable: it is the coordinate
+  /// space this baseline was hydrated in, and folding a delta never moves the baseline to
+  /// a different one. A delta from another generation cannot reach here at all — the
+  /// daemon refuses the resume that would have carried it.
   fileprivate func replacing(
     workstreams: [Workstream]? = nil,
     epics: [Epic]? = nil,
     issues: [Issue]? = nil,
     jobs: [Job]? = nil,
-    sessions: [Session]? = nil
+    sessions: [Session]? = nil,
+    agents: [Agent]? = nil
   ) -> Snapshot {
     Snapshot(
       workstreams: workstreams ?? self.workstreams,
       epics: epics ?? self.epics,
       issues: issues ?? self.issues,
       jobs: jobs ?? self.jobs,
-      sessions: sessions ?? self.sessions)
+      sessions: sessions ?? self.sessions,
+      agents: agents ?? self.agents,
+      generation: generation)
   }
 }

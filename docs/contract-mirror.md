@@ -46,24 +46,88 @@ Notes threaded to the contract's own decisions:
 - Wire field `pr` maps to the Swift property `pullRequest` via `CodingKeys`.
 - `WorkGraphEvent` is **upsert-only** — there is no `*Removed` variant (contract
   §events); a terminal status is an ordinary change.
+- The **registry layer** (`Agent`, mirrored in `Sources/SprinterContract/Registry.swift`)
+  rides the same two surfaces as the read model: `Snapshot.agents` and the
+  `AgentChanged` delta. It is **append-only** and a stored revision is
+  **immutable**, so the upsert-only rule is exact: BOTH mutating operations are an
+  append under a **new id** — an edit is a new revision linked by `supersedes`, and
+  a retirement is a new revision carrying **`supersedes` AND `retiredAt`** (never
+  the same id restamped). There is no delete on the contract and no
+  `AgentRemoved`, and a client folds `AgentChanged` as an upsert by id.
+  Retired-ness is
+  read off `retiredAt`'s presence; there is deliberately no `AgentStatus` enum
+  (INV-SUM). A **retirement is lifecycle-only**: the retiring revision repeats the
+  retired revision's `name`/`model`/`version`/`tools` verbatim and differs only in
+  `id`, `supersedes` and `retiredAt` (the `StateStore` port enforces it), so the
+  mirror never sees a retirement that rewrote content (nor one that retires an
+  already-retired revision — a lineage goes out of service once). Those rules are
+  **order-independent**, because `supersedes` is a **referential** link in the
+  daemon's store: a revision may only name an ALREADY-STORED predecessor, so a
+  writer cannot skip a rule by appending a successor before the revision it
+  supersedes. The same constraint, plus the port's rejection of a self-reference,
+  makes the `supersedes` relation **acyclic by construction** — walking it backwards
+  from any revision terminates at the original, and every `supersedes` a client
+  receives resolves inside the collection it arrived in. Because a retirement
+  is a NEW revision, `Agent.isRetired` is a question about ONE RECORD: the revision it
+  retires stays un-stamped forever. "Is this agent still in service" is
+  `isLineageRetired(_:in:)`, mirrored on both sides, and it is the one a view wants. `retiredAt` is the domain's
+  `Timestamp` — a **canonical** ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SS.sssZ`,
+  always three fractional digits, always `Z`), normalised on decode so string order is
+  instant order; the mirror models it as `String` and may compare two stamps directly.
 - The streamed `events` **success is the `OffsetEvent` envelope** — `{ "offset":
   12, "event": { "_tag": "IssueChanged", … } }` — not the bare `WorkGraphEvent`
   (CE2.0). Each item pairs the delta with its durable `event_log`
   offset (a `NonNegativeInt`, so a bare JSON integer → Swift `Int`), so a client can
-  hand a streamed item's offset back as the request's `sinceOffset` cursor to resume
-  strictly after it. Existing consumers that only need the delta unwrap `.event`.
+  hand a streamed item's offset back as the `sinceOffset` inside the request's `resume`
+  context to resume strictly after it. Existing consumers that only need the delta unwrap `.event`.
+- The **store GENERATION is explicit on the wire.** `Snapshot` carries
+  `generation` (a `StoreGenerationId`, a bare JSON string), minted when the daemon's
+  schema was created and destroyed with it. A durable offset only means something
+  INSIDE the generation it was minted in — the store never migrates, so a
+  schema-version bump drops and recreates it and restarts offsets at `1` — so both
+  cursor-bearing requests (`events` and `sessionEvents`) carry ONE optional-and-omitted
+  `resume` object, `{ "sinceOffset": 12, "generation": "…" }`, in which BOTH fields are
+  REQUIRED. The cursor and its generation are a single nested value, not two independent
+  optional keys, so "a cursor without its generation" has no wire form at all and the
+  daemon has no runtime pairing rule to get wrong. The ABSENCE of `resume` — never a
+  particular offset value — is what makes a request an ORIGIN request; in particular
+  `sinceOffset: 0` is an ordinary resume whose generation is compared like any other. A
+  client retains the generation with the baseline and hands it back on every resume.
+- The streamed `events` **error is `ResyncRequired`**, and `sessionEvents`' error is
+  `SessionNotFound | ResyncRequired`. It says the request's cursor does NOT belong to
+  the daemon's current store generation. Detection is an IDENTITY comparison, not an
+  offset inference: a cursor beyond the log's extent is a symptom, but once a new
+  generation's log outgrows a stale cursor the numbers alone look perfectly resumable,
+  so a mismatched `generation` is refused whatever the offsets say, offset `0` included
+  (the extent check remains as a cheap secondary). An ABSENT generation is not a case
+  the daemon handles, because the payload cannot express one. It carries the rejected `sinceOffset`,
+  the log's `maxOffset`, and the daemon's CURRENT `generation`. The client's obligation
+  is not to retry the resume but to discard **both** its retained state and its cursor
+  and re-hydrate from `snapshot` — `WorkGraphResync` does exactly that. It has to be
+  both: the delta model is upsert-only, so no stream of deltas can remove an entity the
+  reset destroyed.
 - The streamed `sessionEvents` **success is the `OffsetSessionEvent` envelope** — `{
   "offset": 7, "event": { "_tag": "EntryAppended", … } }` — not the bare `SessionEvent`,
   the session-channel mirror of `OffsetEvent`. Each durable, transcript-grade session event
-  pairs with its durable per-session offset, so a client can hand it back as the request's
-  `sinceOffset` cursor. A SETTLED session's durable transcript replays and the stream
+  pairs with its durable per-session offset, so a client can hand it back inside the
+  request's `resume` context. A SETTLED session's durable transcript replays and the stream
   completes (viewable in the Inspector) rather than the old `SessionNotFound`; the
-  `sessionEvents` request gains the same OPTIONAL `sinceOffset` cursor as `events`.
+  `sessionEvents` request gains the same OPTIONAL `resume` context as `events` — the same
+  type, and therefore the same guard, since its per-session log is dropped by a schema
+  bump too.
   `RpcBackend` unwraps `.event` to the existing `SessionEvent` consumer. Ephemeral live
   deltas ride the same channel offset-less (offset present ⇒ durable/replayable, absent ⇒
-  ephemeral).
+  ephemeral). **The session feed is ORIGIN-ONLY until a resuming client exists**:
+  `RpcBackend` builds the `sessionEvents` payload with `sessionId` and no `resume`, and
+  `InteractiveSession` has no `ResyncRequired` handling, so the generation guard on this
+  feed is enforced TS-side and has no end-to-end path to fire on today. It is
+  **latent-but-correct** — defined up front because the per-session offset genuinely is a
+  generation-scoped coordinate, not because it is exercised. The work-graph `events` feed
+  is the one that resumes in practice.
 
 ## What the gate checks
+
+Two gates, each covering what the other cannot.
 
 `make check` (run from `apple/Sprinter/`) **only DECODES the committed goldens** —
 there is no `bun`/Node dependency inside the Swift gate. The decode tests
@@ -71,6 +135,14 @@ there is no `bun`/Node dependency inside the Swift gate. The decode tests
 variant (and both optional-present / optional-absent forms) decodes; every value
 round-trips (decode → encode → decode); and every public initializer builds a
 value equal to the decoded golden (the send direction).
+
+`bun run check` (repo root) adds the **golden-freshness** stage
+(`check:goldens` → `apple/Sprinter/scripts/check-goldens.ts`): it re-runs the
+generator into a temporary directory and diffs against the committed fixtures,
+failing on any stale, missing, or orphaned golden. Without it the goldens could go
+stale silently — the Swift gate would keep validating the mirror against a wire
+shape the contract no longer emits, and INV-MIRROR's guard would guard nothing. The
+check never writes into the working tree.
 
 ## Regenerating the goldens (the INV-CONTRACT ripple procedure)
 
@@ -99,5 +171,6 @@ composes) changes, the Swift mirror and its goldens must ripple:
    cd apple/Sprinter && make check
    ```
 
-The generator is a one-off developer tool; it is **not** part of `make check` and
-never runs in the Swift CI job.
+The generator does not run inside `make check` (the Swift gate stays `bun`-free), but
+forgetting step 1 is no longer silent: the root gate's `check:goldens` stage re-runs it
+and fails on any difference.

@@ -52,6 +52,44 @@ struct SnapshotReconcilerTests {
     #expect(result.sessions == [session])
   }
 
+  @Test("an agent delta appends a revision, then appends the revision that retires it")
+  func appendsAgentRevisions() {
+    let agent = Agent(
+      id: AgentId(rawValue: "agt-1"), name: "implementer", model: "claude-opus-4-8",
+      version: "1.0.0", tools: ["read"], supersedes: nil, retiredAt: nil)
+    let appended = reconciler.reconcile(Fixtures.snapshot, applying: .agentChanged(agent))
+    #expect(appended.agents == [agent])
+
+    // Retirement is a NEW id carrying BOTH `supersedes` (the head it retires) AND
+    // the stamp — never a same-id rewrite, because a stored revision is immutable.
+    // So the fold APPENDS: the retired lineage keeps both revisions, and a past
+    // execution still resolves to the exact revision that ran it.
+    let retiring = Agent(
+      id: AgentId(rawValue: "agt-2"), name: "implementer", model: "claude-opus-4-8",
+      version: "1.0.0", tools: ["read"], supersedes: AgentId(rawValue: "agt-1"),
+      retiredAt: "2026-07-20T12:00:00.000Z")
+    let result = reconciler.reconcile(appended, applying: .agentChanged(retiring))
+    #expect(result.agents == [agent, retiring])
+    #expect(result.agents.last?.isRetired == true)
+    #expect(result.agents.last?.isOriginalRevision == false)
+    // The revision it retires is untouched — still there, still not retired.
+    #expect(result.agents.first?.isRetired == false)
+    // Sibling collections are untouched.
+    #expect(result.issues == Fixtures.snapshot.issues)
+  }
+
+  @Test("re-delivering the SAME agent revision is idempotent (upsert by id)")
+  func agentDeltaIsIdempotent() {
+    let agent = Agent(
+      id: AgentId(rawValue: "agt-1"), name: "implementer", model: "claude-opus-4-8",
+      version: "1.0.0", tools: ["read"], supersedes: nil, retiredAt: nil)
+    // A replay overlap at the resync boundary re-delivers a delta the client
+    // already folded; upsert-by-id absorbs it without duplicating the revision.
+    let once = reconciler.reconcile(Fixtures.snapshot, applying: .agentChanged(agent))
+    let twice = reconciler.reconcile(once, applying: .agentChanged(agent))
+    #expect(twice.agents == [agent])
+  }
+
   @Test("folding a sequence of deltas keeps the state consistent")
   func foldsSequence() {
     let session = Session(id: Fixtures.sessionId, jobId: JobId(rawValue: "job-1"), status: .active)

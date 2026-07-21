@@ -6,7 +6,7 @@ import Testing
 
 /// Cold-review hardening for the reconnect engine: the backoff must WIDEN against a
 /// flapping daemon (FIX2), and memory must stay BOUNDED through the production
-/// ``RpcBackend/events(sinceOffset:)`` path even though that adapter interposes an
+/// ``RpcBackend/events(resume:)`` path even though that adapter interposes an
 /// unbounded stream over the bounded gate (FIX1).
 @Suite("Reconnect hardening — flap backoff + bounded flow control")
 struct ReconnectHardeningTests {
@@ -170,7 +170,7 @@ struct ReconnectHardeningTests {
     var out2 = second.outbound.makeAsyncIterator()
     let resume = try await nextSent(&out2)
     #expect(resume.rpcTag == "events")
-    #expect(resume.payload == (try toJSONValue(EventsPayload(sinceOffset: 1))))
+    #expect(resume.payload == (try Fixtures.resumePayload(1)))
 
     await engine.stop()
     first.close()
@@ -178,7 +178,7 @@ struct ReconnectHardeningTests {
     for await _ in states {}
   }
 
-  /// FIX1 — memory stays bounded through the production ``RpcBackend/events(sinceOffset:)``
+  /// FIX1 — memory stays bounded through the production ``RpcBackend/events(resume:)``
   /// path even though it interposes an UNBOUNDED stream over the bounded gate. A fast daemon
   /// floods far past the bounded reconciler backlog while the reconciler is stalled; rather
   /// than buffering the whole flood the pipeline OVERFLOWS and resyncs — a 2nd `events`
@@ -230,7 +230,7 @@ struct ReconnectHardeningTests {
     let resume = try await nextSent(&out2)
     #expect(resume.rpcTag == "events")
     let payload = try #require(resume.payload)
-    #expect(try fromJSONValue(EventsPayload.self, payload).sinceOffset != nil)
+    #expect(try fromJSONValue(EventsPayload.self, payload).resume != nil)
 
     await engine.stop()
     first.close()
@@ -243,21 +243,6 @@ struct ReconnectHardeningTests {
   /// One offset-tagged issue delta for the flood test.
   private func offsetDelta(_ offset: Int) throws -> String {
     try Wire.encoded(Fixtures.offsetEvent(Fixtures.issueEvent, at: offset))
-  }
-
-  /// Reads the two requests one attempt issues (`events` + `snapshot`, order not
-  /// wire-guaranteed) and indexes them by rpc tag.
-  private func requestsByTag(
-    _ outbound: inout AsyncStream<Data>.Iterator
-  ) async throws -> [String: SentFrame] {
-    var byTag: [String: SentFrame] = [:]
-    for _ in 0..<2 {
-      let frame = try await nextSent(&outbound)
-      if let tag = frame.rpcTag {
-        byTag[tag] = frame
-      }
-    }
-    return byTag
   }
 
   /// Attempt 1 for the idle-health test: answer the snapshot, apply delta@1 (recording resume
@@ -291,7 +276,7 @@ struct ReconnectHardeningTests {
     var out = transport.outbound.makeAsyncIterator()
     let resume = try await nextSent(&out)
     #expect(resume.rpcTag == "events")
-    #expect(resume.payload == (try toJSONValue(EventsPayload(sinceOffset: offset))))
+    #expect(resume.payload == (try Fixtures.resumePayload(offset)))
     return transport
   }
 }

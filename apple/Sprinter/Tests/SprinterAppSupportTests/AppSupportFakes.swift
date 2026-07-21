@@ -207,5 +207,7 @@ enum AppSupportFixtures {
         pullRequest: nil)
     ],
     jobs: [],
-    sessions: [])
+    sessions: [],
+    agents: [],
+    generation: StoreGenerationId(rawValue: "gen-test"))
 }

@@ -75,7 +75,9 @@ enum BoardFixtures {
     epics: [epicA, epicB],
     issues: [issueA, issueB],
     jobs: [runningJob],
-    sessions: [activeSession])
+    sessions: [activeSession],
+    agents: [],
+    generation: StoreGenerationId(rawValue: "gen-test"))
 
   // ── Live-update deltas ───────────────────────────────────────────────────────
 
@@ -140,6 +142,8 @@ enum BoardFixtures {
       ],
       issues: issueIds.map { issue($0) },
       jobs: jobs,
-      sessions: sessions)
+      sessions: sessions,
+      agents: [],
+      generation: StoreGenerationId(rawValue: "gen-test"))
   }
 }

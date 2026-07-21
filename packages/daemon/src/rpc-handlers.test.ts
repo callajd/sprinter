@@ -33,11 +33,13 @@ import { expect } from "vitest";
 import {
   IssueNotFound,
   PlanRejected,
+  ResyncRequired,
   SessionNotFound,
   SprinterRpc,
   WorkstreamNotFound,
 } from "@sprinter/contract";
 import {
+  Agent,
   Epic,
   Issue,
   Job,
@@ -46,6 +48,7 @@ import {
   type SessionEvent,
   type SessionId,
   type SessionInput,
+  StoreGenerationId,
   type UiResponse,
   Workstream,
   WorkstreamId,
@@ -97,6 +100,28 @@ const session = Schema.decodeUnknownSync(Session)({
   id: "ses-1",
   jobId: "job-1",
   status: "completed",
+});
+// The lineage HEAD the retirement below supersedes. It has to be stored first and it
+// has to carry the same content: `supersedes` is a referential link in the store (a
+// revision may only name an already-stored predecessor) and a retirement is
+// lifecycle-only (it repeats the retired revision's content verbatim).
+const agentHead = Schema.decodeUnknownSync(Agent)({
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit"],
+});
+// A RETIRING registry revision: a new id carrying BOTH `supersedes` (the head it
+// retires) and the `retiredAt` stamp — the only shape a retirement takes.
+const agent = Schema.decodeUnknownSync(Agent)({
+  id: "agt-2",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit"],
+  supersedes: "agt-1",
+  retiredAt: "2026-07-20T12:00:00.000Z",
 });
 // A durable RUNNING Job for `job-1` — genuinely mid-dispatch. The session-channel
 // gate keys on the JOB status (CE4.1 FIX A), so a running Job routes to the bounded
@@ -178,6 +203,8 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
       yield* store.jobs.putSession(session);
+      yield* store.agents.putAgent(agentHead);
+      yield* store.agents.putAgent(agent);
 
       const snapshot = yield* client.snapshot();
       expect(snapshot.workstreams).toEqual([workstream]);
@@ -185,12 +212,17 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       expect(snapshot.issues).toEqual([issue]);
       expect(snapshot.jobs).toEqual([queuedJob]);
       expect(snapshot.sessions).toEqual([session]);
+      // The REGISTRY layer hydrates too, whole and flat (never a per-repo slice),
+      // and a persisted revision round-trips through the wire schema with both of
+      // its optional keys intact — a retired, superseding revision is exactly what
+      // a client must be able to resolve a historical execution against.
+      expect(snapshot.agents).toEqual([agentHead, agent]);
     }),
   ),
 );
 
 it.effect("snapshot of an empty daemon is empty", () =>
-  harness(({ client }) =>
+  harness(({ client, store }) =>
     Effect.gen(function* () {
       const snapshot = yield* client.snapshot();
       expect(snapshot).toEqual({
@@ -199,6 +231,11 @@ it.effect("snapshot of an empty daemon is empty", () =>
         issues: [],
         jobs: [],
         sessions: [],
+        agents: [],
+        // Empty of DATA, but never of CONTEXT: the generation is what tells a client
+        // which coordinate space the (currently empty) offset log belongs to, so an
+        // empty snapshot is still a valid resume context.
+        generation: store.generation,
       });
     }),
   ),
@@ -435,7 +472,7 @@ it.effect("events streams a work-graph delta produced by a command", () =>
       // not a replayed one: `events` replays `event_log.tail(sinceOffset)` first.
       const seeded = yield* store.events.read;
       const collector = yield* client
-        .events({ sinceOffset: seeded.length })
+        .events({ resume: { sinceOffset: seeded.length, generation: store.generation } })
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
       // Drive a REPEATABLE command until the (lazily-subscribing) events stream
       // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
@@ -467,7 +504,7 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
       // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
       const replay = yield* client
-        .events({ sinceOffset: 2 })
+        .events({ resume: { sinceOffset: 2, generation: store.generation } })
         .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
         .pipe(Effect.flatMap(Fiber.join));
 
@@ -563,12 +600,121 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
       // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
       const cursor = offsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
         .pipe(Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
     }),
   ),
+);
+
+// The SESSION channel carries the identical stale-generation hazard as the work-graph feed
+// — `session_event_log` is `AUTOINCREMENT` too, and a schema-version bump drops it — so it
+// gets the identical guard, not a weaker one. These pin BOTH halves of it.
+it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      yield* store.jobs.putSession(session);
+      yield* store.jobs.putJob(orphanedJob);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.sessionLog.append(sessionId, noticeEvent);
+
+      // A cursor WITHIN this transcript's extent — an extent check alone would wave it
+      // through — but minted under a generation this store never had. Resuming it would
+      // tail a transcript the cursor's coordinates never indexed.
+      const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
+        "00000000-dead-4000-8000-000000000000",
+      );
+      const failure = yield* client
+        .sessionEvents({ sessionId, resume: { sinceOffset: 1, generation: deadGeneration } })
+        .pipe(Stream.runCollect, Effect.flip);
+      expect(failure).toBeInstanceOf(ResyncRequired);
+      if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+      expect(failure.sinceOffset).toBe(1);
+      // WITHIN the extent — so this refusal is the identity check, not the extent check.
+      expect(failure.sinceOffset).toBeLessThanOrEqual(failure.maxOffset);
+      expect(failure.generation).toBe(store.generation);
+    }),
+  ),
+);
+
+it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
+  harness(({ client, store }) =>
+    Effect.gen(function* () {
+      yield* store.jobs.putSession(session);
+      yield* store.jobs.putJob(orphanedJob);
+      yield* store.sessionLog.append(sessionId, entryAppended);
+
+      // The session channel's half of the zero-offset door. A zero cursor used to skip the
+      // generation comparison outright — it reads as "the origin" numerically — so a
+      // request from a DEAD generation was served a resume against a transcript its
+      // coordinates never indexed. It is now an ordinary resume: the PRESENCE of the
+      // context, never the value of the offset, is what marks it as one.
+      const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
+        "00000000-dead-4000-8000-000000000000",
+      );
+      const failure = yield* client
+        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: deadGeneration } })
+        .pipe(Stream.runCollect, Effect.flip);
+      expect(failure).toBeInstanceOf(ResyncRequired);
+      if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+      expect(failure.sinceOffset).toBe(0);
+      expect(failure.generation).toBe(store.generation);
+
+      // A zero cursor under the CURRENT generation is a REAL resume and is honoured —
+      // closing the door costs a legitimate client nothing.
+      const fromZero = yield* client
+        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: store.generation } })
+        .pipe(Stream.runCollect);
+      expect(fromZero.map((i) => i.event)).toEqual([entryAppended]);
+
+      // The ORIGIN request names no coordinate, so it is valid in EVERY generation and is
+      // never refused — a first connect (and today's client, which sends no cursor) is
+      // untouched by the guard.
+      const replayed = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      expect(replayed.map((i) => i.event)).toEqual([entryAppended]);
+    }),
+  ),
+);
+
+// An UNKNOWN session id under the CURRENT generation is a `SessionNotFound`, NOT a
+// `ResyncRequired`. A never-seen session has a per-session extent of `0`, so an extent check
+// run BEFORE the existence verdict refused every non-zero cursor — and `ResyncRequired` means
+// "discard ALL retained state and re-hydrate the whole store", a wildly over-broad answer to
+// one bad session id. The generation half of the guard is unaffected (the two tests above pin
+// it); only the extent half now waits for the session to be known to exist.
+it.effect(
+  "sessionEvents answers an UNKNOWN session with SessionNotFound, never ResyncRequired",
+  () =>
+    harness(({ client, store }) =>
+      Effect.gen(function* () {
+        const failure = yield* client
+          .sessionEvents({
+            sessionId,
+            resume: { sinceOffset: 7, generation: store.generation },
+          })
+          .pipe(Stream.runCollect, Effect.flip);
+        expect(failure).toBeInstanceOf(SessionNotFound);
+
+        // For a session that DOES exist, a cursor past the transcript's end under the current
+        // generation is still a resync — the extent half is deferred, not dropped.
+        yield* store.jobs.putSession(session);
+        yield* store.jobs.putJob(orphanedJob);
+        yield* store.sessionLog.append(sessionId, entryAppended);
+        const beyond = yield* client
+          .sessionEvents({
+            sessionId,
+            resume: { sinceOffset: 99, generation: store.generation },
+          })
+          .pipe(Stream.runCollect, Effect.flip);
+        expect(beyond).toBeInstanceOf(ResyncRequired);
+        if (!(beyond instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+        expect({ sinceOffset: beyond.sinceOffset, maxOffset: beyond.maxOffset }).toStrictEqual({
+          sinceOffset: 99,
+          maxOffset: 1,
+        });
+      }),
+    ),
 );
 
 // A LIVE session (a registered handle → `resolveLive` resolves it): `sessionEvents` replays
@@ -666,7 +812,7 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
       // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
       const cursor = durableOffsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor })
+        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
         .pipe(Stream.take(1), Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
