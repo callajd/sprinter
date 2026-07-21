@@ -7,16 +7,14 @@ minimal, existing so the verification gate runs against real code.
 
 ## Layout
 
-- `Sources/SprinterCore/` — owned domain seed. Owned types get **plain** names
-  (`Workstream`, `WorkStatus`), per `docs/conventions.md`.
 - `Sources/SprinterContract/` — the **RPC contract mirror** (FE2.4): hand-written
   `Codable` DTOs mirroring the contract, platform-neutral (Foundation only, no
   AppKit/UIKit). It is a foreign consumer (D10) that decodes the SAME wire bytes
   the TypeScript contract emits (INV-CONTRACT). See `docs/contract-mirror.md`.
 - `Tests/SprinterContractTests/` — decode tests over `Goldens/` — JSON generated
   FROM the TS contract by `scripts/generate-goldens.ts`. The gate only DECODES
-  the committed goldens (no `bun` inside `make check`).
-- `Tests/SprinterCoreTests/` — `swift-testing` (`Testing`) suite.
+  the committed goldens (no `bun` inside `make check`). `swift-testing`
+  (`Testing`) is the suite framework across every test target.
 
 ## Verification gate — `make check`
 
