@@ -30,7 +30,10 @@ export type EpicId = (typeof EpicId)["Type"];
 export const IssueId = Schema.NonEmptyString.pipe(Schema.brand("IssueId"));
 export type IssueId = (typeof IssueId)["Type"];
 
-/** Identifies a {@link Job} — one bounded cognitive task (1 Job = 1 execution = 1 transcript = 1 PR). */
+/**
+ * Identifies a {@link Job} — one bounded cognitive task, paired 1:1 with one PR and
+ * advanced by a TREE of {@link Execution}s (each producing exactly one transcript).
+ */
 export const JobId = Schema.NonEmptyString.pipe(Schema.brand("JobId"));
 export type JobId = (typeof JobId)["Type"];
 

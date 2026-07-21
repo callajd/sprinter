@@ -42,7 +42,7 @@ import { RpcClient, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import { BunFileSystem, BunServices, BunSocket } from "@effect/platform-bun";
 import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
-import { Epic, Issue, Job, Execution, ExecutionId, Workstream } from "@sprinter/domain";
+import { Agent, Epic, Issue, Job, Execution, ExecutionId, Workstream } from "@sprinter/domain";
 import { Repository as DomainRepository } from "@sprinter/domain";
 import { CodeHost, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
@@ -374,12 +374,14 @@ it.effect(
           const finalJob = snap.jobs.find((j) => j.id === "job-seed");
           expect(finalJob?.status).toBe("succeeded");
           expect(finalJob?.transcriptRef).toBeDefined();
-          // …with EXACTLY ONE execution, re-attached under the SAME persisted id (1 Job = 1
-          // execution; the resume upserted the same id, it did not fork a second execution).
+          // …with the SAME persisted execution re-attached, not a forked second one: the
+          // resume upserted the same id. (A job MAY own several executions now — DE2.2 —
+          // so this asserts what the resume did, which the store no longer constrains.)
           const jobExecutions = snap.executions.filter((s) => s.jobId === "job-seed");
           expect(jobExecutions.length).toBe(1);
           expect(jobExecutions[0]?.id).toBe(EXECUTION_ID);
-          expect(jobExecutions[0]?.status).toBe("completed");
+          // The run ENDED: its transcript is sealed, which is the whole of that statement.
+          expect(jobExecutions[0]?.transcript._tag).toBe("SealedTranscript");
         }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
       }).pipe(Effect.provide(harnessDaemon(config, piB)), Effect.scoped);
     }).pipe(Effect.provide(BunFileSystem.layer)),
@@ -413,10 +415,19 @@ it.effect(
         status: "running",
         executionId: "execution-job-wal",
       });
+      const runningAgent = decode(Agent, {
+        id: "agt-wal",
+        name: "implementer",
+        model: "claude-opus-4-8",
+        version: "1.0.0",
+        tools: ["read"],
+      });
       const startingExecution = decode(Execution, {
         id: "execution-job-wal",
         jobId: "job-wal",
-        status: "active",
+        agentId: "agt-wal",
+        mode: "autonomous",
+        transcript: { _tag: "LiveTranscript" },
       });
 
       // Writer store A stays OPEN (its scope is the outer `Effect.gen`) — no close, no
@@ -427,8 +438,10 @@ it.effect(
         yield* writer.workGraph.putWorkstream(seedWorkstream);
         yield* writer.workGraph.putEpic(seedEpic);
         yield* writer.workGraph.putIssue(seedIssue);
-        yield* writer.jobs.putExecution(startingExecution);
+        // Agent + job before the execution that names them (both are foreign keys).
+        yield* writer.agents.putAgent(runningAgent);
         yield* writer.jobs.putJob(runningJob);
+        yield* writer.jobs.putExecution(startingExecution);
 
         // …and a SEPARATE reader store B, opened on the SAME file while A is still open,
         // replays the WAL and reads the committed mid-write back intact.

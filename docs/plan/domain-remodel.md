@@ -251,11 +251,20 @@ survives so a past execution resolves to the exact revision that ran it. Both ca
 unconditionally: a bump destroys that history, and DE2.2's `Execution.agentId` can then
 dangle across one.
 
-Resolved for now as *documentation truth* — revisions are immutable **within a store
-generation**, and a bump is accepted data loss while the store is pre-release greenfield.
-**Revisit at DE2.2**, where the choice is a re-derivation source (a config/manifest
-re-seeded on open) or an explicit carve-out. Until then, no task may assert unconditional
-durability of registry history.
+**RESOLVED at DE2.2 (issue #104) for referential integrity.** `Execution.agentId` is a
+real `FOREIGN KEY` onto `agent`, and a version bump drops *every* table in one sweep — so
+`agent` and `execution` go together and no execution can survive naming a discarded
+revision. Within a generation the key refuses the write; across one there is nothing left
+on either side. A dangling `agentId` is **unconstructible**, so no downstream task has to
+model a possibly-absent agent.
+
+What remains is not an integrity question but a product one — *should* agent history
+survive the remodel? While the store is pre-release greenfield, no: the history is worth
+what the executions referencing it are worth, and those go with it. No re-derivation
+source was invented; `putAgent` stays the sole source of truth for registry content. The
+reasoning lives where the durability claim does (`packages/domain/src/registry.ts`,
+`packages/state/src/sqlite.ts`). Revisions remain immutable **within a store generation**,
+and no task may assert durability wider than that.
 
 ## Cross-cutting invariants
 
@@ -348,10 +357,19 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   session_job(jobId)` dropped; Swift mirror + golden. `agentId` is a `FOREIGN KEY` into
   the registry (`INV-ENFORCE`) — and this task lands the registry's **first production
   writer**, since DE1.1 shipped `Agent` reachable only from tests, so `Snapshot.agents` is
-  empty in a real daemon until here. Resolve the durability tension recorded under
-  [Landed foundations](#a-known-tension--inv-fresh-vs-the-registrys-durability): either
-  give the registry a re-derivation source, or state what a dangling `agentId` renders as
-  after a store reset.
+  empty in a real daemon until here. The durability tension recorded under
+  [Landed foundations](#a-known-tension--inv-fresh-vs-the-registrys-durability) is
+  **resolved** by that foreign key: a reset drops the registry and the executions together,
+  so a dangling `agentId` is unconstructible rather than merely unlikely.
+- **Landed as:** `Execution { id, jobId, agentId, parent?, mode, transcript }` — the link
+  is `jobId` **only until DE2.4** re-points it at `sessionId` (`Session` does not exist
+  yet, and a real key now beats a nullable one later). `ExecutionStatus` is **gone**:
+  liveness IS the transcript variant, because a status enum beside it would be a second
+  field that must agree with the first (`INV-SUM` / `INV-ENFORCE`), and a settled run's
+  OUTCOME belongs to the work it advanced. `execution_event_log."executionId"` became a
+  foreign key too (1 Execution = 1 Transcript), and the registry's production writer
+  derives an agent revision's id from its CONTENT, so re-running the same agent is an
+  idempotent no-op and editing it is a new revision by construction.
 - **Depends on:** `DE2.1`
 
 ### DE2.3 — `PullRequest` as an entity
@@ -380,9 +398,10 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   no consumer sees `workspace?`/`product?`; `target` and `product` unions with the
   `PRODUCT_FOR` map declared `satisfies Record<Target["_tag"], Product["_tag"]>`,
   plus a schema refinement rejecting a `product` whose tag is not
-  `PRODUCT_FOR[target._tag]`; `Job`, the old `Session`, `JobStatus`,
-  `SessionStatus`, `JobKind`, `transcriptRef` deleted from `packages/*` and
-  `apple/*`; Swift mirror + golden.
+  `PRODUCT_FOR[target._tag]`; `Job`, the old `Session`, `JobStatus`, `JobKind`,
+  `transcriptRef` deleted from `packages/*` and `apple/*` (`SessionStatus`, i.e.
+  DE2.1's `ExecutionStatus`, is already gone — DE2.2 replaced it with the transcript
+  union); Swift mirror + golden.
 - **Depends on:** `DE2.2`, `DE2.3`
 
 ### DE2.5 — `Workspace` entity
@@ -546,7 +565,11 @@ The workstream is done when none of these can be constructed:
 
 - All sixteen states above are unconstructible.
 - `Job`, `PullRequestRef`, `IssueStatus`, `JobStatus`, `SessionStatus`, `JobKind`
-  appear nowhere in `packages/*` or `apple/*`.
+  appear nowhere in `packages/*` or `apple/*`. (`SessionStatus` — the process-level
+  status enum, renamed `ExecutionStatus` by DE2.1 — was deleted early, at **DE2.2**:
+  giving `Execution` its real shape replaced it with the `LiveTranscript`/
+  `SealedTranscript` distinction, and keeping both would have been two fields that must
+  agree.)
 - `Session` names the unit of work; `Execution` names one agent's run. No
   identifier in `packages/domain` or `packages/contract` uses "session" for a
   process.

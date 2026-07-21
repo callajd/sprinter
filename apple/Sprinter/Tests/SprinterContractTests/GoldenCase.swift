@@ -125,6 +125,7 @@ extension GoldenCase {
     GoldenCase("job-full", Job.self),
     GoldenCase("job-minimal", Job.self),
     GoldenCase("execution", Execution.self),
+    GoldenCase("execution-child", Execution.self),
     GoldenCase("pull-request-ref", PullRequestRef.self),
     GoldenCase("work-graph-events", [WorkGraphEvent].self),
     GoldenCase("offset-events", [OffsetEvent].self)

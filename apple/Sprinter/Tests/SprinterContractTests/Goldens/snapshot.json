@@ -91,7 +91,22 @@
     {
       "id": "exe-1",
       "jobId": "job-1",
-      "status": "active"
+      "agentId": "agt-1",
+      "mode": "autonomous",
+      "transcript": {
+        "_tag": "LiveTranscript"
+      }
+    },
+    {
+      "id": "exe-2",
+      "jobId": "job-1",
+      "agentId": "agt-2",
+      "parent": "exe-1",
+      "mode": "interactive",
+      "transcript": {
+        "_tag": "SealedTranscript",
+        "lastOffset": 12
+      }
     }
   ],
   "agents": [

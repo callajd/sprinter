@@ -67,7 +67,10 @@ enum BoardFixtures {
   static let activeExecution = Execution(
     id: ExecutionId(rawValue: "exe-a"),
     jobId: JobId(rawValue: "job-a"),
-    status: .active)
+    agentId: AgentId(rawValue: "agt-1"),
+    parent: nil,
+    mode: .autonomous,
+    transcript: .live(LiveTranscript()))
 
   // ── Workstream B: a DIFFERENT repo, fully done, no live agent ────────────────
 

@@ -72,8 +72,10 @@
  * - The dependency DAG (`Issue.dependsOn`) is stored as real edges in a dedicated
  *   `issue_dependency` table and reconstructed, ordered, on read — the DAG is
  *   persisted as edges, not as an opaque blob.
- * - Optional links (`Issue.pr`, `Job.executionId` / `Job.transcriptRef` / `Job.pr`)
- *   are nullable columns; `PullRequestRef` is stored as a JSON column.
+ * - Optional links (`Issue.pr`, `Job.executionId` / `Job.transcriptRef` / `Job.pr`,
+ *   `Execution.parent`) are nullable columns; `PullRequestRef` and the `Transcript`
+ *   union are stored as JSON columns (a union is stored WHOLE, so its variant and its
+ *   payload cannot disagree).
  * - The event feed is an `AUTOINCREMENT` table; the auto-assigned rowid is the
  *   monotonic offset.
  *
@@ -107,7 +109,8 @@ import {
   Execution,
   ExecutionEvent,
   ExecutionId,
-  ExecutionStatus,
+  ExecutionMode,
+  Transcript,
   StoreGenerationId,
   Timestamp,
   WorkstreamId,
@@ -312,11 +315,20 @@ const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
   stored.supersedes === next.supersedes &&
   stored.retiredAt === next.retiredAt;
 
-/** An execution row — no optional or JSON columns. */
+/**
+ * An execution row. `parent` is a nullable self-reference (absent on a root
+ * execution); `transcript` is a JSON column holding the owned {@link Transcript}
+ * union, stored WHOLE so the variant and its payload can never disagree — a `_tag`
+ * column beside a nullable `lastOffset` would admit a sealed transcript with no
+ * extent and a live one carrying one (INV-SUM).
+ */
 const ExecutionRow = Schema.Struct({
   id: ExecutionId,
   jobId: JobId,
-  status: ExecutionStatus,
+  agentId: AgentId,
+  parent: Schema.NullOr(ExecutionId),
+  mode: ExecutionMode,
+  transcript: Schema.fromJsonString(Transcript),
 });
 
 /**
@@ -435,6 +447,24 @@ const GENERATION_KEY = "generation";
  * renamed table IS a shape change, and there is no migration ladder, so it drops
  * and recreates like any other (INV-FRESH).
  *
+ * Version 7 gives `Execution` its real shape (DE2.2): `execution` gains `"agentId"`,
+ * `parent` and `mode` columns and a `transcript` JSON column, LOSES its `status`
+ * column (liveness is the transcript variant — see `Transcript` in
+ * `@sprinter/domain`), and gains THREE foreign keys — `"jobId"` → `job (id)`,
+ * `"agentId"` → `agent (id)`, `parent` → `execution (id)`. Its `UNIQUE execution_job`
+ * index becomes a PLAIN index: one job now has a TREE of executions, so uniqueness
+ * would refuse the model rather than protect it. `execution_event_log."executionId"`
+ * also becomes a real foreign key onto `execution (id)`, so a transcript cannot exist
+ * without the run that produced it (1 Execution = 1 Transcript).
+ *
+ * The same RESET consequence version 5 recorded for `workstream.repositoryId` is what
+ * makes `"agentId"` hold: a bump drops `agent`, `job` and `execution` TOGETHER, so a
+ * reset cannot leave an execution behind naming an agent revision (or a job) that no
+ * longer exists. There is no window in which those references dangle — the referencing
+ * table does not outlive the referenced one — which is what closes DE1.1's recorded
+ * `INV-FRESH`-vs-registry-durability tension for referential integrity (see
+ * `registry.ts`).
+ *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
@@ -442,7 +472,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -657,16 +687,50 @@ const createSchema = Effect.gen(function* () {
       pr TEXT
     )`;
   yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
+  // One agent's continuous run (DE2.2). THREE foreign keys, none of them decorative:
+  //
+  // - `"jobId"` → `job (id)`: the work this run advances. It is the `sessionId` of the
+  //   target model under its pre-DE2.4 name (D1) — a real key NOW, so referential
+  //   integrity holds at every intermediate state rather than arriving with `Session`.
+  // - `"agentId"` → `agent (id)`: the exact registry revision that ran. Since the
+  //   registry never rewrites a revision, a historical execution always resolves to the
+  //   agent that actually ran it — and the key is what makes that a guarantee instead of
+  //   a hope (an execution naming an unregistered agent is refused by the engine, and a
+  //   reset drops both tables together so the reference cannot outlive its referent).
+  // - `parent` → `execution (id)`: executions form a TREE. The key means a child cannot
+  //   name a parent that is not already stored, so a DANGLING parent is unstorable and
+  //   no write ORDER closes a cycle of length ≥ 2 (closing one requires naming a row
+  //   that does not exist yet). Self-reference — the single edge a foreign key accepts,
+  //   since a row satisfies a key against itself — is rejected by the port's
+  //   `putExecution`, exactly as `putAgent` rejects a self-`supersedes`. Together they
+  //   make the relation acyclic BY CONSTRUCTION. This is the `supersedes` lesson from
+  //   issue #85 applied to the tree: three separate lineage rules were all defeated by a
+  //   reordered write until a foreign key made the precondition unconstructible.
+  //
+  // There is NO `status` column: liveness IS the transcript variant (`Transcript`,
+  // `@sprinter/domain`), and a status enum beside it would be a second field that must
+  // agree with the first (INV-SUM / INV-ENFORCE). `transcript` is stored as ONE JSON
+  // column for the same reason — the variant and its payload move together.
   yield* sql`CREATE TABLE execution (
       id TEXT PRIMARY KEY NOT NULL,
       "jobId" TEXT NOT NULL,
-      status TEXT NOT NULL
+      "agentId" TEXT NOT NULL,
+      parent TEXT,
+      mode TEXT NOT NULL,
+      transcript TEXT NOT NULL,
+      FOREIGN KEY ("jobId") REFERENCES job (id),
+      FOREIGN KEY ("agentId") REFERENCES agent (id),
+      FOREIGN KEY (parent) REFERENCES execution (id)
     )`;
-  // UNIQUE enforces the domain invariant 1 Job = 1 execution (conventions): at most
-  // one execution per job, so `getExecutionForJob` is deterministic by construction and
-  // a stray second execution for a job fails at the backing (surfacing as a
-  // StateStoreError) rather than silently returning an arbitrary row.
-  yield* sql`CREATE UNIQUE INDEX execution_job ON execution ("jobId")`;
+  // PLAIN, not UNIQUE (DE2.2). It was `UNIQUE` while the model was 1 Job = 1 execution;
+  // a job now owns a TREE of executions, so uniqueness would refuse the model rather
+  // than protect it. `getExecutionForJob` stays deterministic without it — it reads the
+  // job's ROOT (`parent IS NULL`), ordered and limited in the backing, rather than
+  // relying on there being only one row to find.
+  yield* sql`CREATE INDEX execution_job ON execution ("jobId")`;
+  // Keeps the tree walk (a parent's children) and the foreign key's own referencing
+  // scan cheap; SQLite indexes the referenced side of a key, never the referencing one.
+  yield* sql`CREATE INDEX execution_parent ON execution (parent)`;
   yield* sql`CREATE TABLE event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL,
@@ -678,10 +742,18 @@ const createSchema = Effect.gen(function* () {
   // id APPENDS with fresh higher offsets rather than reusing or resetting the sequence
   // (never a duplicated/corrupted offset). The `execution_event_log_execution` index keeps a
   // per-execution ordered read/tail cheap.
+  //
+  // `"executionId"` is a real FOREIGN KEY onto `execution (id)` (DE2.2), not a bare
+  // scoping column: `Execution 1:1 Transcript`, so a transcript that names no stored
+  // run is not a transcript — it is an orphan whose owner nothing can resolve. With the
+  // key, an entry for an unknown execution is refused by the engine at the append, so
+  // "every durable entry belongs to an execution that exists" is a property of the
+  // store rather than a claim about its writers.
   yield* sql`CREATE TABLE execution_event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       "executionId" TEXT NOT NULL,
-      event TEXT NOT NULL
+      event TEXT NOT NULL,
+      FOREIGN KEY ("executionId") REFERENCES execution (id)
     )`;
   yield* sql`CREATE INDEX execution_event_log_execution ON execution_event_log ("executionId")`;
 });
@@ -723,7 +795,7 @@ const configureConnection = Effect.gen(function* () {
     // the caller's single `fail("applySchema")` mapping covers it too.
     return yield* Effect.fail({
       message:
-        "SQLite refused `PRAGMA foreign_keys = ON`; the schema's foreign keys (the agent registry's `supersedes`, `repository_ref.repositoryId`, `workstream.repositoryId`) would not be enforced, leaving dangling references storable",
+        "SQLite refused `PRAGMA foreign_keys = ON`; the schema's foreign keys (the agent registry's `supersedes`, `repository_ref.repositoryId`, `workstream.repositoryId`, the execution's `jobId`/`agentId`/`parent`, and `execution_event_log.executionId`) would not be enforced, leaving dangling references storable",
     });
   }
 });
@@ -1331,23 +1403,51 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail(operation)),
     );
 
-  const putExecution = SqlSchema.void({
-    Request: Execution,
-    execute: (row) =>
-      sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
-  });
+  /**
+   * Reconstruct one {@link Execution} from its row, dropping the SQL `NULL` parent to
+   * an absent optional. `operation` names the calling store method so a decode failure
+   * reports the caller.
+   */
+  const hydrateExecution = (
+    row: unknown,
+    operation: string,
+  ): Effect.Effect<Execution, StateStoreError> =>
+    Schema.decodeUnknownEffect(ExecutionRow)(row).pipe(
+      Effect.map(
+        (r): Execution => ({
+          id: r.id,
+          jobId: r.jobId,
+          agentId: r.agentId,
+          ...(r.parent !== null ? { parent: r.parent } : {}),
+          mode: r.mode,
+          transcript: r.transcript,
+        }),
+      ),
+      Effect.mapError(fail(operation)),
+    );
 
-  const getExecutionQuery = SqlSchema.findOneOption({
-    Request: ExecutionId,
-    Result: ExecutionRow,
-    execute: (id) => sql`SELECT * FROM execution WHERE id = ${id}`,
-  });
+  /**
+   * Read at most one execution row through {@link hydrateExecution}. Shared by the two
+   * reads so the `NULL`-parent handling is written once.
+   */
+  const findExecution = (
+    rows: ReadonlyArray<unknown>,
+    operation: string,
+  ): Effect.Effect<Option.Option<Execution>, StateStoreError> =>
+    Option.match(Arr.head(rows), {
+      onNone: () => Effect.succeedNone,
+      onSome: (row) => Effect.asSome(hydrateExecution(row, operation)),
+    });
 
-  const getExecutionForJobQuery = SqlSchema.findOneOption({
-    Request: JobId,
-    Result: ExecutionRow,
-    execute: (jobId) => sql`SELECT * FROM execution WHERE "jobId" = ${jobId}`,
-  });
+  const getExecutionForJobQuery = (jobId: JobId) =>
+    // The job's ROOT execution: `parent IS NULL`, lowest id. A job owns a TREE now
+    // (DE2.2 dropped `UNIQUE execution_job`), so "the execution for this job" needs a
+    // definition rather than an assumption that only one row can match — and the
+    // definition is answered by the BACKING (`ORDER BY … LIMIT 1`), so it is
+    // deterministic for every history the store can hold, not merely for the ones a
+    // caller expects. DE2.4 replaces this read entirely: a `Session` names its `root`
+    // execution outright, so the root stops being something to look up.
+    sql`SELECT * FROM execution WHERE "jobId" = ${jobId} AND parent IS NULL ORDER BY id LIMIT 1`;
 
   const jobs: JobStore = {
     putJob: (job) =>
@@ -1382,10 +1482,46 @@ const make = Effect.gen(function* () {
         ),
       ),
     putExecution: (execution) =>
-      putExecution(execution).pipe(Effect.mapError(fail("putExecution"))),
-    getExecution: (id) => getExecutionQuery(id).pipe(Effect.mapError(fail("getExecution"))),
+      Effect.gen(function* () {
+        // The ONE tree edge the `parent` foreign key does NOT reject: SQLite checks the
+        // constraint against the table INCLUDING the row being inserted, so a row is its
+        // own valid parent. Rejecting it here is what makes the whole relation acyclic —
+        // every longer cycle needs an edge naming a row that does not exist yet, which
+        // the key already refuses. (The same division of labour as `putAgent`'s
+        // self-`supersedes` check.)
+        if (execution.parent === execution.id) {
+          return yield* Effect.fail(
+            new StateStoreError({
+              operation: "putExecution",
+              detail: `execution "${execution.id}" names itself as its parent; an execution's parent must be a DIFFERENT execution`,
+            }),
+          );
+        }
+        const transcript = yield* Schema.encodeEffect(Schema.fromJsonString(Transcript))(
+          execution.transcript,
+        ).pipe(Effect.mapError(fail("putExecution")));
+        const row = {
+          id: execution.id,
+          jobId: execution.jobId,
+          agentId: execution.agentId,
+          parent: execution.parent ?? null,
+          mode: execution.mode,
+          transcript,
+        };
+        yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`.pipe(
+          Effect.mapError(fail("putExecution")),
+        );
+      }),
+    getExecution: (id) =>
+      sql`SELECT * FROM execution WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getExecution")),
+        Effect.flatMap((rows) => findExecution(rows, "getExecution")),
+      ),
     getExecutionForJob: (jobId) =>
-      getExecutionForJobQuery(jobId).pipe(Effect.mapError(fail("getExecutionForJob"))),
+      getExecutionForJobQuery(jobId).pipe(
+        Effect.mapError(fail("getExecutionForJob")),
+        Effect.flatMap((rows) => findExecution(rows, "getExecutionForJob")),
+      ),
   };
 
   // ── EventLogStore ─────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import {
   Issue,
   isIssueLanded,
   isTerminal,
+  isExecutionLive,
   Job,
   PullRequestRef,
   Execution,
@@ -68,7 +69,23 @@ const jobFull = {
   pr: { number: 42, url: "https://github.com/callajd/sprinter/pull/42", merged: false },
 };
 
-const execution = { id: "exe-1", jobId: "job-1", status: "active" };
+/** A ROOT execution, still running: no `parent`, and an OPEN transcript. */
+const execution = {
+  id: "exe-1",
+  jobId: "job-1",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
+};
+
+/** A SUBAGENT's execution: it names its parent, holds the turn interactively, and has settled. */
+const childExecution = {
+  ...execution,
+  id: "exe-2",
+  parent: "exe-1",
+  mode: "interactive",
+  transcript: { _tag: "SealedTranscript", lastOffset: 12 },
+};
 
 it.effect("round-trips the whole read model (with and without optional keys)", () =>
   Effect.gen(function* () {
@@ -80,6 +97,7 @@ it.effect("round-trips the whole read model (with and without optional keys)", (
     yield* assertRoundTrip(Job, jobMinimal);
     yield* assertRoundTrip(Job, jobFull);
     yield* assertRoundTrip(Execution, execution);
+    yield* assertRoundTrip(Execution, childExecution);
   }),
 );
 
@@ -95,7 +113,18 @@ it.effect("rejects representative invalid inputs", () =>
       [Issue, { ...issueWithoutPr, status: "merged" }],
       [Job, { ...jobMinimal, kind: "unknown-kind" }],
       [Job, { ...jobMinimal, status: "done" }],
-      [Execution, { ...execution, status: "paused" }],
+      // `mode` is a CLOSED literal set, not a string.
+      [Execution, { ...execution, mode: "supervised" }],
+      // A transcript is one of exactly two variants…
+      [Execution, { ...execution, transcript: { _tag: "PartialTranscript" } }],
+      // …and a SEALED one carries its extent as REQUIRED payload — there is no sealed
+      // transcript without a `lastOffset`, and no flag standing in for the variant
+      // (INV-SUM).
+      [Execution, { ...execution, transcript: { _tag: "SealedTranscript" } }],
+      // Every reference is required and branded: an execution with no agent is not a
+      // shape the domain has (its `agentId` is a foreign key in the store).
+      [Execution, { ...execution, agentId: "" }],
+      [Execution, { ...execution, parent: "" }],
       [PullRequestRef, { number: -1, url: "x", merged: true }],
     ];
     yield* Effect.forEach(invalids, ([schema, raw]) =>
@@ -103,6 +132,22 @@ it.effect("rejects representative invalid inputs", () =>
         Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
       ),
     );
+  }),
+);
+
+it.effect("reads liveness off the TRANSCRIPT — the model's only expression of it", () =>
+  Effect.gen(function* () {
+    const running = yield* Schema.decodeUnknownEffect(Execution)(execution);
+    const settled = yield* Schema.decodeUnknownEffect(Execution)(childExecution);
+    expect(isExecutionLive(running)).toBe(true);
+    expect(isExecutionLive(settled)).toBe(false);
+    // The subagent's tree edge and its per-execution mode survive the decode: `mode`
+    // lives HERE and nowhere above (INV-MODE), and a child names its parent.
+    expect(settled.parent).toBe("exe-1");
+    expect(settled.mode).toBe("interactive");
+    expect(running.mode).toBe("autonomous");
+    // A root carries no `parent` KEY at all — absent, never null.
+    expect("parent" in running).toBe(false);
   }),
 );
 

@@ -15,9 +15,11 @@ import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import {
+  type AgentContent,
   type ExecutionEvent,
   ExecutionId,
   type ExecutionInput,
+  isExecutionLive,
   Issue,
   Job,
 } from "@sprinter/domain";
@@ -99,9 +101,24 @@ const recordingHandle = (
   send: (input) => Ref.update(sent, (xs) => [...xs, input]),
 });
 
+/**
+ * The agent content the fake runner declares it runs. The dispatcher REGISTERS it (the
+ * registry's first production writer, DE2.2/D2) and attributes the execution to the
+ * revision it derives from this content.
+ */
+const fakeAgent: AgentContent = {
+  name: "test-agent",
+  model: "test-model",
+  version: "1.0.0",
+  tools: ["read"],
+};
+
 /** A fake {@link ExecutionRunner} that hands back a fixed handle for every job. */
 const fakeRunner = (handle: ExecutionHandle): Layer.Layer<ExecutionRunner> =>
-  Layer.succeed(ExecutionRunner, ExecutionRunner.of({ run: () => Effect.succeed(handle) }));
+  Layer.succeed(
+    ExecutionRunner,
+    ExecutionRunner.of({ agent: fakeAgent, run: () => Effect.succeed(handle) }),
+  );
 
 /** Provide the runner-under-test plus its two faked ports; expose `StateStore` for assertions. */
 const provide =
@@ -157,7 +174,18 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
 
     const forJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
     expect(forJob.id).toBe("execution-job-1");
-    expect(forJob.status).toBe("completed");
+    // The run has ENDED, and that is expressed by the transcript being SEALED at the
+    // extent the durable log reached — there is no status enum beside it to agree with.
+    // The dispatched Job's execution is a ROOT (no parent) and holds the turn itself.
+    expect(forJob.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 1 });
+    expect(isExecutionLive(forJob)).toBe(false);
+    expect(forJob.mode).toBe("autonomous");
+    expect("parent" in forJob).toBe(false);
+    // The registry now has the revision that RAN — the first production writer (D2) —
+    // and the execution is attributed to exactly it.
+    const agents = yield* store.agents.listAgents;
+    expect(agents.map((a) => a.name)).toStrictEqual(["test-agent"]);
+    expect(forJob.agentId).toBe(agents[0]?.id);
     // Reading the same execution by its id round-trips identically.
     const byId = Option.getOrThrow(yield* store.jobs.getExecution(forJob.id));
     expect(byId).toStrictEqual(forJob);
@@ -363,7 +391,13 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
     expect(persistedJob.status).toBe("failed");
 
     const persistedExecution = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
-    expect(persistedExecution.status).toBe("failed");
+    // A failed run is a run that ENDED: its transcript is sealed at the one entry that
+    // was persisted before the teardown. The FAILURE is recorded on the Job (above) —
+    // the execution stores no lifecycle its transcript already determines.
+    expect(persistedExecution.transcript).toStrictEqual({
+      _tag: "SealedTranscript",
+      lastOffset: 1,
+    });
     expect(persistedExecution.id).toBe("execution-job-1");
   }).pipe(
     provide(
@@ -395,12 +429,17 @@ it.effect("fails and persists a failed terminal when the runner cannot start the
     // limbo — the durable rows are moved to a failed terminal.
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
+    // …and the execution is no longer LIVE: its transcript is sealed, so no liveness
+    // gate can still be waiting on a handle that will never register.
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      false,
+    );
   }).pipe(
     provideRunner(
       Layer.succeed(
         ExecutionRunner,
         ExecutionRunner.of({
+          agent: fakeAgent,
           run: () =>
             Effect.fail(new ExecutionRunnerError({ operation: "run", detail: "spawn refused" })),
         }),
@@ -419,7 +458,11 @@ it.effect("fails and persists a failed terminal when driving the execution fails
 
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
+    // …and the execution is no longer LIVE: its transcript is sealed, so no liveness
+    // gate can still be waiting on a handle that will never register.
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      false,
+    );
   }).pipe(
     provide({
       ...fakeHandle(Stream.empty, { _tag: "Completed" }),

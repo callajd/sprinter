@@ -83,6 +83,7 @@ import {
   type Execution,
   type ExecutionId,
   type ExecutionInput,
+  isExecutionLive,
   type Issue,
   type IssueId,
   Job,
@@ -572,7 +573,8 @@ const freshJobFor = (issueId: IssueId): Effect.Effect<Job> =>
 /**
  * Re-dispatch an issue's Job. {@link IssueNotFound} on an unknown issue. Reuses
  * the issue's most recent persisted Job — which carries its `executionId`, so the
- * `JobRunner` re-attaches to the SAME execution (1 Job = 1 execution) — or mints a
+ * `JobRunner` re-attaches to the SAME execution (the runner reuses the id; the store no
+ * longer constrains it to one) — or mints a
  * fresh implement Job when the issue has never been dispatched.
  *
  * "Most recent" is `listJobsForIssue`'s last row (ordered by id); under the current
@@ -623,22 +625,19 @@ const retry = (
 const isMidDispatchJob = (status: Job["status"]): boolean =>
   status === "queued" || status === "running";
 
-/**
- * True while a durable {@link Execution} row is still LIVE — i.e. genuinely
- * `starting`/`active`/`idle`, so its handle is registered or about to be. The
- * complement is a TERMINAL execution (`interrupted`/`completed`/`failed`), whose registry
- * entry is gone for good. A POSITIVE allow-list of the non-terminal statuses, so any
- * future status defaults to fail-fast.
- *
- * This is the belt to {@link isMidDispatchJob}'s braces (CE4.1-R4): `startup-reconcile`
- * can settle a stale `running` Job to `queued` under a paused Workstream — `queued` IS
- * mid-dispatch, so a Job-only gate would bounded-WAIT on that orphan and stall the full
- * resolve bound. Reconcile now also settles the Execution row to a terminal status, so
- * gating on BOTH (mid-dispatch Job AND live Execution) fails that `queued`-orphan fast
- * while still bridging a genuine mid-dispatch (running Job + `starting` Execution).
- */
-const isLiveExecutionRow = (status: Execution["status"]): boolean =>
-  status === "starting" || status === "active" || status === "idle";
+// A durable `Execution` row is LIVE exactly while its TRANSCRIPT is open
+// (`isExecutionLive`, `@sprinter/domain`), so its handle is registered or about to be;
+// a SEALED transcript is a run that has ended and whose registry entry is gone for
+// good. DE2.2 replaced the `ExecutionStatus` allow-list this used to consult: liveness
+// is now ONE value rather than an enum a settle path and a gate had to keep agreeing
+// about, so there is no longer a status this predicate could fail to classify.
+//
+// It remains the belt to `isMidDispatchJob`'s braces (CE4.1-R4): `startup-reconcile`
+// can settle a stale `running` Job to `queued` under a paused Workstream — `queued` IS
+// mid-dispatch, so a Job-only gate would bounded-WAIT on that orphan and stall the full
+// resolve bound. Reconcile SEALS the execution's transcript alongside, so gating on
+// BOTH (mid-dispatch Job AND live Execution) fails that `queued`-orphan fast while
+// still bridging a genuine mid-dispatch (running Job + live Execution).
 
 /**
  * Resolve the live {@link ExecutionHandle} for a `executionId`, choosing wait-vs-fail-fast
@@ -648,7 +647,7 @@ const isLiveExecutionRow = (status: Execution["status"]): boolean =>
  * - read the durable `Execution` row from the {@link StateStore} to recover the `jobId`
  *   it belongs to (1 Job = 1 execution); ABSENT → nothing is or will be registered, fail
  *   fast through `ExecutionRegistry.get`. A row that is itself TERMINAL (not
- *   {@link isLiveExecutionRow live}) also fails fast — it covers the reconcile
+ *   {@link isExecutionLive live}) also fails fast — it covers the reconcile
  *   `queued`-orphan (CE4.1-R4) whose Job stays mid-dispatch but whose Execution was settled;
  * - read that {@link Job} row; a job that is present AND still {@link isMidDispatchJob
  *   mid-dispatch} (`queued`/`running`) — with a LIVE Execution row — is bridged through
@@ -682,7 +681,7 @@ const resolveLive = (
     if (Option.isNone(execution)) return yield* registry.get(executionId);
     // Execution row TERMINAL → registry entry gone for good (settled, or a reconcile
     // `queued`-orphan whose Job stays mid-dispatch, CE4.1-R4); fail fast, no stall.
-    if (!isLiveExecutionRow(execution.value.status)) return yield* registry.get(executionId);
+    if (!isExecutionLive(execution.value)) return yield* registry.get(executionId);
     const job = yield* store.jobs.getJob(execution.value.jobId);
     // Job absent, or terminal → registry entry gone for good; fail fast.
     // Job mid-dispatch (queued/running) AND Execution live → bridge the register-after-
@@ -806,7 +805,7 @@ const resyncExecutionEvents = (
       // durable events replay an EMPTY transcript and COMPLETE (not error). A NON-terminal row
       // with no live handle and no transcript is a mid-dispatch execution whose handle never
       // registered → `ExecutionNotFound` (a transient the client retries), NOT a settled empty.
-      const settledRow = Option.isSome(execution) && !isLiveExecutionRow(execution.value.status);
+      const settledRow = Option.isSome(execution) && !isExecutionLive(execution.value);
       if (Option.isNone(live) && durable.length === 0 && !settledRow) {
         return Stream.fail<ExecutionEventsError>(new ExecutionNotFound({ id: executionId }));
       }

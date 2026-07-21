@@ -51,10 +51,13 @@ invariant).
 
 - Use Sprinter's words, not a vendor's: **PR** / **pull request** (not GitHub's
   "pulls"); **Issue**; **repository**.
-- Fixed hierarchy: **Workstream ⊃ Epic ⊃ Issue**. The execution unit is a **Job**
-  (1 Job = 1 Execution = 1 transcript = 1 PR). An **Execution** is one OS process
-  running one agent — the process-level concept Pi calls a "session"; we use its
-  word only behind the Pi adapter.
+- Fixed hierarchy: **Workstream ⊃ Epic ⊃ Issue**. The unit of work is a **Job**
+  (1 Job = 1 PR), advanced by a **tree** of **Execution**s — each one agent's
+  continuous run, producing exactly one **Transcript** (1 Execution = 1 Transcript).
+  An Execution is the process-level concept Pi calls a "session"; we use its word only
+  behind the Pi adapter. A run is `interactive` or `autonomous` (**mode**, which lives
+  on the Execution and nowhere above it), and its transcript is **live** or **sealed**
+  — two distinct types, never one type with a flag.
 
 ## Effect idioms
 

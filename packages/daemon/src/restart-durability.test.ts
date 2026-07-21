@@ -20,6 +20,7 @@ import { FileSystem } from "effect/FileSystem";
 import { BunFileSystem } from "@effect/platform-bun";
 import { expect } from "vitest";
 import {
+  Agent,
   Epic,
   Execution,
   Issue,
@@ -77,7 +78,21 @@ const issue = decode(Issue, {
   pr,
 });
 
-const execution = decode(Execution, { id: "execution-job-1", jobId: "job-1", status: "active" });
+const agent = decode(Agent, {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read"],
+});
+
+const execution = decode(Execution, {
+  id: "execution-job-1",
+  jobId: "job-1",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "SealedTranscript", lastOffset: 4 },
+});
 
 const job = decode(Job, {
   id: "job-1",
@@ -102,8 +117,11 @@ it.effect("the Job↔execution↔PR mapping survives a restart (build-write-rebu
       yield* store.workGraph.putWorkstream(workstream);
       yield* store.workGraph.putEpic(epic);
       yield* store.workGraph.putIssue(issue);
-      yield* store.jobs.putExecution(execution);
+      // The agent revision and the job row FIRST — both are foreign keys the execution
+      // names, so this order is the constraint, not a convention (DE2.2).
+      yield* store.agents.putAgent(agent);
       yield* store.jobs.putJob(job);
+      yield* store.jobs.putExecution(execution);
     }).pipe(Effect.provide(layer({ filename })));
 
     // ── REBUILD a fresh layer on the SAME file (the "restart") + read back ────
@@ -114,7 +132,8 @@ it.effect("the Job↔execution↔PR mapping survives a restart (build-write-rebu
       const reloadedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
       expect(reloadedJob).toStrictEqual(job);
 
-      // The execution is still reachable both by id and by the 1 Job = 1 execution link.
+      // The execution is still reachable both by id and through its job (which resolves
+      // to the tree's ROOT), transcript seal and all.
       const byJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
       expect(byJob).toStrictEqual(execution);
       const byId = Option.getOrThrow(yield* store.jobs.getExecution(execution.id));

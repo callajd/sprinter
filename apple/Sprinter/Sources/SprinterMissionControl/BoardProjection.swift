@@ -64,18 +64,22 @@ public enum BoardProjection {
   /// Which issues currently have a live agent, keyed by issue id.
   ///
   /// An issue is "live" when it has a `running` ``Job``, or a non-terminal job whose
-  /// ``Execution`` is `active` — the signals BE2.1 surfaces as per-agent activity. A
+  /// ``Execution`` is still running — i.e. its transcript is still OPEN
+  /// (``Execution/isLive``, DE2.2; there is no execution-status enum to consult). A
   /// TERMINAL job (`succeeded`/`failed`/`cancelled`) is never live even if a stale
-  /// `active` execution still points at it. The first live job encountered (in
-  /// snapshot order) represents the issue, so activity is deterministic for a
-  /// given snapshot.
+  /// live execution still points at it. The first live job encountered (in snapshot
+  /// order) represents the issue, so activity is deterministic for a given snapshot.
+  ///
+  /// A job may now own a TREE of executions, so the index below keeps the job's LIVE
+  /// one when there is one: "is this issue live?" must not depend on which sibling
+  /// happened to come last in the snapshot.
   private static func liveActivity(in snapshot: Snapshot) -> [IssueId: IssueActivity] {
-    let executionsByJob = indexed(snapshot.executions, by: \.jobId)
+    let executionsByJob = indexedPreferringLive(snapshot.executions)
     var activity: [IssueId: IssueActivity] = [:]
     for job in snapshot.jobs {
       let execution = executionsByJob[job.id]
       let terminal = job.status == .succeeded || job.status == .failed || job.status == .cancelled
-      let live = job.status == .running || (execution?.status == .active && !terminal)
+      let live = job.status == .running || (execution?.isLive == true && !terminal)
       guard live else { continue }
       if activity[job.issueId] == nil {
         // Prefer the job's declared execution; fall back to the execution that
@@ -86,6 +90,18 @@ public enum BoardProjection {
       }
     }
     return activity
+  }
+
+  /// Indexes the executions by job, keeping a LIVE one over a settled one — a job owns
+  /// a tree of executions (DE2.2), so "the execution for this job" must not be decided
+  /// by snapshot order. Among equals the last wins, as before (never a trap,
+  /// INV-NOFORCE).
+  private static func indexedPreferringLive(_ executions: [Execution]) -> [JobId: Execution] {
+    Dictionary(
+      executions.map { ($0.jobId, $0) },
+      uniquingKeysWith: { first, last in
+        first.isLive ? first : last
+      })
   }
 
   /// Indexes a collection by a derived id, keeping the last element on a

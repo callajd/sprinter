@@ -220,7 +220,7 @@ export const layerWith = (resolveTimeout: Duration.Duration): Layer.Layer<Execut
             ),
             () =>
               // Remove ONLY if this handle is still the one mapped: under execution-id
-              // reuse (1 Job = 1 execution — a re-dispatch registers a fresh handle under
+              // reuse (a re-dispatch registers a fresh handle under
               // the same id), a blind `remove(id)` on this handle's scope-close would
               // evict the live SUCCESSOR. Guard on identity so a superseded entry's
               // teardown never removes its replacement.

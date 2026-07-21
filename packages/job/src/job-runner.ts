@@ -12,10 +12,15 @@
  * flow (D2): the agent only does cognition; assigning execution ids, mapping
  * outcomes, and persisting rows is all owned here.
  *
- * The Issue→Job→execution mapping is durable and 1 Job = 1 execution: the execution id
- * is derived deterministically from the job (or reused from the job's existing
- * `executionId`), so a re-dispatch/restart re-attaches by upserting the SAME execution
- * id, never a new one (the store's `UNIQUE(execution.jobId)` enforces the invariant).
+ * The Issue→Job→execution mapping is durable, and one dispatch drives ONE execution:
+ * the execution id is derived deterministically from the job (or reused from the job's
+ * existing `executionId`), so a re-dispatch/restart re-attaches by upserting the SAME
+ * execution id, never a new one. (A job may now own a TREE of executions — DE2.2 —
+ * so that is a property of THIS dispatch, no longer a `UNIQUE` index on the store.)
+ *
+ * It is also the `Agent` registry's FIRST PRODUCTION WRITER (DE2.2 / D2): every
+ * dispatch registers the agent revision it runs and attributes the execution to it, so
+ * `Snapshot.agents` in a real daemon reflects the agents that actually ran.
  */
 import { Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
@@ -24,13 +29,14 @@ import {
   type ExecutionEvent,
   ExecutionId,
   type ExecutionInput,
-  type ExecutionStatus,
   type Issue,
   type Job,
   type JobResult,
+  type Transcript,
 } from "@sprinter/domain";
 import type { PiRpcError, PiTransportError, ExecutionResult } from "@sprinter/runner";
 import { StateStore, type StateStoreError } from "@sprinter/state";
+import { registerAgent } from "./agent-registration.ts";
 import { ExecutionRunner, type ExecutionRunnerError } from "./execution-runner.ts";
 
 /** Everything that can fail a dispatch: the two ports' failures plus driving the prompt. */
@@ -102,14 +108,6 @@ const isDurableTranscriptEvent = (event: ExecutionEvent): boolean =>
   event._tag === "EntryAppended" || event._tag === "Notice";
 
 /**
- * Map a settled execution's {@link ExecutionResult} onto the terminal {@link Execution}
- * status — TOTAL via discriminated matching (INV-NOCAST): a clean end completes
- * the execution, a transport teardown fails it.
- */
-const toExecutionStatus = (result: ExecutionResult): ExecutionStatus =>
-  result._tag === "Completed" ? "completed" : "failed";
-
-/**
  * Map a settled execution's {@link ExecutionResult} onto the terminal {@link JobResult}
  * envelope (D6) — TOTAL via discriminated matching (INV-NOCAST). `Completed` →
  * `succeeded`; `Failed` → `failed` carrying the neutral error detail. The open
@@ -125,20 +123,43 @@ const toJobResult = (result: ExecutionResult, payload: unknown): JobResult => {
 };
 
 /**
- * Best-effort persist of a `failed` terminal Job/execution when starting or driving
- * the execution fails — so a `run`/`send` failure never leaves the durable rows stuck
- * in the `running`/`starting` limbo the initial persist wrote. The terminal write is
- * best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
+ * SEAL an execution's transcript at the extent its durable log has reached — the write
+ * that ends a run (a settled execution's transcript is `[0, lastOffset]`: complete,
+ * immutable, cacheable).
+ *
+ * The extent is read from the durable log itself (`executionLog.maxOffset`, answered
+ * from the backing's index — no transcript is materialised), so the seal describes what
+ * was actually persisted rather than what this dispatch believes it appended. A
+ * transient read failure falls back to `0` rather than stopping the seal: an execution
+ * that stayed LIVE because the extent could not be read would look forever-running to
+ * every liveness gate, which is strictly worse than an understated extent (`0` is the
+ * empty-transcript sentinel, below every durable offset).
+ */
+const sealTranscript = (
+  store: Context.Service.Shape<typeof StateStore>,
+  executionId: ExecutionId,
+): Effect.Effect<Transcript> =>
+  store.executionLog.maxOffset(executionId).pipe(
+    Effect.orElseSucceed(() => 0),
+    Effect.map((lastOffset): Transcript => ({ _tag: "SealedTranscript", lastOffset })),
+  );
+
+/**
+ * Best-effort persist of a `failed` terminal Job and a SEALED execution when starting
+ * or driving the execution fails — so a `run`/`send` failure never leaves the durable
+ * rows stuck in the `running`/live limbo the initial persist wrote. The terminal write
+ * is best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
  * error still propagates to the caller.
  */
 const persistFailedTerminal = (
   store: Context.Service.Shape<typeof StateStore>,
   job: Job,
-  executionId: ExecutionId,
+  execution: Execution,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    yield* store.jobs.putExecution({ id: executionId, jobId: job.id, status: "failed" });
-    yield* store.jobs.putJob({ ...job, status: "failed", executionId });
+    const transcript = yield* sealTranscript(store, execution.id);
+    yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
+    yield* store.jobs.putExecution({ ...execution, transcript });
   }).pipe(Effect.orElseSucceed(() => undefined));
 
 /**
@@ -161,11 +182,38 @@ const dispatch = (
   Effect.gen(function* () {
     const executionId = yield* executionIdFor(job);
 
-    // Persist the durable Issue→Job→execution mapping BEFORE running: the same
-    // execution id on re-dispatch upserts in place (1 Job = 1 execution).
-    const startExecution: Execution = { id: executionId, jobId: job.id, status: "starting" };
-    yield* store.jobs.putExecution(startExecution);
+    // REGISTER the agent revision this run is attributed to, FIRST — the registry's
+    // first production writer (DE2.2 / D2), and a precondition rather than bookkeeping:
+    // `execution.agentId` is a FOREIGN KEY onto `agent`, so an execution cannot be
+    // stored until its agent revision is. Idempotent by construction (the id is derived
+    // from the content), so a re-dispatch appends nothing and fans out no delta.
+    const agentId = yield* registerAgent(store, runner.agent);
+
+    // Persist the durable Issue→Job→execution mapping BEFORE running. ORDER IS LOAD-
+    // BEARING: `execution."jobId"` is a FOREIGN KEY, so the Job row must exist before
+    // the execution that names it (D1 — the link is `jobId` only until DE2.4 re-points
+    // it at `sessionId`). The same execution id on re-dispatch upserts in place.
+    //
+    // The transcript starts LIVE: an open range with no last entry, which is also the
+    // whole of this execution's liveness (there is no status column to agree with —
+    // `Transcript`, `@sprinter/domain`). A re-dispatch re-opens the previous run's
+    // SEALED transcript, which is sound because offsets only ever grow: whatever a
+    // reader cached of `[0, lastOffset]` stays exactly correct (issue #77's merged
+    // single-transcript decision).
+    //
+    // `mode` is `autonomous`: the agent holds the turn for a dispatched Job and yields
+    // only when blocked. It is recorded on the EXECUTION and nowhere above it
+    // (INV-MODE). `parent` is absent — a dispatched Job's execution is a ROOT; a
+    // subagent's execution names it as parent, which is what makes the relation a tree.
+    const startExecution: Execution = {
+      id: executionId,
+      jobId: job.id,
+      agentId,
+      mode: "autonomous",
+      transcript: { _tag: "LiveTranscript" },
+    };
     yield* store.jobs.putJob({ ...job, status: "running", executionId });
+    yield* store.jobs.putExecution(startExecution);
 
     // Start + drive the execution and await its terminal outcome. On failure of
     // starting/driving (not a mere stream teardown), record a `failed` terminal so
@@ -210,7 +258,7 @@ const dispatch = (
           //   - an EPHEMERAL live delta is fanned out OFFSET-LESS via `publishEphemeral` — it
           //     reaches live subscribers to drive the reactive flow but is never persisted and
           //     never advances the reconnect cursor.
-          // 1 Job = 1 execution = 1 transcript, so this fold is the sole writer of this execution's
+          // 1 Execution = 1 Transcript, so this fold is the sole writer of this execution's
           // transcript; a re-dispatch APPENDS (never resets the offset sequence).
           Effect.gen(function* () {
             if (isDurableTranscriptEvent(event)) {
@@ -234,12 +282,12 @@ const dispatch = (
         Effect.orElseSucceed(() => undefined),
       );
       return yield* handle.result;
-    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, executionId)));
+    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, startExecution)));
 
     // The `entries` metric = the count of DURABLE `EntryAppended` records in the execution's
     // transcript, computed cheaply in the store (`countEntries` — a `COUNT(*)`, no full-log
     // read/decode). DECISION (issue #77): the MERGED single-transcript model is intended by
-    // construction — 1 Job = 1 execution = 1 durable transcript, and a re-dispatch/retry APPENDS
+    // construction — 1 Execution = 1 durable transcript, and a re-dispatch/retry APPENDS
     // to that SAME log (offsets monotonic, never reset). So the count reflects the concatenation
     // of EVERY run — matching the transcript the Inspector renders — rather than diverging to the
     // latest run (the per-dispatch `Ref` divergence). Retry runs are deliberately NOT segmented;
@@ -254,13 +302,17 @@ const dispatch = (
     const transcriptRef = yield* transcriptRefFor(executionId);
     const jobResult = toJobResult(settled, { transcriptRef, entries });
 
-    // Persist the terminal Job/execution rows.
-    yield* store.jobs.putExecution({
-      id: executionId,
-      jobId: job.id,
-      status: toExecutionStatus(settled),
-    });
+    // Persist the terminal Job row and SEAL the execution's transcript. The seal is the
+    // whole of "this run has ended": the transcript stops being tailable and becomes the
+    // closed, cacheable range `[0, lastOffset]`, and every liveness gate reads that one
+    // value. The run's OUTCOME (succeeded / failed) belongs to the Job it advanced —
+    // recording it a second time on the execution would be a lifecycle its transcript
+    // already determines (INV-LIFECYCLE).
     yield* store.jobs.putJob({ ...job, status: jobResult.status, executionId, transcriptRef });
+    yield* store.jobs.putExecution({
+      ...startExecution,
+      transcript: yield* sealTranscript(store, executionId),
+    });
 
     return jobResult;
   });

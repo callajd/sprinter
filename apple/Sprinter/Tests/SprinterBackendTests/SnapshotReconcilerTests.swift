@@ -48,7 +48,9 @@ struct SnapshotReconcilerTests {
   @Test("a new execution delta appends when absent")
   func appendsNewExecution() {
     let execution = Execution(
-      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .active)
+      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .live(LiveTranscript()))
     let result = reconciler.reconcile(Fixtures.snapshot, applying: .executionChanged(execution))
     #expect(result.executions == [execution])
   }
@@ -94,8 +96,14 @@ struct SnapshotReconcilerTests {
   @Test("folding a sequence of deltas keeps the state consistent")
   func foldsSequence() {
     let execution = Execution(
-      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .active)
-    let idle = Execution(id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .idle)
+      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .live(LiveTranscript()))
+    // The SAME execution, later: its run has ended, so its transcript is now SEALED.
+    let idle = Execution(
+      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .sealed(SealedTranscript(lastOffset: 4)))
     var state = Fixtures.snapshot
     for event in [
       WorkGraphEvent.executionChanged(execution),

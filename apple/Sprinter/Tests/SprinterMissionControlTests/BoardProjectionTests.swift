@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Board projection — hierarchy, status, activity")
 struct BoardProjectionTests {
+  /// A RUNNING execution for `job`: its transcript is still open, which is the whole of
+  /// its liveness (DE2.2 — there is no execution-status enum any more).
+  private func liveExecution(_ id: String, job: String) -> Execution {
+    Execution(
+      id: ExecutionId(rawValue: id), jobId: JobId(rawValue: job),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .live(LiveTranscript()))
+  }
+
+  /// A SETTLED execution for `job`: its transcript is sealed at the extent it reached.
+  private func settledExecution(_ id: String, job: String) -> Execution {
+    Execution(
+      id: ExecutionId(rawValue: id), jobId: JobId(rawValue: job),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .sealed(SealedTranscript(lastOffset: 3)))
+  }
+
   /// The snapshot projects into the cross-repo `Workstream ⊃ Epic ⊃ Issue` tree,
   /// preserving declared order and keeping each workstream on its own repo (D14).
   @Test("projects the cross-repo hierarchy in declared order")
@@ -66,10 +83,9 @@ struct BoardProjectionTests {
         BoardFixtures.job("job-idle", issue: "iss-idle", status: .queued, execution: "exe-idle")
       ],
       executions: [
-        Execution(
-          id: ExecutionId(rawValue: "exe-q"), jobId: JobId(rawValue: "job-q"), status: .active),
-        Execution(
-          id: ExecutionId(rawValue: "exe-idle"), jobId: JobId(rawValue: "job-idle"), status: .idle)
+        liveExecution("exe-q", job: "job-q"),
+        // A SETTLED execution: its transcript is sealed, so it is not a live agent.
+        settledExecution("exe-idle", job: "job-idle")
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
@@ -91,11 +107,8 @@ struct BoardProjectionTests {
         BoardFixtures.job("job-fb", issue: "iss-fb", status: .queued, execution: nil)
       ],
       executions: [
-        Execution(
-          id: ExecutionId(rawValue: "exe-done"), jobId: JobId(rawValue: "job-done"),
-          status: .active),
-        Execution(
-          id: ExecutionId(rawValue: "exe-fb"), jobId: JobId(rawValue: "job-fb"), status: .active)
+        liveExecution("exe-done", job: "job-done"),
+        liveExecution("exe-fb", job: "job-fb")
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []

@@ -20,7 +20,9 @@
  *    aborts the whole roll-up.
  * 2. **Resume running Jobs** — walk the (post-roll-up) graph and re-dispatch each
  *    `running` Job through the `JobRunner`, which re-attaches to the Job's PERSISTED
- *    execution id (1 Job = 1 execution, `UNIQUE(execution.jobId)`) — never a new execution.
+ *    execution id — never a new execution. (That re-attachment is the RUNNER's doing, not
+ *    a store constraint: DE2.2 dropped `UNIQUE(execution.jobId)`, because a job may own a
+ *    TREE of executions.)
  *    Each resume is a BACKGROUND fiber tied to the daemon scope (an execution can take
  *    minutes; boot must not block, mirroring the live `dispatchInBackground` path), so
  *    N in-flight executions resume concurrently and `run` returns promptly.
@@ -67,14 +69,7 @@
  * persist/reconcile/re-dispatch LOGIC, wired to the ports and tested offline.
  */
 import { Context, Effect, Layer, Option } from "effect";
-import {
-  type Issue,
-  isIssueLanded,
-  type Job,
-  type JobId,
-  type ExecutionStatus,
-  type WorkStatus,
-} from "@sprinter/domain";
+import { type Issue, isIssueLanded, type Job, type JobId, type WorkStatus } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { reconcileWorkstream, CodeHost } from "@sprinter/repository";
 import { StateStore, type StateStoreError } from "@sprinter/state";
@@ -122,20 +117,6 @@ type SettleStatus = "succeeded" | "cancelled" | "queued";
 type ResumeAction =
   | { readonly _tag: "resume" }
   | { readonly _tag: "settle"; readonly status: SettleStatus };
-
-/**
- * The terminal {@link ExecutionStatus} a settled Job's execution row is moved to alongside
- * the Job row (CE4.1-R4 root fix), so no stale NON-TERMINAL Execution outlives a settled
- * Job. `succeeded` → `completed`; `cancelled`/`queued` → `interrupted` (the pre-restart
- * turn ended; a later `control resume` of a `queued` Job re-attaches the same execution id
- * and moves it back to `starting`). A total map (INV-NOCAST): every {@link SettleStatus}
- * has a terminal image.
- */
-const executionSettleStatus: Record<SettleStatus, ExecutionStatus> = {
-  succeeded: "completed",
-  cancelled: "interrupted",
-  queued: "interrupted",
-};
 
 /**
  * Decide a `running` Job's fate. Resume is NARROWED (CE5-F4) to the genuinely-in-flight
@@ -221,21 +202,34 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
         );
 
       /**
-       * Settle a stale `running` Job to a terminal/pending status AND settle its EXECUTION
-       * row to a terminal status (CE4.1-R4 root fix) — writing ONLY the Job row would
-       * leave a NON-TERMINAL Execution orphan that stalls the execution-resolve gate. The
-       * execution write is conditional on a row existing (a `running` Job always has one,
-       * but the read stays graceful) and reuses the persisted execution id, so a later
-       * re-dispatch of a `queued` Job re-attaches the SAME execution (1 Job = 1 execution).
+       * Settle a stale `running` Job to a terminal/pending status AND SEAL its EXECUTION's
+       * transcript (CE4.1-R4 root fix) — writing ONLY the Job row would leave a LIVE
+       * Execution orphan that stalls the execution-resolve gate. The pre-restart run is
+       * over whatever the Job's fate is, and a sealed transcript is exactly that
+       * statement: the durable entries it produced are complete at the extent the log
+       * reached, and nothing will tail it.
+       *
+       * The execution write is conditional on a row existing (a `running` Job always has
+       * one, but the read stays graceful) and reuses the persisted execution id, so a
+       * later re-dispatch of a `queued` Job re-attaches the SAME execution and re-opens
+       * its transcript — sound because offsets only grow, so a cached prefix stays
+       * correct (see `Transcript`, `@sprinter/domain`).
+       *
+       * The extent comes from the durable log's own indexed `maxOffset`; a transient read
+       * failure seals at `0` (the empty-transcript sentinel) rather than leaving the
+       * execution LIVE forever, which is the failure this settle exists to prevent.
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {
           yield* store.jobs.putJob({ ...job, status });
           const execution = yield* store.jobs.getExecutionForJob(job.id);
           if (Option.isSome(execution)) {
+            const lastOffset = yield* store.executionLog
+              .maxOffset(execution.value.id)
+              .pipe(Effect.orElseSucceed(() => 0));
             yield* store.jobs.putExecution({
               ...execution.value,
-              status: executionSettleStatus[status],
+              transcript: { _tag: "SealedTranscript", lastOffset },
             });
           }
         });

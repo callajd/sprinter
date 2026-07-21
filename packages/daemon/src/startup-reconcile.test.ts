@@ -23,11 +23,13 @@
  * tmpfile) is proven separately in {@link ./restart-durability.test.ts}.
  */
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option, Queue, Schema } from "effect";
+import { type Context, Effect, Layer, Option, Queue, Schema } from "effect";
 import { expect } from "vitest";
 import {
+  Agent,
   Epic,
   Execution,
+  isExecutionLive,
   Issue,
   Job,
   type JobResult,
@@ -105,7 +107,38 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
   });
 
 const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
-  decode(Execution, { id: "execution-job-1", jobId: "job-1", status: "active", ...over });
+  decode(Execution, {
+    id: "execution-job-1",
+    jobId: "job-1",
+    agentId: "agt-1",
+    mode: "autonomous",
+    transcript: { _tag: "LiveTranscript" },
+    ...over,
+  });
+
+/** The registry revision every {@link execution} fixture is attributed to. */
+const agent = decode(Agent, {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read"],
+});
+
+/**
+ * Store a job and its execution, in the order the FOREIGN KEYs require: the agent
+ * revision and the job row must exist before an execution can name them (DE2.2).
+ */
+const seedRun = (
+  store: Context.Service.Shape<typeof StateStore>,
+  jobRow: Job,
+  executionRow: Execution,
+) =>
+  Effect.gen(function* () {
+    yield* store.agents.putAgent(agent);
+    yield* store.jobs.putJob(jobRow);
+    yield* store.jobs.putExecution(executionRow);
+  });
 
 const pullRef = (number: number, merged: boolean): PullRequestRef =>
   decode(PullRequestRef, {
@@ -299,8 +332,7 @@ it.effect("resumes a running Job onto its persisted execution id, never a new on
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -333,8 +365,11 @@ it.effect("does not re-dispatch an already-terminal Job", () =>
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution({ status: "completed" }));
-      yield* store.jobs.putJob(job({ status: "succeeded" }));
+      yield* seedRun(
+        store,
+        job({ status: "succeeded" }),
+        execution({ transcript: { _tag: "SealedTranscript", lastOffset: 3 } }),
+      );
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -363,8 +398,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream());
         yield* store.workGraph.putEpic(epic());
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putExecution(execution());
-        yield* store.jobs.putJob(job());
+        yield* seedRun(store, job(), execution());
 
         const startup = yield* StartupReconcile;
         const summary = yield* startup.run;
@@ -378,9 +412,10 @@ it.effect(
         expect(yield* Queue.size(dispatched)).toBe(0);
         const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
         expect(j1.status).toBe("succeeded");
-        // ROOT FIX (CE4.1-R4): a landed Job's EXECUTION row is settled to `completed`.
+        // ROOT FIX (CE4.1-R4): a landed Job's EXECUTION has its transcript SEALED, so
+        // nothing is left looking live to the execution-resolve gate.
         const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-        expect(s1.status).toBe("completed");
+        expect(isExecutionLive(s1)).toBe(false);
       }).pipe(
         Effect.provide(
           testLayer(
@@ -409,8 +444,7 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
       yield* store.workGraph.putEpic(epic({ status: "blocked" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -424,11 +458,11 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("queued");
-      // ROOT FIX (CE4.1-R4): the EXECUTION row is settled to a terminal status alongside
-      // the re-queued Job, so no NON-TERMINAL execution orphan survives to stall the
-      // execution-resolve gate. A later resume re-attaches this same id back to `starting`.
+      // ROOT FIX (CE4.1-R4): the EXECUTION's transcript is SEALED alongside the
+      // re-queued Job, so no LIVE execution orphan survives to stall the
+      // execution-resolve gate. A later resume re-attaches this same id and re-opens it.
       const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-      expect(s1.status).toBe("interrupted");
+      expect(isExecutionLive(s1)).toBe(false);
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -446,8 +480,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
       yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -463,7 +496,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       expect(j1.status).toBe("cancelled");
       // ROOT FIX (CE4.1-R4): the EXECUTION row is settled terminal alongside the Job.
       const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-      expect(s1.status).toBe("interrupted");
+      expect(isExecutionLive(s1)).toBe(false);
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -486,8 +519,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream({ status: "done" }));
         yield* store.workGraph.putEpic(epic({ status: "done" }));
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putExecution(execution());
-        yield* store.jobs.putJob(job());
+        yield* seedRun(store, job(), execution());
 
         const startup = yield* StartupReconcile;
         const summary = yield* startup.run;
@@ -501,7 +533,7 @@ it.effect(
         expect(j1.status).toBe("cancelled");
         // ROOT FIX (CE4.1-R4): its EXECUTION row is settled terminal alongside the Job.
         const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-        expect(s1.status).toBe("interrupted");
+        expect(isExecutionLive(s1)).toBe(false);
       }).pipe(
         Effect.provide(
           testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -525,11 +557,11 @@ it.effect("isolates a resume failure so the other in-flight Jobs still resume", 
       yield* store.workGraph.putIssue(issue(1));
       yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
       // Two running jobs; job-1's dispatch fails, job-2's succeeds.
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
-      yield* store.jobs.putExecution(execution({ id: "execution-job-2", jobId: "job-2" }));
-      yield* store.jobs.putJob(
+      yield* seedRun(store, job(), execution());
+      yield* seedRun(
+        store,
         job({ id: "job-2", issueId: "issue-2", executionId: "execution-job-2" }),
+        execution({ id: "execution-job-2", jobId: "job-2" }),
       );
 
       const startup = yield* StartupReconcile;

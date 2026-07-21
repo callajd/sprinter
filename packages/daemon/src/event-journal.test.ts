@@ -86,7 +86,20 @@ const job = Schema.decodeUnknownSync(Job)({
 const execution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
-  status: "active",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
+});
+// A SECOND execution for the SAME job (a subagent): stored so the transcript tests can
+// interleave two logs. `execution_event_log."executionId"` is a foreign key, so an
+// entry can only be appended for an execution that exists (DE2.2).
+const executionChild = Schema.decodeUnknownSync(Execution)({
+  id: "exe-2",
+  jobId: "job-1",
+  agentId: "agt-1",
+  parent: "exe-1",
+  mode: "interactive",
+  transcript: { _tag: "LiveTranscript" },
 });
 const agent = Schema.decodeUnknownSync(Agent)({
   id: "agt-1",
@@ -115,9 +128,22 @@ const seedGraph = (store: Context.Service.Shape<typeof StateStore>) =>
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
     yield* store.workGraph.putIssue(issue);
+    yield* store.agents.putAgent(agent);
     yield* store.jobs.putJob(job);
     yield* store.jobs.putExecution(execution);
+  });
+
+/**
+ * Store just what a TRANSCRIPT append needs: the agent revision, the job, and the two
+ * executions the entries are scoped to. Their ORDER is the foreign keys (agent and job
+ * before the execution that names them; the parent before the child).
+ */
+const seedRuns = (store: Context.Service.Shape<typeof StateStore>) =>
+  Effect.gen(function* () {
     yield* store.agents.putAgent(agent);
+    yield* store.jobs.putJob(job);
+    yield* store.jobs.putExecution(execution);
+    yield* store.jobs.putExecution(executionChild);
   });
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -133,9 +159,11 @@ it.effect("journals every persisted mutation to the durable offset log, in order
       "WorkstreamChanged",
       "EpicChanged",
       "IssueChanged",
+      // The AGENT revision is journaled before the execution attributed to it — that is
+      // the seed order the foreign key requires, not a preference (DE2.2).
+      "AgentChanged",
       "JobChanged",
       "ExecutionChanged",
-      "AgentChanged",
     ]);
     // Offsets are strictly increasing (the monotonic tail cursor).
     const offsets = entries.map((e) => e.offset);
@@ -343,10 +371,12 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
       { _tag: "WorkstreamChanged", workstream },
       { _tag: "EpicChanged", epic },
       { _tag: "IssueChanged", issue },
+      // The REGISTRY delta rides the same durable log as the work graph — and lands
+      // BEFORE the execution attributed to that revision, which is the order the
+      // `agentId` foreign key requires (DE2.2).
+      { _tag: "AgentChanged", agent },
       { _tag: "JobChanged", job },
       { _tag: "ExecutionChanged", execution },
-      // The REGISTRY delta rides the same durable log as the work graph.
-      { _tag: "AgentChanged", agent },
     ]);
     // Offsets are strictly increasing (the monotonic tail cursor) and all > 0.
     const offsets = replay.map((e) => e.offset);
@@ -361,9 +391,11 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
     expect(fromThird.map((e) => e.event._tag)).toEqual([
       "EpicChanged",
       "IssueChanged",
+      // The AGENT revision is journaled before the execution attributed to it — that is
+      // the seed order the foreign key requires, not a preference (DE2.2).
+      "AgentChanged",
       "JobChanged",
       "ExecutionChanged",
-      "AgentChanged",
     ]);
     expect(fromThird.every((e) => e.offset > cursor)).toBe(true);
   }).pipe(
@@ -395,9 +427,11 @@ it.effect("the live feed stamps every fanned-out delta with its durable offset (
       "WorkstreamChanged",
       "EpicChanged",
       "IssueChanged",
+      // The AGENT revision is journaled before the execution attributed to it — that is
+      // the seed order the foreign key requires, not a preference (DE2.2).
+      "AgentChanged",
       "JobChanged",
       "ExecutionChanged",
-      "AgentChanged",
     ]);
     // Monotonic, strictly increasing.
     const offsets = received.map((e) => e.offset);
@@ -757,7 +791,7 @@ it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () 
 // ── execution-transcript journaling + durable replay ─────────────────────────────────────────
 
 const executionA: ExecutionId = execution.id; // "exe-1"
-const executionB: ExecutionId = Schema.decodeUnknownSync(ExecutionId)("exe-2");
+const executionB: ExecutionId = executionChild.id; // "exe-2"
 const entryA1: ExecutionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "AssistantMessage", id: "a1", text: "hello" },
@@ -777,6 +811,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* seedRuns(store);
       // Interleave two executions to prove per-execution scoping AND that the shared global
       // offset counter keeps each execution's replay strictly increasing (not contiguous).
       yield* store.executionLog.append(executionA, entryA1);
@@ -811,6 +846,7 @@ it.effect(
 it.effect("the ExecutionEvents feed stamps every appended durable entry with its offset", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    yield* seedRuns(store);
     const executionFeed = yield* ExecutionEvents;
     // Subscribe BEFORE appending so the live fan-out is observed in order.
     const subscription = yield* executionFeed.subscribe;
@@ -842,6 +878,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const store = yield* StateStore;
+      yield* seedRuns(store);
       const executionFeed = yield* ExecutionEvents;
       const subscription = yield* executionFeed.subscribe;
 
@@ -873,6 +910,7 @@ it.effect(
 it.effect("a re-dispatch of the same execution APPENDS without resetting the offset sequence", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    yield* seedRuns(store);
     // First run persists two entries…
     yield* store.executionLog.append(executionA, entryA1);
     yield* store.executionLog.append(executionA, noticeA);

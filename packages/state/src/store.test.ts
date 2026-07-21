@@ -27,6 +27,8 @@ import {
   RepositoryId,
   RepositoryKey,
   Execution,
+  ExecutionEvent,
+  ExecutionId,
   Workstream,
 } from "@sprinter/domain";
 import {
@@ -118,7 +120,30 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
   });
 
 const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
-  decode(Execution, { id: "execution-1", jobId: "job-1", status: "active", ...over });
+  decode(Execution, {
+    id: "execution-1",
+    jobId: "job-1",
+    agentId: "agt-1",
+    mode: "autonomous",
+    transcript: { _tag: "LiveTranscript" },
+    ...over,
+  });
+
+/**
+ * Store the job and the agent revision every {@link execution} fixture references.
+ *
+ * `execution."jobId"` and `execution."agentId"` are real FOREIGN KEYs, so both referents
+ * have to exist before an execution can name them — that ordering requirement IS the
+ * constraint working, exactly as {@link seedRepository} is for `workstream`, and the FK
+ * tests below assert that skipping it is REJECTED rather than quietly stored.
+ */
+const executionId = (raw: string) => decode(ExecutionId, raw);
+
+const seedExecutionRefs = (store: Context.Service.Shape<typeof StateStore>) =>
+  Effect.gen(function* () {
+    yield* store.jobs.putJob(yield* job());
+    yield* store.agents.putAgent(yield* agent());
+  }).pipe(Effect.orDie);
 
 const agent = (over: Partial<(typeof Agent)["Encoded"]> = {}) =>
   decode(Agent, {
@@ -900,6 +925,7 @@ it.effect("elides a Job's absent optional links", () =>
 it.effect("maps an execution to and from its job", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
     const se = yield* execution();
     yield* store.jobs.putExecution(se);
     expect(Option.getOrThrow(yield* store.jobs.getExecution(se.id))).toStrictEqual(se);
@@ -907,25 +933,126 @@ it.effect("maps an execution to and from its job", () =>
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("enforces 1 Job = 1 execution, surfacing the backing failure as StateStoreError", () =>
+it.effect("round-trips a CHILD execution — the tree edge and the sealed transcript", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    const root = yield* execution();
+    yield* store.jobs.putExecution(root);
+    // A subagent: it names its parent, runs INTERACTIVE, and has already settled — so
+    // its transcript is the closed, cacheable range the sealed variant carries. Every
+    // field of the DE2.2 shape is exercised in one row, `parent` included.
+    const child = yield* execution({
+      id: "execution-2",
+      parent: "execution-1",
+      mode: "interactive",
+      transcript: { _tag: "SealedTranscript", lastOffset: 7 },
+    });
+    yield* store.jobs.putExecution(child);
+    expect(Option.getOrThrow(yield* store.jobs.getExecution(child.id))).toStrictEqual(child);
+    // The ROOT is what the job resolves to, not the child — `getExecutionForJob` reads
+    // `parent IS NULL`, so a tree does not make the answer arbitrary.
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(root.jobId)).id).toBe(
+      "execution-1",
+    );
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("stores MANY executions for one job — the tree the dropped UNIQUE index refused", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
     const first = yield* execution({ id: "execution-1", jobId: "job-1" });
     yield* store.jobs.putExecution(first);
-    // A second, DISTINCT execution for the same job violates the 1-execution-per-job
-    // invariant. This drives a real backing (UNIQUE-constraint) failure — the one
-    // place a SQL error is produced — and asserts INV-PORT: it crosses the port as
-    // the owned StateStoreError (operation named), never as a SQL/SQLite type.
-    const error = yield* store.jobs
-      .putExecution(yield* execution({ id: "execution-2", jobId: "job-1" }))
-      .pipe(Effect.flip);
-    expect(error).toBeInstanceOf(StateStoreError);
-    expect(error.operation).toBe("putExecution");
-    expect(error.detail.length).toBeGreaterThan(0);
-    // The first execution remains the deterministic answer for the job.
+    // Two executions for ONE job. This FAILED before DE2.2 (`UNIQUE execution_job`) and
+    // must now SUCCEED: a job is advanced by a TREE of executions, so uniqueness would
+    // refuse the model rather than protect it.
+    const second = yield* execution({ id: "execution-2", jobId: "job-1", parent: "execution-1" });
+    yield* store.jobs.putExecution(second);
+    expect(Option.isSome(yield* store.jobs.getExecution(second.id))).toBe(true);
+    // And the job still resolves DETERMINISTICALLY — to its root, by definition, not to
+    // whichever row the backing happened to return first.
     expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(first.jobId)).id).toBe(
       "execution-1",
     );
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses an execution naming an UNSTORED job — the FOREIGN KEY, not a check", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.agents.putAgent(yield* agent());
+    // No `putJob`: the job this execution names does not exist. The engine refuses the
+    // INSERT, so a dangling `jobId` is unstorable rather than reconciled later
+    // (INV-ENFORCE). It crosses the port as the owned StateStoreError (INV-PORT).
+    const error = yield* store.jobs.putExecution(yield* execution()).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putExecution");
+    expect(error.detail.length).toBeGreaterThan(0);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses an execution naming an UNREGISTERED agent revision", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.jobs.putJob(yield* job());
+    // No `putAgent`: the registry has no such revision. `Execution.agentId` is a real
+    // key into it, so an execution attributed to an agent nobody registered cannot be
+    // stored — which is also why a DANGLING `agentId` is unconstructible (D2/D3).
+    const error = yield* store.jobs.putExecution(yield* execution()).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putExecution");
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses a DANGLING parent and a SELF-parent — the tree is acyclic by construction", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    // (a) DANGLING — a parent that is not stored. Refused by the FOREIGN KEY, so no
+    // write ORDER can close a cycle of length >= 2: doing it in the other order needs an
+    // edge naming a row that does not exist yet, which is this very rejection.
+    const dangling = yield* store.jobs
+      .putExecution(yield* execution({ id: "execution-2", parent: "execution-absent" }))
+      .pipe(Effect.flip);
+    expect(dangling).toBeInstanceOf(StateStoreError);
+    expect(dangling.operation).toBe("putExecution");
+    // (b) SELF — the ONE edge a referential constraint accepts (a row satisfies a key
+    // against itself), so the port rejects it explicitly. Together with (a) that makes
+    // the relation acyclic BY CONSTRUCTION, exactly as `putAgent` + the `supersedes` key
+    // do for the registry lineage (the #85 lesson).
+    const self = yield* store.jobs
+      .putExecution(yield* execution({ id: "execution-3", parent: "execution-3" }))
+      .pipe(Effect.flip);
+    expect(self).toBeInstanceOf(StateStoreError);
+    expect(self.operation).toBe("putExecution");
+    expect(self.detail).toContain("itself");
+    // POSITIVE CONTROL: a WELL-FORMED parent, in the same test, is stored — so the two
+    // refusals above are the constraints working, not every write failing.
+    yield* store.jobs.putExecution(yield* execution());
+    yield* store.jobs.putExecution(yield* execution({ id: "execution-4", parent: "execution-1" }));
+    expect(Option.isSome(yield* store.jobs.getExecution(yield* executionId("execution-4")))).toBe(
+      true,
+    );
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("refuses a transcript entry for an execution that was never stored", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    // `execution_event_log."executionId"` is a FOREIGN KEY (DE2.2): 1 Execution = 1
+    // Transcript, so a transcript with no run to belong to is an orphan nothing can
+    // resolve — and is refused at the append rather than stored.
+    const entry = yield* decode(ExecutionEvent, { _tag: "ExecutionIdle" });
+    const error = yield* store.executionLog
+      .append(yield* executionId("execution-absent"), entry)
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    // POSITIVE CONTROL: the same append against a STORED execution succeeds.
+    yield* store.jobs.putExecution(yield* execution());
+    const persisted = yield* store.executionLog.append(yield* executionId("execution-1"), entry);
+    expect(persisted.offset).toBeGreaterThan(0);
   }).pipe(Effect.provide(layerMemory)),
 );
 

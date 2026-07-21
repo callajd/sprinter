@@ -52,14 +52,18 @@ public enum JobStatus: String, Codable, CaseIterable, Sendable {
   case cancelled
 }
 
-/// Execution lifecycle status.
-public enum ExecutionStatus: String, Codable, CaseIterable, Sendable {
-  case starting
-  case active
-  case idle
-  case interrupted
-  case completed
-  case failed
+/// Who holds the turn in an ``Execution`` — a CLOSED axis (DE2.2).
+///
+/// `interactive`: the human holds the turn and the agent yields at the end of each one.
+/// `autonomous`: the agent holds the turn and yields only when blocked.
+///
+/// It lives on the EXECUTION and nowhere above it (INV-MODE): an interactive session
+/// spawns autonomous subagents and an autonomous one escalates to a human, so a
+/// session-level mode would be a second source of truth. A session's character is the
+/// mode of its ROOT execution — derived by reading that execution, never stored.
+public enum ExecutionMode: String, Codable, CaseIterable, Sendable {
+  case interactive
+  case autonomous
 }
 
 /// A reference to the pull request that closes an ``Issue``.
@@ -282,16 +286,51 @@ public struct Job: Codable, Equatable, Sendable {
   }
 }
 
-/// An execution: one agent run executing a ``Job``.
+/// An execution: ONE AGENT'S CONTINUOUS RUN, producing exactly one ``Transcript``
+/// (DE2.2).
+///
+/// - ``jobId``: the work this run advances. **Only until DE2.4** — the target model
+///   links an execution to the `Session` that owns it, but that type does not exist
+///   yet, so the daemon keeps the existing job link (a real foreign key) and re-points
+///   it later.
+/// - ``agentId``: the exact ``Agent`` REVISION that ran. The registry is append-only, so
+///   a historical execution always resolves to the agent that actually ran it — look it
+///   up in ``Snapshot/agents``.
+/// - ``parent``: the execution that SPAWNED this one; `nil` on a ROOT. Executions form a
+///   TREE, so one job may carry several.
+/// - ``mode``: who holds the turn (``ExecutionMode``), per execution.
+/// - ``transcript``: LIVE or SEALED (``Transcript``), which is also where liveness lives
+///   — there is deliberately no execution-status enum beside it, so nothing can disagree
+///   with it. A settled run's OUTCOME belongs to the ``Job`` it advanced.
 public struct Execution: Codable, Equatable, Sendable {
   public let id: ExecutionId
   public let jobId: JobId
-  public let status: ExecutionStatus
+  public let agentId: AgentId
+  public let parent: ExecutionId?
+  public let mode: ExecutionMode
+  public let transcript: Transcript
 
-  public init(id: ExecutionId, jobId: JobId, status: ExecutionStatus) {
+  /// True while this run is still going — i.e. its transcript is still open. The ONE
+  /// expression of liveness in the model.
+  public var isLive: Bool {
+    if case .live = transcript { return true }
+    return false
+  }
+
+  public init(
+    id: ExecutionId,
+    jobId: JobId,
+    agentId: AgentId,
+    parent: ExecutionId?,
+    mode: ExecutionMode,
+    transcript: Transcript
+  ) {
     self.id = id
     self.jobId = jobId
-    self.status = status
+    self.agentId = agentId
+    self.parent = parent
+    self.mode = mode
+    self.transcript = transcript
   }
 }
 

@@ -97,6 +97,7 @@ const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   4: "ac07e2636d90f3fa43cf7265cc16747c29ba0af4b822461873b1f1ec24fd9572",
   5: "45ac3c1188e9d0fed3d26ce55a38b838389bc137da0974c3a2100ece0c9f599f",
   6: "a9753b45791103db9e9384ad15948e8a9ee58a1060370410c0b5a6b521c5b860",
+  7: "09d407d8024db421d7046ad2ec59aef0660868364f595d2292b5ffee1d0f9d67",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */

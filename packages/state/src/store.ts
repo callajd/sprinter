@@ -22,7 +22,7 @@
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
  * - {@link JobStore} — the `Job` model and the `Issue → Job → execution → PR`
- *   mapping (1 Job = 1 execution = 1 transcript = 1 PR), plus {@link Execution}.
+ *   mapping, plus the {@link Execution} TREE that advances a job.
  * - {@link EventLogStore} — an append-only durable event feed (append / ordered
  *   read / tail-from-offset): the durable event record distinct from the reactive
  *   in-memory stream, supporting D17 reconciliation and AE4's snapshot.
@@ -377,9 +377,12 @@ export interface WorkGraphStore {
 
 /**
  * Persist and read the {@link Job} model and the `Issue → Job → execution → PR`
- * mapping (1 Job = 1 execution = 1 transcript = 1 PR). `putJob` carries a job's
- * optional `executionId` / `transcriptRef` / `pr`; {@link Execution} rows are stored
- * alongside so a job can be resolved to its running execution (and back).
+ * mapping. `putJob` carries a job's optional `executionId` / `transcriptRef` / `pr`;
+ * {@link Execution} rows are stored alongside so a job can be resolved to its running
+ * execution (and back).
+ *
+ * A job is advanced by a TREE of executions (DE2.2), not by exactly one: `putExecution`
+ * accepts many per job, and `getExecutionForJob` answers with the tree's ROOT.
  */
 export interface JobStore {
   /** Upsert a {@link Job} (with its optional execution / transcript / PR links). */
@@ -391,17 +394,35 @@ export interface JobStore {
     issueId: IssueId,
   ) => Effect.Effect<ReadonlyArray<Job>, StateStoreError>;
   /**
-   * Upsert an {@link Execution} (by execution id). At most one execution may exist per
-   * job (1 Job = 1 execution); attaching a second, distinct execution to a job that
-   * already has one fails with {@link StateStoreError}. A restart re-attaches by
-   * upserting the SAME execution id, not a new one.
+   * Upsert an {@link Execution} (by execution id). A job owns a TREE of executions
+   * (DE2.2 dropped the `UNIQUE (jobId)` index), so a SECOND execution for a job is
+   * ordinary and SUCCEEDS; what fails is a reference the model does not admit:
+   *
+   * - a `jobId` naming a job that is NOT STORED, an `agentId` naming an unregistered
+   *   agent revision, or a `parent` naming an execution that is not stored — all three
+   *   are real FOREIGN KEYs in the adapter, refused by the engine at the write rather
+   *   than reconciled later (INV-ENFORCE);
+   * - a `parent` equal to the execution's own `id`. That is the single edge a
+   *   referential constraint accepts (a row satisfies a key against itself), so it is
+   *   rejected HERE, and with it closed no cycle of any length is constructible: a
+   *   longer one needs an edge naming a row that does not exist yet.
+   *
+   * A restart re-attaches by upserting the SAME execution id, not a new one.
    */
   readonly putExecution: (execution: Execution) => Effect.Effect<void, StateStoreError>;
   /** Read an {@link Execution} by id, if present. */
   readonly getExecution: (
     id: ExecutionId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
-  /** Read the execution executing a given job (the `Job → execution` mapping), if present. */
+  /**
+   * Read a job's ROOT execution — the one with no `parent`, lowest id — if present.
+   *
+   * "The execution for this job" needed a DEFINITION once a job could own a tree, and
+   * this is it. It is answered by the backing (`ORDER BY id LIMIT 1`), so it is
+   * deterministic for every history the store can hold rather than for the ones a
+   * caller happens to expect. DE2.4 removes the lookup: a `Session` names its `root`
+   * outright.
+   */
   readonly getExecutionForJob: (
     jobId: JobId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
@@ -437,8 +458,11 @@ export interface EventLogStore {
 }
 
 /**
- * The append-only durable EXECUTION-TRANSCRIPT log, keyed per execution (1 Job = 1 execution
- * = 1 transcript). It is the execution-channel analogue of {@link EventLogStore}: `append`
+ * The append-only durable EXECUTION-TRANSCRIPT log, keyed per execution (1 Execution =
+ * 1 Transcript — and the key is REAL: the adapter's `execution_event_log."executionId"`
+ * is a FOREIGN KEY onto `execution (id)`, so an entry for an execution that was never
+ * stored is refused at the append rather than left as an orphan nothing can resolve).
+ * It is the execution-channel analogue of {@link EventLogStore}: `append`
  * stamps an execution's next transcript entry with a monotonic `offset` and returns the
  * persisted entry; `read` returns an execution's whole transcript in order; `tail` returns a
  * execution's entries strictly after a given offset — the primitive the `executionEvents`

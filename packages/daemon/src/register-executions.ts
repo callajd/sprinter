@@ -53,6 +53,10 @@ export const layerRegisterExecutions = <E, R>(
       const registry = yield* ExecutionRegistry;
       const base = yield* ExecutionRunner;
       return ExecutionRunner.of({
+        // Transparent about WHAT runs, too: the decorator adds registration, never a
+        // different agent, so the inner adapter's declared revision passes through and
+        // the dispatcher attributes executions to the agent that actually ran them.
+        agent: base.agent,
         run: (job) =>
           base
             .run(job)

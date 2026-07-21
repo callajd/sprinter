@@ -23,7 +23,7 @@
 import { Cause, Deferred, Effect, Layer, Option, Pull, Ref, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import type { Job, ExecutionEvent } from "@sprinter/domain";
+import type { AgentContent, Job, ExecutionEvent } from "@sprinter/domain";
 import {
   type ExecutionHandle,
   type ExecutionResult,
@@ -33,6 +33,32 @@ import {
 } from "@sprinter/runner";
 import { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
 import { PiSpawnRouter } from "./spawn-router.ts";
+
+/**
+ * The agent revision this adapter runs — the `pi` CLI as Sprinter dispatches it
+ * (DE2.2 / D2). Every execution it starts is attributed to THIS content, and the
+ * registry revision's id is DERIVED from it (`agent-registration.ts`), so changing any
+ * field here lands as a new revision rather than colliding with the old one.
+ *
+ * Two fields are recorded honestly rather than invented:
+ *
+ * - `model` — the model selection is `pi`'s OWN configuration. This adapter spawns
+ *   `pi --mode rpc` and the wire it consumes reports the resolved model only through a
+ *   `get_state` response the {@link ExecutionHandle} does not surface, so what Sprinter
+ *   can truthfully say today is "whatever `pi` resolves for itself". When the runner
+ *   learns the concrete model, this content changes — and because identity is
+ *   content-derived, that is automatically a NEW registry revision, with every past
+ *   execution still resolving to the one it actually ran under.
+ * - `tools` — likewise `pi`'s own configuration, so Sprinter declares NO tool
+ *   allow-list here rather than asserting one it does not enforce. An empty list is
+ *   "not declared by Sprinter", and it is not a claim that the agent has no tools.
+ */
+export const LOCAL_PI_AGENT: AgentContent = {
+  name: "pi",
+  model: "pi-cli-default",
+  version: "1.0.0",
+  tools: [],
+};
 
 /** The `ExecutionIdle` (Pi `agent_settled`) event that ends a one-shot dispatch. */
 const isExecutionIdle = (event: ExecutionEvent): boolean => event._tag === "ExecutionIdle";
@@ -175,6 +201,7 @@ export const layerLocalPi: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const router = yield* PiSpawnRouter;
     return ExecutionRunner.of({
+      agent: LOCAL_PI_AGENT,
       run: (job) =>
         router.configFor(job).pipe(
           Effect.flatMap((config) => run(job, config)),
