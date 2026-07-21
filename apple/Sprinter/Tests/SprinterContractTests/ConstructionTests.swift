@@ -115,8 +115,16 @@ struct ConstructionTests {
   @Test("builds an execution equal to the golden")
   func buildsExecution() throws {
     let built = Execution(
-      id: ExecutionId(rawValue: "exe-1"), jobId: JobId(rawValue: "job-1"), status: .active)
+      id: ExecutionId(rawValue: "exe-1"), jobId: JobId(rawValue: "job-1"),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .live(LiveTranscript()))
     #expect(built == (try Golden.decode(Execution.self, from: "execution")))
+    // The CHILD form: `parent` present, the other mode, the other transcript variant.
+    let child = Execution(
+      id: ExecutionId(rawValue: "exe-2"), jobId: JobId(rawValue: "job-1"),
+      agentId: AgentId(rawValue: "agt-2"), parent: ExecutionId(rawValue: "exe-1"),
+      mode: .interactive, transcript: .sealed(SealedTranscript(lastOffset: 12)))
+    #expect(child == (try Golden.decode(Execution.self, from: "execution-child")))
   }
 
   @Test("builds a snapshot equal to the golden")

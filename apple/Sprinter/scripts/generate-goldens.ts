@@ -133,7 +133,35 @@ const jobFull = {
 };
 const jobMinimal = { id: "job-2", issueId: "iss-2", kind: "review", status: "queued" };
 
-const execution = { id: "exe-1", jobId: "job-1", status: "active" };
+// ── Execution fixtures (DE2.2) ───────────────────────────────────────────────
+//
+// TWO of them, and the pair is deliberate — between them they pin every shape the
+// entity has: the ROOT execution OMITS `parent` (the absent form the #89 census needs)
+// and runs AUTONOMOUS with a LIVE transcript; the CHILD CARRIES `parent`, runs
+// INTERACTIVE, and carries a SEALED transcript with its extent. So each `mode` literal
+// and each transcript variant appears in the corpus, and `parent` appears in both its
+// present and its omitted form.
+//
+// `agentId` REFERENCES a revision in the registry fixtures below — the ROOT names
+// `agt-1` and the CHILD names `agt-2`, so the corpus pins that DIFFERENT executions in
+// ONE job may run DIFFERENT agent revisions rather than a job-wide one. An execution
+// names the revision of the run it records, and the reference is a real foreign key in
+// the store.
+const execution = {
+  id: "exe-1",
+  jobId: "job-1",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
+};
+const executionChild = {
+  id: "exe-2",
+  jobId: "job-1",
+  agentId: "agt-2",
+  parent: "exe-1",
+  mode: "interactive",
+  transcript: { _tag: "SealedTranscript", lastOffset: 12 },
+};
 
 // ── Registry fixtures (DE1.1) ────────────────────────────────────────────────
 //
@@ -225,7 +253,7 @@ write("snapshot", Snapshot, {
   epics: [epic],
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
-  executions: [execution],
+  executions: [execution, executionChild],
   // BYTE order by id (SQLite's default BINARY collation) — the order `listAgents`
   // pins and the daemon hydrates in.
   // It is presentational (a client upserts by id); a lineage is read off
@@ -249,6 +277,7 @@ write("issue-no-pr", Issue, issueNoPr);
 write("job-full", Job, jobFull);
 write("job-minimal", Job, jobMinimal);
 write("execution", Execution, execution);
+write("execution-child", Execution, executionChild);
 write("agent-original", Agent, agentOriginal);
 write("agent-revised", Agent, agentRevised);
 write("agent-retired", Agent, agentRetired);

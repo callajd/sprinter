@@ -76,7 +76,13 @@ const issue = {
   dependsOn: ["iss-0"],
 };
 const job = { id: "job-1", issueId: "iss-1", kind: "implement", status: "running" };
-const execution = { id: "exe-1", jobId: "job-1", status: "active" };
+const execution = {
+  id: "exe-1",
+  jobId: "job-1",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
+};
 const agent = {
   id: "agt-1",
   name: "implementer",
@@ -481,6 +487,6 @@ it("rejects a payload that is not an owned domain value", () => {
 it("uses only owned domain fixtures", () => {
   expect(Schema.decodeUnknownSync(Issue)(issue).epicId).toBe("ep-1");
   expect(Schema.decodeUnknownSync(Job)(job).kind).toBe("implement");
-  expect(Schema.decodeUnknownSync(Execution)(execution).status).toBe("active");
+  expect(Schema.decodeUnknownSync(Execution)(execution).transcript._tag).toBe("LiveTranscript");
   expect(Schema.decodeUnknownSync(Agent)(agent).tools).toEqual(["read", "edit"]);
 });

@@ -1,0 +1,11 @@
+{
+  "id": "exe-2",
+  "jobId": "job-1",
+  "agentId": "agt-2",
+  "parent": "exe-1",
+  "mode": "interactive",
+  "transcript": {
+    "_tag": "SealedTranscript",
+    "lastOffset": 12
+  }
+}

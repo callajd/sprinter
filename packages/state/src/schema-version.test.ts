@@ -80,6 +80,16 @@ const withStore = <A>(
  * When the schema changes: bump {@link SCHEMA_VERSION} and ADD a row. Do not edit an
  * existing row.
  *
+ * **"CHANGES" MEANS CHANGES THAT LAND.** A row is a schema that SHIPPED, and the ledger
+ * is read as a changelog of shapes an already-deployed store may be holding — so a
+ * version that only ever existed on a review branch has no reader and no store, and
+ * leaving one behind claims a history that did not happen. Reshaping the SAME unlanded
+ * schema across review rounds therefore REWRITES the pending row rather than appending
+ * another; the "never edit" rule binds from the moment a row reaches the default branch,
+ * which is the moment a store can exist at that version. (Concretely: DE2.2 reshaped
+ * `execution` three times in review and briefly carried rows 7, 8 AND 9 for one landing,
+ * reading as three historical schemas where there was one.)
+ *
  * **HISTORICAL ROWS ARE DOCUMENTATION, NOT VERIFIED GUARDS.** Only the row for the
  * CURRENT {@link SCHEMA_VERSION} is re-derived and compared below; every earlier row
  * pins DDL that no longer exists anywhere in the tree, so its digest can never be
@@ -97,6 +107,7 @@ const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   4: "ac07e2636d90f3fa43cf7265cc16747c29ba0af4b822461873b1f1ec24fd9572",
   5: "45ac3c1188e9d0fed3d26ce55a38b838389bc137da0974c3a2100ece0c9f599f",
   6: "a9753b45791103db9e9384ad15948e8a9ee58a1060370410c0b5a6b521c5b860",
+  7: "19ee48eb126c67d279d870706cc758e8fbcd5e224ea5a7996d160e2b8d151eb9",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */

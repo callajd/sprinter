@@ -34,7 +34,10 @@ const cannedHandle: ExecutionHandle = {
 /** A fake inner {@link ExecutionRunner} that hands back the {@link cannedHandle}. */
 const fakeInner: Layer.Layer<ExecutionRunner> = Layer.succeed(
   ExecutionRunner,
-  ExecutionRunner.of({ run: () => Effect.succeed(cannedHandle) }),
+  ExecutionRunner.of({
+    agent: { name: "pi", model: "test-model", version: "1.0.0", tools: [] },
+    run: () => Effect.succeed(cannedHandle),
+  }),
 );
 
 /** The decorated runner over the fake inner + a real registry. */

@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Board projection — hierarchy, status, activity")
 struct BoardProjectionTests {
+  /// A RUNNING execution for `job`: its transcript is still open, which is the whole of
+  /// its liveness (DE2.2 — there is no execution-status enum any more).
+  private func liveExecution(_ id: String, job: String) -> Execution {
+    Execution(
+      id: ExecutionId(rawValue: id), jobId: JobId(rawValue: job),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .live(LiveTranscript()))
+  }
+
+  /// A SETTLED execution for `job`: its transcript is sealed at the extent it reached.
+  private func settledExecution(_ id: String, job: String) -> Execution {
+    Execution(
+      id: ExecutionId(rawValue: id), jobId: JobId(rawValue: job),
+      agentId: AgentId(rawValue: "agt-1"), parent: nil, mode: .autonomous,
+      transcript: .sealed(SealedTranscript(lastOffset: 3)))
+  }
+
   /// The snapshot projects into the cross-repo `Workstream ⊃ Epic ⊃ Issue` tree,
   /// preserving declared order and keeping each workstream on its own repo (D14).
   @Test("projects the cross-repo hierarchy in declared order")
@@ -66,10 +83,9 @@ struct BoardProjectionTests {
         BoardFixtures.job("job-idle", issue: "iss-idle", status: .queued, execution: "exe-idle")
       ],
       executions: [
-        Execution(
-          id: ExecutionId(rawValue: "exe-q"), jobId: JobId(rawValue: "job-q"), status: .active),
-        Execution(
-          id: ExecutionId(rawValue: "exe-idle"), jobId: JobId(rawValue: "job-idle"), status: .idle)
+        liveExecution("exe-q", job: "job-q"),
+        // A SETTLED execution: its transcript is sealed, so it is not a live agent.
+        settledExecution("exe-idle", job: "job-idle")
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
@@ -91,11 +107,8 @@ struct BoardProjectionTests {
         BoardFixtures.job("job-fb", issue: "iss-fb", status: .queued, execution: nil)
       ],
       executions: [
-        Execution(
-          id: ExecutionId(rawValue: "exe-done"), jobId: JobId(rawValue: "job-done"),
-          status: .active),
-        Execution(
-          id: ExecutionId(rawValue: "exe-fb"), jobId: JobId(rawValue: "job-fb"), status: .active)
+        liveExecution("exe-done", job: "job-done"),
+        liveExecution("exe-fb", job: "job-fb")
       ])
 
     let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
@@ -106,6 +119,59 @@ struct BoardProjectionTests {
     let fallback = byId[IssueId(rawValue: "iss-fb")]
     #expect(fallback?.hasLiveAgent == true)
     #expect(fallback?.activity?.executionId == ExecutionId(rawValue: "exe-fb"))
+  }
+
+  /// PINS THE DELIBERATE WIDENING (DE2.2) and its dependency on the daemon's seal.
+  ///
+  /// ``BoardProjection/liveActivity`` now fires for a QUEUED job holding an OPEN
+  /// transcript. That is not a hypothetical state: `startup-reconcile` produces it on
+  /// purpose — a paused workstream's `running` job is settled to `queued` — and the ONLY
+  /// thing that clears it is the same settle SEALING the job's executions. So the board's
+  /// answer here is a direct readout of whether that seal landed, which is why it is
+  /// pinned by a test rather than left to the docstring.
+  ///
+  /// Three jobs, one per state the seal can leave behind:
+  ///
+  /// - `iss-open` — queued, transcript OPEN. The pre-seal state: LIVE (the widening).
+  /// - `iss-sealed` — queued, transcript SEALED. What a correct settle produces: NOT live.
+  /// - `iss-partial` — queued, ROOT sealed but a CHILD still open. What a settle that
+  ///   sealed only `getExecutionForJob`'s root produced: still LIVE, so a root-only seal
+  ///   does not clear the board and the stall stays visible. This is the Swift-side
+  ///   witness for the daemon's "seal EVERY execution" test.
+  @Test("a queued job with an open transcript is live until EVERY execution is sealed")
+  func queuedJobLivenessTracksTheSeal() {
+    let child = Execution(
+      id: ExecutionId(rawValue: "exe-partial-child"), jobId: JobId(rawValue: "job-partial"),
+      agentId: AgentId(rawValue: "agt-1"), parent: ExecutionId(rawValue: "exe-partial"),
+      mode: .autonomous, transcript: .live(LiveTranscript()))
+    let snapshot = BoardFixtures.singleEpicSnapshot(
+      issueIds: ["iss-open", "iss-sealed", "iss-partial"],
+      jobs: [
+        BoardFixtures.job("job-open", issue: "iss-open", status: .queued, execution: "exe-open"),
+        BoardFixtures.job(
+          "job-sealed", issue: "iss-sealed", status: .queued, execution: "exe-sealed"),
+        BoardFixtures.job(
+          "job-partial", issue: "iss-partial", status: .queued, execution: "exe-partial")
+      ],
+      executions: [
+        liveExecution("exe-open", job: "job-open"),
+        settledExecution("exe-sealed", job: "job-sealed"),
+        settledExecution("exe-partial", job: "job-partial"),
+        child
+      ])
+
+    let issues = BoardProjection.project(snapshot).first?.epics.first?.issues ?? []
+    let byId = Dictionary(uniqueKeysWithValues: issues.map { ($0.id, $0) })
+    #expect(byId[IssueId(rawValue: "iss-open")]?.hasLiveAgent == true)
+    #expect(byId[IssueId(rawValue: "iss-sealed")]?.hasLiveAgent == false)
+    #expect(byId[IssueId(rawValue: "iss-partial")]?.hasLiveAgent == true)
+    // `iss-partial` is live BECAUSE of the child: `indexedPreferringLive` keeps the OPEN
+    // execution over the sealed root, so a single unsealed node anywhere in the tree keeps
+    // the issue live. The id the activity NAMES is still the job's declared one — the
+    // fallback to the indexed execution only applies when `job.executionId` is nil.
+    #expect(
+      byId[IssueId(rawValue: "iss-partial")]?.activity?.executionId
+        == ExecutionId(rawValue: "exe-partial"))
   }
 
   /// A child id listed by its parent but absent from the snapshot is skipped, not

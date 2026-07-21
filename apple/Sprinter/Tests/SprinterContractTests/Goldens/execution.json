@@ -1,5 +1,9 @@
 {
   "id": "exe-1",
   "jobId": "job-1",
-  "status": "active"
+  "agentId": "agt-1",
+  "mode": "autonomous",
+  "transcript": {
+    "_tag": "LiveTranscript"
+  }
 }

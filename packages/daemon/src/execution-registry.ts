@@ -21,8 +21,9 @@
  *
  * ## Ordering guarantee — the register-after-dispatch window ({@link resolve})
  *
- * `JobRunner.dispatch` persists the `running`/`starting` Job/execution rows — fanning
- * out the `JobChanged`/`ExecutionChanged` deltas the app reacts to — BEFORE
+ * `JobRunner.dispatch` persists the `running` Job row and the execution row with its OPEN
+ * (`LiveTranscript`) transcript — fanning out the `JobChanged`/`ExecutionChanged` deltas
+ * the app reacts to — BEFORE
  * `ExecutionRunner.run(job)` returns the live {@link ExecutionHandle} that
  * {@link register}s it (the `pi` spawn + handshake happen inside `run`). So a
  * `running` delta does NOT yet imply the execution is registered: a client that reacts
@@ -37,19 +38,40 @@
  * fails with `ExecutionNotFound` after the bound. The immediate {@link get} is retained
  * for callers that want a strict present-or-absent read (no wait).
  *
+ * ### The bridge does NOT cover the FIRST leg of that window (DE2.2)
+ *
+ * `execution."jobId"` became a FOREIGN KEY in DE2.2, so `dispatch` must now write the Job
+ * row BEFORE the execution row — the reverse of the pre-DE2.2 order, and forced by the
+ * database rather than chosen. The `running` `JobChanged` delta already carries
+ * `executionId`, so a client can open the execution channel the INSTANT it lands — and
+ * between that delta and the very next statement, the execution row DOES NOT YET EXIST.
+ *
+ * The bridge above is gated on the durable read (see the next section): with no row,
+ * `getExecution` answers `None`, the handlers' gate takes the fail-fast {@link get} path,
+ * and the client sees `ExecutionNotFound` WITHOUT the bounded wait. Previously the
+ * execution row was written first, so that same instant found a LIVE row and waited the
+ * window out. The window is therefore covered in two parts, not one: its first leg (job
+ * written, execution not yet) degrades to a CLIENT RETRY, and only its second leg (execution
+ * row live, handle not yet registered) is bridged here. That first leg is a couple of
+ * statements wide with no I/O of its own between them, and a retry is a far better failure
+ * than the alternative — but it IS a retry, and this section would otherwise claim
+ * otherwise.
+ *
  * ## Who decides wait-vs-fail-fast — the durable-state gate lives in the CALLER
  *
  * `resolve` is INTENTIONALLY unconditional: on a miss it always waits out the bound.
- * A registry entry only lives for its execution's run scope, so a SETTLED
- * (completed/failed/interrupted) execution — or one that never existed — is absent from
- * the map, and waiting the full bound on it would be a spurious multi-second stall
- * (the Inspector opens channels for SETTLED jobs by design, BE4.1). So the
- * execution-channel handlers gate the choice on DURABLE state (`StateStore`): an execution
- * whose durable `Execution` row is still NON-TERMINAL (`starting`/`active`/`idle` — genuinely
- * mid-dispatch) resolves through {@link resolve} (bridging the window); an execution whose
- * row is TERMINAL or ABSENT resolves through {@link get} (fail fast, no wait). The
- * registry stays a pure map + wait primitive; the durable read that distinguishes the
- * two cases belongs to the caller that already holds the `StateStore`.
+ * A registry entry only lives for its execution's run scope, so a SETTLED execution — one
+ * whose transcript is SEALED — or one that never existed is absent from the map, and
+ * waiting the full bound on it would be a spurious multi-second stall (the Inspector opens
+ * channels for SETTLED jobs by design, BE4.1). So the execution-channel handlers gate the
+ * choice on DURABLE state (`StateStore`): an execution whose durable `Execution` row is
+ * still LIVE — its transcript OPEN (`isExecutionLive`, `@sprinter/domain`; DE2.2 deleted
+ * the `ExecutionStatus` enum, so liveness is the transcript variant and nothing else) —
+ * and whose Job is still mid-dispatch resolves through {@link resolve} (bridging the
+ * window); an execution whose transcript is SEALED, or whose Job is terminal or ABSENT,
+ * resolves through {@link get} (fail fast, no wait). The registry stays a pure map + wait
+ * primitive; the durable read that distinguishes the two cases belongs to the caller that
+ * already holds the `StateStore`.
  */
 import { Context, Deferred, Duration, Effect, HashMap, Layer, Option, Ref } from "effect";
 import type { Scope } from "effect/Scope";
@@ -220,7 +242,7 @@ export const layerWith = (resolveTimeout: Duration.Duration): Layer.Layer<Execut
             ),
             () =>
               // Remove ONLY if this handle is still the one mapped: under execution-id
-              // reuse (1 Job = 1 execution — a re-dispatch registers a fresh handle under
+              // reuse (a re-dispatch registers a fresh handle under
               // the same id), a blind `remove(id)` on this handle's scope-close would
               // evict the live SUCCESSOR. Guard on identity so a superseded entry's
               // teardown never removes its replacement.

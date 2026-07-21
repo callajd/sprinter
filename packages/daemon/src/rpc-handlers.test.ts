@@ -43,7 +43,7 @@ import {
   Epic,
   Execution,
   type ExecutionEvent,
-  type ExecutionId,
+  ExecutionId,
   type ExecutionInput,
   Issue,
   Job,
@@ -99,10 +99,15 @@ const queuedJob = Schema.decodeUnknownSync(Job)({
   kind: "implement",
   status: "queued",
 });
+// A SETTLED execution: its transcript is SEALED, which is the whole of "this run has
+// ended" (there is no status enum beside it — DE2.2). Attributed to `agentHead`, the
+// registry revision the FOREIGN KEY requires to be stored first.
 const execution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
-  status: "completed",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "SealedTranscript", lastOffset: 0 },
 });
 // The lineage HEAD the retirement below supersedes. It has to be stored first and it
 // has to carry the same content: `supersedes` is a referential link in the store (a
@@ -432,15 +437,30 @@ const seedGraph = (store: StateStore["Service"]) =>
     yield* store.workGraph.putIssue(issue);
   });
 
+/**
+ * Store an execution together with the rows its FOREIGN KEYs require (DE2.2): the agent
+ * revision it is attributed to and the job it advances, in that order. A test that needs
+ * a particular Job status passes its own `jobRow`; `putAgent` is idempotent for a
+ * byte-identical revision, so seeding it here never doubles up.
+ */
+const seedExecution = (
+  store: StateStore["Service"],
+  executionRow: Execution,
+  jobRow: Job = queuedJob,
+) =>
+  Effect.gen(function* () {
+    yield* store.agents.putAgent(agentHead);
+    yield* store.jobs.putJob(jobRow);
+    yield* store.jobs.putExecution(executionRow);
+  });
+
 // ── snapshot ──────────────────────────────────────────────────────────────────
 
 it.effect("snapshot hydrates the full persisted work graph", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
       yield* seedGraph(store);
-      yield* store.jobs.putJob(queuedJob);
-      yield* store.jobs.putExecution(execution);
-      yield* store.agents.putAgent(agentHead);
+      yield* seedExecution(store, execution);
       yield* store.agents.putAgent(agent);
 
       const snapshot = yield* client.snapshot();
@@ -1086,11 +1106,11 @@ it.effect("events streams a work-graph delta produced by a command", () =>
 it.effect("events resumes durable replay after a client-supplied sinceOffset cursor (CE2.0)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      // Seed durable history: six journaled deltas at offsets 1..6 (the first is the
-      // repository the workstream is anchored to).
+      // Seed durable history: seven journaled deltas at offsets 1..7 (the first is the
+      // repository the workstream is anchored to, and the AGENT revision precedes the
+      // execution attributed to it — the order its foreign key requires).
       yield* seedGraph(store);
-      yield* store.jobs.putJob(queuedJob);
-      yield* store.jobs.putExecution(execution);
+      yield* seedExecution(store, execution);
 
       // Subscribe with a cursor PAST the first three entries (offset 3): the served
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
@@ -1102,8 +1122,9 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
 
       expect(replay.map((item) => item.event._tag)).toEqual([
         "IssueChanged",
+        // The agent revision is journaled before the execution attributed to it (DE2.2).
+        "AgentChanged",
         "JobChanged",
-        "ExecutionChanged",
       ]);
       // The response envelope carries the durable offsets: all STRICTLY GREATER than
       // the supplied cursor (3) and contiguous (4, 5, 6) — the coordinate the client
@@ -1175,8 +1196,8 @@ const makeFakeExecution = (events: ReadonlyArray<ExecutionEvent>): Effect.Effect
 it.effect("executionEvents replays a SETTLED execution's durable transcript and completes", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putExecution(execution); // `completed` (terminal)
-      yield* store.jobs.putJob(orphanedJob); // terminal Job, no live handle
+      // A SETTLED execution (sealed transcript) under a terminal Job — no live handle.
+      yield* seedExecution(store, execution, orphanedJob);
       yield* store.executionLog.append(executionId, entryAppended);
       yield* store.executionLog.append(executionId, noticeEvent);
       yield* store.executionLog.append(executionId, entryAppended2);
@@ -1209,8 +1230,7 @@ it.effect("executionEvents replays a SETTLED execution's durable transcript and 
 it.effect("executionEvents REFUSES a cursor from a PRIOR store generation", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putExecution(execution);
-      yield* store.jobs.putJob(orphanedJob);
+      yield* seedExecution(store, execution, orphanedJob);
       yield* store.executionLog.append(executionId, entryAppended);
       yield* store.executionLog.append(executionId, noticeEvent);
 
@@ -1236,8 +1256,7 @@ it.effect("executionEvents REFUSES a cursor from a PRIOR store generation", () =
 it.effect("executionEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putExecution(execution);
-      yield* store.jobs.putJob(orphanedJob);
+      yield* seedExecution(store, execution, orphanedJob);
       yield* store.executionLog.append(executionId, entryAppended);
 
       // The execution channel's half of the zero-offset door. A zero cursor used to skip the
@@ -1293,8 +1312,7 @@ it.effect(
 
         // For an execution that DOES exist, a cursor past the transcript's end under the current
         // generation is still a resync — the extent half is deferred, not dropped.
-        yield* store.jobs.putExecution(execution);
-        yield* store.jobs.putJob(orphanedJob);
+        yield* seedExecution(store, execution, orphanedJob);
         yield* store.executionLog.append(executionId, entryAppended);
         const beyond = yield* client
           .executionEvents({
@@ -1325,6 +1343,9 @@ it.live(
         // A STILL-RUNNING execution: its terminal `result` stays pending, so the live tail keeps
         // tailing new durable entries (it completes only once the execution settles).
         const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+        // The durable row a dispatch writes BEFORE running — required now that a
+        // transcript entry is keyed to an execution that exists (DE2.2).
+        yield* seedExecution(store, startingExecution, midDispatchJob);
         yield* executions.register(executionId, liveHandle);
         // One durable entry already in the transcript before the client attaches.
         yield* store.executionLog.append(executionId, entryAppended);
@@ -1356,6 +1377,7 @@ it.effect(
     harness(({ client, store, executions }) =>
       Effect.gen(function* () {
         const fake = yield* makeFakeExecution([]); // result is already `Completed` → settled
+        yield* seedExecution(store, startingExecution, midDispatchJob);
         yield* executions.register(executionId, fake.handle);
         yield* store.executionLog.append(executionId, entryAppended);
 
@@ -1375,6 +1397,7 @@ it.live("executionEvents forwards a LIVE execution's ephemeral deltas AND durabl
       const fake = yield* makeFakeExecution([]);
       // A STILL-RUNNING execution: `result` stays pending so the live tail keeps forwarding.
       const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+      yield* seedExecution(store, startingExecution, midDispatchJob);
       yield* executions.register(executionId, liveHandle);
 
       // Collect the full interleaved flow off the live tail (nothing durable pre-attach).
@@ -1445,8 +1468,8 @@ it.effect(
   () =>
     harness(({ client, store }) =>
       Effect.gen(function* () {
-        yield* store.jobs.putExecution(execution); // terminal row, NO durable entries, no live handle
-        yield* store.jobs.putJob(orphanedJob);
+        // Settled row (sealed transcript), NO durable entries, no live handle.
+        yield* seedExecution(store, execution, orphanedJob);
 
         const received = yield* client.executionEvents({ executionId }).pipe(Stream.runCollect);
         expect(received.length).toBe(0);
@@ -1466,6 +1489,7 @@ it.live(
       Effect.gen(function* () {
         const fake = yield* makeFakeExecution([]);
         const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+        yield* seedExecution(store, startingExecution, midDispatchJob);
         yield* executions.register(executionId, liveHandle);
         const idlessNotice: ExecutionEvent = { _tag: "Notice", level: "info", message: "started" };
         // The id-less notice is in the durable transcript before attach → covered by REPLAY.
@@ -1565,24 +1589,30 @@ it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
   ),
 );
 
-// A durable NON-TERMINAL execution row (`starting`) — the register-after-dispatch window
-// state: `JobRunner.dispatch` persists this BEFORE `run` registers the handle, so a
-// client reacting to the `running` delta arrives with the row already durable but the
-// handle not yet registered.
+// A durable LIVE execution row (an OPEN transcript — there is no `starting` status, DE2.2
+// deleted `ExecutionStatus`) — the register-after-dispatch window state: `JobRunner.dispatch`
+// persists this BEFORE `run` registers the handle, so a client reacting to the `running`
+// delta arrives with the row already durable but the handle not yet registered.
 const startingExecution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
-  status: "starting",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
 });
-// A NON-TERMINAL (`active`) Execution row whose Job has since settled — the crash-orphaned
-// limbo `startup-reconcile` leaves (Job-only settle). Pairs with {@link orphanedJob}.
+// A LIVE Execution row whose Job has since settled — the crash-orphaned limbo an OLDER,
+// Job-only `startup-reconcile` settle left behind (it now seals every execution the job
+// owns, but a store written before that fix can still hold this). Pairs with
+// {@link orphanedJob}: the gate must fail it FAST rather than wait out the bound.
 const activeExecution = Schema.decodeUnknownSync(Execution)({
   id: "exe-1",
   jobId: "job-1",
-  status: "active",
+  agentId: "agt-1",
+  mode: "autonomous",
+  transcript: { _tag: "LiveTranscript" },
 });
 
-// The register-after-dispatch window: `JobRunner.dispatch` persists the `starting`
+// The register-after-dispatch window: `JobRunner.dispatch` persists the LIVE-transcript
 // Execution + `running` Job BEFORE `run` registers the execution handle, so a client
 // reacting to the `running` delta can open the execution channel before registration.
 // Because the durable JOB is `running` (NON-TERMINAL) at that point, the handler's
@@ -1594,8 +1624,7 @@ it.effect(
     harness(({ client, store, executions }) =>
       Effect.gen(function* () {
         // Seed the durable mid-dispatch state: Execution row + a RUNNING Job → gate waits.
-        yield* store.jobs.putExecution(startingExecution);
-        yield* store.jobs.putJob(midDispatchJob);
+        yield* seedExecution(store, startingExecution, midDispatchJob);
         const fake = yield* makeFakeExecution([]);
         const input: ExecutionInput = { text: "go", mode: "prompt" };
 
@@ -1629,8 +1658,7 @@ it.effect(
       Effect.gen(function* () {
         // Execution row NON-TERMINAL (`active`) but its Job terminal (`cancelled`) — the
         // durable limbo `startup-reconcile` leaves after settling a non-resumable job.
-        yield* store.jobs.putExecution(activeExecution);
-        yield* store.jobs.putJob(orphanedJob);
+        yield* seedExecution(store, activeExecution, orphanedJob);
 
         const before = yield* Clock.currentTimeMillis;
         const error = yield* client
@@ -1666,10 +1694,11 @@ it.effect(
         const interruptedExecution = Schema.decodeUnknownSync(Execution)({
           id: "exe-1",
           jobId: "job-1",
-          status: "interrupted",
+          agentId: "agt-1",
+          mode: "autonomous",
+          transcript: { _tag: "SealedTranscript", lastOffset: 0 },
         });
-        yield* store.jobs.putExecution(interruptedExecution);
-        yield* store.jobs.putJob(queuedOrphanJob);
+        yield* seedExecution(store, interruptedExecution, queuedOrphanJob);
 
         const before = yield* Clock.currentTimeMillis;
         const error = yield* client
@@ -1692,8 +1721,7 @@ it.effect("a SETTLED execution's channel fails FAST — no 5s stall (Job termina
   harness(({ client, store }) =>
     Effect.gen(function* () {
       // `execution` fixture is `completed` (terminal); its Job is terminal too.
-      yield* store.jobs.putExecution(execution);
-      yield* store.jobs.putJob(orphanedJob);
+      yield* seedExecution(store, execution, orphanedJob);
 
       const before = yield* Clock.currentTimeMillis;
       const error = yield* client
@@ -1715,11 +1743,7 @@ it.effect(
   () =>
     harness(({ client }) =>
       Effect.gen(function* () {
-        const missing: ExecutionId = Schema.decodeUnknownSync(Execution)({
-          id: "exe-x",
-          jobId: "job-1",
-          status: "starting",
-        }).id;
+        const missing: ExecutionId = Schema.decodeUnknownSync(ExecutionId)("exe-x");
 
         // No durable row and nothing registered → each procedure fails immediately (no
         // TestClock advance): the durable-state gate never enters the bounded wait.
@@ -1756,8 +1780,7 @@ it.effect("a mid-dispatch execution whose handle never registers fails AFTER the
   harness(({ client, store }) =>
     Effect.gen(function* () {
       // Durable Job is `running` (NON-TERMINAL) → the gate waits; nothing ever registers.
-      yield* store.jobs.putExecution(startingExecution);
-      yield* store.jobs.putJob(midDispatchJob);
+      yield* seedExecution(store, startingExecution, midDispatchJob);
 
       const sendFiber = yield* Effect.forkChild(
         client
@@ -1892,8 +1915,7 @@ it.effect(
         const fake = yield* makeFakeExecution([]);
         yield* executions.register(executionId, { ...fake.handle, result: Effect.never });
         yield* Ref.set(armed, false); // seed with the store DISARMED …
-        yield* store.jobs.putExecution(startingExecution);
-        yield* store.jobs.putJob(midDispatchJob);
+        yield* seedExecution(store, startingExecution, midDispatchJob);
         yield* store.executionLog.append(executionId, entryAppended);
         yield* Ref.set(armed, true); // … then arm for the resolveLive read under test.
 

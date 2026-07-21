@@ -17,7 +17,7 @@
  */
 import { Context, type Effect, Schema } from "effect";
 import type { Scope } from "effect/Scope";
-import type { Job } from "@sprinter/domain";
+import type { AgentContent, Job } from "@sprinter/domain";
 import type { ExecutionHandle } from "@sprinter/runner";
 
 /**
@@ -57,5 +57,21 @@ export class ExecutionRunner extends Context.Service<
   ExecutionRunner,
   {
     readonly run: (job: Job) => Effect.Effect<ExecutionHandle, ExecutionRunnerError, Scope>;
+    /**
+     * WHAT this runner runs — the {@link AgentContent} of the agent revision every
+     * execution it starts is attributed to (DE2.2 / D2).
+     *
+     * A PLAIN VALUE, not an effect, for the same reason `StateStore.generation` is one:
+     * it cannot change while the service exists. An adapter declares the agent it
+     * dispatches through at CONSTRUCTION, so swapping the agent means providing a
+     * different `Layer`, and nothing can observe it changing underneath a live
+     * dispatch.
+     *
+     * It is CONTENT, not a whole `Agent`: the revision's identity is derived from the
+     * content (`agent-registration.ts`), so an adapter cannot mint an id that
+     * contradicts what it actually runs, and re-declaring the same content is an
+     * idempotent no-op in the registry rather than a collision.
+     */
+    readonly agent: AgentContent;
   }
 >()("sprinter/execution/ExecutionRunner") {}

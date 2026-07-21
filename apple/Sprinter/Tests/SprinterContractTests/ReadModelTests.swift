@@ -15,7 +15,11 @@ struct ReadModelTests {
     #expect(snapshot.epics.count == 1)
     #expect(snapshot.issues.count == 2)
     #expect(snapshot.jobs.count == 2)
-    #expect(snapshot.executions.count == 1)
+    // TWO executions for ONE job: a job is advanced by a TREE of executions (DE2.2), so
+    // a client must fold several under one job rather than assuming a single row.
+    #expect(snapshot.executions.count == 2)
+    #expect(snapshot.executions.filter { $0.jobId == JobId(rawValue: "job-1") }.count == 2)
+    #expect(snapshot.executions.filter(\.isLive).count == 1)
     // The REGISTRY layer rides the snapshot whole — every revision, retired included
     // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED), in
     // the lexicographic-by-id order the daemon's `listAgents` pins.
@@ -134,7 +138,26 @@ struct ReadModelTests {
     let execution = try Golden.decode(Execution.self, from: "execution")
     #expect(execution.id == ExecutionId(rawValue: "exe-1"))
     #expect(execution.jobId == JobId(rawValue: "job-1"))
-    #expect(execution.status == .active)
+    // It names the exact registry revision that ran it, holds the turn itself, and is a
+    // ROOT — `parent` is OMITTED on the wire, which decodes to `nil` (never a null).
+    #expect(execution.agentId == AgentId(rawValue: "agt-1"))
+    #expect(execution.mode == .autonomous)
+    #expect(execution.parent == nil)
+    // Liveness is the TRANSCRIPT, and nothing else: this run is still going.
+    #expect(execution.transcript == .live(LiveTranscript()))
+    #expect(execution.isLive == true)
+    #expect(try Golden.roundTrip(execution) == execution)
+  }
+
+  @Test("decodes a CHILD execution — the tree edge, the other mode, a sealed transcript")
+  func decodesChildExecution() throws {
+    let execution = try Golden.decode(Execution.self, from: "execution-child")
+    #expect(execution.parent == ExecutionId(rawValue: "exe-1"))
+    #expect(execution.mode == .interactive)
+    // A settled run: the closed, cacheable range `[0, 12]`. A tail subscription cannot
+    // be formed against it — `SealedTranscript` is not a `LiveTranscript` (D4).
+    #expect(execution.transcript == .sealed(SealedTranscript(lastOffset: 12)))
+    #expect(execution.isLive == false)
     #expect(try Golden.roundTrip(execution) == execution)
   }
 

@@ -23,7 +23,7 @@
 import { Cause, Deferred, Effect, Layer, Option, Pull, Ref, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import type { Job, ExecutionEvent } from "@sprinter/domain";
+import type { AgentContent, Job, ExecutionEvent } from "@sprinter/domain";
 import {
   type ExecutionHandle,
   type ExecutionResult,
@@ -33,6 +33,73 @@ import {
 } from "@sprinter/runner";
 import { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
 import { PiSpawnRouter } from "./spawn-router.ts";
+
+/**
+ * The agent revision this adapter runs — the `pi` CLI as Sprinter dispatches it
+ * (DE2.2 / D2). Every execution it starts is attributed to THIS content, and the
+ * registry revision's id is DERIVED from it (`agent-registration.ts`), so changing any
+ * field here lands as a new revision rather than colliding with the old one.
+ *
+ * EVERY FIELD IS TRUE. That is a requirement, not a style preference: this content is
+ * written into an APPEND-ONLY production registry with no delete, so a fabricated value
+ * here is permanent bad data that a docstring cannot travel with or retract.
+ *
+ * - `tools: []` — an empty list is a real statement (see below).
+ * - `model: "unknown"` and `version: "unknown"` — the two facts this adapter genuinely
+ *   does NOT have. It spawns whatever `pi` the spawn router resolves and never asks it
+ *   what it is, and the resolved model is reported only through a `get_state` response the
+ *   {@link ExecutionHandle} does not surface. `"unknown"` says exactly that. It replaced
+ *   `"pi-cli-default"` / `"1.0.0"`, which were INVENTED — no such model name is reported
+ *   by anything, and no `pi` binary was consulted for that version — and which read as
+ *   settled facts to anyone looking at `Snapshot.agents` rather than at this file.
+ *
+ * So `sqlite.ts`'s claim that "a historical execution always resolves to the agent that
+ * actually ran it" is now HONEST for the only agent that exists, though still WEAK: a
+ * revision reading `pi unknown/unknown` does not distinguish two `pi` binaries, so an
+ * upgrade re-derives the SAME content-derived id and the registry records "the same agent"
+ * for both. What it no longer does is assert a version that is false. The strengthening is
+ * the change described at the end of this docstring: the resolved version and model must
+ * reach this module as DATA at spawn time, after which `LOCAL_PI_AGENT` stops being a
+ * constant and a real value appends a SECOND revision beside these — with every past
+ * execution still resolving to the `unknown` revision it truthfully ran under.
+ *
+ * The per-field caveats:
+ *
+ * - `model` — the model selection is `pi`'s OWN configuration. This adapter spawns
+ *   `pi --mode rpc` and the wire it consumes reports the resolved model only through a
+ *   `get_state` response the {@link ExecutionHandle} does not surface, so what Sprinter
+ *   can truthfully say today is "unknown — whatever `pi` resolves for itself", which is
+ *   what the field says. When the runner learns the concrete model, this content changes —
+ *   and because identity is content-derived, that is automatically a NEW registry revision,
+ *   with every past execution still resolving to the one it actually ran under.
+ * - `tools` — likewise `pi`'s own configuration, so Sprinter declares NO tool
+ *   allow-list here rather than asserting one it does not enforce. An empty list is
+ *   "not declared by Sprinter", and it is not a claim that the agent has no tools.
+ * - `version` — `"unknown"`, and load-bearing, so it is called out rather than left to look
+ *   settled. It does not track the `pi` binary: this adapter spawns
+ *   whatever `pi` the spawn router resolves and never asks it what it is, so upgrading
+ *   the binary leaves this content byte-identical and re-derives the SAME registry id.
+ *   The registry then records that "the same agent" ran both before and after the
+ *   upgrade, which is the OPPOSITE of the guarantee `Execution.agentId` exists to give
+ *   ("a historical execution always resolves to the agent that actually ran it" —
+ *   `sqlite.ts`). The key and the content-derived id are both working correctly; what
+ *   is wrong is the CONTENT they are computed over.
+ *
+ *   For it to track the binary, the adapter needs the resolved version at spawn time —
+ *   i.e. the `pi` version has to reach this module as DATA (a `--version` probe through
+ *   {@link PiSpawnRouter}, or the `get_state` response the {@link ExecutionHandle} does
+ *   not surface today, which is the same missing capability the `model` caveat above
+ *   names). At that point `LOCAL_PI_AGENT` stops being a constant and becomes a
+ *   per-spawn value; nothing else changes, because identity is already derived from
+ *   content, so every upgrade lands as a new revision automatically and every past
+ *   execution keeps resolving to the revision it actually ran.
+ */
+export const LOCAL_PI_AGENT: AgentContent = {
+  name: "pi",
+  model: "unknown",
+  version: "unknown",
+  tools: [],
+};
 
 /** The `ExecutionIdle` (Pi `agent_settled`) event that ends a one-shot dispatch. */
 const isExecutionIdle = (event: ExecutionEvent): boolean => event._tag === "ExecutionIdle";
@@ -175,6 +242,7 @@ export const layerLocalPi: Layer.Layer<
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const router = yield* PiSpawnRouter;
     return ExecutionRunner.of({
+      agent: LOCAL_PI_AGENT,
       run: (job) =>
         router.configFor(job).pipe(
           Effect.flatMap((config) => run(job, config)),

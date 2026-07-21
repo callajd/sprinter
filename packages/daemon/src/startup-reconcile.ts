@@ -20,7 +20,9 @@
  *    aborts the whole roll-up.
  * 2. **Resume running Jobs** — walk the (post-roll-up) graph and re-dispatch each
  *    `running` Job through the `JobRunner`, which re-attaches to the Job's PERSISTED
- *    execution id (1 Job = 1 execution, `UNIQUE(execution.jobId)`) — never a new execution.
+ *    execution id — never a new execution. (That re-attachment is the RUNNER's doing, not
+ *    a store constraint: DE2.2 dropped `UNIQUE(execution.jobId)`, because a job may own a
+ *    TREE of executions.)
  *    Each resume is a BACKGROUND fiber tied to the daemon scope (an execution can take
  *    minutes; boot must not block, mirroring the live `dispatchInBackground` path), so
  *    N in-flight executions resume concurrently and `run` returns promptly.
@@ -42,13 +44,18 @@
  *   than resurrected — resume is NARROWED to the genuinely-in-flight (`active`/`pending`)
  *   Workstreams, so every terminal/paused Workstream status settles instead.
  *
- * Every settle path also settles the corresponding EXECUTION row to a terminal status
- * alongside the Job row (CE4.1-R4 root fix): a settled Job must never leave a stale
- * NON-TERMINAL Execution behind, or the execution-resolve gate ({@link ./rpc-handlers.ts}
- * `resolveLive`) would mistake that orphan for a mid-dispatch execution and stall the full
- * resolve bound before `ExecutionNotFound`. `succeeded` → `completed`; `cancelled`/`queued`
- * → `interrupted` (a later re-dispatch of a `queued` Job re-attaches its execution id and
- * moves it back to `starting`). This is INV-RESTART behavior.
+ * Every settle path also SEALS the transcript of EVERY Execution the Job owns — BEFORE it
+ * writes the Job row (CE4.1-R4 root fix): a settled Job must never leave a LIVE Execution behind,
+ * or the execution-resolve gate ({@link ./rpc-handlers.ts} `resolveLive`) would mistake
+ * that orphan for a mid-dispatch execution and stall the full resolve bound before
+ * `ExecutionNotFound`. "Terminal" for an Execution is a `SealedTranscript` and nothing
+ * else — DE2.2 deleted the `ExecutionStatus` enum, so there is no `completed`/`interrupted`
+ * status to move a row to and no second field a settle path could leave disagreeing with
+ * the transcript (INV-SUM). EVERY execution, not just the root: a job owns a TREE, and a
+ * sibling left with a `LiveTranscript` stalls the gate exactly as the root would. A later
+ * re-dispatch of a `queued` Job re-attaches the SAME execution id and re-opens its
+ * transcript, which never invalidates a cached prefix (offsets only grow). This is
+ * INV-RESTART behavior.
  *
  * A single resume failure is isolated (logged in its background fiber) so one bad Job
  * never disturbs the others; a {@link StateStoreError} reading/writing the durable
@@ -66,13 +73,13 @@
  * `docs/decisions.md` / architecture §10 — NOT part of AE5.1. This module is the
  * persist/reconcile/re-dispatch LOGIC, wired to the ports and tested offline.
  */
-import { Context, Effect, Layer, Option } from "effect";
+import { Context, Effect, Layer } from "effect";
 import {
   type Issue,
+  isExecutionLive,
   isIssueLanded,
   type Job,
   type JobId,
-  type ExecutionStatus,
   type WorkStatus,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
@@ -122,20 +129,6 @@ type SettleStatus = "succeeded" | "cancelled" | "queued";
 type ResumeAction =
   | { readonly _tag: "resume" }
   | { readonly _tag: "settle"; readonly status: SettleStatus };
-
-/**
- * The terminal {@link ExecutionStatus} a settled Job's execution row is moved to alongside
- * the Job row (CE4.1-R4 root fix), so no stale NON-TERMINAL Execution outlives a settled
- * Job. `succeeded` → `completed`; `cancelled`/`queued` → `interrupted` (the pre-restart
- * turn ended; a later `control resume` of a `queued` Job re-attaches the same execution id
- * and moves it back to `starting`). A total map (INV-NOCAST): every {@link SettleStatus}
- * has a terminal image.
- */
-const executionSettleStatus: Record<SettleStatus, ExecutionStatus> = {
-  succeeded: "completed",
-  cancelled: "interrupted",
-  queued: "interrupted",
-};
 
 /**
  * Decide a `running` Job's fate. Resume is NARROWED (CE5-F4) to the genuinely-in-flight
@@ -221,23 +214,98 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
         );
 
       /**
-       * Settle a stale `running` Job to a terminal/pending status AND settle its EXECUTION
-       * row to a terminal status (CE4.1-R4 root fix) — writing ONLY the Job row would
-       * leave a NON-TERMINAL Execution orphan that stalls the execution-resolve gate. The
-       * execution write is conditional on a row existing (a `running` Job always has one,
-       * but the read stays graceful) and reuses the persisted execution id, so a later
-       * re-dispatch of a `queued` Job re-attaches the SAME execution (1 Job = 1 execution).
+       * Settle a stale `running` Job to a terminal/pending status AND SEAL EVERY LIVE
+       * EXECUTION it owns (CE4.1-R4 root fix) — writing ONLY the Job row would leave LIVE
+       * Execution orphans that stall the execution-resolve gate. The pre-restart run is
+       * over whatever the Job's fate is, and a sealed transcript is exactly that
+       * statement: the durable entries it produced are complete at the extent the log
+       * reached, and nothing will tail it.
+       *
+       * It iterates `listExecutionsForJob`, NOT `getExecutionForJob`. A job owns a TREE of
+       * executions (DE2.2), and the root is only one node of it: sealing the root alone
+       * left every SIBLING and CHILD holding a `LiveTranscript` forever, so
+       * `isExecutionLive` stayed true on them and `resolveLive` (`./rpc-handlers.ts`)
+       * bounded-WAITED on each whenever the job was still `queued`/`running` — the exact
+       * stall this settle exists to prevent, merely moved off the root. This is the ONE
+       * path whose correctness depends on seeing every execution, because it is the one
+       * making a statement about all of them.
+       *
+       * Each execution is sealed at ITS OWN `executionLog.maxOffset`: the log is scoped
+       * per execution, so a shared extent would understate one sibling and overstate
+       * another. Already-sealed rows are left alone — re-sealing would rewrite a settled
+       * extent for no gain, and a seal is idempotent only if it is not recomputed.
+       *
+       * A job with NO executions writes nothing, and that is now a real statement rather
+       * than a gap: the composite `parent` key means a job's executions are closed under
+       * `parent`, so an empty list means empty, not "the root was lost to a cross-job
+       * edge" (see `putExecution`, `@sprinter/state`).
+       *
+       * The seal reuses each persisted execution id, so a later re-dispatch of a `queued`
+       * Job re-attaches the SAME execution and re-opens its transcript — sound because
+       * offsets only grow, so a cached prefix stays correct (see `Transcript`,
+       * `@sprinter/domain`).
+       *
+       * The extent comes from the durable log's own indexed `maxOffset`; a transient read
+       * failure seals at `0` rather than leaving the execution LIVE forever, which is the
+       * failure this settle exists to prevent. That fallback is why the contract states
+       * `lastOffset` as a LOWER BOUND rather than an exact extent (see `Transcript`,
+       * `@sprinter/domain`, and the same fallback in `job-runner.ts`'s `sealTranscript`):
+       * `0` here does NOT assert an empty transcript, it asserts only that `[0, 0]` is
+       * settled — which is trivially true and never invalidates a cached prefix. There is
+       * no local high-water mark to prefer on THIS path: the run whose appends it would
+       * have counted belongs to a process that is already gone, which is why this settle
+       * runs at all. That argument is specific to this path and does NOT carry over to
+       * `job-runner`'s seal, whose fold IS the writer and therefore holds the offsets
+       * `append` returned; it seals at `max(localHighWater, maxOffset ?? 0)` and is exact
+       * in the common case. The LOWER-BOUND contract is written for the path here, where
+       * nothing better exists.
+       *
+       * **TERMINAL WRITE ORDER — the seals FIRST, the Job LAST, and it is RECOVERY-ORDERED**
+       * (round 5, B1). Both orders are legal to the engine here — the Job row already
+       * exists, so `putJob` is a pure UPDATE with no foreign key to satisfy — so the order
+       * is FREE and is chosen by asking what an interruption BETWEEN the writes leaves
+       * behind. This is the identical question, and the identical answer, as the terminal
+       * pair in `job-runner.ts`'s `dispatch` (see the full statement there):
+       *
+       * - Job LAST (what this does): an interrupted seal leaves a `running` Job with LIVE
+       *   executions — precisely the state THIS function exists to settle, so the NEXT boot
+       *   repairs it. `run` re-reads the graph from scratch every time, so a resumed settle
+       *   is just a settle.
+       * - Job FIRST (what this used to do): the same interruption leaves a TERMINAL Job with
+       *   a LIVE execution, and NOTHING repairs it — `run` skips every job whose
+       *   `status !== "running"`, and this settle is the only other `SealedTranscript`
+       *   writer in the tree and sits behind that gate. A permanent live orphan that
+       *   survives every restart. Unrepresentable-22 in `docs/plan/domain-remodel.md`.
+       *
+       * The seal loop is deliberately ALL-OR-NOTHING across siblings, and that is only safe
+       * BECAUSE the Job write is last (round 5, B2). A `StateStoreError` on execution *k*
+       * aborts *k+1…n* and fails the boot — but the Job is still `running`, so the next boot
+       * re-lists the tree and re-seals from the top; the already-sealed rows are skipped and
+       * the remainder is reached. Isolating each execution with a log instead would let the
+       * `putJob` run over a PARTIALLY sealed tree, which is the live orphan again, one node
+       * down. A failure here is therefore raised, not swallowed: our own store failing at
+       * boot is a real failure the caller must see, and the durable state it leaves is
+       * repairable.
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {
+          const executions = yield* store.jobs.listExecutionsForJob(job.id);
+          yield* Effect.forEach(executions, (execution) =>
+            Effect.gen(function* () {
+              if (!isExecutionLive(execution)) return;
+              const lastOffset = yield* store.executionLog
+                .maxOffset(execution.id)
+                .pipe(Effect.orElseSucceed(() => 0));
+              yield* store.jobs.putExecution({
+                ...execution,
+                transcript: { _tag: "SealedTranscript", lastOffset },
+              });
+            }),
+          );
+          // ORDER: FREE (no FK — the Job row exists, this is a pure UPDATE), chosen
+          // RECOVERY-ORDERED. The Job goes terminal LAST so any interruption above leaves
+          // the `running` Job this very function is the repair for.
           yield* store.jobs.putJob({ ...job, status });
-          const execution = yield* store.jobs.getExecutionForJob(job.id);
-          if (Option.isSome(execution)) {
-            yield* store.jobs.putExecution({
-              ...execution.value,
-              status: executionSettleStatus[status],
-            });
-          }
         });
 
       const run = Effect.gen(function* () {

@@ -59,11 +59,21 @@
  * — so that reset is real, permanent data loss, ACCEPTED because `DMR` treats the
  * store as greenfield pre-release.
  *
- * The consequence a downstream task must plan for: `Execution.agentId` (DE2.2) can
- * DANGLE across a generation boundary — an execution retained by a client (or
- * re-observed from an external system) may name an `Agent` revision the reset
- * destroyed. DE2.2 must therefore treat the referent as possibly-absent and must not
- * assume resolution succeeds.
+ * A DANGLING `Execution.agentId` was recorded here as the downstream consequence of
+ * that reset. DE2.2 RESOLVED it, and not by asking anyone to be careful:
+ * `execution.agentId` is a real FOREIGN KEY onto this table, and a reset drops EVERY
+ * table in one sweep — so `agent` and `execution` go together and no execution can
+ * survive referencing a discarded revision. Within a generation the key refuses the
+ * write; across one there is nothing left on either side. A dangling `agentId` is
+ * UNCONSTRUCTIBLE, not merely unlikely, so nothing downstream has to model a
+ * possibly-absent agent (INV-ENFORCE).
+ *
+ * What the reset still costs is a PRODUCT question, not an integrity one: SHOULD the
+ * registry's history survive a remodel? While the store is pre-release greenfield, no
+ * — the history is worth exactly what the executions that reference it are worth, and
+ * those go with it. That is the whole of the tension DE1.1 recorded; there is no
+ * re-derivation source to invent, and inventing one (a manifest re-seeded on open)
+ * would make `putAgent` stop being the sole source of truth for registry content.
  *
  * That generation boundary is also the ONLY bound on the registry's SIZE. Append-only
  * with no delete means every revision ever written stays — superseded and retired ones
@@ -142,6 +152,28 @@ export const Agent = Schema.Struct({
 export type Agent = (typeof Agent)["Type"];
 
 /**
+ * The CONTENT of an agent revision — what an agent IS (`name` / `model` / `version` /
+ * `tools`), with no identity and no lineage.
+ *
+ * It exists because a PRODUCTION WRITER declares content, not identity: the runner
+ * adapter knows which agent it dispatches through, but the revision's `id` is not its
+ * to choose — it is DERIVED from this content, so that "identical content is an
+ * idempotent no-op, differing content is a new revision" holds by construction rather
+ * than by a writer remembering to mint a new id (see `@sprinter/job`'s
+ * `agent-registration.ts`, the registry's first production writer).
+ *
+ * These are the exact fields a RETIREMENT may not rewrite (see the module docstring),
+ * which is the same partition read from the other side.
+ */
+export const AgentContent = Schema.Struct({
+  name: Schema.NonEmptyString,
+  model: Schema.NonEmptyString,
+  version: Schema.NonEmptyString,
+  tools: Schema.Array(Schema.NonEmptyString),
+});
+export type AgentContent = (typeof AgentContent)["Type"];
+
+/**
  * True when an agent has been retired — i.e. it carries a `retiredAt` stamp. This
  * is the ONLY way retired-ness is expressed; there is no `AgentStatus` to consult
  * and no second source of truth to keep in sync (INV-SUM).
@@ -155,6 +187,19 @@ export const isRetired = (agent: Agent): boolean => agent.retiredAt !== undefine
  * observe the chain, but the walk built out of it terminates for every history the
  * store can hold: `supersedes` is acyclic BY CONSTRUCTION (see the module
  * docstring), not by a writer's promise.
+ *
+ * KNOWN CONSEQUENCE — in a live daemon this is `true` of nearly everything. The only
+ * production writer (`agent-registration.ts`, DE2.2) appends ORIGINAL revisions only:
+ * it never sets `supersedes`, because the runner knows the content it is about to run
+ * but not whether a person meant that content to REPLACE something. Identity is derived
+ * from content, so editing an agent definition (`LOCAL_PI_AGENT`, say) does not extend a
+ * lineage — it starts a NEW one, unlinked to the old. `Snapshot.agents` therefore
+ * accumulates unrelated single-revision lineages, and the helpers below are CORRECT
+ * about them in a way that may read as surprising: {@link isLineageRetired} answers for
+ * a lineage of one, and the pre-edit and post-edit revisions of "the same" agent are, to
+ * every helper here, two different agents that happen to share a `name`. Linking them is
+ * a human operation on the registry surface — nothing on the dispatch path can infer it,
+ * and no helper here should pretend otherwise (`name` is not an identity).
  */
 export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes === undefined;
 

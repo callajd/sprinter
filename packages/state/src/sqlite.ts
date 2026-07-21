@@ -72,8 +72,10 @@
  * - The dependency DAG (`Issue.dependsOn`) is stored as real edges in a dedicated
  *   `issue_dependency` table and reconstructed, ordered, on read — the DAG is
  *   persisted as edges, not as an opaque blob.
- * - Optional links (`Issue.pr`, `Job.executionId` / `Job.transcriptRef` / `Job.pr`)
- *   are nullable columns; `PullRequestRef` is stored as a JSON column.
+ * - Optional links (`Issue.pr`, `Job.executionId` / `Job.transcriptRef` / `Job.pr`,
+ *   `Execution.parent`) are nullable columns; `PullRequestRef` and the `Transcript`
+ *   union are stored as JSON columns (a union is stored WHOLE, so its variant and its
+ *   payload cannot disagree).
  * - The event feed is an `AUTOINCREMENT` table; the auto-assigned rowid is the
  *   monotonic offset.
  *
@@ -107,7 +109,8 @@ import {
   Execution,
   ExecutionEvent,
   ExecutionId,
-  ExecutionStatus,
+  ExecutionMode,
+  Transcript,
   StoreGenerationId,
   Timestamp,
   WorkstreamId,
@@ -312,11 +315,20 @@ const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
   stored.supersedes === next.supersedes &&
   stored.retiredAt === next.retiredAt;
 
-/** An execution row — no optional or JSON columns. */
+/**
+ * An execution row. `parent` is a nullable self-reference (absent on a root
+ * execution); `transcript` is a JSON column holding the owned {@link Transcript}
+ * union, stored WHOLE so the variant and its payload can never disagree — a `_tag`
+ * column beside a nullable `lastOffset` would admit a sealed transcript with no
+ * extent and a live one carrying one (INV-SUM).
+ */
 const ExecutionRow = Schema.Struct({
   id: ExecutionId,
   jobId: JobId,
-  status: ExecutionStatus,
+  agentId: AgentId,
+  parent: Schema.NullOr(ExecutionId),
+  mode: ExecutionMode,
+  transcript: Schema.fromJsonString(Transcript),
 });
 
 /**
@@ -435,6 +447,44 @@ const GENERATION_KEY = "generation";
  * renamed table IS a shape change, and there is no migration ladder, so it drops
  * and recreates like any other (INV-FRESH).
  *
+ * Version 7 gives `Execution` its real shape (DE2.2): `execution` gains `"agentId"`,
+ * `parent` and `mode` columns and a `transcript` JSON column, LOSES its `status`
+ * column (liveness is the transcript variant — see `Transcript` in
+ * `@sprinter/domain`), and gains THREE foreign keys — `"jobId"` → `job (id)`,
+ * `"agentId"` → `agent (id)`, and a COMPOSITE `parent` edge (below). Its
+ * `UNIQUE execution_job` index becomes a PLAIN index: one job now has a TREE of
+ * executions, so uniqueness would refuse the model rather than protect it.
+ * `execution_event_log."executionId"` also becomes a real foreign key onto
+ * `execution (id)`, so a transcript cannot exist without the run that produced it
+ * (1 Execution = 1 Transcript).
+ *
+ * Dropping `UNIQUE execution_job` is what forces the REST of version 7's tree shape, and
+ * both pieces landed in this same version rather than in any later one:
+ *
+ * - a partial `UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`.
+ *   Without it, "the job's ROOT execution" ({@link StateStore}'s `getExecutionForJob`) is
+ *   undefined the moment two PARENTLESS rows exist for one job — an ordinary write — and
+ *   the read's `ORDER BY id LIMIT 1` picks between them by id collation while calling
+ *   itself deterministic. The partial index refuses the second root outright, so a tree
+ *   has one root by construction and the read has exactly one row it can return.
+ * - a `UNIQUE (id, "jobId")` key and a COMPOSITE parent edge —
+ *   `FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")`. A single-column
+ *   `parent` → `execution (id)` would constrain only that the parent ROW exists; nothing
+ *   would require it to belong to the SAME job, so a CROSS-JOB edge would be an ordinary
+ *   write and would recreate the very state the root index closes — a job owning an
+ *   execution while holding no `parent IS NULL` row, hence `getExecutionForJob` → `None`
+ *   and a `startup-reconcile.settle` that silently skips sealing. With the composite key a
+ *   child's `"jobId"` must MATCH its parent's, so "one job owns one tree, and that tree has
+ *   exactly one root" is enforced by the engine (INV-ENFORCE).
+ *
+ * The same RESET consequence version 5 recorded for `workstream.repositoryId` is what
+ * makes `"agentId"` hold: a bump drops `agent`, `job` and `execution` TOGETHER, so a
+ * reset cannot leave an execution behind naming an agent revision (or a job) that no
+ * longer exists. There is no window in which those references dangle — the referencing
+ * table does not outlive the referenced one — which is what closes DE1.1's recorded
+ * `INV-FRESH`-vs-registry-durability tension for referential integrity (see
+ * `registry.ts`).
+ *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
@@ -442,7 +492,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -647,6 +697,17 @@ const createSchema = Effect.gen(function* () {
       "dependsOn" TEXT NOT NULL,
       PRIMARY KEY ("issueId", seq)
     )`;
+  // KNOWN ASYMMETRY — `job."executionId"` is NOT a foreign key, while `execution."jobId"`
+  // is. That is deliberate, and it is the one place this schema does not reach INV-ENFORCE:
+  // the two tables reference each OTHER, so a plain key is unwritable in EITHER order. A
+  // job's execution cannot be stored before the job (its own `"jobId"` key refuses it), and
+  // a job naming an execution cannot be stored before that execution — the pair is only
+  // insertable as a cycle, which SQLite admits solely through DEFERRABLE INITIALLY DEFERRED
+  // constraints inside an explicit transaction, a mechanism nothing else on this path uses.
+  // The surviving consequence, stated rather than hidden: a job may name an `"executionId"`
+  // that was never stored, and no engine check will say so. Every read that matters resolves
+  // the other way (`execution."jobId"`, which IS enforced), so the dangling direction is
+  // presentational, not structural.
   yield* sql`CREATE TABLE job (
       id TEXT PRIMARY KEY NOT NULL,
       "issueId" TEXT NOT NULL,
@@ -657,16 +718,104 @@ const createSchema = Effect.gen(function* () {
       pr TEXT
     )`;
   yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
+  // One agent's continuous run (DE2.2). THREE foreign keys, none of them decorative:
+  //
+  // - `"jobId"` → `job (id)`: the work this run advances. It is the `sessionId` of the
+  //   target model under its pre-DE2.4 name (D1) — a real key NOW, so referential
+  //   integrity holds at every intermediate state rather than arriving with `Session`.
+  // - `"agentId"` → `agent (id)`: the registry revision that ran — specifically, the one
+  //   that ran the MOST RECENT dispatch under this execution id. Since the registry never
+  //   rewrites a revision, whatever this column names always resolves to a real, intact
+  //   revision — and the key is what makes THAT a guarantee instead of a hope (an
+  //   execution naming an unregistered agent is refused by the engine, and a reset drops
+  //   both tables together so the reference cannot outlive its referent). It is NOT a
+  //   claim that the column is frozen: it is a PER-RUN FACT and a re-dispatch rewrites it
+  //   (see `putExecution`'s per-column rule, `store.ts`).
+  // - `parent` → `execution (id)`: executions form a TREE. Acyclicity takes THREE
+  //   things, and the key alone is only the first of them:
+  //   1. the KEY — a child cannot name a parent that is not already stored, so a
+  //      DANGLING parent is unstorable;
+  //   2. `putExecution`'s SELF-parent refusal — the single edge a foreign key accepts,
+  //      since a row satisfies a key against itself (exactly as `putAgent` rejects a
+  //      self-`supersedes`);
+  //   3. `parent` being INSERT-ONLY in `putExecution`'s upsert. This is the one the key
+  //      says NOTHING about: it constrains the REFERENCED row, not the re-pointing of an
+  //      EXISTING one, so while `parent` sat in the `DO UPDATE SET` list a 2-cycle was
+  //      constructible in three ordinary writes (insert `a` rootless, insert `b` under
+  //      `a`, upsert `a` under `b`) — each satisfying the key at the moment it ran.
+  //   With (3) in place, closing a cycle of length ≥ 2 genuinely requires naming a row
+  //   that does not exist yet, which (1) refuses, and the relation is acyclic BY
+  //   CONSTRUCTION for real. This is the `supersedes` lesson from issue #85 applied to
+  //   the tree: three separate lineage rules were all defeated by a reordered write
+  //   until a foreign key made the precondition unconstructible — and the registry's
+  //   version holds only because `putAgent` is a bare INSERT, which is the same property
+  //   (3) restores here.
+  //
+  //   The `parent` edge is COMPOSITE — `(parent, "jobId")` → `(id, "jobId")`, backed by
+  //   the `UNIQUE (id, "jobId")` below — because "ONE JOB OWNS ONE TREE" is the model
+  //   (Point B: `Session 1:∗ Execution`, the tree formed by `parent`), and a single-column
+  //   key expresses only "the parent row exists". Nothing required it to belong to the
+  //   SAME job, so a CROSS-JOB edge was an ordinary write — and it reproduced the exact
+  //   no-root state (3) was added to close: store `exe-a` rootless under `job-A`, store
+  //   `exe-b` under `job-B` naming `exe-a` as its parent, and `job-B` owns an execution
+  //   while having NO `parent IS NULL` row of its own. `getExecutionForJob(job-B)` then
+  //   answers `None`, `startup-reconcile`'s `settle` (guarded on that `Option`) silently
+  //   skips sealing, and the CE4.1-R4 live-orphan stall is back. With the composite key
+  //   the child's `"jobId"` must MATCH its parent's, so a job's executions are closed
+  //   under `parent` and "a job owns a tree, and that tree has exactly one root" is a
+  //   property of the store rather than a claim about its writers (INV-ENFORCE). A
+  //   ROOTLESS row still passes: SQLite's default MATCH SIMPLE satisfies a composite key
+  //   whenever ANY of its referencing columns is NULL, which is exactly the root case.
+  //
+  // There is NO `status` column: liveness IS the transcript variant (`Transcript`,
+  // `@sprinter/domain`), and a status enum beside it would be a second field that must
+  // agree with the first (INV-SUM / INV-ENFORCE). `transcript` is stored as ONE JSON
+  // column for the same reason — the variant and its payload move together.
+  //
+  // WHAT AN UPSERT MAY REWRITE — the per-column rule, stated where the columns are
+  // declared so a column added HERE inherits it. An `Execution` is a HISTORICAL RECORD
+  // OF A RUN, so a column is FROZEN unless there is a NAMED reason it changes:
+  //
+  //   id         KEY            selects the row
+  //   "jobId"    STRUCTURAL     FROZEN — nothing re-homes a run that already happened
+  //   parent     STRUCTURAL     FROZEN — nothing re-parents one either
+  //   "agentId"  PER-RUN FACT   rewritten by a re-dispatch (issue #77's merged transcript
+  //                             reuses ONE execution id, so a retry after an agent/`pi`
+  //                             upgrade must be able to re-attribute the row)
+  //   mode       PER-RUN FACT   rewritten by a re-dispatch, same reason
+  //   transcript THE LIVE FIELD rewritten — live → sealed IS the lifecycle
+  //
+  // A NEW COLUMN'S DEFAULT IS FROZEN. The full rule, its reasons and the four review
+  // rounds that produced it live on `putExecution` in `store.ts`; the mechanism (the
+  // exclusion list and the `WHERE … IS excluded.…` clauses) is in `putExecution` here.
   yield* sql`CREATE TABLE execution (
       id TEXT PRIMARY KEY NOT NULL,
       "jobId" TEXT NOT NULL,
-      status TEXT NOT NULL
+      "agentId" TEXT NOT NULL,
+      parent TEXT,
+      mode TEXT NOT NULL,
+      transcript TEXT NOT NULL,
+      UNIQUE (id, "jobId"),
+      FOREIGN KEY ("jobId") REFERENCES job (id),
+      FOREIGN KEY ("agentId") REFERENCES agent (id),
+      FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")
     )`;
-  // UNIQUE enforces the domain invariant 1 Job = 1 execution (conventions): at most
-  // one execution per job, so `getExecutionForJob` is deterministic by construction and
-  // a stray second execution for a job fails at the backing (surfacing as a
-  // StateStoreError) rather than silently returning an arbitrary row.
-  yield* sql`CREATE UNIQUE INDEX execution_job ON execution ("jobId")`;
+  // PLAIN, not UNIQUE (DE2.2). It was `UNIQUE` while the model was 1 Job = 1 execution;
+  // a job now owns a TREE of executions, so uniqueness would refuse the model rather
+  // than protect it.
+  yield* sql`CREATE INDEX execution_job ON execution ("jobId")`;
+  // A job's executions are a TREE, and a tree has ONE root. Uniqueness on `"jobId"` is
+  // wrong (that is the index above), but uniqueness on `"jobId"` AMONG THE ROOTLESS rows
+  // is exactly the model: a job may own any number of executions and at most one of them
+  // has no parent. Without it `getExecutionForJob`'s "the root" was not a definition at
+  // all — two parentless rows for one job were an ordinary write, and the `ORDER BY id
+  // LIMIT 1` picked between them by id COLLATION, which is arbitrary, not deterministic.
+  // A partial UNIQUE index makes the second root unstorable instead (INV-ENFORCE), so
+  // the read's answer is the only row that can match rather than the first of several.
+  yield* sql`CREATE UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`;
+  // Keeps the tree walk (a parent's children) and the foreign key's own referencing
+  // scan cheap; SQLite indexes the referenced side of a key, never the referencing one.
+  yield* sql`CREATE INDEX execution_parent ON execution (parent)`;
   yield* sql`CREATE TABLE event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL,
@@ -678,10 +827,18 @@ const createSchema = Effect.gen(function* () {
   // id APPENDS with fresh higher offsets rather than reusing or resetting the sequence
   // (never a duplicated/corrupted offset). The `execution_event_log_execution` index keeps a
   // per-execution ordered read/tail cheap.
+  //
+  // `"executionId"` is a real FOREIGN KEY onto `execution (id)` (DE2.2), not a bare
+  // scoping column: `Execution 1:1 Transcript`, so a transcript that names no stored
+  // run is not a transcript — it is an orphan whose owner nothing can resolve. With the
+  // key, an entry for an unknown execution is refused by the engine at the append, so
+  // "every durable entry belongs to an execution that exists" is a property of the
+  // store rather than a claim about its writers.
   yield* sql`CREATE TABLE execution_event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       "executionId" TEXT NOT NULL,
-      event TEXT NOT NULL
+      event TEXT NOT NULL,
+      FOREIGN KEY ("executionId") REFERENCES execution (id)
     )`;
   yield* sql`CREATE INDEX execution_event_log_execution ON execution_event_log ("executionId")`;
 });
@@ -723,7 +880,7 @@ const configureConnection = Effect.gen(function* () {
     // the caller's single `fail("applySchema")` mapping covers it too.
     return yield* Effect.fail({
       message:
-        "SQLite refused `PRAGMA foreign_keys = ON`; the schema's foreign keys (the agent registry's `supersedes`, `repository_ref.repositoryId`, `workstream.repositoryId`) would not be enforced, leaving dangling references storable",
+        "SQLite refused `PRAGMA foreign_keys = ON`; the schema's foreign keys (the agent registry's `supersedes`, `repository_ref.repositoryId`, `workstream.repositoryId`, the execution's `jobId`/`agentId`/`parent`, and `execution_event_log.executionId`) would not be enforced, leaving dangling references storable",
     });
   }
 });
@@ -1331,23 +1488,52 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail(operation)),
     );
 
-  const putExecution = SqlSchema.void({
-    Request: Execution,
-    execute: (row) =>
-      sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
-  });
+  /**
+   * Reconstruct one {@link Execution} from its row, dropping the SQL `NULL` parent to
+   * an absent optional. `operation` names the calling store method so a decode failure
+   * reports the caller.
+   */
+  const hydrateExecution = (
+    row: unknown,
+    operation: string,
+  ): Effect.Effect<Execution, StateStoreError> =>
+    Schema.decodeUnknownEffect(ExecutionRow)(row).pipe(
+      Effect.map(
+        (r): Execution => ({
+          id: r.id,
+          jobId: r.jobId,
+          agentId: r.agentId,
+          ...(r.parent !== null ? { parent: r.parent } : {}),
+          mode: r.mode,
+          transcript: r.transcript,
+        }),
+      ),
+      Effect.mapError(fail(operation)),
+    );
 
-  const getExecutionQuery = SqlSchema.findOneOption({
-    Request: ExecutionId,
-    Result: ExecutionRow,
-    execute: (id) => sql`SELECT * FROM execution WHERE id = ${id}`,
-  });
+  /**
+   * Read at most one execution row through {@link hydrateExecution}. Shared by the two
+   * reads so the `NULL`-parent handling is written once.
+   */
+  const findExecution = (
+    rows: ReadonlyArray<unknown>,
+    operation: string,
+  ): Effect.Effect<Option.Option<Execution>, StateStoreError> =>
+    Option.match(Arr.head(rows), {
+      onNone: () => Effect.succeedNone,
+      onSome: (row) => Effect.asSome(hydrateExecution(row, operation)),
+    });
 
-  const getExecutionForJobQuery = SqlSchema.findOneOption({
-    Request: JobId,
-    Result: ExecutionRow,
-    execute: (jobId) => sql`SELECT * FROM execution WHERE "jobId" = ${jobId}`,
-  });
+  const getExecutionForJobQuery = (jobId: JobId) =>
+    // The job's ROOT execution: `parent IS NULL`. A job owns a TREE now (DE2.2 dropped
+    // `UNIQUE execution_job`), so "the execution for this job" needs a definition rather
+    // than an assumption that only one row can match. The definition holds because the
+    // `execution_root` partial UNIQUE index makes a SECOND rootless row for one job
+    // unstorable — that, not the `LIMIT 1`, is what makes the answer deterministic. The
+    // `ORDER BY id LIMIT 1` is kept as a plan hint only; with the index there is at most
+    // one candidate to order. DE2.4 replaces this read entirely: a `Session` names its
+    // `root` execution outright, so the root stops being something to look up.
+    sql`SELECT * FROM execution WHERE "jobId" = ${jobId} AND parent IS NULL ORDER BY id LIMIT 1`;
 
   const jobs: JobStore = {
     putJob: (job) =>
@@ -1382,10 +1568,105 @@ const make = Effect.gen(function* () {
         ),
       ),
     putExecution: (execution) =>
-      putExecution(execution).pipe(Effect.mapError(fail("putExecution"))),
-    getExecution: (id) => getExecutionQuery(id).pipe(Effect.mapError(fail("getExecution"))),
+      Effect.gen(function* () {
+        // The ONE tree edge the `parent` foreign key does NOT reject: SQLite checks the
+        // constraint against the table INCLUDING the row being inserted, so a row is its
+        // own valid parent. Rejecting it here is what makes the whole relation acyclic —
+        // every longer cycle needs an edge naming a row that does not exist yet, which
+        // the key already refuses. (The same division of labour as `putAgent`'s
+        // self-`supersedes` check.)
+        if (execution.parent === execution.id) {
+          return yield* Effect.fail(
+            new StateStoreError({
+              operation: "putExecution",
+              detail: `execution "${execution.id}" names itself as its parent; an execution's parent must be a DIFFERENT execution`,
+            }),
+          );
+        }
+        const transcript = yield* Schema.encodeEffect(Schema.fromJsonString(Transcript))(
+          execution.transcript,
+        ).pipe(Effect.mapError(fail("putExecution")));
+        const row = {
+          id: execution.id,
+          jobId: execution.jobId,
+          agentId: execution.agentId,
+          parent: execution.parent ?? null,
+          mode: execution.mode,
+          transcript,
+        };
+        // THE UPDATE SET IS DERIVED FROM ONE RULE, NOT ASSEMBLED COLUMN BY COLUMN. See
+        // `putExecution` in `store.ts` for the rule and the per-column table it produces;
+        // this is its mechanism. An `Execution` is a HISTORICAL RECORD OF A RUN, so a
+        // column is FROZEN unless there is a named reason it changes, and only
+        // `transcript` has one. The frozen list is therefore what `sql.update` EXCLUDES:
+        // `id` (the key), plus the two STRUCTURAL columns `"jobId"` and `parent`.
+        //
+        // The `WHERE … IS excluded.…` makes each freeze LOUD rather than silent, and the
+        // ENGINE decides it inside the one statement — no read-then-write window a
+        // concurrent writer can slip through. A re-attach (the intended upsert) passes the
+        // same structural columns and updates normally; a re-home or a re-parent matches
+        // no row, updates nothing, and `RETURNING` comes back empty, which is the failure
+        // below. `IS` is SQLite's null-safe equality, so a rootless execution's `NULL`
+        // parent compares as a value.
+        //
+        // Why each structural column needs its OWN clause — neither covers the other, and
+        // both were live holes found in review:
+        //   - `parent`: a foreign key constrains the row a write REFERENCES, never the
+        //     re-pointing of an EXISTING one, so while `parent` was in the updated set a
+        //     2-cycle was constructible in three ordinary writes (insert `a` rootless,
+        //     insert `b` under `a`, upsert `a` under `b`), leaving the job with NO
+        //     `parent IS NULL` row at all.
+        //   - `"jobId"`: the COMPOSITE `(parent, "jobId")` key closes cross-job EDGES and
+        //     says nothing about a row re-pointing its own `"jobId"`. While it was in the
+        //     updated set, an ordinary re-put MIGRATED a stored execution to another job —
+        //     no dangling reference, no cycle, no second root — leaving the original job
+        //     owning nothing while its Job row still named the execution, so
+        //     `listExecutionsForJob` answered `[]` and `startup-reconcile`'s `settle`
+        //     iterated an empty list and sealed nothing: the CE4.1-R4 live-orphan stall
+        //     again, by a third route.
+        // Frozen, each of those states requires naming a row that does not exist yet,
+        // which the keys refuse (INV-ENFORCE: unconstructible, not checked).
+        const written =
+          yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id", "jobId", "parent"])} WHERE execution."jobId" IS excluded."jobId" AND execution.parent IS excluded.parent RETURNING id`.pipe(
+            Effect.mapError(fail("putExecution")),
+          );
+        if (written.length === 0) {
+          // The statement refused; SAY WHICH freeze did it. This read runs only on the
+          // failure path — after the write is already known not to have happened — so it
+          // adds no window to the write itself, and it is the only way to tell the two
+          // apart from an empty `RETURNING`.
+          const current = yield* sql`SELECT * FROM execution WHERE id = ${execution.id}`.pipe(
+            Effect.mapError(fail("putExecution")),
+            Effect.flatMap((rows) => findExecution(rows, "putExecution")),
+          );
+          const rehomed = Option.exists(current, (stored) => stored.jobId !== execution.jobId);
+          return yield* Effect.fail(
+            new StateStoreError({
+              operation: "putExecution",
+              detail: rehomed
+                ? `execution "${execution.id}" is already stored under a DIFFERENT job; an execution's job is fixed at its first write — re-homing is not an operation an execution has`
+                : `execution "${execution.id}" is already stored with a DIFFERENT parent; an execution's parent is fixed at its first write — re-parenting is not an operation an execution has`,
+            }),
+          );
+        }
+      }),
+    getExecution: (id) =>
+      sql`SELECT * FROM execution WHERE id = ${id}`.pipe(
+        Effect.mapError(fail("getExecution")),
+        Effect.flatMap((rows) => findExecution(rows, "getExecution")),
+      ),
     getExecutionForJob: (jobId) =>
-      getExecutionForJobQuery(jobId).pipe(Effect.mapError(fail("getExecutionForJob"))),
+      getExecutionForJobQuery(jobId).pipe(
+        Effect.mapError(fail("getExecutionForJob")),
+        Effect.flatMap((rows) => findExecution(rows, "getExecutionForJob")),
+      ),
+    listExecutionsForJob: (jobId) =>
+      sql`SELECT * FROM execution WHERE "jobId" = ${jobId} ORDER BY id`.pipe(
+        Effect.mapError(fail("listExecutionsForJob")),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) => hydrateExecution(row, "listExecutionsForJob")),
+        ),
+      ),
   };
 
   // ── EventLogStore ─────────────────────────────────────────────────────────

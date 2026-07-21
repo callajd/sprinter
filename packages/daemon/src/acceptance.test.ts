@@ -466,6 +466,11 @@ it.effect(
           // ── baseline: the seeded plan hydrates, PR-open already present ──────
           const base: Snapshot = yield* client.snapshot();
           expect(base.workstreams.map((w) => w.id)).toContain("ws-seed");
+          // The `Agent` REGISTRY is EMPTY before anything runs — the NEGATIVE half of the
+          // DE2.2/D2 check below. Nothing seeds it, and until this task nothing on the
+          // production path ever wrote to it, so a real daemon shipped an empty
+          // `Snapshot.agents` forever.
+          expect(base.agents).toStrictEqual([]);
           const baseIssue = base.issues.find((i) => i.id === "issue-seed");
           expect(baseIssue?.status).toBe("in_review");
           expect(baseIssue?.pr?.number).toBe(PR_NUMBER);
@@ -552,7 +557,30 @@ it.effect(
           // only once MERGED; see the runbook's "Known limitation"). This asserts the
           // pairing WIRE, not open-PR discovery.
           const execution = finalSnap.executions.find((s) => s.id === "execution-job-seed");
-          expect(execution?.jobId).toBe("job-seed");
+          expect(execution).toBeDefined();
+          // `toBeDefined` asserts, but does not NARROW, so the guard below is what lets the
+          // assertions read plainly instead of being smuggled into a ternary (and it keeps
+          // a missing row failing HERE, with a legible message, rather than obscurely).
+          if (execution === undefined) throw new Error("execution-job-seed missing from snapshot");
+          expect(execution.jobId).toBe("job-seed");
+          // ── DE2.2 / D2: the registry's FIRST PRODUCTION WRITER ────────────────
+          //
+          // After a REAL daemon has run ONE execution end-to-end, `Snapshot.agents` is
+          // NON-EMPTY — the criterion DE1.1 could not meet, since `Agent` was reachable
+          // only from tests. Paired with the empty baseline above, this is the guard
+          // working rather than a fixture being echoed back.
+          expect(finalSnap.agents.length).toBeGreaterThan(0);
+          // …and the execution RESOLVES to the exact revision that ran it: the id is a
+          // FOREIGN KEY into that registry, so it cannot name anything else.
+          const ranBy = finalSnap.agents.find((a) => a.id === execution.agentId);
+          expect(ranBy?.name).toBe("pi");
+          // The run has ENDED — its transcript is SEALED, and it holds the turn itself
+          // (an autonomous root, no parent). Liveness lives in that one value.
+          expect(execution.transcript._tag).toBe("SealedTranscript");
+          expect(execution.mode).toBe("autonomous");
+          // `parent` is an `optionalKey`, so ROOT means the KEY IS ABSENT — a membership
+          // check, not a value check (`undefined` would also read as absent).
+          expect("parent" in execution).toBe(false);
           const pairedIssue = finalSnap.issues.find((i) => i.id === finalJob?.issueId);
           expect(pairedIssue?.pr?.number).toBe(PR_NUMBER);
           expect(pairedIssue?.pr?.merged).toBe(false);

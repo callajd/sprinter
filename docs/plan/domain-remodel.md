@@ -155,6 +155,39 @@ New branded ids: `RepositoryId`, `PullRequestId`, `SessionId` (re-pointed),
 `ExecutionId`, `WorkspaceId`, `AgentId`, `SpecId`, `SpecRevisionId`, `CommitSha`,
 `BranchName`.
 
+### Mutability follows the layer
+
+Point B gives each entity's **shape**. It does not say which of its fields are *facts about
+something that already happened* — and that omission cost DE2.2 (issue #104) four review
+rounds, each one a different column that turned out to be mutable when it should not have
+been, plus a write ordering the same key had forced.
+
+The answer does not need to be invented per entity: **the layer an entity sits in
+determines it.** `INV-OBSERVED` already splits entities into referenced-vs-owned for
+`observedAt`; mutability follows the same split.
+
+| Layer | On a re-put | Why |
+|---|---|---|
+| `── STATE ──` / `── TRANSITION ──` referenced (`Repository`, `Issue`, `PullRequest`) | **REPLACE wholesale**; `observedAt` advances | the row *is* the latest observation — replacing it is the point |
+| `── AGENTIC WORK ──` owned historical (`Execution`, `Session`) | **FREEZE** every field that records what happened; exactly one field carries the lifecycle | a record of a past run; re-pointing it rewrites history |
+| `── AGENTIC WORK ──` owned ephemeral (`Workspace`) | mutable throughout; released as one unit | diff/processes/ports change constantly by design |
+| `── REGISTRY ──` and `SpecRevision` | **APPEND-ONLY**; an edit mints a new revision | already stated; `Agent` enforced since DE1.1, `SpecRevision` at DE3.2 |
+
+**Every issue that lands an entity must state its column-by-column answer**, with a reason
+per column, and a NEW column's default is the layer's default. DE2.2 landed that table for
+`Execution` on `putExecution`; use it as the template.
+
+The two exceptions worth naming, because both are real and neither is obvious:
+
+- `Execution.agentId` and `Execution.mode` are **overwritten** despite `Execution` being an
+  owned historical record — because #77's merged-transcript model deliberately reuses one
+  execution id across re-dispatches. Freezing them would break retry-after-upgrade. The
+  docstrings therefore promise "the revision of the MOST RECENT run under this id", not
+  "the run".
+- A referenced entity's **identity** must still be stable across re-observation (DE1.2:
+  `RepositoryId` from the host's numeric id, not from `owner/name`), or "replace wholesale"
+  silently becomes "insert a duplicate".
+
 ### The work matrix
 
 `mode` is a **closed** axis; `target` is an **open** one. Every cell is valid; the
@@ -251,11 +284,20 @@ survives so a past execution resolves to the exact revision that ran it. Both ca
 unconditionally: a bump destroys that history, and DE2.2's `Execution.agentId` can then
 dangle across one.
 
-Resolved for now as *documentation truth* — revisions are immutable **within a store
-generation**, and a bump is accepted data loss while the store is pre-release greenfield.
-**Revisit at DE2.2**, where the choice is a re-derivation source (a config/manifest
-re-seeded on open) or an explicit carve-out. Until then, no task may assert unconditional
-durability of registry history.
+**RESOLVED at DE2.2 (issue #104) for referential integrity.** `Execution.agentId` is a
+real `FOREIGN KEY` onto `agent`, and a version bump drops *every* table in one sweep — so
+`agent` and `execution` go together and no execution can survive naming a discarded
+revision. Within a generation the key refuses the write; across one there is nothing left
+on either side. A dangling `agentId` is **unconstructible**, so no downstream task has to
+model a possibly-absent agent.
+
+What remains is not an integrity question but a product one — *should* agent history
+survive the remodel? While the store is pre-release greenfield, no: the history is worth
+what the executions referencing it are worth, and those go with it. No re-derivation
+source was invented; `putAgent` stays the sole source of truth for registry content. The
+reasoning lives where the durability claim does (`packages/domain/src/registry.ts`,
+`packages/state/src/sqlite.ts`). Revisions remain immutable **within a store generation**,
+and no task may assert durability wider than that.
 
 ## Cross-cutting invariants
 
@@ -276,7 +318,7 @@ durability of registry history.
 | `INV-LIFECYCLE` | No entity stores a lifecycle its children already determine | review + typecheck |
 | `INV-OPAQUE` | No code in `packages/*` parses spec content. Structure exists only in the derived work graph | review |
 | `INV-MODE` | `mode` is per-execution. Nothing stores a session-level mode | review |
-| `INV-ENFORCE` | Every invariant above is enforced by a mechanism that makes violation **unconstructible** — a schema constraint (`UNIQUE`/`FOREIGN KEY`/`CHECK`) or a type — never by convention, and never by a runtime check a sibling code path can bypass. Two fields that must agree are **one value**. A surviving runtime guard states in its docstring why the state cannot instead be made unconstructible | review + the constraint itself |
+| `INV-ENFORCE` | Every invariant above is enforced by a mechanism that makes violation **unconstructible** — a schema constraint (`UNIQUE`/`FOREIGN KEY`/`CHECK`) or a type — never by convention, and never by a runtime check a sibling code path can bypass. Two fields that must agree are **one value**. A constraint must name **which tuple it ranges over** and **which operations may reach the state**: DE2.2 shipped a real `FOREIGN KEY (parent)` that still admitted a cross-job edge (wrong tuple — it needed `(parent, jobId)`) and still admitted a re-parent (wrong operation — it constrained INSERT but not UPDATE). A surviving runtime guard states in its docstring why the state cannot instead be made unconstructible | review + the constraint itself |
 
 ## Epics — set & sequencing
 
@@ -348,10 +390,110 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   session_job(jobId)` dropped; Swift mirror + golden. `agentId` is a `FOREIGN KEY` into
   the registry (`INV-ENFORCE`) — and this task lands the registry's **first production
   writer**, since DE1.1 shipped `Agent` reachable only from tests, so `Snapshot.agents` is
-  empty in a real daemon until here. Resolve the durability tension recorded under
-  [Landed foundations](#a-known-tension--inv-fresh-vs-the-registrys-durability): either
-  give the registry a re-derivation source, or state what a dangling `agentId` renders as
-  after a store reset.
+  empty in a real daemon until here. The durability tension recorded under
+  [Landed foundations](#a-known-tension--inv-fresh-vs-the-registrys-durability) is
+  **resolved** by that foreign key: a reset drops the registry and the executions together,
+  so a dangling `agentId` is unconstructible rather than merely unlikely.
+- **Landed as:** `Execution { id, jobId, agentId, parent?, mode, transcript }` — the link
+  is `jobId` **only until DE2.4** re-points it at `sessionId` (`Session` does not exist
+  yet, and a real key now beats a nullable one later). `ExecutionStatus` is **gone**:
+  liveness IS the transcript variant, because a status enum beside it would be a second
+  field that must agree with the first (`INV-SUM` / `INV-ENFORCE`), and a settled run's
+  OUTCOME belongs to the work it advanced. `execution_event_log."executionId"` became a
+  foreign key too (1 Execution = 1 Transcript), and the registry's production writer
+  derives an agent revision's id from its CONTENT, so re-running the same agent is an
+  idempotent no-op and editing it is a new revision by construction.
+- **Decided at cold review (issue #109):**
+  - **The tree is acyclic only with `parent` FROZEN.** The `parent` foreign key
+    constrains the row a write *references*, never the re-pointing of an existing one, so
+    while `parent` sat in `putExecution`'s `ON CONFLICT … DO UPDATE SET` list a 2-cycle
+    was constructible in three ordinary writes — after which the job had no rootless row,
+    `getExecutionForJob` answered `None`, and the job's execution vanished from the
+    snapshot *and* from `startup-reconcile`'s seal, re-opening the CE4.1-R4 live-orphan
+    stall. `parent` is now INSERT-ONLY: **re-parenting is not an operation an execution
+    has**, and a write attempting one is refused by the engine inside the same statement
+    (`INV-ENFORCE` — unconstructible, not walked for).
+  - **A job has exactly ONE root**, enforced by a partial `UNIQUE (jobId) WHERE parent IS
+    NULL` index. `getExecutionForJob`'s "the root" was previously undefined for two
+    parentless rows and picked between them by id collation.
+  - **ONE JOB OWNS ONE TREE**, enforced by a COMPOSITE `parent` edge — `UNIQUE (id,
+    "jobId")` plus `FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")`
+    (`SCHEMA_VERSION` 7). The single-column key constrained only that the parent ROW
+    exists; nothing required it to belong to the same job, so a CROSS-JOB edge was an
+    ordinary write and it recreated the very state the single-root index closed — a job
+    owning an execution while holding no rootless row, hence `getExecutionForJob` → `None`
+    and a `startup-reconcile.settle` that silently skipped sealing. With the edge scoped to
+    the job a job's executions are closed under `parent`, so `None` now genuinely means
+    "this job owns no executions" (`INV-ENFORCE`).
+  - **`putExecution`'s update set is a RULE, not a list.** Four review rounds each found a
+    freeze that covered the column someone had named while the invariant needed a
+    different one (`supersedes` write order → `parent` re-point → `parent` cross-job →
+    `jobId` migration: an ordinary re-put moved a leaf to another job, leaving the
+    original owning nothing and `settle` sealing nothing). The rule that replaces the
+    patching: **an `Execution` is a historical record of a run, so every column is FROZEN
+    unless there is a named reason it changes** — generalised for every entity as
+    [Mutability follows the layer](#mutability-follows-the-layer). That yields `id` (key), `jobId`/`parent`
+    (STRUCTURAL — frozen, refused inside the upsert statement), `agentId`/`mode` (PER-RUN
+    FACTS — rewritten by a re-dispatch), `transcript` (the one field that legitimately
+    changes, live → sealed). **A new column's default is FROZEN.** Stated on
+    `putExecution` in `store.ts` and beside the DDL.
+  - **`agentId` is the MOST RECENT run's revision, not "the agent that ran".** #77's
+    merged-transcript model reuses ONE execution id across re-dispatches, so a retry
+    after an agent upgrade must be able to re-attribute the row — freezing it would break
+    the retry. The docstrings claiming an unconditional "always resolves to the agent that
+    actually ran it" were narrowed on both sides of the wire instead: a merged transcript
+    is attributed to the latest revision, and *"a retry is a new execution"* is DE2.4 work.
+  - **The dispatch seal is EXACT; only the reconcile seal is a bound.** `job-runner`'s
+    fold is the sole writer of the transcript and now KEEPS the offsets `append` returns,
+    sealing at `max(localHighWater, maxOffset ?? 0)`. The "no local high-water mark to
+    prefer" argument is true only of `startup-reconcile`'s settle, whose run's process is
+    already gone — which is the path the lower-bound contract is written for.
+  - **`settle` seals EVERY execution a job owns**, iterating `listExecutionsForJob` rather
+    than sealing `getExecutionForJob`'s root. A job owns a tree; a sibling left with a
+    `LiveTranscript` kept `isExecutionLive` true and made `resolveLive` bounded-WAIT on it
+    while the job was still `queued`/`running` — the CE4.1-R4 stall moved off the root
+    rather than closed. Each is sealed at ITS OWN `executionLog.maxOffset`.
+  - **The snapshot carries the whole TREE**, via a new `listExecutionsForJob` read.
+    `putExecution` journals `ExecutionChanged` for *every* execution, so a snapshot built
+    from the root alone shipped strictly less than the deltas that follow it and a
+    reconnecting client converged differently from one that never dropped.
+  - **`SealedTranscript.lastOffset` is a LOWER BOUND**, stated on both sides of the wire.
+    `[0, lastOffset]` is complete and immutable — the entire cacheability claim, and
+    unconditionally true — but it is not a claim that nothing exists beyond it: the seal
+    falls back to `0` on a transient extent read (better than an execution left live
+    forever), the durable-append fold is bounded by the execution's terminal so an
+    in-flight append can land after the extent is read, and a per-append failure is
+    absorbed. Nothing consumes `lastOffset` yet — `resyncExecutionEvents` reads
+    `executionLog.maxOffset` directly — so the bound is documented before it has a reader.
+  - **`BoardProjection.liveActivity`'s widening is INTENDED.** The old
+    `execution?.status == .active` clause was dead; `isLive` makes the execution clause
+    decide for the first time, and a non-terminal non-`running` job with an open
+    transcript now reads live. Narrowing back would put liveness on the job's status enum
+    and make the transcript decorative — the second source of truth `INV-SUM` removed —
+    and the state it newly surfaces is exactly the live orphan the startup seal clears.
+  - **`LOCAL_PI_AGENT.version` is a placeholder that does NOT track the `pi` binary**, so
+    an upgrade re-derives the same registry id and the registry records that "the same
+    agent" ran across it. Documented alongside the `model` caveat, with what would have to
+    change (the resolved version reaching the adapter as data at spawn time).
+  - **`registerAgent` appends ORIGINAL revisions only**, so editing an agent definition
+    starts a new unlinked lineage rather than extending one; `Snapshot.agents` accumulates
+    single-revision lineages the helpers correctly treat as unrelated agents.
+  - **A RETIREMENT is a no-op on the dispatch path**, a consequence of content-addressed
+    ids. Retiring a lineage appends a new revision with `supersedes` + `retiredAt`, but the
+    local `pi` content is unchanged, so the next dispatch re-derives the ORIGINAL id,
+    `putAgent` answers "unchanged", and the execution is attributed to a retired lineage's
+    head. Dispatch never consults `isLineageRetired`. Recorded, not fixed: honouring a
+    retirement is a decision about what one MEANS operationally (refuse? run the
+    successor's content? warn?) and no task on this workstream takes it.
+  - **`Job.executionId` is deliberately NOT a foreign key** while `execution."jobId"` is.
+    The tables reference each other, so a plain key is unwritable in either order without
+    deferred constraints; the surviving consequence — a job may name an execution never
+    stored — is stated in the DDL rather than hidden. Every read that matters resolves the
+    enforced direction.
+  - **`indexedPreferringLive` is a PROJECTION, not an index.** Now that the snapshot ships
+    a job's whole tree, it reduces N executions per job to one. Correct for the board's
+    boolean question; anything that needs to say something *about* the tree must read
+    `snapshot.executions` directly.
 - **Depends on:** `DE2.1`
 
 ### DE2.3 — `PullRequest` as an entity
@@ -380,9 +522,37 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   no consumer sees `workspace?`/`product?`; `target` and `product` unions with the
   `PRODUCT_FOR` map declared `satisfies Record<Target["_tag"], Product["_tag"]>`,
   plus a schema refinement rejecting a `product` whose tag is not
-  `PRODUCT_FOR[target._tag]`; `Job`, the old `Session`, `JobStatus`,
-  `SessionStatus`, `JobKind`, `transcriptRef` deleted from `packages/*` and
-  `apple/*`; Swift mirror + golden.
+  `PRODUCT_FOR[target._tag]`; `Job`, the old `Session`, `JobStatus`, `JobKind`,
+  `transcriptRef` deleted from `packages/*` and `apple/*` (`SessionStatus`, i.e.
+  DE2.1's `ExecutionStatus`, is already gone — DE2.2 replaced it with the transcript
+  union); Swift mirror + golden.
+- **Hazard inherited from DE2.2:** this task re-points `Execution.jobId` at `sessionId`,
+  which is another foreign-key change — and an FK change **forces write reorderings**. In
+  DE2.2 the new `execution."jobId"` key forced *execution-after-job* at dispatch start
+  (correct and required), and the reversal leaked to the **terminal** write site where the
+  opposite order is load-bearing and neither order is forced: the job must go terminal
+  LAST, so a crash between the two statements leaves it `running` and the reconciler can
+  still find and seal it. Inverted, a crash left a permanently unrecoverable live orphan —
+  the exact class DE2.2 spent three rounds closing. **When an FK forces a reorder,
+  re-justify every other ordering on that path**, and comment each with the invariant it
+  protects.
+  **And re-justify EVERY site, not the ones a reviewer names.** The fix at the two named
+  `job-runner.ts` sites left the SAME inversion standing in `startup-reconcile.ts`'s
+  `settle` — the repair path itself — and it took a fifth round to find. The obligation is
+  therefore an ENUMERATION: `grep` every writer of the affected pair, classify each ordering
+  as **FORCED** (a constraint admits one order) or **FREE** (both legal to the engine), and
+  for every FREE one name the invariant that chose it. A free ordering with no stated reason
+  is a defect. DE2.2's table of the four sites is the template.
+- **Forward constraint — `Snapshot.executions` is UNBOUNDED once a child-execution writer
+  lands.** DE2.2 left `job-runner` writing only ROOTS — one execution per job — so the
+  snapshot's size was unchanged. But the model is a TREE with no arity limit and the
+  snapshot carries every execution unfiltered, so whichever task lands the first
+  child-execution writer (this one, or a subagent path) must land WITH a bound: a
+  depth/count limit, roots-only with children fetched per-execution, or pagination. An
+  unbounded fan-out reaches every connected client on every snapshot.
+- **Mutability:** `Session` is an owned historical record, so its run-facts freeze; see
+  [Mutability follows the layer](#mutability-follows-the-layer). `SessionState` is derived
+  and never stored, so it is not a column at all.
 - **Depends on:** `DE2.2`, `DE2.3`
 
 ### DE2.5 — `Workspace` entity
@@ -391,6 +561,10 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   processes, ports and background tasks; the contract exposes a narrowed
   projection (`branch`, `base`, diff summary) — process ids and ports do not cross
   to the app; Swift mirror + golden for the projection.
+- **Mutability:** `Workspace` is the one owned entity that is *ephemeral*, not historical —
+  `diff`, `processes`, `ports` and `tasks` change constantly, so it is mutable throughout
+  and released as a single unit. Do not apply DE2.2's freeze rule here; see
+  [Mutability follows the layer](#mutability-follows-the-layer).
 - **Depends on:** `DE2.4`
 
 ---
@@ -536,6 +710,23 @@ The workstream is done when none of these can be constructed:
 20. A malformed value in a validated position — a `CommitSha` that is not 40 hex
     characters, a `BranchName` that is not a legal git ref, an instant that is not
     canonical. Branding a `NonEmptyString` does not satisfy this.
+21. An execution whose `parent` belongs to a **different job** — the tree is closed at the
+    job boundary by a composite key, not by writer discipline.
+22. A **terminal job with a live transcript**. Recovery walks only `running` jobs, so this
+    state is repaired by nothing; the terminal write order (execution sealed BEFORE the job
+    goes terminal) is what prevents it.
+23. A row that records a past event and can still be **re-pointed** — see
+    [Mutability follows the layer](#mutability-follows-the-layer).
+
+> **21-23 were learned in DE2.2 (#104), at a cost of five review rounds.** 21 and 23 were
+> each found only after the previous fix; 22 was introduced by the FOREIGN KEY the feature
+> itself added — which forced one write order at dispatch start and silently reversed the
+> opposite one at terminal — and was caught only on the fourth pass. The fifth pass found 22
+> a THIRD time, in the reconciler's own `settle`, where the order in fact pre-dated the
+> feature: stating the invariant is what made the pre-existing code a violation of it.
+> **Corollary: when a task promotes a behaviour to a stated rule, it owns every existing
+> site that breaks the new rule** — including the ones it did not write. They are stated
+> here so DE2.4, DE2.5 and DE3 inherit them.
 
 > **17-20 were learned, not designed.** They come from DE1.1's implementation
 > (issue #85 / PR #88), where each was initially a runtime check that some other path
@@ -544,9 +735,13 @@ The workstream is done when none of these can be constructed:
 
 ## Done (workstream)
 
-- All sixteen states above are unconstructible.
+- All twenty-three states above are unconstructible.
 - `Job`, `PullRequestRef`, `IssueStatus`, `JobStatus`, `SessionStatus`, `JobKind`
-  appear nowhere in `packages/*` or `apple/*`.
+  appear nowhere in `packages/*` or `apple/*`. (`SessionStatus` — the process-level
+  status enum, renamed `ExecutionStatus` by DE2.1 — was deleted early, at **DE2.2**:
+  giving `Execution` its real shape replaced it with the `LiveTranscript`/
+  `SealedTranscript` distinction, and keeping both would have been two fields that must
+  agree.)
 - `Session` names the unit of work; `Execution` names one agent's run. No
   identifier in `packages/domain` or `packages/contract` uses "session" for a
   process.

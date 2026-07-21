@@ -349,6 +349,11 @@ const journaling = (base: Store, feed: Feed, executionFeed: ExecutionFeed): Stor
       listEpics: base.workGraph.listEpics,
       listIssues: base.workGraph.listIssues,
     },
+    // `putJob` / `putExecution` are the two writes that can carry a TERMINAL Job status or a
+    // `SealedTranscript`. This decorator makes NO ordering choice: it wraps each write
+    // one-for-one and journals it, preserving whatever order its caller issued. The order is
+    // decided at the three call sites that pair them (`job-runner.ts` ×2, `startup-reconcile.ts`
+    // `settle`), each of which names its order and the invariant that picked it.
     jobs: {
       putJob: (job) =>
         putAndJournal(base, feed, base.jobs.putJob(job), { _tag: "JobChanged", job }),
@@ -361,6 +366,7 @@ const journaling = (base: Store, feed: Feed, executionFeed: ExecutionFeed): Stor
         }),
       getExecution: base.jobs.getExecution,
       getExecutionForJob: base.jobs.getExecutionForJob,
+      listExecutionsForJob: base.jobs.listExecutionsForJob,
     },
     events: base.events,
     executionLog: {

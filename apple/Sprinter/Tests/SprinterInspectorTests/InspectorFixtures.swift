@@ -7,7 +7,13 @@ enum InspectorFixtures {
   static let jobId = JobId(rawValue: "job-1")
   static let issueId = IssueId(rawValue: "issue-1")
 
-  static let execution = Execution(id: executionId, jobId: jobId, status: .active)
+  static let execution = Execution(
+    id: executionId,
+    jobId: jobId,
+    agentId: AgentId(rawValue: "agt-1"),
+    parent: nil,
+    mode: .autonomous,
+    transcript: .live(LiveTranscript()))
 
   /// The job's own closing PR (the `execution.jobId → job.pullRequest` path).
   static let jobPullRequest = PullRequestRef(

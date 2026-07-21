@@ -22,7 +22,7 @@
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
  * - {@link JobStore} — the `Job` model and the `Issue → Job → execution → PR`
- *   mapping (1 Job = 1 execution = 1 transcript = 1 PR), plus {@link Execution}.
+ *   mapping, plus the {@link Execution} TREE that advances a job.
  * - {@link EventLogStore} — an append-only durable event feed (append / ordered
  *   read / tail-from-offset): the durable event record distinct from the reactive
  *   in-memory stream, supporting D17 reconciliation and AE4's snapshot.
@@ -186,7 +186,11 @@ export type AgentWrite = "appended" | "unchanged";
  *   referential constraint accepts (a row satisfies a key against itself), and with
  *   it closed no cycle of any length is constructible: a longer one needs an edge
  *   naming a revision that does not exist yet. Acyclicity is therefore structural,
- *   not a precondition anyone owes.
+ *   not a precondition anyone owes — but note WHY the key is enough here and is not
+ *   enough for the execution tree ({@link putExecution}): a key constrains the row a
+ *   write REFERENCES, not the re-pointing of an existing one, and this store is
+ *   APPEND-ONLY, so there is no update through which an edge could be re-pointed. The
+ *   tree had to freeze `parent` explicitly to buy the same property.
  * - a RETIRING revision (one carrying BOTH `supersedes` and `retiredAt`) must carry
  *   the SAME `name` / `model` / `version` / `tools` as the revision it supersedes.
  *   Retirement is LIFECYCLE-ONLY; fusing a content edit into it would make the two
@@ -377,9 +381,14 @@ export interface WorkGraphStore {
 
 /**
  * Persist and read the {@link Job} model and the `Issue → Job → execution → PR`
- * mapping (1 Job = 1 execution = 1 transcript = 1 PR). `putJob` carries a job's
- * optional `executionId` / `transcriptRef` / `pr`; {@link Execution} rows are stored
- * alongside so a job can be resolved to its running execution (and back).
+ * mapping. `putJob` carries a job's optional `executionId` / `transcriptRef` / `pr`;
+ * {@link Execution} rows are stored alongside so a job can be resolved to its running
+ * execution (and back).
+ *
+ * A job is advanced by a TREE of executions (DE2.2), not by exactly one: `putExecution`
+ * accepts many per job, and `getExecutionForJob` answers with the tree's ROOT. ONE JOB
+ * OWNS ONE TREE — the `parent` edge may not cross jobs, so a job's executions are closed
+ * under `parent` and exactly one of them is rootless.
  */
 export interface JobStore {
   /** Upsert a {@link Job} (with its optional execution / transcript / PR links). */
@@ -391,20 +400,142 @@ export interface JobStore {
     issueId: IssueId,
   ) => Effect.Effect<ReadonlyArray<Job>, StateStoreError>;
   /**
-   * Upsert an {@link Execution} (by execution id). At most one execution may exist per
-   * job (1 Job = 1 execution); attaching a second, distinct execution to a job that
-   * already has one fails with {@link StateStoreError}. A restart re-attaches by
-   * upserting the SAME execution id, not a new one.
+   * Upsert an {@link Execution} (by execution id). A job owns a TREE of executions
+   * (DE2.2 dropped the `UNIQUE (jobId)` index), so a SECOND execution for a job is
+   * ordinary and SUCCEEDS.
+   *
+   * ## What an upsert may change — the RULE, and the table it produces
+   *
+   * **An `Execution` is a HISTORICAL RECORD OF A RUN.** A field that is a FACT ABOUT
+   * WHAT HAPPENED does not become a different fact later, so every column is FROZEN
+   * unless there is a NAMED reason it changes. Exactly one column has such a reason.
+   * The upsert's updated set is DERIVED from that rule rather than assembled column by
+   * column — four review rounds in a row found a freeze that covered the column someone
+   * happened to name while the invariant needed a different one (`supersedes` write
+   * order → `parent` re-point → `parent` cross-job → `jobId` migration), and this table
+   * is what stops the fifth:
+   *
+   * | column       | class            | on re-put                                      |
+   * | ------------ | ---------------- | ---------------------------------------------- |
+   * | `id`         | KEY              | selects the row; never a value that changes    |
+   * | `jobId`      | STRUCTURAL       | **FROZEN** — refused (see below)                |
+   * | `parent`     | STRUCTURAL       | **FROZEN** — refused (see below)                |
+   * | `agentId`    | PER-RUN FACT     | OVERWRITTEN by a re-dispatch (issue #77)       |
+   * | `mode`       | PER-RUN FACT     | OVERWRITTEN by a re-dispatch (issue #77)       |
+   * | `transcript` | THE LIVE FIELD   | OVERWRITTEN — live → sealed IS the lifecycle   |
+   *
+   * - STRUCTURAL means WHERE THIS RUN SITS: which job owns it and which execution
+   *   spawned it. Nothing legitimately re-homes or re-parents a run that already
+   *   happened, and every attempt so far has been a live-orphan bug rather than a use
+   *   case. Both are refused by the adapter INSIDE the upsert statement (INV-ENFORCE),
+   *   not checked afterwards.
+   * - PER-RUN FACT means WHAT RAN THIS TIME. These are deliberately NOT frozen: issue
+   *   #77's merged-transcript model reuses ONE execution id across re-dispatches, so a
+   *   retry after an agent/`pi` upgrade MUST be able to re-attribute the row — freezing
+   *   `agentId` would make that retry fail hard. The consequence is stated, not hidden:
+   *   the row carries the agent revision of the MOST RECENT run while
+   *   `execution_event_log` keeps every earlier run's entries, so a merged transcript is
+   *   attributed to the latest revision. Modelling "a retry is a NEW execution" is DE2.4
+   *   work (it re-points the link at `sessionId` and models the unit of work), not this
+   *   column's.
+   * - THE LIVE FIELD is the one thing that genuinely changes about a run in progress:
+   *   its transcript goes from live to sealed. That transition is the whole of an
+   *   execution's lifecycle (INV-SUM / INV-LIFECYCLE — there is no status column).
+   *
+   * **A NEW COLUMN'S DEFAULT IS FROZEN.** Adding one to the updated set requires the
+   * kind of named reason the two PER-RUN rows carry; absent that, it belongs in the
+   * adapter's exclusion list and in this table as STRUCTURAL.
+   *
+   * ## What fails
+   *
+   * A reference the model does not admit:
+   *
+   * - a `jobId` naming a job that is NOT STORED, an `agentId` naming an unregistered
+   *   agent revision, or a `parent` naming an execution that is not stored — all three
+   *   are real FOREIGN KEYs in the adapter, refused by the engine at the write rather
+   *   than reconciled later (INV-ENFORCE);
+   * - a `parent` equal to the execution's own `id`. That is the single edge a
+   *   referential constraint accepts (a row satisfies a key against itself), so it is
+   *   rejected HERE;
+   * - a `parent` DIFFERENT from the one the execution was first stored with. `parent`
+   *   is fixed at insert: RE-PARENTING is not an operation an execution has, and the
+   *   upsert leaves the column out of its updated set rather than checking a tree
+   *   invariant afterwards (INV-ENFORCE);
+   * - a `jobId` DIFFERENT from the one the execution was first stored under. Same
+   *   freeze, same reason: RE-HOMING is not an operation an execution has. The composite
+   *   `parent` key below closes cross-job EDGES and says NOTHING about a row re-pointing
+   *   its own `jobId`, so this needs its own clause — while it had none, an ordinary
+   *   re-put migrated a leaf to another job and left the original owning nothing, which
+   *   `listExecutionsForJob` reported as `[]` and `startup-reconcile`'s seal skipped;
+   * - a `parent` belonging to a DIFFERENT `jobId`. ONE JOB OWNS ONE TREE, so an edge
+   *   that crosses jobs is not a tree edge at all; the adapter's `parent` key is
+   *   COMPOSITE — `(parent, jobId)` → `(id, jobId)` — so a child's job must match its
+   *   parent's and the engine refuses the write.
+   *
+   * A SECOND ROOT for one job is refused too, by a partial `UNIQUE (jobId) WHERE parent
+   * IS NULL` index — see {@link getExecutionForJob}.
+   *
+   * The last FOUR rules are what make the relation a FOREST OF TREES, one per job — the
+   * first two do not get there on their own. A foreign key constrains the row a write
+   * REFERENCES, never the re-pointing of an existing row, so while `parent` was mutable a
+   * 2-cycle was constructible out of three writes each of which satisfied the key and
+   * neither of which was a self-parent (insert `a` rootless, insert `b` under `a`, upsert
+   * `a` under `b`). With `parent` frozen, closing any cycle requires naming a row that
+   * does not exist yet — which the key refuses — so acyclicity is structural rather than a
+   * precondition callers owe or a walk someone remembers to run.
+   *
+   * Acyclicity alone was still not the model, which is what the job-scoping rule adds: a
+   * CROSS-JOB parent is acyclic and perfectly storable under a single-column key, and it
+   * left the child's job owning an execution with NO rootless row of its own — so
+   * `getExecutionForJob` answered `None` for a job that plainly had executions, and every
+   * caller guarded on that `Option` (notably `startup-reconcile`'s seal) silently did
+   * nothing. Scoping the edge to the job makes that state unconstructible rather than
+   * detected — and freezing `jobId` closes the remaining route to the SAME state, which
+   * needed no edge at all: a lone leaf simply re-put under another job.
+   *
+   * A restart re-attaches by upserting the SAME execution id, not a new one — which is
+   * unaffected: a re-attach carries the job and parent it already had, and rewrites only
+   * the per-run facts and the transcript, exactly as the table above says.
    */
   readonly putExecution: (execution: Execution) => Effect.Effect<void, StateStoreError>;
   /** Read an {@link Execution} by id, if present. */
   readonly getExecution: (
     id: ExecutionId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
-  /** Read the execution executing a given job (the `Job → execution` mapping), if present. */
+  /**
+   * Read a job's ROOT execution — the one with no `parent` — if present.
+   *
+   * "The execution for this job" needed a DEFINITION once a job could own a tree, and
+   * this is it. It is deterministic because a job can hold AT MOST ONE parentless
+   * execution: the adapter carries a partial `UNIQUE (jobId) WHERE parent IS NULL`
+   * index, so a second root is unstorable and this read has exactly one candidate row
+   * rather than a collation-ordered pick among several (INV-ENFORCE). DE2.4 removes the
+   * lookup: a `Session` names its `root` outright.
+   *
+   * `None` means the job owns NO executions AT ALL — not merely "no rootless one". That
+   * is the composite `parent` key's doing (see {@link putExecution}): an edge cannot cross
+   * jobs, so a job's executions are closed under `parent`, and a finite acyclic relation
+   * closed under a parent edge always has a rootless member. A caller may therefore treat
+   * `None` as "nothing to do", which is exactly what `startup-reconcile`'s seal did while
+   * a cross-job edge could make it lie.
+   */
   readonly getExecutionForJob: (
     jobId: JobId,
   ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
+  /**
+   * ALL executions advancing a job — the whole tree, ordered by id, root included.
+   *
+   * {@link getExecutionForJob} answers "the" execution and is the wrong read for anyone
+   * assembling a complete picture: it returns the root ONLY, while `putExecution`
+   * journals an `ExecutionChanged` delta for EVERY execution. A snapshot built from the
+   * root alone therefore ships strictly less than the delta stream that follows it, and
+   * a reconnecting client converges to a different read model than a client that stayed
+   * connected — the divergence the snapshot exists to prevent. This read is what keeps
+   * `Snapshot.executions` carrying what the deltas carry.
+   */
+  readonly listExecutionsForJob: (
+    jobId: JobId,
+  ) => Effect.Effect<ReadonlyArray<Execution>, StateStoreError>;
 }
 
 /**
@@ -437,8 +568,11 @@ export interface EventLogStore {
 }
 
 /**
- * The append-only durable EXECUTION-TRANSCRIPT log, keyed per execution (1 Job = 1 execution
- * = 1 transcript). It is the execution-channel analogue of {@link EventLogStore}: `append`
+ * The append-only durable EXECUTION-TRANSCRIPT log, keyed per execution (1 Execution =
+ * 1 Transcript — and the key is REAL: the adapter's `execution_event_log."executionId"`
+ * is a FOREIGN KEY onto `execution (id)`, so an entry for an execution that was never
+ * stored is refused at the append rather than left as an orphan nothing can resolve).
+ * It is the execution-channel analogue of {@link EventLogStore}: `append`
  * stamps an execution's next transcript entry with a monotonic `offset` and returns the
  * persisted entry; `read` returns an execution's whole transcript in order; `tail` returns a
  * execution's entries strictly after a given offset — the primitive the `executionEvents`

@@ -15,9 +15,11 @@ import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import {
+  type AgentContent,
   type ExecutionEvent,
   ExecutionId,
   type ExecutionInput,
+  isExecutionLive,
   Issue,
   Job,
 } from "@sprinter/domain";
@@ -99,9 +101,24 @@ const recordingHandle = (
   send: (input) => Ref.update(sent, (xs) => [...xs, input]),
 });
 
+/**
+ * The agent content the fake runner declares it runs. The dispatcher REGISTERS it (the
+ * registry's first production writer, DE2.2/D2) and attributes the execution to the
+ * revision it derives from this content.
+ */
+const fakeAgent: AgentContent = {
+  name: "test-agent",
+  model: "test-model",
+  version: "1.0.0",
+  tools: ["read"],
+};
+
 /** A fake {@link ExecutionRunner} that hands back a fixed handle for every job. */
 const fakeRunner = (handle: ExecutionHandle): Layer.Layer<ExecutionRunner> =>
-  Layer.succeed(ExecutionRunner, ExecutionRunner.of({ run: () => Effect.succeed(handle) }));
+  Layer.succeed(
+    ExecutionRunner,
+    ExecutionRunner.of({ agent: fakeAgent, run: () => Effect.succeed(handle) }),
+  );
 
 /** Provide the runner-under-test plus its two faked ports; expose `StateStore` for assertions. */
 const provide =
@@ -157,7 +174,18 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
 
     const forJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
     expect(forJob.id).toBe("execution-job-1");
-    expect(forJob.status).toBe("completed");
+    // The run has ENDED, and that is expressed by the transcript being SEALED at the
+    // extent the durable log reached — there is no status enum beside it to agree with.
+    // The dispatched Job's execution is a ROOT (no parent) and holds the turn itself.
+    expect(forJob.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 1 });
+    expect(isExecutionLive(forJob)).toBe(false);
+    expect(forJob.mode).toBe("autonomous");
+    expect("parent" in forJob).toBe(false);
+    // The registry now has the revision that RAN — the first production writer (D2) —
+    // and the execution is attributed to exactly it.
+    const agents = yield* store.agents.listAgents;
+    expect(agents.map((a) => a.name)).toStrictEqual(["test-agent"]);
+    expect(forJob.agentId).toBe(agents[0]?.id);
     // Reading the same execution by its id round-trips identically.
     const byId = Option.getOrThrow(yield* store.jobs.getExecution(forJob.id));
     expect(byId).toStrictEqual(forJob);
@@ -264,6 +292,82 @@ it.effect(
 );
 
 // ============================================================================
+// Sealing under a failing `maxOffset` — the LOWER-BOUND fallback
+// ============================================================================
+
+/** A {@link StateStore} whose `executionLog.maxOffset` ALWAYS fails; everything else delegates. */
+const failMaxOffset: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      executionLog: {
+        ...base.executionLog,
+        maxOffset: () =>
+          Effect.fail(new StateStoreError({ operation: "maxOffset", detail: "transient" })),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
+
+// The seal must NEVER be blocked by a failed extent read. An execution left LIVE because
+// `maxOffset` hiccupped looks forever-running to every liveness gate — the CE4.1-R4 stall —
+// which is strictly worse than an understated `lastOffset`. That fallback is the load-bearing
+// premise of the `Transcript` contract's LOWER-BOUND wording, so it is pinned here rather than
+// left as prose: with nothing appended and the read failing, the seal is `{ lastOffset: 0 }` and
+// liveness STILL clears.
+it.effect("seals at the LOWER BOUND 0 when `maxOffset` fails and nothing was appended", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+    const result = yield* runner.dispatch(job);
+    expect(result.status).toBe("succeeded");
+
+    const store = yield* StateStore;
+    const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 0 });
+    // The whole point: `0` is not a claim the run produced nothing — it is a lower bound,
+    // and LIVENESS IS CLEARED regardless, so no gate sees a forever-running execution.
+    expect(isExecutionLive(sealed)).toBe(false);
+    const persistedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
+    expect(persistedJob.status).toBe("succeeded");
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    // Only EPHEMERAL events, so the fold appends nothing and has no local high-water either.
+    Effect.provide(fakeRunner(fakeHandle(Stream.make(messageDelta), { _tag: "Completed" }))),
+    Effect.provide(failMaxOffset),
+  ),
+);
+
+// …and when the fold DID append, the dispatch path does better than the bound: it seals at the
+// offsets `append` handed back, so a `maxOffset` hiccup costs nothing here. "No local high-water
+// mark to prefer" is true of `startup-reconcile`'s settle (the run's process is gone) and FALSE
+// of this one — the fold is the sole writer of this transcript and knows exactly what it wrote.
+it.effect("prefers THIS dispatch's high-water mark over the failed `maxOffset` read", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+    yield* runner.dispatch(job);
+
+    const store = yield* StateStore;
+    const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    // Two durable entries were appended at offsets 1 and 2; the seal is EXACT despite the
+    // read failing, rather than falling back to `0` and understating the whole run.
+    expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 2 });
+    expect(isExecutionLive(sealed)).toBe(false);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    Effect.provide(
+      fakeRunner(fakeHandle(Stream.make(entryEvent, noticeEvent), { _tag: "Completed" })),
+    ),
+    Effect.provide(failMaxOffset),
+  ),
+);
+
+// ============================================================================
 // F1 terminal-result contract — the events fold is BOUNDED by handle.result
 // ============================================================================
 
@@ -363,7 +467,13 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
     expect(persistedJob.status).toBe("failed");
 
     const persistedExecution = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
-    expect(persistedExecution.status).toBe("failed");
+    // A failed run is a run that ENDED: its transcript is sealed at the one entry that
+    // was persisted before the teardown. The FAILURE is recorded on the Job (above) —
+    // the execution stores no lifecycle its transcript already determines.
+    expect(persistedExecution.transcript).toStrictEqual({
+      _tag: "SealedTranscript",
+      lastOffset: 1,
+    });
     expect(persistedExecution.id).toBe("execution-job-1");
   }).pipe(
     provide(
@@ -391,16 +501,22 @@ it.effect("fails and persists a failed terminal when the runner cannot start the
     const error = yield* runner.dispatch(job).pipe(Effect.flip);
     expect(error._tag).toBe("ExecutionRunnerError");
 
-    // The initial persist wrote running/starting; a run failure must not leave that
-    // limbo — the durable rows are moved to a failed terminal.
+    // The initial persist wrote a `running` Job and an execution with an OPEN transcript
+    // (there is no `starting` status — DE2.2 deleted `ExecutionStatus`); a run failure
+    // must not leave that limbo — the durable rows are moved to a failed terminal.
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
+    // …and the execution is no longer LIVE: its transcript is sealed, so no liveness
+    // gate can still be waiting on a handle that will never register.
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      false,
+    );
   }).pipe(
     provideRunner(
       Layer.succeed(
         ExecutionRunner,
         ExecutionRunner.of({
+          agent: fakeAgent,
           run: () =>
             Effect.fail(new ExecutionRunnerError({ operation: "run", detail: "spawn refused" })),
         }),
@@ -419,13 +535,119 @@ it.effect("fails and persists a failed terminal when driving the execution fails
 
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
+    // …and the execution is no longer LIVE: its transcript is sealed, so no liveness
+    // gate can still be waiting on a handle that will never register.
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      false,
+    );
   }).pipe(
     provide({
       ...fakeHandle(Stream.empty, { _tag: "Completed" }),
       send: () =>
         Effect.fail(new PiTransportError({ reason: "closed", detail: "send after close" })),
     }),
+  ),
+);
+
+// ============================================================================
+// TERMINAL WRITE ORDER — a crash between the two writes must leave a RECOVERABLE
+// state, never a permanent live orphan (round 4, B1)
+// ============================================================================
+
+/**
+ * A {@link StateStore} whose `putExecution` fails ONLY for a SEALED transcript — i.e. the
+ * terminal seal — while the initial LIVE insert and everything else delegates. It stands in
+ * for the two things that can interrupt the terminal pair: a transient `StateStoreError`,
+ * and a crash between the two statements (indistinguishable from the durable rows' point of
+ * view — in both cases the first write landed and the second did not).
+ */
+const failSealPutExecution: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      jobs: {
+        ...base.jobs,
+        putExecution: (execution) =>
+          execution.transcript._tag === "SealedTranscript"
+            ? Effect.fail(new StateStoreError({ operation: "putExecution", detail: "transient" }))
+            : base.jobs.putExecution(execution),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
+
+// The terminal order is the INVERSE of the start order, and THAT is what this pins. Start is
+// FK-ordered (`execution."jobId"` — the execution cannot exist before its job). Terminal is
+// RECOVERY-ordered: both orders are legal to the database there (the job row already exists,
+// so `putJob` is a pure update), so the order is chosen by asking what a crash BETWEEN the
+// two writes leaves behind.
+//
+// The Job must go terminal LAST. Then an interrupted seal leaves a `running` Job with a LIVE
+// execution — exactly the state `startup-reconcile` exists to settle and seal on the next
+// boot. Under the INVERSE order the same interruption leaves a TERMINAL Job with a LIVE
+// execution, and NOTHING repairs it: reconcile skips every job whose `status !== "running"`,
+// and `settle` (the only other `SealedTranscript` writer) sits behind that gate — a permanent
+// live orphan that survives every restart, and a permanent `ExecutionNotFound` for a run that
+// wrote no durable entries. Re-inverting the two statements in `dispatch` fails THIS test.
+it.effect("leaves the Job RECOVERABLE (still `running`) when the terminal seal fails", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+
+    // The seal failure is NOT swallowed on this path — it propagates, so the caller knows.
+    const error = yield* runner.dispatch(job).pipe(Effect.flip);
+    expect(error._tag).toBe("StateStoreError");
+
+    const store = yield* StateStore;
+    // THE ASSERTION: the Job did NOT go terminal ahead of the seal. It is still `running`,
+    // which is the ONE status `startup-reconcile.run` will look at again.
+    expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("running");
+    // …and the execution is correspondingly still LIVE — a consistent, reconcilable pair
+    // (running Job + live execution), not a terminal Job orphaning a live execution.
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      true,
+    );
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    Effect.provide(fakeRunner(fakeHandle(Stream.make(entryEvent), { _tag: "Completed" }))),
+    Effect.provide(failSealPutExecution),
+  ),
+);
+
+// The same order, on the OTHER terminal writer: `persistFailedTerminal`. Its whole write is
+// best-effort (`orElseSucceed`), so a failed seal is SILENT there — which makes the order the
+// only thing standing between a `run`/`send` failure and a permanent live orphan. This is the
+// branch that was uncovered, and is why the inversion shipped.
+it.effect("keeps the failed-terminal write recoverable too when its seal fails", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+
+    // Driving fails, so `persistFailedTerminal` runs — and its seal fails as well.
+    const error = yield* runner.dispatch(job).pipe(Effect.flip);
+    // The ORIGINAL dispatch error still propagates (the best-effort write swallows its own).
+    expect(error._tag).toBe("PiTransportError");
+
+    const store = yield* StateStore;
+    // Not `failed`: the seal never landed, so the Job stays in the state reconcile settles.
+    expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("running");
+    expect(isExecutionLive(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)))).toBe(
+      true,
+    );
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    Effect.provide(
+      fakeRunner({
+        ...fakeHandle(Stream.empty, { _tag: "Completed" }),
+        send: () =>
+          Effect.fail(new PiTransportError({ reason: "closed", detail: "send after close" })),
+      }),
+    ),
+    Effect.provide(failSealPutExecution),
   ),
 );
 

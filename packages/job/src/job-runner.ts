@@ -12,25 +12,31 @@
  * flow (D2): the agent only does cognition; assigning execution ids, mapping
  * outcomes, and persisting rows is all owned here.
  *
- * The Issue→Job→execution mapping is durable and 1 Job = 1 execution: the execution id
- * is derived deterministically from the job (or reused from the job's existing
- * `executionId`), so a re-dispatch/restart re-attaches by upserting the SAME execution
- * id, never a new one (the store's `UNIQUE(execution.jobId)` enforces the invariant).
+ * The Issue→Job→execution mapping is durable, and one dispatch drives ONE execution:
+ * the execution id is derived deterministically from the job (or reused from the job's
+ * existing `executionId`), so a re-dispatch/restart re-attaches by upserting the SAME
+ * execution id, never a new one. (A job may now own a TREE of executions — DE2.2 —
+ * so that is a property of THIS dispatch, no longer a `UNIQUE` index on the store.)
+ *
+ * It is also the `Agent` registry's FIRST PRODUCTION WRITER (DE2.2 / D2): every
+ * dispatch registers the agent revision it runs and attributes the execution to it, so
+ * `Snapshot.agents` in a real daemon reflects the agents that actually ran.
  */
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type Execution,
   type ExecutionEvent,
   ExecutionId,
   type ExecutionInput,
-  type ExecutionStatus,
   type Issue,
   type Job,
   type JobResult,
+  type Transcript,
 } from "@sprinter/domain";
 import type { PiRpcError, PiTransportError, ExecutionResult } from "@sprinter/runner";
 import { StateStore, type StateStoreError } from "@sprinter/state";
+import { registerAgent } from "./agent-registration.ts";
 import { ExecutionRunner, type ExecutionRunnerError } from "./execution-runner.ts";
 
 /** Everything that can fail a dispatch: the two ports' failures plus driving the prompt. */
@@ -102,14 +108,6 @@ const isDurableTranscriptEvent = (event: ExecutionEvent): boolean =>
   event._tag === "EntryAppended" || event._tag === "Notice";
 
 /**
- * Map a settled execution's {@link ExecutionResult} onto the terminal {@link Execution}
- * status — TOTAL via discriminated matching (INV-NOCAST): a clean end completes
- * the execution, a transport teardown fails it.
- */
-const toExecutionStatus = (result: ExecutionResult): ExecutionStatus =>
-  result._tag === "Completed" ? "completed" : "failed";
-
-/**
  * Map a settled execution's {@link ExecutionResult} onto the terminal {@link JobResult}
  * envelope (D6) — TOTAL via discriminated matching (INV-NOCAST). `Completed` →
  * `succeeded`; `Failed` → `failed` carrying the neutral error detail. The open
@@ -125,20 +123,84 @@ const toJobResult = (result: ExecutionResult, payload: unknown): JobResult => {
 };
 
 /**
- * Best-effort persist of a `failed` terminal Job/execution when starting or driving
- * the execution fails — so a `run`/`send` failure never leaves the durable rows stuck
- * in the `running`/`starting` limbo the initial persist wrote. The terminal write is
- * best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
+ * SEAL an execution's transcript at the extent its durable log has reached — the write
+ * that ends a run.
+ *
+ * The extent is the MAXIMUM of two things this dispatch actually knows:
+ *
+ * 1. `executionLog.maxOffset` — read from the durable log itself (answered from the
+ *    backing's index, no transcript materialised), so it describes what was persisted
+ *    rather than what this dispatch believes it appended;
+ * 2. `localHighWater` — the highest offset THIS dispatch's fold saw `append` RETURN.
+ *    The fold is the sole writer of this execution's transcript and every successful
+ *    append hands back its assigned offset, so discarding them and then falling back to
+ *    `0` when the read hiccups would throw away an exact answer already in hand. Taking
+ *    the max means a `maxOffset` failure on the DISPATCH path degrades to "everything
+ *    this run durably wrote" rather than to "nothing" — and in the ordinary case the two
+ *    agree, so the seal is exact.
+ *
+ * `lastOffset` is still a LOWER BOUND, and this function is one of the reasons the
+ * contract says so (`Transcript`, `@sprinter/domain` — the claim is mirrored
+ * client-side). TWO ways it can understate, both deliberate:
+ *
+ * - if BOTH the read fails and this dispatch appended nothing it observed, the seal is
+ *   `0` rather than a refusal. An execution left LIVE because the extent could not be
+ *   read would look forever-running to every liveness gate — the CE4.1-R4 stall — which
+ *   is strictly worse than an understated extent. It is NOT a claim that the run produced
+ *   nothing: `0` is a lower bound like any other, which is exactly why the contract
+ *   cannot promise an upper one. (This is also the case a PRIOR run's entries fall into:
+ *   the local high-water covers THIS dispatch only, so a re-dispatch whose read fails
+ *   understates by the earlier runs — a lower bound, and the prefix claim is unaffected.)
+ * - the durable-append fold is bounded by `Stream.interruptWhen(handle.result)` (below),
+ *   so an append still in flight when the terminal resolves can land AFTER this read.
+ *   Waiting for it would mean deciding how long to wait for a stream the terminal has
+ *   already overtaken; the bound is the honest answer instead.
+ *
+ * Neither weakens cacheability, because the cacheability claim is about the PREFIX:
+ * `[0, lastOffset]` is complete and immutable whatever the true extent is, since entries
+ * never change and per-execution offsets never reset.
+ *
+ * `startup-reconcile`'s settle seals WITHOUT a local high-water and cannot do better:
+ * the run whose appends it would have counted belongs to a process that is already gone,
+ * which is why that settle runs at all. The lower-bound contract exists for that path.
+ */
+const sealTranscript = (
+  store: Context.Service.Shape<typeof StateStore>,
+  executionId: ExecutionId,
+  localHighWater: number,
+): Effect.Effect<Transcript> =>
+  store.executionLog.maxOffset(executionId).pipe(
+    Effect.orElseSucceed(() => 0),
+    Effect.map(
+      (durable): Transcript => ({
+        _tag: "SealedTranscript",
+        lastOffset: Math.max(durable, localHighWater),
+      }),
+    ),
+  );
+
+/**
+ * Best-effort persist of a `failed` terminal Job and a SEALED execution when starting
+ * or driving the execution fails — so a `run`/`send` failure never leaves the durable
+ * rows stuck in the `running`/live limbo the initial persist wrote. The terminal write
+ * is best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
  * error still propagates to the caller.
+ *
+ * ORDER IS FREE (both writes are pure updates by this point — no FK to satisfy) and chosen
+ * RECOVERY-ORDERED: the Job goes terminal LAST, the INVERSE of the start order. See the
+ * terminal write in {@link dispatch} for the full statement of why.
  */
 const persistFailedTerminal = (
   store: Context.Service.Shape<typeof StateStore>,
   job: Job,
-  executionId: ExecutionId,
+  execution: Execution,
+  highWater: Ref.Ref<number>,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    yield* store.jobs.putExecution({ id: executionId, jobId: job.id, status: "failed" });
-    yield* store.jobs.putJob({ ...job, status: "failed", executionId });
+    const transcript = yield* sealTranscript(store, execution.id, yield* Ref.get(highWater));
+    // ORDER: FREE (no FK — both rows exist), chosen RECOVERY-ORDERED. Seal, then Job LAST.
+    yield* store.jobs.putExecution({ ...execution, transcript });
+    yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
   }).pipe(Effect.orElseSucceed(() => undefined));
 
 /**
@@ -161,11 +223,74 @@ const dispatch = (
   Effect.gen(function* () {
     const executionId = yield* executionIdFor(job);
 
-    // Persist the durable Issue→Job→execution mapping BEFORE running: the same
-    // execution id on re-dispatch upserts in place (1 Job = 1 execution).
-    const startExecution: Execution = { id: executionId, jobId: job.id, status: "starting" };
-    yield* store.jobs.putExecution(startExecution);
+    // REGISTER the agent revision this run is attributed to, FIRST — the registry's
+    // first production writer (DE2.2 / D2), and a precondition rather than bookkeeping:
+    // `execution.agentId` is a FOREIGN KEY onto `agent`, so an execution cannot be
+    // stored until its agent revision is. Idempotent by construction (the id is derived
+    // from the content), so a re-dispatch appends nothing and fans out no delta.
+    //
+    // ITS BLAST RADIUS IS INTENDED, not overlooked: a transient `putAgent` failure fails
+    // the WHOLE dispatch, before `run` and before any durable row is written. That is the
+    // right trade rather than a fragility, because `agentId` is a hard FOREIGN KEY — the
+    // execution literally cannot be stored without its agent revision, so "degrade by
+    // skipping the registration and running anyway" is not an available behaviour; it would
+    // just move the same failure one statement later, after a `pi` process had been spawned.
+    // Failing here leaves the Job NOT `running` and nothing half-written, which is the
+    // recoverable state (`startup-reconcile` settles `running` jobs; a job that never
+    // started is simply re-dispatchable).
+    //
+    // "Before any durable row is written" is exact for a FIRST dispatch and NOT for a RESUME:
+    // on a `startup-reconcile` resume the Job is ALREADY durably `running` with a LIVE
+    // execution, so a transient `putAgent` failure fails the resume, is swallowed by that
+    // module's per-Job `Effect.catch`, and leaves the pair exactly as it found it. Still
+    // recoverable — `running` is the one status the next boot re-examines — but it is a
+    // no-op retry, not a clean slate.
+    const agentId = yield* registerAgent(store, runner.agent);
+
+    // Persist the durable Issue→Job→execution mapping BEFORE running. ORDER IS LOAD-
+    // BEARING: `execution."jobId"` is a FOREIGN KEY, so the Job row must exist before
+    // the execution that names it (D1 — the link is `jobId` only until DE2.4 re-points
+    // it at `sessionId`). The same execution id on re-dispatch upserts in place.
+    //
+    // The transcript starts LIVE: an open range with no last entry, which is also the
+    // whole of this execution's liveness (there is no status column to agree with —
+    // `Transcript`, `@sprinter/domain`). A re-dispatch re-opens the previous run's
+    // SEALED transcript, which is sound because offsets only ever grow: whatever a
+    // reader cached of `[0, lastOffset]` stays exactly correct (issue #77's merged
+    // single-transcript decision).
+    //
+    // `mode` is `autonomous`: the agent holds the turn for a dispatched Job and yields
+    // only when blocked. It is recorded on the EXECUTION and nowhere above it
+    // (INV-MODE). `parent` is absent — a dispatched Job's execution is a ROOT; a
+    // subagent's execution names it as parent, which is what makes the relation a tree.
+    //
+    // THIS IS THE ONLY PRODUCTION WRITER OF `mode`, and it is CONSTANT — so
+    // `ExecutionMode.interactive` is, in this PR's scope, an inhabited type with no
+    // producer. That is deliberate, not an oversight: a dispatched Job is autonomous by
+    // definition, and the interactive turn belongs to the human-driven path DE2.4 models
+    // (a `Session` a person drives, whose root execution carries `interactive`). The axis
+    // is declared CLOSED now (`ExecutionMode`, `@sprinter/domain`) because it is part of
+    // the shape the contract and its Swift mirror pin; the second inhabitant gets its
+    // writer when the thing that would set it exists. Read a store that holds only
+    // `autonomous` as a KNOWN state of the world, not as evidence the field is dead.
+    const startExecution: Execution = {
+      id: executionId,
+      jobId: job.id,
+      agentId,
+      mode: "autonomous",
+      transcript: { _tag: "LiveTranscript" },
+    };
+    // ORDER: FORCED. `execution."jobId"` is a FOREIGN KEY onto a job row that does not yet
+    // exist for a first dispatch, so the engine admits exactly one order. No choice to make.
     yield* store.jobs.putJob({ ...job, status: "running", executionId });
+    yield* store.jobs.putExecution(startExecution);
+
+    // THIS dispatch's high-water mark: the highest offset the fold below saw `append`
+    // RETURN. It is what lets the seal be exact on this path instead of depending on a
+    // second read that may hiccup (see {@link sealTranscript}). It starts at `0`, which
+    // is below every durable offset, so a dispatch that appends nothing contributes
+    // nothing.
+    const highWater = yield* Ref.make(0);
 
     // Start + drive the execution and await its terminal outcome. On failure of
     // starting/driving (not a mere stream teardown), record a `failed` terminal so
@@ -210,7 +335,7 @@ const dispatch = (
           //   - an EPHEMERAL live delta is fanned out OFFSET-LESS via `publishEphemeral` — it
           //     reaches live subscribers to drive the reactive flow but is never persisted and
           //     never advances the reconnect cursor.
-          // 1 Job = 1 execution = 1 transcript, so this fold is the sole writer of this execution's
+          // 1 Execution = 1 Transcript, so this fold is the sole writer of this execution's
           // transcript; a re-dispatch APPENDS (never resets the offset sequence).
           Effect.gen(function* () {
             if (isDurableTranscriptEvent(event)) {
@@ -219,9 +344,33 @@ const dispatch = (
               // truncate every SUBSEQUENT durable entry. The `entries` count is derived at
               // terminal from the durable log itself (`executionLog.countEntries`), so a dropped
               // append is reflected there rather than tracked by a separate in-memory counter.
-              yield* store.executionLog
-                .append(executionId, event)
-                .pipe(Effect.catchTag("StateStoreError", () => Effect.void));
+              //
+              // But NOT SILENTLY. `execution_event_log."executionId"` is a real FOREIGN KEY
+              // (DE2.2), so this path now has a failure mode that is NOT transient: if the
+              // execution row is missing, EVERY append of this run is rejected identically and
+              // the tolerance above turns a structural bug into a transcript that is simply
+              // empty — no log line, no delta, `entries` and `lastOffset` both `0`, and nothing
+              // anywhere saying why. A `StateStoreError` does not distinguish a constraint
+              // rejection from a hiccup, so the discipline is to LOG every one and let the
+              // repetition be the signal: one line is a hiccup, one per event is the key.
+              yield* store.executionLog.append(executionId, event).pipe(
+                // Remember the offset the store just assigned. Offsets only grow, so
+                // `max` is belt-and-braces over a plain set; what matters is that the
+                // fold no longer DISCARDS what it wrote (see {@link sealTranscript}).
+                Effect.flatMap((persisted) =>
+                  Ref.update(highWater, (seen) => Math.max(seen, persisted.offset)),
+                ),
+                Effect.catchTag("StateStoreError", (error) =>
+                  Effect.logWarning("durable transcript append rejected — entry dropped").pipe(
+                    Effect.annotateLogs({
+                      executionId,
+                      event: event._tag,
+                      operation: error.operation,
+                      detail: error.detail,
+                    }),
+                  ),
+                ),
+              );
             } else {
               yield* store.executionLog.publishEphemeral(executionId, event);
             }
@@ -234,12 +383,12 @@ const dispatch = (
         Effect.orElseSucceed(() => undefined),
       );
       return yield* handle.result;
-    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, executionId)));
+    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, startExecution, highWater)));
 
     // The `entries` metric = the count of DURABLE `EntryAppended` records in the execution's
     // transcript, computed cheaply in the store (`countEntries` — a `COUNT(*)`, no full-log
     // read/decode). DECISION (issue #77): the MERGED single-transcript model is intended by
-    // construction — 1 Job = 1 execution = 1 durable transcript, and a re-dispatch/retry APPENDS
+    // construction — 1 Execution = 1 durable transcript, and a re-dispatch/retry APPENDS
     // to that SAME log (offsets monotonic, never reset). So the count reflects the concatenation
     // of EVERY run — matching the transcript the Inspector renders — rather than diverging to the
     // latest run (the per-dispatch `Ref` divergence). Retry runs are deliberately NOT segmented;
@@ -254,11 +403,46 @@ const dispatch = (
     const transcriptRef = yield* transcriptRefFor(executionId);
     const jobResult = toJobResult(settled, { transcriptRef, entries });
 
-    // Persist the terminal Job/execution rows.
+    // SEAL the execution's transcript, then persist the terminal Job row. The seal is the
+    // whole of "this run has ended": the transcript stops being tailable and becomes the
+    // closed, cacheable range `[0, lastOffset]`, and every liveness gate reads that one
+    // value. The run's OUTCOME (succeeded / failed) belongs to the Job it advanced —
+    // recording it a second time on the execution would be a lifecycle its transcript
+    // already determines (INV-LIFECYCLE).
+    //
+    // ORDER IS LOAD-BEARING, and it is DELIBERATELY THE INVERSE of the START order above.
+    // The two orders answer two different questions, and neither generalises to the other:
+    //
+    //   - START is FK-ORDERED. `execution."jobId"` is a foreign key, so the execution
+    //     CANNOT exist before its job. The database forces `putJob` → `putExecution`
+    //     there; there is no choice to make.
+    //   - TERMINAL is RECOVERY-ORDERED. The job row already exists, so `putJob` is a pure
+    //     update and BOTH orders are legal to the database — which means the order is ours
+    //     to choose, and we choose by asking what a crash BETWEEN the two writes leaves
+    //     behind. The Job must be the LAST thing to go terminal, so that any crash (or a
+    //     transient `StateStoreError` from the seal) leaves a `running` Job with a LIVE
+    //     execution — precisely the state `startup-reconcile` exists to settle and seal on
+    //     the next boot. The inverse order leaves a TERMINAL Job with a LIVE execution, and
+    //     NOTHING repairs that: reconcile skips every job whose `status !== "running"`, and
+    //     `settle` — the only other writer of a `SealedTranscript` in this tree — is
+    //     reachable only from behind that gate. Such a row is a PERMANENT live orphan that
+    //     survives every restart, and it is user-visible: `resyncExecutionEvents` sees an
+    //     unsettled row, so a run that produced no durable entries answers `ExecutionNotFound`
+    //     forever rather than returning an empty settled transcript.
+    //
+    // {@link persistFailedTerminal} holds the same order for the same reason, and so does
+    // `startup-reconcile.ts`'s `settle` — the THIRD terminal-write site in the tree, and the
+    // one that had this inverted until round 5. Every terminal write pair in the tree now
+    // carries a comment naming its order (FORCED vs FREE) and the invariant that picked it,
+    // so the next constraint-driven reorder (DE2.4 re-points the FK at `sessionId`) cannot
+    // silently sweep a FREE one along with a FORCED one — which is exactly how round 4's
+    // regression happened. A test pins each: failing the seal `putExecution` must leave the
+    // Job `running` (still recoverable).
+    //
+    // ORDER: FREE (no FK — both rows exist), chosen RECOVERY-ORDERED. Seal, then Job LAST.
     yield* store.jobs.putExecution({
-      id: executionId,
-      jobId: job.id,
-      status: toExecutionStatus(settled),
+      ...startExecution,
+      transcript: yield* sealTranscript(store, executionId, yield* Ref.get(highWater)),
     });
     yield* store.jobs.putJob({ ...job, status: jobResult.status, executionId, transcriptRef });
 

@@ -23,11 +23,14 @@
  * tmpfile) is proven separately in {@link ./restart-durability.test.ts}.
  */
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option, Queue, Schema } from "effect";
+import { type Context, Effect, Layer, Option, Queue, Ref, Schema } from "effect";
 import { expect } from "vitest";
 import {
+  Agent,
   Epic,
   Execution,
+  ExecutionEvent,
+  isExecutionLive,
   Issue,
   Job,
   type JobResult,
@@ -38,7 +41,7 @@ import {
 import { Repository as DomainRepository } from "@sprinter/domain";
 import { ExecutionRunnerError, JobRunner } from "@sprinter/job";
 import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
-import { layerMemory, StateStore } from "@sprinter/state";
+import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layer as startupLayer, StartupReconcile } from "./startup-reconcile.ts";
 
 // ============================================================================
@@ -105,7 +108,38 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
   });
 
 const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
-  decode(Execution, { id: "execution-job-1", jobId: "job-1", status: "active", ...over });
+  decode(Execution, {
+    id: "execution-job-1",
+    jobId: "job-1",
+    agentId: "agt-1",
+    mode: "autonomous",
+    transcript: { _tag: "LiveTranscript" },
+    ...over,
+  });
+
+/** The registry revision every {@link execution} fixture is attributed to. */
+const agent = decode(Agent, {
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.0.0",
+  tools: ["read"],
+});
+
+/**
+ * Store a job and its execution, in the order the FOREIGN KEYs require: the agent
+ * revision and the job row must exist before an execution can name them (DE2.2).
+ */
+const seedRun = (
+  store: Context.Service.Shape<typeof StateStore>,
+  jobRow: Job,
+  executionRow: Execution,
+) =>
+  Effect.gen(function* () {
+    yield* store.agents.putAgent(agent);
+    yield* store.jobs.putJob(jobRow);
+    yield* store.jobs.putExecution(executionRow);
+  });
 
 const pullRef = (number: number, merged: boolean): PullRequestRef =>
   decode(PullRequestRef, {
@@ -239,8 +273,27 @@ const flakyRunner = (log: Queue.Enqueue<Job>, failFor: string): Layer.Layer<JobR
  * `provideMerge`, so the `StateStore` the test seeds is the exact instance
  * `StartupReconcile` reads (a plain `Layer.provide` would build a second store).
  */
-const testLayer = (state: HostState, runner: Layer.Layer<JobRunner>) =>
-  startupLayer.pipe(Layer.provideMerge(Layer.mergeAll(layerMemory, fakeRepository(state), runner)));
+const testLayer = (
+  state: HostState,
+  runner: Layer.Layer<JobRunner>,
+  store: Layer.Layer<StateStore, StateStoreError> = layerMemory,
+) => startupLayer.pipe(Layer.provideMerge(Layer.mergeAll(store, fakeRepository(state), runner)));
+
+/** A {@link StateStore} whose `executionLog.maxOffset` ALWAYS fails; everything else delegates. */
+const failMaxOffset: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      executionLog: {
+        ...base.executionLog,
+        maxOffset: () =>
+          Effect.fail(new StateStoreError({ operation: "maxOffset", detail: "transient" })),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
 
 // ============================================================================
 // reconcile roll-up with one host error isolated (F4)
@@ -299,8 +352,7 @@ it.effect("resumes a running Job onto its persisted execution id, never a new on
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -333,8 +385,11 @@ it.effect("does not re-dispatch an already-terminal Job", () =>
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution({ status: "completed" }));
-      yield* store.jobs.putJob(job({ status: "succeeded" }));
+      yield* seedRun(
+        store,
+        job({ status: "succeeded" }),
+        execution({ transcript: { _tag: "SealedTranscript", lastOffset: 3 } }),
+      );
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -363,8 +418,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream());
         yield* store.workGraph.putEpic(epic());
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putExecution(execution());
-        yield* store.jobs.putJob(job());
+        yield* seedRun(store, job(), execution());
 
         const startup = yield* StartupReconcile;
         const summary = yield* startup.run;
@@ -378,9 +432,10 @@ it.effect(
         expect(yield* Queue.size(dispatched)).toBe(0);
         const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
         expect(j1.status).toBe("succeeded");
-        // ROOT FIX (CE4.1-R4): a landed Job's EXECUTION row is settled to `completed`.
+        // ROOT FIX (CE4.1-R4): a landed Job's EXECUTION has its transcript SEALED, so
+        // nothing is left looking live to the execution-resolve gate.
         const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-        expect(s1.status).toBe("completed");
+        expect(isExecutionLive(s1)).toBe(false);
       }).pipe(
         Effect.provide(
           testLayer(
@@ -409,8 +464,7 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
       yield* store.workGraph.putEpic(epic({ status: "blocked" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -424,14 +478,303 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("queued");
-      // ROOT FIX (CE4.1-R4): the EXECUTION row is settled to a terminal status alongside
-      // the re-queued Job, so no NON-TERMINAL execution orphan survives to stall the
-      // execution-resolve gate. A later resume re-attaches this same id back to `starting`.
+      // ROOT FIX (CE4.1-R4): the EXECUTION's transcript is SEALED alongside the
+      // re-queued Job, so no LIVE execution orphan survives to stall the
+      // execution-resolve gate. A later resume re-attaches this same id and re-opens it.
       const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-      expect(s1.status).toBe("interrupted");
+      expect(isExecutionLive(s1)).toBe(false);
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
+
+it.effect("seals EVERY execution a settled Job owns, not just the tree's ROOT", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
+      yield* store.workGraph.putEpic(epic({ status: "blocked" }));
+      yield* store.workGraph.putIssue(issue(1));
+      // A job owning a TREE: the root and a CHILD (a subagent), both LIVE. A settle that
+      // read `getExecutionForJob` saw only the root — so the child kept its
+      // `LiveTranscript` forever, `isExecutionLive` stayed true on it, and `resolveLive`
+      // bounded-WAITED on it every time the (now `queued`, i.e. still mid-dispatch) job
+      // was resolved. That is the CE4.1-R4 stall the seal exists to prevent, merely moved
+      // off the root and onto a sibling.
+      yield* seedRun(store, job(), execution());
+      yield* store.jobs.putExecution(
+        execution({ id: "execution-child", parent: "execution-job-1" }),
+      );
+      // A THIRD execution that is ALREADY SEALED. The settle must SKIP it rather than
+      // re-seal it: a sealed range is settled and immutable, and re-writing its
+      // `lastOffset` from a fresh read would move a range a client may already have
+      // cached (the whole cacheability claim).
+      yield* store.jobs.putExecution(
+        execution({
+          id: "execution-done",
+          parent: "execution-job-1",
+          transcript: { _tag: "SealedTranscript", lastOffset: 99 },
+        }),
+      );
+      // Distinct per-execution extents, so a seal that reused ONE offset for the whole
+      // tree would be visible rather than coincidentally right.
+      const entry = decode(ExecutionEvent, { _tag: "ExecutionIdle" });
+      yield* store.executionLog.append(execution().id, entry);
+      yield* store.executionLog.append(execution({ id: "execution-child" }).id, entry);
+      yield* store.executionLog.append(execution({ id: "execution-child" }).id, entry);
+
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+
+      // EVERY execution is sealed — the whole tree, not the root alone.
+      const all = yield* store.jobs.listExecutionsForJob(job().id);
+      expect(all.map((e) => e.id)).toStrictEqual([
+        "execution-child",
+        "execution-done",
+        "execution-job-1",
+      ]);
+      expect(all.every((e) => !isExecutionLive(e))).toBe(true);
+      // The ALREADY-SEALED one was SKIPPED, not re-sealed: its settled range is exactly
+      // what it was, even though its own log is empty (a re-seal would have moved it to 0).
+      expect(all.find((e) => e.id === "execution-done")?.transcript).toStrictEqual({
+        _tag: "SealedTranscript",
+        lastOffset: 99,
+      });
+      // …and each at ITS OWN log's extent, not a shared one.
+      const sealedAt = new Map(
+        all.map((e) => [
+          e.id,
+          e.transcript._tag === "SealedTranscript" ? e.transcript.lastOffset : -1,
+        ]),
+      );
+      expect(sealedAt.get(execution().id)).toBe(
+        yield* store.executionLog.maxOffset(execution().id),
+      );
+      expect(sealedAt.get(execution({ id: "execution-child" }).id)).toBe(
+        yield* store.executionLog.maxOffset(execution({ id: "execution-child" }).id),
+      );
+      expect(sealedAt.get(execution().id)).not.toBe(
+        sealedAt.get(execution({ id: "execution-child" }).id),
+      );
+    }).pipe(
+      Effect.provide(
+        testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
+
+// The settle's `maxOffset` fallback, pinned. It is the LOAD-BEARING premise of the whole
+// lower-bound disposition of `Transcript.lastOffset`: sealing at `0` rather than refusing to
+// seal is what guarantees a settle can never leave an execution LIVE, and an execution left live
+// because an extent read hiccupped is the CE4.1-R4 stall — strictly worse than an understated
+// extent. Unlike the dispatch path there is NO local high-water mark to prefer here: the run
+// whose appends it would have counted belongs to a process that is already gone, which is why
+// this settle runs at all. So `0` is the honest answer, and liveness must still clear.
+it.effect("seals at the LOWER BOUND 0 when the settle's `maxOffset` read fails", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
+      yield* store.workGraph.putEpic(epic({ status: "blocked" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* seedRun(store, job(), execution());
+      // Entries DO exist — so `0` is demonstrably an understatement rather than a
+      // coincidentally-correct empty log, which is exactly the lower-bound claim.
+      const entry = decode(ExecutionEvent, { _tag: "ExecutionIdle" });
+      yield* store.executionLog.append(execution().id, entry);
+      yield* store.executionLog.append(execution().id, entry);
+
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+
+      const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
+      expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 0 });
+      // The whole point of the fallback: LIVENESS STILL CLEARS, so no gate sees a
+      // forever-running execution, and the settled Job is durably settled.
+      expect(isExecutionLive(sealed)).toBe(false);
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job().id)).status).toBe("queued");
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({ issues: new Map([[1, "open"]]) }),
+          recordingRunner(dispatched),
+          failMaxOffset,
+        ),
+      ),
+    );
+  }),
+);
+
+// ============================================================================
+// TERMINAL WRITE ORDER on the REPAIR path — the settle's own writes must leave a
+// RECOVERABLE state, never the permanent live orphan it exists to clear (round 5, B1/B2)
+// ============================================================================
+
+/**
+ * A {@link StateStore} whose `putExecution` fails for every SEALED transcript — the settle's
+ * seal — while the LIVE seeds and everything else delegate. It stands in for both things that
+ * can interrupt the settle's write sequence: a transient `StateStoreError`, and a crash
+ * between the statements (indistinguishable in the durable rows — one write landed, the next
+ * did not).
+ */
+const failSealPutExecution: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      jobs: {
+        ...base.jobs,
+        putExecution: (execution) =>
+          execution.transcript._tag === "SealedTranscript"
+            ? Effect.fail(new StateStoreError({ operation: "putExecution", detail: "transient" }))
+            : base.jobs.putExecution(execution),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
+
+/**
+ * The same, but failing the seal of exactly ONE execution and only ONCE — so the first
+ * `run` seals part of the tree and then aborts, and the second `run` (a later boot) finds
+ * the store healthy again. `execution-job-1` sorts AFTER `execution-child`, so the child is
+ * sealed and the root is not: a genuinely PARTIAL tree.
+ */
+const failRootSealOnce: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    const spent = yield* Ref.make(false);
+    return StateStore.of({
+      ...base,
+      jobs: {
+        ...base.jobs,
+        putExecution: (execution) =>
+          Effect.gen(function* () {
+            const alreadyFailed = yield* Ref.get(spent);
+            if (
+              !alreadyFailed &&
+              execution.id === "execution-job-1" &&
+              execution.transcript._tag === "SealedTranscript"
+            ) {
+              yield* Ref.set(spent, true);
+              return yield* Effect.fail(
+                new StateStoreError({ operation: "putExecution", detail: "transient" }),
+              );
+            }
+            return yield* base.jobs.putExecution(execution);
+          }),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
+
+// The settle is the THIRD terminal-write site in the tree, and the one that matters most:
+// it IS the repair path. Both of its writes are pure updates by this point — the Job row
+// exists — so the engine admits either order and the order is chosen by asking what an
+// interruption between them leaves behind. The Job must go terminal LAST.
+//
+// Under the INVERSE order (which is what shipped until round 5) this exact scenario left a
+// `cancelled`/`queued` Job with a LIVE execution, and NOTHING repaired it: `run` skips every
+// job whose `status !== "running"`, and this settle is the only other `SealedTranscript`
+// writer in the tree — so a SECOND boot reported `skipped: []` with the orphan still live,
+// forever. Moving the `putJob` back above the seal loop fails THIS test.
+it.effect("leaves the Job RECOVERABLE (still `running`) when the settle's seal fails", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
+      yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* seedRun(store, job(), execution());
+
+      const startup = yield* StartupReconcile;
+      // The store failure is NOT isolated — our own store failing at boot is a real failure
+      // the caller must see (and `bootLayer` makes it fatal).
+      const error = yield* startup.run.pipe(Effect.flip);
+      expect(error.operation).toBe("putExecution");
+
+      // THE ASSERTION: the Job did NOT go terminal ahead of its seal. It is still `running`,
+      // which is the ONE status `run` looks at — so the next boot repairs this.
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job().id)).status).toBe("running");
+      // …and the execution is correspondingly still LIVE: a consistent, reconcilable pair,
+      // not a terminal Job orphaning a live execution.
+      const stalled = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
+      expect(isExecutionLive(stalled)).toBe(true);
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({ issues: new Map([[1, "open"]]) }),
+          recordingRunner(dispatched),
+          failSealPutExecution,
+        ),
+      ),
+    );
+  }),
+);
+
+// B2: the seal loop is ALL-OR-NOTHING across siblings — `Effect.forEach` with no per-item
+// isolation, so a failure on execution `k` aborts `k+1…n`. That is only SAFE because the Job
+// write is last: the partially-sealed tree stays behind a `running` Job, so the next boot
+// re-lists it, skips what is already sealed, and reaches the remainder. Isolating each
+// execution with a log instead would let the `putJob` run over a partial tree — the live
+// orphan again, one node down.
+it.effect("resumes a PARTIALLY sealed tree on the next boot rather than stranding it", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
+      yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* seedRun(store, job(), execution());
+      yield* store.jobs.putExecution(
+        execution({ id: "execution-child", parent: "execution-job-1" }),
+      );
+
+      const startup = yield* StartupReconcile;
+
+      // FIRST boot: the child seals, the root's seal fails, the whole run fails.
+      const error = yield* startup.run.pipe(Effect.flip);
+      expect(error.operation).toBe("putExecution");
+      const partial = yield* store.jobs.listExecutionsForJob(job().id);
+      expect(partial.map((e) => [e.id, isExecutionLive(e)])).toStrictEqual([
+        ["execution-child", false],
+        ["execution-job-1", true],
+      ]);
+      // The Job is untouched, so the remainder is REACHABLE — this is the whole safety
+      // argument for the loop being all-or-nothing.
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job().id)).status).toBe("running");
+
+      // SECOND boot: the store is healthy, the already-sealed child is skipped, the root is
+      // sealed, and only THEN does the Job go terminal.
+      const summary = yield* startup.run;
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+      expect(yield* Queue.size(dispatched)).toBe(0);
+      const healed = yield* store.jobs.listExecutionsForJob(job().id);
+      expect(healed.every((e) => !isExecutionLive(e))).toBe(true);
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job().id)).status).toBe("cancelled");
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({ issues: new Map([[1, "open"]]) }),
+          recordingRunner(dispatched),
+          failRootSealOnce,
+        ),
       ),
     );
   }),
@@ -446,8 +789,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
       yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
+      yield* seedRun(store, job(), execution());
 
       const startup = yield* StartupReconcile;
       const summary = yield* startup.run;
@@ -463,7 +805,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       expect(j1.status).toBe("cancelled");
       // ROOT FIX (CE4.1-R4): the EXECUTION row is settled terminal alongside the Job.
       const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-      expect(s1.status).toBe("interrupted");
+      expect(isExecutionLive(s1)).toBe(false);
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -486,8 +828,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream({ status: "done" }));
         yield* store.workGraph.putEpic(epic({ status: "done" }));
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putExecution(execution());
-        yield* store.jobs.putJob(job());
+        yield* seedRun(store, job(), execution());
 
         const startup = yield* StartupReconcile;
         const summary = yield* startup.run;
@@ -501,7 +842,7 @@ it.effect(
         expect(j1.status).toBe("cancelled");
         // ROOT FIX (CE4.1-R4): its EXECUTION row is settled terminal alongside the Job.
         const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
-        expect(s1.status).toBe("interrupted");
+        expect(isExecutionLive(s1)).toBe(false);
       }).pipe(
         Effect.provide(
           testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -525,11 +866,11 @@ it.effect("isolates a resume failure so the other in-flight Jobs still resume", 
       yield* store.workGraph.putIssue(issue(1));
       yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
       // Two running jobs; job-1's dispatch fails, job-2's succeeds.
-      yield* store.jobs.putExecution(execution());
-      yield* store.jobs.putJob(job());
-      yield* store.jobs.putExecution(execution({ id: "execution-job-2", jobId: "job-2" }));
-      yield* store.jobs.putJob(
+      yield* seedRun(store, job(), execution());
+      yield* seedRun(
+        store,
         job({ id: "job-2", issueId: "issue-2", executionId: "execution-job-2" }),
+        execution({ id: "execution-job-2", jobId: "job-2" }),
       );
 
       const startup = yield* StartupReconcile;
