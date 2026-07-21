@@ -38,9 +38,9 @@
   {
     "offset": 5,
     "event": {
-      "_tag": "SessionChanged",
-      "session": {
-        "id": "ses-1",
+      "_tag": "ExecutionChanged",
+      "execution": {
+        "id": "exe-1",
         "jobId": "job-1",
         "status": "active"
       }

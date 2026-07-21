@@ -1,6 +1,6 @@
 import SprinterBackend
 import SprinterContract
-import SprinterSession
+import SprinterExecution
 import Testing
 
 @testable import SprinterInspector
@@ -13,20 +13,20 @@ import Testing
 @Suite("Inspector view model")
 @MainActor
 struct InspectorViewModelTests {
-  private static let session = InspectorFixtures.sessionId
+  private static let execution = InspectorFixtures.executionId
 
-  /// The transcript builds from the scripted session feed, and a diff-bearing edit
+  /// The transcript builds from the scripted execution feed, and a diff-bearing edit
   /// tool call renders its diff off the reused transcript item.
   @Test("the transcript builds and a diff-bearing tool call renders its diff")
   func transcriptRendersDiff() async {
     let backend = InspectorFakeBackend(
-      knownSession: Self.session,
+      knownExecution: Self.execution,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
     let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
-    let model = InspectorViewModel(backend: backend, sessionId: Self.session)
+    let model = InspectorViewModel(backend: backend, executionId: Self.execution)
     model.start(feed)
 
-    #expect(await waitUntil { backend.sessionFeedCount == 1 })
+    #expect(await waitUntil { backend.executionFeedCount == 1 })
     backend.emit(
       .toolStarted(
         id: "t1",
@@ -55,10 +55,10 @@ struct InspectorViewModelTests {
   @Test("a live .jobChanged delta flips the pane's merged")
   func jobChangedFlipsMerged() async {
     let backend = InspectorFakeBackend(
-      knownSession: Self.session,
+      knownExecution: Self.execution,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
     let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
-    let model = InspectorViewModel(backend: backend, sessionId: Self.session)
+    let model = InspectorViewModel(backend: backend, executionId: Self.execution)
     model.start(feed)
 
     // Baseline: the PR is open but not merged.
@@ -82,10 +82,10 @@ struct InspectorViewModelTests {
   @Test("a live .issueChanged delta flips the pane's merged")
   func issueChangedFlipsMerged() async {
     let backend = InspectorFakeBackend(
-      knownSession: Self.session,
+      knownExecution: Self.execution,
       snapshot: InspectorFixtures.snapshotWithIssuePullRequest(InspectorFixtures.issuePullRequest))
     let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
-    let model = InspectorViewModel(backend: backend, sessionId: Self.session)
+    let model = InspectorViewModel(backend: backend, executionId: Self.execution)
     model.start(feed)
 
     #expect(await waitUntil { model.pullRequest.pullRequest?.merged == false })
@@ -110,17 +110,17 @@ struct InspectorViewModelTests {
   }
 
   /// `apply` re-resolves the pane directly (the pure main-actor core) and surfaces
-  /// the "no PR yet" state and the session↔PR link both ways.
-  @Test("apply resolves the pane and links session ↔ PR both ways")
+  /// the "no PR yet" state and the execution↔PR link both ways.
+  @Test("apply resolves the pane and links execution ↔ PR both ways")
   func applyResolvesAndLinks() {
     let model = InspectorViewModel(
       backend: InspectorFakeBackend(
-        knownSession: Self.session,
+        knownExecution: Self.execution,
         snapshot: Snapshot(
-          repositories: [], workstreams: [], epics: [], issues: [], jobs: [], sessions: [],
+          repositories: [], workstreams: [], epics: [], issues: [], jobs: [], executions: [],
           agents: [],
           generation: StoreGenerationId(rawValue: "gen-test"))),
-      sessionId: Self.session)
+      executionId: Self.execution)
 
     // Before any snapshot the pane is unresolved.
     #expect(model.pullRequest.state == .unresolved)
@@ -130,9 +130,9 @@ struct InspectorViewModelTests {
     #expect(model.pullRequest.state == .awaitingPullRequest)
     #expect(model.pullRequest.issueId == InspectorFixtures.issueId)
 
-    // Link both ways: the pane names the session, and the transcript drives it too.
-    #expect(model.pullRequest.sessionId == model.sessionId)
-    #expect(model.transcript.sessionId == model.sessionId)
+    // Link both ways: the pane names the execution, and the transcript drives it too.
+    #expect(model.pullRequest.executionId == model.executionId)
+    #expect(model.transcript.executionId == model.executionId)
   }
 
   /// `start` is idempotent (the single-consumer work-graph feed is not respun and the
@@ -141,34 +141,34 @@ struct InspectorViewModelTests {
   @Test("start is idempotent; stop then start on a fresh feed re-consumes")
   func lifecycleIsIdempotent() async {
     let backend = InspectorFakeBackend(
-      knownSession: Self.session,
+      knownExecution: Self.execution,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
     let feed = WorkGraphResync(connect: { backend }, backoff: .noDelay)
-    let model = InspectorViewModel(backend: backend, sessionId: Self.session)
+    let model = InspectorViewModel(backend: backend, executionId: Self.execution)
 
     model.start(feed)
     // A second start while running is a no-op — the transcript feed is not
     // re-subscribed (single-consumer).
     model.start(feed)
-    #expect(await waitUntil { backend.sessionFeedCount == 1 })
+    #expect(await waitUntil { backend.executionFeedCount == 1 })
     #expect(await waitUntil { model.pullRequest.pullRequest != nil })
     #expect(model.transcript.lifecycle == .live)
-    #expect(backend.sessionFeedCount == 1)
+    #expect(backend.executionFeedCount == 1)
 
     model.stop()
     model.stop()  // idempotent
     #expect(model.transcript.lifecycle == .ended)
 
     // Reconnect: the PR pane consumes a FRESH work-graph feed (its own backend,
-    // reconnected per attempt), while the transcript re-subscribes a fresh session
-    // feed on its original long-lived backend (the session channel is bound at
+    // reconnected per attempt), while the transcript re-subscribes a fresh execution
+    // feed on its original long-lived backend (the execution channel is bound at
     // construction — count 1 → 2).
     let backend2 = InspectorFakeBackend(
-      knownSession: Self.session,
+      knownExecution: Self.execution,
       snapshot: InspectorFixtures.snapshotWithJobPullRequest(InspectorFixtures.jobPullRequest))
     let feed2 = WorkGraphResync(connect: { backend2 }, backoff: .noDelay)
     model.start(feed2)
-    #expect(await waitUntil { backend.sessionFeedCount == 2 })
+    #expect(await waitUntil { backend.executionFeedCount == 2 })
     #expect(model.transcript.lifecycle == .live)
     #expect(await waitUntil { model.pullRequest.pullRequest != nil })
 

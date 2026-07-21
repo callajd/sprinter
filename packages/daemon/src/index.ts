@@ -13,15 +13,15 @@
  *   persisted mutation durably AND fans it out onto that feed stamped with its
  *   durable offset, so the daemon is reactive-plus-durable end-to-end.
  *
- * Task AE4.2 adds the session channel behind the same frozen contract: the
- * {@link SessionRegistry} PORT (`sessionId → live SessionHandle`) the four
- * session-channel handlers resolve against, bridging a live `@sprinter/runner`
- * session's neutral surface (INV-BOUNDARY / INV-PORT).
+ * Task AE4.2 adds the execution channel behind the same frozen contract: the
+ * {@link ExecutionRegistry} PORT (`executionId → live ExecutionHandle`) the four
+ * execution-channel handlers resolve against, bridging a live `@sprinter/runner`
+ * execution's neutral surface (INV-BOUNDARY / INV-PORT).
  *
  * Task AE5.1 adds restart safety: the {@link StartupReconcile} service, wired to
  * the `StateStore` / `CodeHost` / `JobRunner` PORTS, that on boot reconciles the
  * durable graph against the host and resumes any in-flight Job onto its persisted
- * session — without loss or double-run (INV-PORT).
+ * execution — without loss or double-run (INV-PORT).
  *
  * Task CE1.2 provisions the runnable daemon: {@link mainLayer} — the composition
  * root, a single Effect layer graph wiring the file-backed `StateStore`, the real
@@ -31,7 +31,7 @@
  * {@link bootLayer} — the boot-time `StartupReconcile` run. The runnable process
  * entrypoint is the sibling `run.ts` (`sprinter-daemon` bin).
  */
-export { layerJournaling, resyncEvents, resyncFrom, resyncSessionFrom } from "./event-journal.ts";
+export { layerJournaling, resyncEvents, resyncFrom, resyncExecutionFrom } from "./event-journal.ts";
 export type { DaemonConfig } from "./main.ts";
 export {
   appLayer,
@@ -43,10 +43,10 @@ export {
   stateStoreLayer,
 } from "./main.ts";
 export { handlers } from "./rpc-handlers.ts";
-export type { SessionFeedItem } from "./session-events.ts";
-export { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
-export { layer as layerSessionRegistry, SessionRegistry } from "./session-registry.ts";
-export { layerRegisterSessions } from "./session-runner.ts";
+export type { ExecutionFeedItem } from "./execution-events.ts";
+export { layer as layerExecutionEvents, ExecutionEvents } from "./execution-events.ts";
+export { layer as layerExecutionRegistry, ExecutionRegistry } from "./execution-registry.ts";
+export { layerRegisterExecutions } from "./register-executions.ts";
 export type { StartupSummary } from "./startup-reconcile.ts";
 export { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 export { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";

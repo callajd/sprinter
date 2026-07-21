@@ -35,11 +35,13 @@ import {
   configFromEnv,
   type DaemonConfig,
   DaemonSocketInUseError,
+  EXECUTION_RESOLVE_TIMEOUT_ENV,
   mainLayer,
   probeSocket,
+  RETIRED_RESOLVE_TIMEOUT_ENV,
   unlinkStaleSocket,
 } from "./main.ts";
-import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
+import { EXECUTION_RESOLVE_TIMEOUT } from "./execution-registry.ts";
 import { StartupReconcile } from "./startup-reconcile.ts";
 
 // ── substitutable leaves (fakes) ──────────────────────────────────────────────
@@ -131,7 +133,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
   repository: { owner: "callajd", repo: "sprinter", token: "test-token" },
-  sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+  executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
 });
 
 /** The full graph with the leaves substituted by fakes/real-Bun services. */
@@ -160,8 +162,8 @@ it("configFromEnv maps the environment with sensible defaults and the required t
     socketPath: "/run/sprinter.sock",
     workspaceRoot: "/srv/worktrees",
     repository: { owner: "acme", repo: "widgets", token: "ghp_secret" },
-    // No explicit override → the session-resolve bound falls back to the default.
-    sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+    // No explicit override → the execution-resolve bound falls back to the default.
+    executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
   });
 
   // Only GITHUB_TOKEN supplied: everything else falls back to the local defaults.
@@ -170,26 +172,26 @@ it("configFromEnv maps the environment with sensible defaults and the required t
   expect(defaults.socketPath).toBe("./sprinter.sock");
   expect(defaults.workspaceRoot).toBe("./worktrees");
   expect(defaults.repository).toEqual({ owner: "callajd", repo: "sprinter", token: "ghp_secret" });
-  expect(Duration.equals(defaults.sessionResolveTimeout, SESSION_RESOLVE_TIMEOUT)).toBe(true);
+  expect(Duration.equals(defaults.executionResolveTimeout, EXECUTION_RESOLVE_TIMEOUT)).toBe(true);
 });
 
-it("configFromEnv reads the session-resolve bound override, ignoring nonsense (FIX B knob)", () => {
+it("configFromEnv reads the execution-resolve bound override, ignoring nonsense (FIX B knob)", () => {
   // A valid positive millisecond override raises the bound — the operational knob for a
   // slow `pi` cold-start (FIX B).
   const raised = configFromEnv({
     GITHUB_TOKEN: "ghp_secret",
-    SPRINTER_SESSION_RESOLVE_TIMEOUT_MS: "12000",
+    [EXECUTION_RESOLVE_TIMEOUT_ENV]: "12000",
   });
-  expect(Duration.equals(raised.sessionResolveTimeout, Duration.millis(12000))).toBe(true);
+  expect(Duration.equals(raised.executionResolveTimeout, Duration.millis(12000))).toBe(true);
 
   // Blank / non-numeric / non-positive values fall back to the default rather than a
   // nonsensical bound (never breaks the sane cold-start allowance).
   for (const bad of ["", "   ", "abc", "0", "-5", "1.5"]) {
     const cfg = configFromEnv({
       GITHUB_TOKEN: "ghp_secret",
-      SPRINTER_SESSION_RESOLVE_TIMEOUT_MS: bad,
+      [EXECUTION_RESOLVE_TIMEOUT_ENV]: bad,
     });
-    expect(Duration.equals(cfg.sessionResolveTimeout, SESSION_RESOLVE_TIMEOUT)).toBe(true);
+    expect(Duration.equals(cfg.executionResolveTimeout, EXECUTION_RESOLVE_TIMEOUT)).toBe(true);
   }
 });
 
@@ -200,6 +202,30 @@ it("configFromEnv FAILS FAST when GITHUB_TOKEN is absent or empty (B1)", () => {
   expect(() => configFromEnv({})).toThrow(/GITHUB_TOKEN is required/);
   expect(() => configFromEnv({ GITHUB_TOKEN: "" })).toThrow(/GITHUB_TOKEN is required/);
   expect(() => configFromEnv({ GITHUB_TOKEN: "   " })).toThrow(/GITHUB_TOKEN is required/);
+});
+
+it("configFromEnv FAILS FAST when the RETIRED session-spelled knob is still exported (DE2.1)", () => {
+  // DE2.1 renamed the operator-facing knob. Accepting the old name as an alias is
+  // pre-release cruft; IGNORING it is worse — the operator's raised bound would
+  // silently revert to the 5s default. Boot refuses and names the replacement.
+  expect(() =>
+    configFromEnv({
+      GITHUB_TOKEN: "ghp_secret",
+      [RETIRED_RESOLVE_TIMEOUT_ENV]: "12000",
+    }),
+  ).toThrow(new RegExp(`${RETIRED_RESOLVE_TIMEOUT_ENV} is retired`));
+
+  // The error names the NEW knob, so the message is actionable on its own.
+  expect(() =>
+    configFromEnv({ GITHUB_TOKEN: "ghp_secret", [RETIRED_RESOLVE_TIMEOUT_ENV]: "" }),
+  ).toThrow(new RegExp(EXECUTION_RESOLVE_TIMEOUT_ENV));
+
+  // The new spelling is of course accepted.
+  const ok = configFromEnv({
+    GITHUB_TOKEN: "ghp_secret",
+    [EXECUTION_RESOLVE_TIMEOUT_ENV]: "12000",
+  });
+  expect(Duration.equals(ok.executionResolveTimeout, Duration.millis(12000))).toBe(true);
 });
 
 // ── the served graph composes ─────────────────────────────────────────────────

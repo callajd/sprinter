@@ -298,12 +298,12 @@ final class ControllableBackend: Backend {
       continuation.onTermination = { _ in task.cancel() }
     }
   }
-  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+  func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<ExecutionEvent, any Error> {
     AsyncThrowingStream { $0.finish() }
   }
-  func sessionSend(sessionId: SessionId, input: SessionInput) async throws {}
-  func interrupt(sessionId: SessionId) async throws {}
-  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {}
+  func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws {}
+  func interrupt(executionId: ExecutionId) async throws {}
+  func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws {}
   func close() async { await onClose() }
 }
 

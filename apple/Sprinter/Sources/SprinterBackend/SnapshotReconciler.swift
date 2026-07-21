@@ -32,8 +32,9 @@ public struct SnapshotReconciler: Sendable {
       return snapshot.replacing(issues: Self.upsert(issue, into: snapshot.issues, by: \.id))
     case .jobChanged(let job):
       return snapshot.replacing(jobs: Self.upsert(job, into: snapshot.jobs, by: \.id))
-    case .sessionChanged(let session):
-      return snapshot.replacing(sessions: Self.upsert(session, into: snapshot.sessions, by: \.id))
+    case .executionChanged(let execution):
+      return snapshot.replacing(
+        executions: Self.upsert(execution, into: snapshot.executions, by: \.id))
     // The registry folds under the SAME upsert rule, and in practice the upsert is
     // always an APPEND: a stored revision is immutable, so both an edit and a
     // retirement arrive as a NEW id linked by `supersedes` (the retirement also
@@ -76,7 +77,7 @@ extension Snapshot {
     epics: [Epic]? = nil,
     issues: [Issue]? = nil,
     jobs: [Job]? = nil,
-    sessions: [Session]? = nil,
+    executions: [Execution]? = nil,
     agents: [Agent]? = nil
   ) -> Snapshot {
     Snapshot(
@@ -85,7 +86,7 @@ extension Snapshot {
       epics: epics ?? self.epics,
       issues: issues ?? self.issues,
       jobs: jobs ?? self.jobs,
-      sessions: sessions ?? self.sessions,
+      executions: executions ?? self.executions,
       agents: agents ?? self.agents,
       generation: generation)
   }

@@ -72,8 +72,8 @@
       "issueId": "iss-1",
       "kind": "implement",
       "status": "running",
-      "sessionId": "ses-1",
-      "transcriptRef": "transcripts/ses-1.jsonl",
+      "executionId": "exe-1",
+      "transcriptRef": "transcripts/exe-1.jsonl",
       "pr": {
         "number": 15,
         "url": "https://github.com/callajd/sprinter/pull/15",
@@ -87,9 +87,9 @@
       "status": "queued"
     }
   ],
-  "sessions": [
+  "executions": [
     {
-      "id": "ses-1",
+      "id": "exe-1",
       "jobId": "job-1",
       "status": "active"
     }

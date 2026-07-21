@@ -40,7 +40,7 @@ public enum DaemonEndpointResolver {
 /// the concrete transport stack — `BackendConnector` → ``DaemonTransports`` →
 /// ``UnixSocketTransport`` → ``RpcBackend`` — behind a single `connect` closure, so
 /// the app never names a transport (INV-PORT). Feature view models are handed either a
-/// connected ``Backend`` (session channel) or a fresh ``WorkGraphResync`` feed built on
+/// connected ``Backend`` (execution channel) or a fresh ``WorkGraphResync`` feed built on
 /// the same seam (the board / inspector PR pane).
 ///
 /// The seam is injectable: the live initializer wires the real socket stack, while a
@@ -71,8 +71,8 @@ public struct DaemonConnection: Sendable {
     self.connectSeam = { try await connector.connect(to: endpoint) }
   }
 
-  /// Connects a ``Backend`` for the session-channel view models (inbox / session /
-  /// planner / inspector transcript), which drive input and subscribe session feeds
+  /// Connects a ``Backend`` for the execution-channel view models (inbox / execution /
+  /// planner / inspector transcript), which drive input and subscribe execution feeds
   /// over a persistent connection.
   public func connect() async throws -> any Backend {
     try await connectSeam()

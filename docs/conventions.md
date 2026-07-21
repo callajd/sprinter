@@ -30,13 +30,14 @@ invariant).
 
 ## Owned vs. foreign types
 
-- Our domain types get **plain** names: `Job`, `Session`, `SessionEvent`,
+- Our domain types get **plain** names: `Job`, `Execution`, `ExecutionEvent`,
   `Workstream`, `Epic`, `Issue`, `Repository`.
 - Foreign/protocol types keep a **qualifier**: `AgentSessionEvent`, `RpcCommand`,
-  `RpcResponse` are **Pi's**.
+  `RpcResponse` are **Pi's**. The qualifier is what makes Pi's *word* ("session")
+  safe to keep: it names Pi's concept, not ours.
 - Never leak a foreign type past the boundary that owns its translation — e.g.
-  `LocalPiRunner` translates Pi's `AgentSessionEvent` → our `SessionEvent`; nothing
-  above the runner sees Pi's type.
+  `LocalPiRunner` translates Pi's `AgentSessionEvent` → our `ExecutionEvent`;
+  nothing above the runner sees Pi's type.
 
 ## Sub-component suffixes
 
@@ -51,7 +52,9 @@ invariant).
 - Use Sprinter's words, not a vendor's: **PR** / **pull request** (not GitHub's
   "pulls"); **Issue**; **repository**.
 - Fixed hierarchy: **Workstream ⊃ Epic ⊃ Issue**. The execution unit is a **Job**
-  (1 Job = 1 session = 1 transcript = 1 PR).
+  (1 Job = 1 Execution = 1 transcript = 1 PR). An **Execution** is one OS process
+  running one agent — the process-level concept Pi calls a "session"; we use its
+  word only behind the Pi adapter.
 
 ## Effect idioms
 

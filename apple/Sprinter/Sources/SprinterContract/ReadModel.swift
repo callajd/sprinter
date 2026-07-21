@@ -1,5 +1,5 @@
 /// The owned read model — `Workstream ⊃ Epic ⊃ Issue`, plus ``Job`` and
-/// ``Session`` — mirrored from `@sprinter/domain`'s `Schema.Struct`s.
+/// ``Execution`` — mirrored from `@sprinter/domain`'s `Schema.Struct`s.
 ///
 /// Optional-key fields (`Schema.optionalKey`) are modelled as Swift optionals: the
 /// contract OMITS the key when absent, and synthesized `Codable` maps a missing key
@@ -52,8 +52,8 @@ public enum JobStatus: String, Codable, CaseIterable, Sendable {
   case cancelled
 }
 
-/// Session lifecycle status.
-public enum SessionStatus: String, Codable, CaseIterable, Sendable {
+/// Execution lifecycle status.
+public enum ExecutionStatus: String, Codable, CaseIterable, Sendable {
   case starting
   case active
   case idle
@@ -243,13 +243,13 @@ public struct Workstream: Codable, Equatable, Sendable {
   }
 }
 
-/// A job: one bounded cognitive task, run as one ``Session``, paired 1:1 with one PR.
+/// A job: one bounded cognitive task, run as one ``Execution``, paired 1:1 with one PR.
 public struct Job: Codable, Equatable, Sendable {
   public let id: JobId
   public let issueId: IssueId
   public let kind: JobKind
   public let status: JobStatus
-  public let sessionId: SessionId?
+  public let executionId: ExecutionId?
   public let transcriptRef: String?
   public let pullRequest: PullRequestRef?
 
@@ -258,7 +258,7 @@ public struct Job: Codable, Equatable, Sendable {
     case issueId
     case kind
     case status
-    case sessionId
+    case executionId
     case transcriptRef
     case pullRequest = "pr"
   }
@@ -268,7 +268,7 @@ public struct Job: Codable, Equatable, Sendable {
     issueId: IssueId,
     kind: JobKind,
     status: JobStatus,
-    sessionId: SessionId?,
+    executionId: ExecutionId?,
     transcriptRef: String?,
     pullRequest: PullRequestRef?
   ) {
@@ -276,19 +276,19 @@ public struct Job: Codable, Equatable, Sendable {
     self.issueId = issueId
     self.kind = kind
     self.status = status
-    self.sessionId = sessionId
+    self.executionId = executionId
     self.transcriptRef = transcriptRef
     self.pullRequest = pullRequest
   }
 }
 
-/// A session: one agent run executing a ``Job``.
-public struct Session: Codable, Equatable, Sendable {
-  public let id: SessionId
+/// An execution: one agent run executing a ``Job``.
+public struct Execution: Codable, Equatable, Sendable {
+  public let id: ExecutionId
   public let jobId: JobId
-  public let status: SessionStatus
+  public let status: ExecutionStatus
 
-  public init(id: SessionId, jobId: JobId, status: SessionStatus) {
+  public init(id: ExecutionId, jobId: JobId, status: ExecutionStatus) {
     self.id = id
     self.jobId = jobId
     self.status = status
@@ -313,7 +313,7 @@ public struct Session: Codable, Equatable, Sendable {
 /// ``generation`` is the identity of the daemon's STORE GENERATION — the coordinate
 /// space this state's durable offsets live in. It is REQUIRED for the same reason,
 /// and it is what a client must retain alongside the state: every cursor-bearing
-/// resume (``EventsPayload``/``SessionEventsPayload``) hands it back, and a cursor
+/// resume (``EventsPayload``/``ExecutionEventsPayload``) hands it back, and a cursor
 /// whose generation the daemon no longer has is refused with
 /// ``ContractError/resyncRequired(sinceOffset:maxOffset:generation:)`` rather than
 /// silently resumed against a log it never belonged to. It is OPAQUE — equality is
@@ -324,7 +324,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
   public let epics: [Epic]
   public let issues: [Issue]
   public let jobs: [Job]
-  public let sessions: [Session]
+  public let executions: [Execution]
   public let agents: [Agent]
   public let generation: StoreGenerationId
 
@@ -334,7 +334,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
     epics: [Epic],
     issues: [Issue],
     jobs: [Job],
-    sessions: [Session],
+    executions: [Execution],
     agents: [Agent],
     generation: StoreGenerationId
   ) {
@@ -343,7 +343,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
     self.epics = epics
     self.issues = issues
     self.jobs = jobs
-    self.sessions = sessions
+    self.executions = executions
     self.agents = agents
     self.generation = generation
   }

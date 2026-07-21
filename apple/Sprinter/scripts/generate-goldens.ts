@@ -34,13 +34,13 @@ import { assertGoldenCoverage, type WrittenGolden } from "./golden-coverage.ts";
 import {
   Agent,
   Epic,
+  Execution,
+  ExecutionEvent,
+  ExecutionInput,
   Issue,
   Job,
   PullRequestRef,
   Repository,
-  Session,
-  SessionEvent,
-  SessionInput,
   TranscriptEntry,
   UiResponse,
   Usage,
@@ -52,17 +52,17 @@ import {
   ControlAction,
   createWorkstreamFromPlan,
   events,
+  executionEvents,
+  ExecutionNotFound,
+  executionSend,
   interrupt,
   IssueNotFound,
   OffsetEvent,
-  OffsetSessionEvent,
+  OffsetExecutionEvent,
   PlanRejected,
   ResyncRequired,
   retryIssue,
-  sessionEvents,
-  sessionSend,
   Snapshot,
-  SessionNotFound,
   WorkGraphEvent,
   WorkstreamNotFound,
   WorkstreamPlan,
@@ -127,13 +127,13 @@ const jobFull = {
   issueId: "iss-1",
   kind: "implement",
   status: "running",
-  sessionId: "ses-1",
-  transcriptRef: "transcripts/ses-1.jsonl",
+  executionId: "exe-1",
+  transcriptRef: "transcripts/exe-1.jsonl",
   pr: prMerged,
 };
 const jobMinimal = { id: "job-2", issueId: "iss-2", kind: "review", status: "queued" };
 
-const session = { id: "ses-1", jobId: "job-1", status: "active" };
+const execution = { id: "exe-1", jobId: "job-1", status: "active" };
 
 // ── Registry fixtures (DE1.1) ────────────────────────────────────────────────
 //
@@ -225,7 +225,7 @@ write("snapshot", Snapshot, {
   epics: [epic],
   issues: [issueWithPr, issueNoPr],
   jobs: [jobFull, jobMinimal],
-  sessions: [session],
+  executions: [execution],
   // BYTE order by id (SQLite's default BINARY collation) — the order `listAgents`
   // pins and the daemon hydrates in.
   // It is presentational (a client upserts by id); a lineage is read off
@@ -248,7 +248,7 @@ write("issue-with-pr", Issue, issueWithPr);
 write("issue-no-pr", Issue, issueNoPr);
 write("job-full", Job, jobFull);
 write("job-minimal", Job, jobMinimal);
-write("session", Session, session);
+write("execution", Execution, execution);
 write("agent-original", Agent, agentOriginal);
 write("agent-revised", Agent, agentRevised);
 write("agent-retired", Agent, agentRetired);
@@ -267,7 +267,7 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
   { _tag: "EpicChanged", epic },
   { _tag: "IssueChanged", issue: issueWithPr },
   { _tag: "JobChanged", job: jobFull },
-  { _tag: "SessionChanged", session },
+  { _tag: "ExecutionChanged", execution },
   { _tag: "AgentChanged", agent: agentRevised },
 ]);
 
@@ -282,20 +282,20 @@ write("work-graph-events", Schema.Array(WorkGraphEvent), [
 write("offset-events", Schema.Array(OffsetEvent), [
   { offset: 3, event: { _tag: "WorkstreamChanged", workstream } },
   { offset: 4, event: { _tag: "IssueChanged", issue: issueWithPr } },
-  { offset: 5, event: { _tag: "SessionChanged", session } },
+  { offset: 5, event: { _tag: "ExecutionChanged", execution } },
   { offset: 6, event: { _tag: "AgentChanged", agent: agentRetired } },
 ]);
 
-// ── OffsetSessionEvent — the streamed `sessionEvents` success envelope ──────
+// ── OffsetExecutionEvent — the streamed `executionEvents` success envelope ───────────────────
 //
-// The ONE channel serves BOTH modalities: DURABLE transcript-grade events carry a per-session
+// The ONE channel serves BOTH modalities: DURABLE transcript-grade events carry a per-execution
 // `offset` (replayable; the client feeds it back as `sinceOffset`), while EPHEMERAL live deltas
 // ride the SAME channel OFFSET-LESS (the `offset` key is omitted). The sample interleaves both:
 // the durable entries resume from a mid-transcript position (2,3,4), and the ephemeral deltas
 // (TurnStarted, MessageDelta, UiRequestRaised) prove the mirror decodes a missing `offset` to
 // `nil` and still surfaces the event.
 
-write("offset-session-events", Schema.Array(OffsetSessionEvent), [
+write("offset-execution-events", Schema.Array(OffsetExecutionEvent), [
   // Ephemeral live delta — NO `offset` key (turn lifecycle).
   { event: { _tag: "TurnStarted" } },
   {
@@ -319,7 +319,7 @@ write("offset-session-events", Schema.Array(OffsetSessionEvent), [
   },
 ]);
 
-// ── SessionEvent — every variant (+ optional present/absent) ─────────────────
+// ── ExecutionEvent — every variant (+ optional present/absent) ───────────────────────────────
 
 const usageFull = {
   inputTokens: 1200,
@@ -329,7 +329,7 @@ const usageFull = {
 };
 const usageMinimal = { inputTokens: 10, outputTokens: 5 };
 
-write("session-events", Schema.Array(SessionEvent), [
+write("execution-events", Schema.Array(ExecutionEvent), [
   { _tag: "TurnStarted" },
   { _tag: "TurnCompleted", usage: usageFull },
   { _tag: "TurnCompleted" },
@@ -342,7 +342,7 @@ write("session-events", Schema.Array(SessionEvent), [
   { _tag: "ToolStarted", id: "t1", name: "read_file", input: { path: "/etc/hosts", limit: 20 } },
   { _tag: "ToolProgress", id: "t1", partial: { bytes: 512 } },
   { _tag: "ToolCompleted", id: "t1", output: ["line-a", "line-b"], isError: false },
-  { _tag: "SessionIdle" },
+  { _tag: "ExecutionIdle" },
   { _tag: "RetryScheduled", attempt: 2, delayMs: 1500, error: "429 rate limited" },
   { _tag: "ContextCompacted" },
   { _tag: "UiRequestRaised", id: "req-1", kind: "select", prompt: "Pick one", options: ["a", "b"] },
@@ -374,9 +374,9 @@ write("transcript-entries", Schema.Array(TranscriptEntry), [
 
 write("usages", Schema.Array(Usage), [usageFull, usageMinimal]);
 
-// ── SessionInput — every mode (+ images present/absent) ──────────────────────
+// ── ExecutionInput — every mode (+ images present/absent) ────────────────────────────────────
 
-write("session-inputs", Schema.Array(SessionInput), [
+write("execution-inputs", Schema.Array(ExecutionInput), [
   { text: "kick it off", mode: "prompt", images: ["img-ref-1"] },
   { text: "actually, focus here", mode: "steer" },
   { text: "one more thing", mode: "followUp" },
@@ -418,14 +418,14 @@ const encodedErrors = [
   Schema.encodeUnknownSync(IssueNotFound)(
     Schema.decodeUnknownSync(IssueNotFound)({ _tag: "IssueNotFound", id: "iss-9" }),
   ),
-  Schema.encodeUnknownSync(SessionNotFound)(
-    Schema.decodeUnknownSync(SessionNotFound)({ _tag: "SessionNotFound", id: "ses-9" }),
+  Schema.encodeUnknownSync(ExecutionNotFound)(
+    Schema.decodeUnknownSync(ExecutionNotFound)({ _tag: "ExecutionNotFound", id: "exe-9" }),
   ),
   Schema.encodeUnknownSync(PlanRejected)(
     Schema.decodeUnknownSync(PlanRejected)({ _tag: "PlanRejected", reason: "empty spec" }),
   ),
   // The resume refusal, shared by BOTH cursor-bearing feeds (`events` and
-  // `sessionEvents`): the client's cursor is not from the daemon's current store
+  // `executionEvents`): the client's cursor is not from the daemon's current store
   // generation, so it must discard its retained state and re-hydrate from `snapshot`.
   // NOTE the cursor here is WITHIN the log's extent (2 <= 3) — the case an offset-only
   // rule cannot detect, and the reason the generation is an explicit identity. The
@@ -449,7 +449,7 @@ writeEncoded(
     Schema.Union([
       WorkstreamNotFound,
       IssueNotFound,
-      SessionNotFound,
+      ExecutionNotFound,
       PlanRejected,
       ResyncRequired,
     ]),
@@ -475,21 +475,23 @@ write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSch
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
-// The `sessionEvents` request resume context is OPTIONAL, and is the SAME nested
+// The `executionEvents` request resume context is OPTIONAL, and is the SAME nested
 // value `events` carries: both wire forms are captured — present and absent (the
 // origin-replay case) — so the Swift mirror decodes each.
-write("payload-session-events", sessionEvents.payloadSchema, {
-  sessionId: "ses-1",
+write("payload-execution-events", executionEvents.payloadSchema, {
+  executionId: "exe-1",
   resume: { sinceOffset: 12, generation },
 });
-write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
-write("payload-session-send", sessionSend.payloadSchema, {
-  sessionId: "ses-1",
+write("payload-execution-events-no-offset", executionEvents.payloadSchema, {
+  executionId: "exe-1",
+});
+write("payload-execution-send", executionSend.payloadSchema, {
+  executionId: "exe-1",
   input: { text: "go", mode: "prompt" },
 });
-write("payload-interrupt", interrupt.payloadSchema, { sessionId: "ses-1" });
+write("payload-interrupt", interrupt.payloadSchema, { executionId: "exe-1" });
 write("payload-answer-ui-request", answerUiRequest.payloadSchema, {
-  sessionId: "ses-1",
+  executionId: "exe-1",
   response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
 });
 

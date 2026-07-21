@@ -6,10 +6,10 @@ import {
   BranchName,
   CommitSha,
   EpicId,
+  ExecutionId,
   IssueId,
   JobId,
   RepositoryId,
-  SessionId,
   WorkstreamId,
 } from "./ids.ts";
 
@@ -22,7 +22,7 @@ const brands = [
   [EpicId, "epic-alpha"],
   [IssueId, "issue-alpha"],
   [JobId, "job-alpha"],
-  [SessionId, "session-alpha"],
+  [ExecutionId, "execution-alpha"],
   [AgentId, "agent-alpha"],
   [RepositoryId, "repo:github:1296269"],
 ] as const;

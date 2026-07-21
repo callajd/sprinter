@@ -20,10 +20,10 @@
  *    aborts the whole roll-up.
  * 2. **Resume running Jobs** — walk the (post-roll-up) graph and re-dispatch each
  *    `running` Job through the `JobRunner`, which re-attaches to the Job's PERSISTED
- *    session id (1 Job = 1 session, `UNIQUE(session.jobId)`) — never a new session.
- *    Each resume is a BACKGROUND fiber tied to the daemon scope (a session can take
+ *    execution id (1 Job = 1 execution, `UNIQUE(execution.jobId)`) — never a new execution.
+ *    Each resume is a BACKGROUND fiber tied to the daemon scope (an execution can take
  *    minutes; boot must not block, mirroring the live `dispatchInBackground` path), so
- *    N in-flight sessions resume concurrently and `run` returns promptly.
+ *    N in-flight executions resume concurrently and `run` returns promptly.
  *
  * The resume is guarded so it never double-runs, respects control state, and leaves no
  * durable `running` limbo — a `running` Job that is NOT resumed is settled to a
@@ -42,12 +42,12 @@
  *   than resurrected — resume is NARROWED to the genuinely-in-flight (`active`/`pending`)
  *   Workstreams, so every terminal/paused Workstream status settles instead.
  *
- * Every settle path also settles the corresponding SESSION row to a terminal status
+ * Every settle path also settles the corresponding EXECUTION row to a terminal status
  * alongside the Job row (CE4.1-R4 root fix): a settled Job must never leave a stale
- * NON-TERMINAL Session behind, or the session-resolve gate ({@link ./rpc-handlers.ts}
- * `resolveLive`) would mistake that orphan for a mid-dispatch session and stall the full
- * resolve bound before `SessionNotFound`. `succeeded` → `completed`; `cancelled`/`queued`
- * → `interrupted` (a later re-dispatch of a `queued` Job re-attaches its session id and
+ * NON-TERMINAL Execution behind, or the execution-resolve gate ({@link ./rpc-handlers.ts}
+ * `resolveLive`) would mistake that orphan for a mid-dispatch execution and stall the full
+ * resolve bound before `ExecutionNotFound`. `succeeded` → `completed`; `cancelled`/`queued`
+ * → `interrupted` (a later re-dispatch of a `queued` Job re-attaches its execution id and
  * moves it back to `starting`). This is INV-RESTART behavior.
  *
  * A single resume failure is isolated (logged in its background fiber) so one bad Job
@@ -55,9 +55,9 @@
  * graph is NOT isolated — our own store failing at startup is a real failure the
  * caller must see.
  *
- * A resumed Job whose session was mid-turn is re-driven from the start (the runner
- * re-issues the prompt, reusing the session id) — idempotent full re-run is the AE5.1
- * behavior; true mid-session continuation rides the deferred LocalPi adapter below.
+ * A resumed Job whose execution was mid-turn is re-driven from the start (the runner
+ * re-issues the prompt, reusing the execution id) — idempotent full re-run is the AE5.1
+ * behavior; true mid-execution continuation rides the deferred LocalPi adapter below.
  *
  * **Scope note — deferred provisioning.** The concrete LocalPi `ExecutionRunner`
  * adapter that spawns a real `pi` process (the `JobRunner`'s runtime) and a runnable
@@ -72,7 +72,7 @@ import {
   isIssueLanded,
   type Job,
   type JobId,
-  type SessionStatus,
+  type ExecutionStatus,
   type WorkStatus,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
@@ -91,8 +91,8 @@ export interface StartupSummary {
   /** The number of persisted Workstreams reconciled against the host. */
   readonly reconciledWorkstreams: number;
   /**
-   * The ids of the `running` Jobs **re-dispatched** onto their persisted sessions.
-   * Each is handed to the `JobRunner` as a BACKGROUND fiber (a session can take
+   * The ids of the `running` Jobs **re-dispatched** onto their persisted executions.
+   * Each is handed to the `JobRunner` as a BACKGROUND fiber (an execution can take
    * minutes — boot must not block on it, mirroring the live dispatch path), so this
    * counts what was re-dispatched, NOT what has completed; a background resume's
    * outcome is logged asynchronously, never awaited here.
@@ -124,14 +124,14 @@ type ResumeAction =
   | { readonly _tag: "settle"; readonly status: SettleStatus };
 
 /**
- * The terminal {@link SessionStatus} a settled Job's session row is moved to alongside
- * the Job row (CE4.1-R4 root fix), so no stale NON-TERMINAL Session outlives a settled
+ * The terminal {@link ExecutionStatus} a settled Job's execution row is moved to alongside
+ * the Job row (CE4.1-R4 root fix), so no stale NON-TERMINAL Execution outlives a settled
  * Job. `succeeded` → `completed`; `cancelled`/`queued` → `interrupted` (the pre-restart
- * turn ended; a later `control resume` of a `queued` Job re-attaches the same session id
+ * turn ended; a later `control resume` of a `queued` Job re-attaches the same execution id
  * and moves it back to `starting`). A total map (INV-NOCAST): every {@link SettleStatus}
  * has a terminal image.
  */
-const sessionSettleStatus: Record<SettleStatus, SessionStatus> = {
+const executionSettleStatus: Record<SettleStatus, ExecutionStatus> = {
   succeeded: "completed",
   cancelled: "interrupted",
   queued: "interrupted",
@@ -202,12 +202,12 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
         );
 
       /**
-       * Re-dispatch one Job onto its persisted session as a BACKGROUND fiber tied to
-       * the daemon scope. `JobRunner.dispatch` awaits the session's terminal outcome
+       * Re-dispatch one Job onto its persisted execution as a BACKGROUND fiber tied to
+       * the daemon scope. `JobRunner.dispatch` awaits the execution's terminal outcome
        * (a run can take minutes), so — exactly as the live command path
        * (`dispatchInBackground`) does — boot must fork it rather than block: N
-       * in-flight sessions resume concurrently and `run` returns promptly. The
-       * dispatch owns a fresh per-Job scope (the session lifetime); any failure is
+       * in-flight executions resume concurrently and `run` returns promptly. The
+       * dispatch owns a fresh per-Job scope (the execution lifetime); any failure is
        * isolated (logged) so one bad resume never disturbs the others.
        */
       const resume = (job: Job): Effect.Effect<void> =>
@@ -221,21 +221,21 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
         );
 
       /**
-       * Settle a stale `running` Job to a terminal/pending status AND settle its SESSION
+       * Settle a stale `running` Job to a terminal/pending status AND settle its EXECUTION
        * row to a terminal status (CE4.1-R4 root fix) — writing ONLY the Job row would
-       * leave a NON-TERMINAL Session orphan that stalls the session-resolve gate. The
-       * session write is conditional on a row existing (a `running` Job always has one,
-       * but the read stays graceful) and reuses the persisted session id, so a later
-       * re-dispatch of a `queued` Job re-attaches the SAME session (1 Job = 1 session).
+       * leave a NON-TERMINAL Execution orphan that stalls the execution-resolve gate. The
+       * execution write is conditional on a row existing (a `running` Job always has one,
+       * but the read stays graceful) and reuses the persisted execution id, so a later
+       * re-dispatch of a `queued` Job re-attaches the SAME execution (1 Job = 1 execution).
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {
           yield* store.jobs.putJob({ ...job, status });
-          const session = yield* store.jobs.getSessionForJob(job.id);
-          if (Option.isSome(session)) {
-            yield* store.jobs.putSession({
-              ...session.value,
-              status: sessionSettleStatus[status],
+          const execution = yield* store.jobs.getExecutionForJob(job.id);
+          if (Option.isSome(execution)) {
+            yield* store.jobs.putExecution({
+              ...execution.value,
+              status: executionSettleStatus[status],
             });
           }
         });
@@ -274,8 +274,8 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
                   yield* resume(job);
                   resumed.push(job.id);
                 } else {
-                  // Settle the stale `running` Job AND its Session row to terminal, so no
-                  // durable `running` limbo — and no orphaned NON-TERMINAL Session — survives
+                  // Settle the stale `running` Job AND its Execution row to terminal, so no
+                  // durable `running` limbo — and no orphaned NON-TERMINAL Execution — survives
                   // across restarts (CE4.1-R4).
                   yield* settle(job, action.status);
                   skipped.push(job.id);

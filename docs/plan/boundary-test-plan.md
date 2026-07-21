@@ -87,7 +87,7 @@ BT2 (harness fixture) ──┴─► BT3, BT4, BT5, BT6  ─► BT8 (gated cros
 ### BT1.1 — Golden coverage completeness gate
 - **Done:** a check that enumerates every wire type in `packages/contract/src/rpc.ts`
   (all `Rpc` payload/success/error schemas, `WorkGraphEvent`/`OffsetEvent`, `Snapshot`,
-  session-channel frames, `TranscriptEntry`, `Notice`/`NoticeEntry`, `UiRequest*`) and
+  execution-channel frames, `TranscriptEntry`, `Notice`/`NoticeEntry`, `UiRequest*`) and
   **fails** if any lacks a golden vector under
   `apple/Sprinter/Tests/SprinterContractTests/Goldens/`. Goldens are produced only by
   `apple/Sprinter/scripts/generate-goldens.ts` (regeneration is drift-free); both the TS
@@ -120,9 +120,9 @@ BT2 (harness fixture) ──┴─► BT3, BT4, BT5, BT6  ─► BT8 (gated cros
 - **Done:** a **reusable** test fixture (factored out of `packages/daemon/src/acceptance.test.ts`)
   that: boots the **real** `mainLayer`/`bootLayer` graph on a **real** Unix socket at a
   short temp path (respect `sun_path` ≤ ~104 bytes), file-backed `StateStore` on a temp
-  db, `SESSION_RESOLVE_TIMEOUT` overridable; substitutes ONLY (a) the `pi` via a
+  db, `EXECUTION_RESOLVE_TIMEOUT` overridable; substitutes ONLY (a) the `pi` via a
   **scripted `ChildProcessSpawner`** emitting a caller-supplied frame script to a terminal
-  `SessionResult`, and (b) an **in-process sandboxed `Repository`** with programmable
+  `ExecutionResult`, and (b) an **in-process sandboxed `Repository`** with programmable
   Issue/PR responses; exposes a **real `RpcClient`** (`RpcClient.layerProtocolSocket` +
   `BunSocket.layerNet` + NDJSON) byte-identical to the app's transport; and provides
   `acquireRelease` teardown that kills the daemon fiber, unlinks the socket, closes the
@@ -131,7 +131,7 @@ BT2 (harness fixture) ──┴─► BT3, BT4, BT5, BT6  ─► BT8 (gated cros
 
 ### BT2.2 — Observation contract for assertions
 - **Done:** the fixture exposes the same **read-model projections** the app consumes
-  (`snapshot()` + the `events`/`OffsetEvent` feed → the board projection, the session
+  (`snapshot()` + the `events`/`OffsetEvent` feed → the board projection, the execution
   channel → transcript, the inspector pairing), and a bounded `awaitProjection(pred)`
   helper that converges to a **named terminal state** and fails on timeout. Assertions
   are made on observable projected state (never on internal daemon fields), so a test
@@ -203,24 +203,24 @@ Anchors: `WorkGraphResync.swift`, `ContiguousOffsetTracker.swift`, `ReconnectBac
 
 ## Epic `BT5` — Restart & durability chaos  ·  tags: `INV-RESTART`, `INV-REAL-WIRE`, `INV-GATE-A`, `INV-GATE-B`
 
-Anchors: `startup-reconcile.ts`, `session-registry.ts` (`resolveLive`), `rpc-handlers.ts`, `job-runner.ts`, `state/src/sqlite.ts`.
+Anchors: `startup-reconcile.ts`, `execution-registry.ts` (`resolveLive`), `rpc-handlers.ts`, `job-runner.ts`, `state/src/sqlite.ts`.
 
 ### BT5.1 — Build-write-restart-read across the wire
-- **Done:** dispatch a job to a live (scripted-pi) session, **restart the real daemon
+- **Done:** dispatch a job to a live (scripted-pi) execution, **restart the real daemon
   process** mid-flight (kill fiber + rebind socket + fresh graph on the same file-backed
   db), assert the client **resyncs** (snapshot + offset replay) and the daemon
-  **re-dispatches** persisted work; **1 Job = 1 session re-attached by id**; no work lost
-  or duplicated. Client-side reconnect (`WorkGraphResync` + the app session-channel
+  **re-dispatches** persisted work; **1 Job = 1 execution re-attached by id**; no work lost
+  or duplicated. Client-side reconnect (`WorkGraphResync` + the app execution-channel
   re-dial) is exercised, not assumed.
 - **Depends on:** `BT2`
 
-### BT5.2 — Startup-reconcile settle correctness (Job **and** Session rows)
-- **Done:** `startup-reconcile`'s settle/skip path settles the **Session** row to terminal
+### BT5.2 — Startup-reconcile settle correctness (Job **and** Execution rows)
+- **Done:** `startup-reconcile`'s settle/skip path settles the **Execution** row to terminal
   alongside the **Job** row for every settle (`succeeded`/`cancelled`/`queued`), so no
-  stale non-terminal Session survives a settled Job; assert (a) a stray non-landed
+  stale non-terminal Execution survives a settled Job; assert (a) a stray non-landed
   `running` Job under a **`done`** workstream is NOT resumed; (b) a **`queued`**-orphan
-  under a paused (`blocked`) workstream **fails fast** on session-channel resolve (no
-  `sessionResolveTimeout` stall — the `resolveLive` Job-status gate holds); (c) the
+  under a paused (`blocked`) workstream **fails fast** on execution-channel resolve (no
+  `executionResolveTimeout` stall — the `resolveLive` Job-status gate holds); (c) the
   register-after-persist window still bridges (a running Job whose handle is not yet
   registered waits, bounded).
 - **Depends on:** BT5.1
@@ -237,10 +237,10 @@ Anchors: `startup-reconcile.ts`, `session-registry.ts` (`resolveLive`), `rpc-han
 ## Epic `BT6` — Fault injection & graceful-degradation  ·  tags: `INV-REAL-WIRE`, `INV-HONEST-SCOPE`
 
 ### BT6.1 — Transient backend/host faults surface as typed errors, never defects/hangs
-- **Done:** injected transient failures — a `StateStoreError` on a session-channel resolve
+- **Done:** injected transient failures — a `StateStoreError` on an execution-channel resolve
   read; a `Repository` host `404`/`403`/`429` mid reconcile-roll-up; a daemon socket close
   mid in-flight query — each surfaces as the **typed** channel error the consumer handles
-  (`SessionNotFound`/`BackendError.connectionClosed`/isolated per-issue reconcile
+  (`ExecutionNotFound`/`BackendError.connectionClosed`/isolated per-issue reconcile
   continue), never an unrecoverable **defect** that kills a long-lived stream fiber, and
   never a hang. `reconcileWorkstream` is asserted fail-**soft** (one bad issue does not
   abort the roll-up).
@@ -261,7 +261,7 @@ Anchors: `startup-reconcile.ts`, `session-registry.ts` (`resolveLive`), `rpc-han
 ### BT8.1 — Swift-transport → real-daemon e2e (periodic / opt-in)
 - **Done:** an **opt-in** (non-CI-gating, env/flag-guarded) integration that drives the
   **real Swift `UnixSocketTransport` + `RpcBackend` + view models** against a spawned real
-  Bun daemon (scripted-pi + sandboxed `Repository` leaves), asserting the board/session/
+  Bun daemon (scripted-pi + sandboxed `Repository` leaves), asserting the board/execution/
   inspector **view-model** state end-to-end — closing the one gap the TS-side L3 harness
   cannot (the Swift transport/view-model code is not in the L3 loop). If a stable
   cross-language CI harness is infeasible, this lands as a **runbook** + a documented
@@ -286,7 +286,7 @@ Every task traces to a boundary hazard or technique exercised (and often a bug c
 | `BT4.1/4.2` | CE2.0/CE2.2 offset cursor + `ContiguousOffsetTracker` loss-freeness under out-of-order live delivery |
 | `BT4.3` | CE2.2 #63 `ReconnectBackoff` flap-vs-idle health-reset |
 | `BT5.1` | CE4.2 #71 build-write-restart-read |
-| `BT5.2` | CE4.1 R3/R4 `resolveLive` Job-status gate + the `startup-reconcile` Session-row settle root fix |
+| `BT5.2` | CE4.1 R3/R4 `resolveLive` Job-status gate + the `startup-reconcile` Execution-row settle root fix |
 | `BT5.3` | CE4.2 #71 WAL cross-connection visibility vs real crash-recovery (honest-scope) |
 | `BT6.1` | CE1.3 reconcile per-issue error isolation + CE4.1 `StateStoreError`→graceful mapping |
 | `BT6.2` | CE2.0 unknown-`_tag` decode-failure vector |

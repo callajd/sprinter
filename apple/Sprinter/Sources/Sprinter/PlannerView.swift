@@ -1,11 +1,11 @@
 import SprinterBackend
 import SprinterContract
-import SprinterSession
+import SprinterExecution
 import SwiftUI
 
-/// Thin planner View (CE3.1): renders `PlannerViewModel` — the reused session transcript
-/// plus the one explicit materialize step. Planning is just an interactive session (D9),
-/// so this reuses `SessionView` for the conversation and adds the plan form + the
+/// Thin planner View (CE3.1): renders `PlannerViewModel` — the reused execution transcript
+/// plus the one explicit materialize step. Planning is just an interactive execution (D9),
+/// so this reuses `ExecutionView` for the conversation and adds the plan form + the
 /// reflected outcome. No planner logic here; it lives in the tested view model.
 struct PlannerView: View {
   @Bindable var model: PlannerViewModel
@@ -14,13 +14,13 @@ struct PlannerView: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      SessionView(model: model.session)
+      ExecutionView(model: model.execution)
       Divider()
       planForm
     }
     .frame(minWidth: 480, minHeight: 420)
-    .task { model.session.start() }
-    .onDisappear { model.session.stop() }
+    .task { model.execution.start() }
+    .onDisappear { model.execution.stop() }
     .shellActionErrorAlert($actionError)
   }
 
@@ -73,13 +73,13 @@ struct PlannerView: View {
   }
 }
 
-/// Opens a `PlannerViewModel` for a planning session the user names, then renders the
-/// planner. Spawning a planning session server-side is later shell/product flow (CE3.2);
-/// CE3.1 renders the model for a supplied planning session id.
+/// Opens a `PlannerViewModel` for a planning execution the user names, then renders the
+/// planner. Spawning a planning execution server-side is later shell/product flow (CE3.2);
+/// CE3.1 renders the model for a supplied planning execution id.
 struct PlannerContainer: View {
   let backend: any Backend
 
-  @State private var sessionText = ""
+  @State private var executionText = ""
   @State private var planner: PlannerViewModel?
 
   var body: some View {
@@ -92,14 +92,14 @@ struct PlannerContainer: View {
 
   private var startForm: some View {
     VStack(spacing: 12) {
-      Text("Start a planning session").font(.headline)
-      TextField("Planning session id", text: $sessionText)
+      Text("Start a planning execution").font(.headline)
+      TextField("Planning execution id", text: $executionText)
         .textFieldStyle(.roundedBorder)
       Button("Open") {
         planner = PlannerViewModel(
-          backend: backend, planningSessionId: SessionId(rawValue: sessionText))
+          backend: backend, planningExecutionId: ExecutionId(rawValue: executionText))
       }
-      .disabled(sessionText.isEmpty)
+      .disabled(executionText.isEmpty)
     }
     .padding()
     .frame(minWidth: 380, minHeight: 200)

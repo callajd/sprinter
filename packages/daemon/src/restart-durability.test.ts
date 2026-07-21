@@ -1,6 +1,6 @@
 /**
  * Durable-persistence restart proof (AE5.1, carried AE2 / #23 F2) — the restart
- * premise the whole {@link StartupReconcile} rests on: the Job↔session↔PR mapping
+ * premise the whole {@link StartupReconcile} rests on: the Job↔execution↔PR mapping
  * survives a process restart.
  *
  * This is a real **build-write-rebuild-read** cycle against a FILE-backed
@@ -21,11 +21,11 @@ import { BunFileSystem } from "@effect/platform-bun";
 import { expect } from "vitest";
 import {
   Epic,
+  Execution,
   Issue,
   Job,
   PullRequestRef,
   Repository,
-  Session,
   Workstream,
 } from "@sprinter/domain";
 import { layer, StateStore } from "@sprinter/state";
@@ -77,19 +77,19 @@ const issue = decode(Issue, {
   pr,
 });
 
-const session = decode(Session, { id: "session-job-1", jobId: "job-1", status: "active" });
+const execution = decode(Execution, { id: "execution-job-1", jobId: "job-1", status: "active" });
 
 const job = decode(Job, {
   id: "job-1",
   issueId: "issue-1",
   kind: "implement",
   status: "running",
-  sessionId: "session-job-1",
-  transcriptRef: "transcript://session-job-1",
+  executionId: "execution-job-1",
+  transcriptRef: "transcript://execution-job-1",
   pr,
 });
 
-it.effect("the Job↔session↔PR mapping survives a restart (build-write-rebuild-read)", () =>
+it.effect("the Job↔execution↔PR mapping survives a restart (build-write-rebuild-read)", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem;
     const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-restart-" });
@@ -102,7 +102,7 @@ it.effect("the Job↔session↔PR mapping survives a restart (build-write-rebuil
       yield* store.workGraph.putWorkstream(workstream);
       yield* store.workGraph.putEpic(epic);
       yield* store.workGraph.putIssue(issue);
-      yield* store.jobs.putSession(session);
+      yield* store.jobs.putExecution(execution);
       yield* store.jobs.putJob(job);
     }).pipe(Effect.provide(layer({ filename })));
 
@@ -110,15 +110,15 @@ it.effect("the Job↔session↔PR mapping survives a restart (build-write-rebuil
     yield* Effect.gen(function* () {
       const store = yield* StateStore;
 
-      // The Job row comes back intact — status, session link, transcript ref, PR.
+      // The Job row comes back intact — status, execution link, transcript ref, PR.
       const reloadedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
       expect(reloadedJob).toStrictEqual(job);
 
-      // The session is still reachable both by id and by the 1 Job = 1 session link.
-      const byJob = Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id));
-      expect(byJob).toStrictEqual(session);
-      const byId = Option.getOrThrow(yield* store.jobs.getSession(session.id));
-      expect(byId).toStrictEqual(session);
+      // The execution is still reachable both by id and by the 1 Job = 1 execution link.
+      const byJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+      expect(byJob).toStrictEqual(execution);
+      const byId = Option.getOrThrow(yield* store.jobs.getExecution(execution.id));
+      expect(byId).toStrictEqual(execution);
 
       // The Issue's PR ref survives the round-trip.
       const reloadedIssue = Option.getOrThrow(yield* store.workGraph.getIssue(issue.id));

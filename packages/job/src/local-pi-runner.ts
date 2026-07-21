@@ -1,8 +1,8 @@
 /**
  * `layerLocalPi` — the concrete `LocalPi` adapter for the {@link ExecutionRunner}
  * port (CVG task CE1.1). It is the ONE production `Layer` behind the port: it
- * starts a real `pi` session via `@sprinter/runner`'s {@link makeSession} and hands
- * back the neutral {@link SessionHandle} the {@link JobRunner} dispatches through.
+ * starts a real `pi` execution via `@sprinter/runner`'s {@link makeExecution} and hands
+ * back the neutral {@link ExecutionHandle} the {@link JobRunner} dispatches through.
  * It is a drop-in `Layer` substitution for the test fake — no consumer above the
  * `ExecutionRunner` tag changes, and none gains any Pi/localness knowledge
  * (INV-PORT / INV-EFFECT-DI). Its single external requirement is the
@@ -13,7 +13,7 @@
  * stream never ends and its `result` never resolves, which would hang
  * `JobRunner.dispatch` (it folds `events` to completion, then awaits `result`).
  * This adapter makes the dispatch ONE-SHOT deterministically: it drives the
- * session to its first `SessionIdle` (Pi's `agent_settled`) and truncates the
+ * execution to its first `ExecutionIdle` (Pi's `agent_settled`) and truncates the
  * handle there. The returned handle's `events` END at that settle (so the fold
  * terminates) and its `result` resolves — `Completed` on a clean settle/close,
  * `Failed` on a transport teardown. The underlying `pi` process is still
@@ -23,29 +23,29 @@
 import { Cause, Deferred, Effect, Layer, Option, Pull, Ref, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
-import type { Job, SessionEvent } from "@sprinter/domain";
+import type { Job, ExecutionEvent } from "@sprinter/domain";
 import {
-  makeSession,
+  type ExecutionHandle,
+  type ExecutionResult,
+  makeExecution,
   type PiProcessConfig,
   type PiTransportError,
-  type SessionHandle,
-  type SessionResult,
 } from "@sprinter/runner";
 import { ExecutionRunner, ExecutionRunnerError } from "./execution-runner.ts";
 import { PiSpawnRouter } from "./spawn-router.ts";
 
-/** The `SessionIdle` (Pi `agent_settled`) event that ends a one-shot dispatch. */
-const isSessionIdle = (event: SessionEvent): boolean => event._tag === "SessionIdle";
+/** The `ExecutionIdle` (Pi `agent_settled`) event that ends a one-shot dispatch. */
+const isExecutionIdle = (event: ExecutionEvent): boolean => event._tag === "ExecutionIdle";
 
 /** The `TurnStarted` (Pi `turn_start`) event: the agent has begun a prompted turn. */
-const isTurnStarted = (event: SessionEvent): boolean => event._tag === "TurnStarted";
+const isTurnStarted = (event: ExecutionEvent): boolean => event._tag === "TurnStarted";
 
 /**
  * The neutral terminal outcome of a transport-error teardown: the transport's own
  * neutral `detail` when present, else the pretty-printed cause. Mirrors the
- * runner's own `failedResult` so a truncated session reports failure identically.
+ * runner's own `failedResult` so a truncated execution reports failure identically.
  */
-const failedResult = (cause: Cause.Cause<PiTransportError>): SessionResult => {
+const failedResult = (cause: Cause.Cause<PiTransportError>): ExecutionResult => {
   const failure = Cause.findErrorOption(cause);
   return {
     _tag: "Failed",
@@ -54,26 +54,26 @@ const failedResult = (cause: Cause.Cause<PiTransportError>): SessionResult => {
 };
 
 /**
- * Wrap a live {@link SessionHandle} into a ONE-SHOT handle that honours the
+ * Wrap a live {@link ExecutionHandle} into a ONE-SHOT handle that honours the
  * terminal-result contract. The wrapped `events` stream ends at the first
- * `SessionIdle` (inclusive), so the {@link JobRunner}'s fold terminates instead of
+ * `ExecutionIdle` (inclusive), so the {@link JobRunner}'s fold terminates instead of
  * hanging on an idle-but-alive `pi`. A scoped watcher drains that same truncated
  * stream to resolve the terminal `result`: `Completed` when it settles/ends
  * cleanly, `Failed` when the transport tears down. `send` / `interrupt` /
  * `answerUi` / `pid` delegate to the underlying handle unchanged.
  *
  * **Pre-prompt settle gating (CE1.1-F2 cold review / CE1.1-F1).** A real
- * `pi --mode rpc` idles-on-startup: it emits an `agent_settled` (→ `SessionIdle`)
+ * `pi --mode rpc` idles-on-startup: it emits an `agent_settled` (→ `ExecutionIdle`)
  * BEFORE any prompt is sent. Truncating the one-shot on THAT settle would end the
  * dispatch with zero work and report `Completed` — the load-bearing failure of the
- * dispatch loop. So the settle-watcher is GATED: a `SessionIdle` only arms
+ * dispatch loop. So the settle-watcher is GATED: an `ExecutionIdle` only arms
  * truncation once a turn has begun (the {@link JobRunner}'s prompt drives Pi's
  * `turn_start` → `TurnStarted`). Every pre-turn (pre-prompt) settle is DROPPED — it
  * neither ends the stream nor resolves `result` — so a truncating settle always
  * follows real agent work.
  *
  * **Subscribe-before-emit (CE1.1-F1 cold review).** The gate is only sound if the
- * watcher is LISTENING before `TurnStarted` can flow: the session's `events` is a
+ * watcher is LISTENING before `TurnStarted` can flow: the execution's `events` is a
  * bounded SLIDING PubSub (`@sprinter/runner`), so under a real-`pi` burst a
  * `TurnStarted` could slide out of the replay window before a late subscriber
  * attaches — leaving the gate un-armed so the watcher never truncates and dispatch
@@ -82,17 +82,17 @@ const failedResult = (cause: Cause.Cause<PiTransportError>): SessionResult => {
  * `JobRunner` sends the prompt that drives `TurnStarted` (`dispatch` calls `send`
  * only after `run` returns). The subscription is armed before any event can flow.
  */
-const oneShot = (handle: SessionHandle): Effect.Effect<SessionHandle, never, Scope> =>
+const oneShot = (handle: ExecutionHandle): Effect.Effect<ExecutionHandle, never, Scope> =>
   Effect.gen(function* () {
-    const settled = yield* Deferred.make<SessionResult>();
-    // A fresh gated view of the session's events. Each call gets its OWN
+    const settled = yield* Deferred.make<ExecutionResult>();
+    // A fresh gated view of the execution's events. Each call gets its OWN
     // `turnStarted` ref via `Stream.unwrap` — a SHARED ref would race: the watcher,
     // draining ahead, could flip the ref from a later `turn_start` while the consumer
     // is still on the pre-prompt settle, so the consumer would wrongly keep it.
     // Per-subscription state keeps the gate correct regardless of interleaving. A
-    // `SessionIdle` truncates only AFTER `TurnStarted` in THAT subscription; every
+    // `ExecutionIdle` truncates only AFTER `TurnStarted` in THAT subscription; every
     // pre-turn settle is dropped.
-    const gated = (): Stream.Stream<SessionEvent, PiTransportError> =>
+    const gated = (): Stream.Stream<ExecutionEvent, PiTransportError> =>
       Stream.unwrap(
         Effect.gen(function* () {
           const turnStarted = yield* Ref.make(false);
@@ -100,20 +100,20 @@ const oneShot = (handle: SessionHandle): Effect.Effect<SessionHandle, never, Sco
             Stream.filterEffect((event) =>
               isTurnStarted(event)
                 ? Ref.set(turnStarted, true).pipe(Effect.as(true))
-                : isSessionIdle(event)
+                : isExecutionIdle(event)
                   ? Ref.get(turnStarted)
                   : Effect.succeed(true),
             ),
-            Stream.takeUntil(isSessionIdle),
+            Stream.takeUntil(isExecutionIdle),
           );
         }),
       );
     // Arm the terminal watcher's subscription EAGERLY, before returning the handle:
-    // `Stream.toPull` opens the channel (subscribing to the session's PubSub) as it
+    // `Stream.toPull` opens the channel (subscribing to the execution's PubSub) as it
     // runs, so the gate is listening before any event can flow (subscribe-before-emit).
     const pull = yield* Stream.toPull(gated());
     // Drain that pre-armed subscription to its terminal: a clean stream end (the gated
-    // `SessionIdle`, or `pi` closing) resolves `Completed`; a transport teardown
+    // `ExecutionIdle`, or `pi` closing) resolves `Completed`; a transport teardown
     // resolves `Failed`. `Pull.catchDone` turns the end-of-stream halt into the clean
     // outcome, leaving only a real `PiTransportError` cause for the failure branch.
     const watch = Effect.forever(pull).pipe(
@@ -127,30 +127,30 @@ const oneShot = (handle: SessionHandle): Effect.Effect<SessionHandle, never, Sco
   });
 
 /**
- * Start a real `pi` session for a {@link Job} in the Job's OWN spawn config and
- * expose it as a one-shot {@link SessionHandle}. The `config` (notably `cwd`) is
+ * Start a real `pi` execution for a {@link Job} in the Job's OWN spawn config and
+ * expose it as a one-shot {@link ExecutionHandle}. The `config` (notably `cwd`) is
  * resolved per-Job by the {@link PiSpawnRouter} at the composition root, so `pi`
- * runs in the Job's worktree, not the daemon's cwd (CE1.1-F2). A `makeSession`
+ * runs in the Job's worktree, not the daemon's cwd (CE1.1-F2). A `makeExecution`
  * spawn failure (a `PlatformError`) is translated at the boundary into the owned
  * {@link ExecutionRunnerError}, so no consumer depends on a concrete runtime's
  * error shape (INV-PORT). The prompt is NOT driven here — the {@link JobRunner}
  * owns deriving and sending the Issue-content prompt; this adapter owns starting
- * the session and the terminal-result contract.
+ * the execution and the terminal-result contract.
  */
 const run = (
   job: Job,
   config: PiProcessConfig,
 ): Effect.Effect<
-  SessionHandle,
+  ExecutionHandle,
   ExecutionRunnerError,
   ChildProcessSpawner.ChildProcessSpawner | Scope
 > =>
-  makeSession(config).pipe(
+  makeExecution(config).pipe(
     Effect.mapError(
       (error) =>
         new ExecutionRunnerError({
           operation: "run",
-          detail: `failed to start pi session for job ${job.id}: ${error.message}`,
+          detail: `failed to start pi execution for job ${job.id}: ${error.message}`,
         }),
     ),
     Effect.flatMap(oneShot),

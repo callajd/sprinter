@@ -4,7 +4,7 @@ import SprinterContract
 /// `BoardWorkstream ⊃ BoardEpic ⊃ BoardIssue` hierarchy (BE2.1 / D13).
 ///
 /// The read model is stored flat (parallel arrays of workstreams, epics, issues,
-/// jobs, sessions cross-referenced by id); the board is a tree. This is the pure,
+/// jobs, executions cross-referenced by id); the board is a tree. This is the pure,
 /// `Sendable`, offline-testable transform that rebuilds the tree from one snapshot:
 /// it walks each workstream's declared `epics`, each epic's declared `issues`, and
 /// resolves the referenced nodes out of the snapshot's flat arrays — preserving the
@@ -64,25 +64,25 @@ public enum BoardProjection {
   /// Which issues currently have a live agent, keyed by issue id.
   ///
   /// An issue is "live" when it has a `running` ``Job``, or a non-terminal job whose
-  /// ``Session`` is `active` — the signals BE2.1 surfaces as per-agent activity. A
+  /// ``Execution`` is `active` — the signals BE2.1 surfaces as per-agent activity. A
   /// TERMINAL job (`succeeded`/`failed`/`cancelled`) is never live even if a stale
-  /// `active` session still points at it. The first live job encountered (in
+  /// `active` execution still points at it. The first live job encountered (in
   /// snapshot order) represents the issue, so activity is deterministic for a
   /// given snapshot.
   private static func liveActivity(in snapshot: Snapshot) -> [IssueId: IssueActivity] {
-    let sessionsByJob = indexed(snapshot.sessions, by: \.jobId)
+    let executionsByJob = indexed(snapshot.executions, by: \.jobId)
     var activity: [IssueId: IssueActivity] = [:]
     for job in snapshot.jobs {
-      let session = sessionsByJob[job.id]
+      let execution = executionsByJob[job.id]
       let terminal = job.status == .succeeded || job.status == .failed || job.status == .cancelled
-      let live = job.status == .running || (session?.status == .active && !terminal)
+      let live = job.status == .running || (execution?.status == .active && !terminal)
       guard live else { continue }
       if activity[job.issueId] == nil {
-        // Prefer the job's declared session; fall back to the session that
-        // references the job, so a live session is named even when `job.sessionId`
+        // Prefer the job's declared execution; fall back to the execution that
+        // references the job, so a live execution is named even when `job.executionId`
         // has not been persisted yet.
         activity[job.issueId] = IssueActivity(
-          jobId: job.id, kind: job.kind, sessionId: job.sessionId ?? session?.id)
+          jobId: job.id, kind: job.kind, executionId: job.executionId ?? execution?.id)
       }
     }
     return activity

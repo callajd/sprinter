@@ -2,7 +2,7 @@
 /// tool-payload fields (`input` / `output` / `partial` on the tool events and
 /// transcript entries).
 ///
-/// The session model is deliberately agnostic to a tool's payload shape, so the
+/// The execution model is deliberately agnostic to a tool's payload shape, so the
 /// mirror carries those fields as an arbitrary, losslessly-decodable JSON tree
 /// rather than a fixed struct. A small owned enum (rather than a third-party
 /// `AnyCodable`) keeps the frozen contract surface dependency-free and auditable

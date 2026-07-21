@@ -87,7 +87,7 @@ Notes threaded to the contract's own decisions:
   schema was created and destroyed with it. A durable offset only means something
   INSIDE the generation it was minted in — the store never migrates, so a
   schema-version bump drops and recreates it and restarts offsets at `1` — so both
-  cursor-bearing requests (`events` and `sessionEvents`) carry ONE optional-and-omitted
+  cursor-bearing requests (`events` and `executionEvents`) carry ONE optional-and-omitted
   `resume` object, `{ "sinceOffset": 12, "generation": "…" }`, in which BOTH fields are
   REQUIRED. The cursor and its generation are a single nested value, not two independent
   optional keys, so "a cursor without its generation" has no wire form at all and the
@@ -95,8 +95,8 @@ Notes threaded to the contract's own decisions:
   particular offset value — is what makes a request an ORIGIN request; in particular
   `sinceOffset: 0` is an ordinary resume whose generation is compared like any other. A
   client retains the generation with the baseline and hands it back on every resume.
-- The streamed `events` **error is `ResyncRequired`**, and `sessionEvents`' error is
-  `SessionNotFound | ResyncRequired`. It says the request's cursor does NOT belong to
+- The streamed `events` **error is `ResyncRequired`**, and `executionEvents`' error is
+  `ExecutionNotFound | ResyncRequired`. It says the request's cursor does NOT belong to
   the daemon's current store generation. Detection is an IDENTITY comparison, not an
   offset inference: a cursor beyond the log's extent is a symptom, but once a new
   generation's log outgrows a stale cursor the numbers alone look perfectly resumable,
@@ -108,22 +108,22 @@ Notes threaded to the contract's own decisions:
   and re-hydrate from `snapshot` — `WorkGraphResync` does exactly that. It has to be
   both: the delta model is upsert-only, so no stream of deltas can remove an entity the
   reset destroyed.
-- The streamed `sessionEvents` **success is the `OffsetSessionEvent` envelope** — `{
-  "offset": 7, "event": { "_tag": "EntryAppended", … } }` — not the bare `SessionEvent`,
-  the session-channel mirror of `OffsetEvent`. Each durable, transcript-grade session event
-  pairs with its durable per-session offset, so a client can hand it back inside the
-  request's `resume` context. A SETTLED session's durable transcript replays and the stream
-  completes (viewable in the Inspector) rather than the old `SessionNotFound`; the
-  `sessionEvents` request gains the same OPTIONAL `resume` context as `events` — the same
-  type, and therefore the same guard, since its per-session log is dropped by a schema
+- The streamed `executionEvents` **success is the `OffsetExecutionEvent` envelope** — `{
+  "offset": 7, "event": { "_tag": "EntryAppended", … } }` — not the bare `ExecutionEvent`,
+  the execution-channel mirror of `OffsetEvent`. Each durable, transcript-grade execution event
+  pairs with its durable per-execution offset, so a client can hand it back inside the
+  request's `resume` context. A SETTLED execution's durable transcript replays and the stream
+  completes (viewable in the Inspector) rather than the old `ExecutionNotFound`; the
+  `executionEvents` request gains the same OPTIONAL `resume` context as `events` — the same
+  type, and therefore the same guard, since its per-execution log is dropped by a schema
   bump too.
-  `RpcBackend` unwraps `.event` to the existing `SessionEvent` consumer. Ephemeral live
+  `RpcBackend` unwraps `.event` to the existing `ExecutionEvent` consumer. Ephemeral live
   deltas ride the same channel offset-less (offset present ⇒ durable/replayable, absent ⇒
-  ephemeral). **The session feed is ORIGIN-ONLY until a resuming client exists**:
-  `RpcBackend` builds the `sessionEvents` payload with `sessionId` and no `resume`, and
-  `InteractiveSession` has no `ResyncRequired` handling, so the generation guard on this
+  ephemeral). **The execution feed is ORIGIN-ONLY until a resuming client exists**:
+  `RpcBackend` builds the `executionEvents` payload with `executionId` and no `resume`, and
+  `InteractiveExecution` has no `ResyncRequired` handling, so the generation guard on this
   feed is enforced TS-side and has no end-to-end path to fire on today. It is
-  **latent-but-correct** — defined up front because the per-session offset genuinely is a
+  **latent-but-correct** — defined up front because the per-execution offset genuinely is a
   generation-scoped coordinate, not because it is exercised. The work-graph `events` feed
   is the one that resumes in practice.
 

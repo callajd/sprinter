@@ -135,7 +135,7 @@ export type RepositoryHost = (typeof RepositoryHost)["Type"];
  * ## COUPLING: the macOS client MIRRORS this allow-list
  *
  * `PlannerViewModel.segmentProblem`
- * (`apple/Sprinter/Sources/SprinterSession/PlannerViewModel.swift`) re-states this same
+ * (`apple/Sprinter/Sources/SprinterExecution/PlannerViewModel.swift`) re-states this same
  * character set client-side, so the plan form can say WHY a key is unusable before it is
  * submitted rather than surfacing a decode failure. That copy is a UX affordance and the
  * daemon's decode stays the authority — but it IS a copy, and this rule is deliberately

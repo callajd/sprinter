@@ -30,13 +30,13 @@ export type EpicId = (typeof EpicId)["Type"];
 export const IssueId = Schema.NonEmptyString.pipe(Schema.brand("IssueId"));
 export type IssueId = (typeof IssueId)["Type"];
 
-/** Identifies a {@link Job} — one bounded cognitive task (1 Job = 1 session = 1 transcript = 1 PR). */
+/** Identifies a {@link Job} — one bounded cognitive task (1 Job = 1 execution = 1 transcript = 1 PR). */
 export const JobId = Schema.NonEmptyString.pipe(Schema.brand("JobId"));
 export type JobId = (typeof JobId)["Type"];
 
-/** Identifies a {@link Session} — one agent run executing a {@link Job}. */
-export const SessionId = Schema.NonEmptyString.pipe(Schema.brand("SessionId"));
-export type SessionId = (typeof SessionId)["Type"];
+/** Identifies an {@link Execution} — one agent run executing a {@link Job}. */
+export const ExecutionId = Schema.NonEmptyString.pipe(Schema.brand("ExecutionId"));
+export type ExecutionId = (typeof ExecutionId)["Type"];
 
 /**
  * Identifies an {@link Agent} — a member of the REGISTRY layer: owned, global,

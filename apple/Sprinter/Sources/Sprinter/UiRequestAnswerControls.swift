@@ -3,7 +3,7 @@ import SprinterContract
 import SwiftUI
 
 /// The per-kind answering widget for a raised UI request, shared by the inbox rows and the
-/// in-session prompt rows. It shows the control matching the request `kind` — confirm
+/// in-execution prompt rows. It shows the control matching the request `kind` — confirm
 /// buttons, a single-line text field, a multi-line editor, or an option picker — and
 /// reports the user's action as a ``UiRequestReply``. The owner maps that reply to the
 /// correct wire ``UiAnswer`` via the tested `makeUiAnswer(forKind:reply:)` helper; this

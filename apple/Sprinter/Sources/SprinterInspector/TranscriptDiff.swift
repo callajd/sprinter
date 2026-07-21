@@ -1,5 +1,5 @@
 import SprinterContract
-import SprinterSession
+import SprinterExecution
 
 /// One line of a rendered file diff — an addition or a removal.
 ///

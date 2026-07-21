@@ -19,8 +19,8 @@
  *
  * The issue allows either a Swift-spawns-bun integration test or an in-process TS
  * harness speaking the same wire. This is the TS harness, chosen for DETERMINISM:
- * the test drives the scripted pi's stdout timing DIRECTLY, so it can hold a session
- * LIVE across `sessionSend` + `interrupt` before settling it — a control a spawned,
+ * the test drives the scripted pi's stdout timing DIRECTLY, so it can hold an execution
+ * LIVE across `executionSend` + `interrupt` before settling it — a control a spawned,
  * opaque process cannot give — with no cross-language toolchain (bun on the Swift CI
  * runner) and no wall-clock races. It stays FAITHFUL to the real wire: the daemon is
  * its real `main.ts` graph bound to a real Unix socket, and the client is a real
@@ -37,16 +37,16 @@
  *   1. **materialize a plan → workstream** — `createWorkstreamFromPlan`, observed as
  *      a live `WorkstreamChanged` on the `events` feed;
  *   2. **dispatch a Sprinter Issue** — `control(start)` dispatches the issue's Job;
- *      the scripted pi drives a session to a terminal settle, observed as live
- *      `JobChanged` (running → succeeded) + `SessionChanged` deltas — the **Mission
+ *      the scripted pi drives an execution to a terminal settle, observed as live
+ *      `JobChanged` (running → succeeded) + `ExecutionChanged` deltas — the **Mission
  *      Control** board updating live; the boot reconcile survives against the fake
  *      code host;
- *   3. **session channel resolves** — the **Interactive session** channel:
- *      `sessionEvents` streams the live transcript, `sessionSend` drives input, and
- *      `interrupt` aborts the turn — all resolving the SAME live session with NO
+ *   3. **execution channel resolves** — the **Interactive execution** channel:
+ *      `executionEvents` streams the live transcript, `executionSend` drives input, and
+ *      `interrupt` aborts the turn — all resolving the SAME live execution with NO
  *      client retry (the registration wire + the server-side bounded-wait CE4.1 close);
  *   4. **a SEEDED PR pairs through the real read model** — the **Inspector** pairing:
- *      the settled Job carries a `transcriptRef` and resolves, session → job → issue,
+ *      the settled Job carries a `transcriptRef` and resolves, execution → job → issue,
  *      to a PR. That PR-open is SEED DATA — injected into the materialized plan
  *      (`seedIssue.pr`) and the fake `CodeHost`, NOT produced by the loop and NOT
  *      discovered by the daemon. So this proves the read-model pairing WIRE carries a
@@ -79,19 +79,19 @@ import { expect } from "vitest";
 import { type Snapshot, SprinterRpc, type WorkGraphEvent } from "@sprinter/contract";
 import {
   Epic,
+  ExecutionId,
   Issue,
   Job,
   PositiveInt,
   PullRequestRef,
   RepositoryKey,
-  SessionId,
   Workstream,
 } from "@sprinter/domain";
 import { Repository as DomainRepository } from "@sprinter/domain";
 import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
 import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
-import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
+import { EXECUTION_RESOLVE_TIMEOUT } from "./execution-registry.ts";
 
 // ── hard timeout so a hung socket/daemon/event fails fast, never blocks ────────
 const HARD_TIMEOUT = "15 seconds";
@@ -199,7 +199,7 @@ const RESPONDS_TO = new Set(["prompt", "steer", "follow_up", "abort", "get_state
 interface ScriptedPi {
   /** The `ChildProcessSpawner` `Layer` substituting the real spawner (INV-EFFECT-DI). */
   readonly layer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
-  /** Resolves once the daemon has spawned the (single) session process. */
+  /** Resolves once the daemon has spawned the (single) execution process. */
   readonly awaitSpawn: Effect.Effect<void>;
   /** Push one raw NDJSON server message onto the stand-in's stdout. */
   readonly emit: (message: unknown) => Effect.Effect<void>;
@@ -208,10 +208,10 @@ interface ScriptedPi {
 /**
  * A scripted `pi` process at the `ChildProcessSpawner` seam: it decodes the
  * runner's stdin commands and ACKs the correlated ones (so `handle.send` /
- * `handle.interrupt` — hence the `sessionSend` / `interrupt` RPCs — resolve), and
+ * `handle.interrupt` — hence the `executionSend` / `interrupt` RPCs — resolve), and
  * its stdout is a test-driven queue of raw NDJSON server messages. The test emits a
  * canned transcript (`turn_start` → `entry_appended` → … → `agent_settled`) on its
- * own schedule, so a session can be held LIVE across the session-channel drive and
+ * own schedule, so an execution can be held LIVE across the execution-channel drive and
  * only THEN settled — fully deterministic, no `pi` binary, no wall-clock.
  */
 const makeScriptedPi: Effect.Effect<ScriptedPi> = Effect.gen(function* () {
@@ -328,7 +328,7 @@ const seedJob = decode(Job, {
   kind: "implement",
   status: "queued",
 });
-const SESSION_ID = decode(SessionId, "session-job-seed");
+const EXECUTION_ID = decode(ExecutionId, "execution-job-seed");
 
 /**
  * A repository segment carrying the domain's BRAND but NONE of its checks.
@@ -411,7 +411,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
   repository: { owner: "callajd", repo: "sprinter", token: "unused-in-sandbox" },
-  sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+  executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
 });
 
 // ── the real socket client (the app's transport) ──────────────────────────────
@@ -497,20 +497,20 @@ it.effect(
           );
           expect(running._tag).toBe("JobChanged");
           yield* waitForDelta(
-            (e) => e._tag === "SessionChanged" && e.session.id === "session-job-seed",
+            (e) => e._tag === "ExecutionChanged" && e.execution.id === "execution-job-seed",
           );
 
-          // ── (3) session drives + is interruptible (Interactive session) ──────
-          // `sessionEvents` resolves the SAME live session (the registration wire
+          // ── (3) execution drives + is interruptible (Interactive execution) ────────────────
+          // `executionEvents` resolves the SAME live execution (the registration wire
           // CE4.1 closes) and streams the transcript. NO client retry: opening the
           // channel immediately after the `running` delta must resolve, because the
-          // daemon's `SessionRegistry.resolve` bounded-WAITS out the
+          // daemon's `ExecutionRegistry.resolve` bounded-WAITS out the
           // register-after-dispatch window server-side (the real Swift app carries no
           // retry — that is exactly what this proves). Bounded hard so a genuine hang
           // still fails fast.
-          // Each streamed item is an `OffsetSessionEvent`: unwrap `.event` to
-          // the durable transcript entry the daemon journaled as the live session ran.
-          const transcript = yield* client.sessionEvents({ sessionId: SESSION_ID }).pipe(
+          // Each streamed item is an `OffsetExecutionEvent`: unwrap `.event` to
+          // the durable transcript entry the daemon journaled as the live execution ran.
+          const transcript = yield* client.executionEvents({ executionId: EXECUTION_ID }).pipe(
             Stream.filter((item) => item.event._tag === "EntryAppended"),
             Stream.runHead,
             Effect.timeout(HARD_TIMEOUT),
@@ -519,16 +519,19 @@ it.effect(
           );
           expect(transcript.event._tag).toBe("EntryAppended");
 
-          // Drive input and interrupt the turn — both must resolve the live session
-          // (never `SessionNotFound`), proving the channel is wired end-to-end.
+          // Drive input and interrupt the turn — both must resolve the live execution
+          // (never `ExecutionNotFound`), proving the channel is wired end-to-end.
           yield* client
-            .sessionSend({ sessionId: SESSION_ID, input: { text: "keep going", mode: "steer" } })
+            .executionSend({
+              executionId: EXECUTION_ID,
+              input: { text: "keep going", mode: "steer" },
+            })
             .pipe(Effect.timeout(HARD_TIMEOUT), Effect.orDie);
           yield* client
-            .interrupt({ sessionId: SESSION_ID })
+            .interrupt({ executionId: EXECUTION_ID })
             .pipe(Effect.timeout(HARD_TIMEOUT), Effect.orDie);
 
-          // ── settle the session → the Job completes (live board update) ───────
+          // ── settle the execution → the Job completes (live board update) ───────────────────
           yield* pi.emit(settled);
           const succeeded = yield* waitForDelta(
             (e) =>
@@ -542,14 +545,14 @@ it.effect(
           expect(finalJob?.status).toBe("succeeded");
           // The Job carries a durable transcript reference (the "transcript" side)…
           expect(finalJob?.transcriptRef).toBeDefined();
-          // …and resolves — session → job → issue — to the PR (the "PR" side), exactly
-          // the Inspector's session↔PR pairing. NB: this open PR is SEED DATA
+          // …and resolves — execution → job → issue — to the PR (the "PR" side), exactly
+          // the Inspector's execution↔PR pairing. NB: this open PR is SEED DATA
           // (`seedIssue.pr` + the fake `CodeHost`), carried through the real read
           // model — it is NOT discovered by the daemon (production reconcile pairs a PR
           // only once MERGED; see the runbook's "Known limitation"). This asserts the
           // pairing WIRE, not open-PR discovery.
-          const session = finalSnap.sessions.find((s) => s.id === "session-job-seed");
-          expect(session?.jobId).toBe("job-seed");
+          const execution = finalSnap.executions.find((s) => s.id === "execution-job-seed");
+          expect(execution?.jobId).toBe("job-seed");
           const pairedIssue = finalSnap.issues.find((i) => i.id === finalJob?.issueId);
           expect(pairedIssue?.pr?.number).toBe(PR_NUMBER);
           expect(pairedIssue?.pr?.merged).toBe(false);

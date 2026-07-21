@@ -5,7 +5,7 @@ import SwiftUI
 
 /// The app's root shell (CE3.1): reflects the connection lifecycle and, once connected,
 /// composes the feature Views into a running window — the board in the sidebar and the
-/// selected session's inspector (transcript ↔ PR) in the detail, with the inbox and
+/// selected execution's inspector (transcript ↔ PR) in the detail, with the inbox and
 /// planner reachable from the toolbar. Thin: it wires already-tested view models; it
 /// holds no feature logic.
 struct RootView: View {
@@ -46,14 +46,14 @@ private struct ConnectedShell: View {
   let model: AppModel
   let backend: any Backend
 
-  @State private var selectedSession: SessionId?
+  @State private var selectedExecution: ExecutionId?
   @State private var showInbox = false
   @State private var showPlanner = false
 
   var body: some View {
     NavigationSplitView {
-      MissionControlBoardView(board: model.board) { session in
-        selectedSession = session
+      MissionControlBoardView(board: model.board) { execution in
+        selectedExecution = execution
       }
       .navigationTitle("Mission Control")
     } detail: {
@@ -74,9 +74,9 @@ private struct ConnectedShell: View {
 
   @ViewBuilder
   private var detail: some View {
-    if let session = selectedSession {
-      InspectorContainer(model: model, backend: backend, sessionId: session)
-        .id(session.rawValue)
+    if let execution = selectedExecution {
+      InspectorContainer(model: model, backend: backend, executionId: execution)
+        .id(execution.rawValue)
     } else {
       ContentUnavailableView(
         "Select an active issue",

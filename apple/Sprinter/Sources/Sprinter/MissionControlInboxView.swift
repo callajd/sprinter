@@ -5,7 +5,7 @@ import SprinterMissionControl
 import SwiftUI
 
 /// Thin Mission Control inbox View (CE3.1): renders `MissionControlInbox.entries` — the
-/// outstanding `extension_ui_request`s across sessions — and answers through the model.
+/// outstanding `extension_ui_request`s across executions — and answers through the model.
 /// The round-trip lives in the tested `MissionControlInbox`; this only lays it out and,
 /// per the request kind, shows the matching answering widget (confirm buttons / text
 /// field / editor / option picker). The kind → wire-answer mapping is the tested
@@ -63,8 +63,8 @@ private struct InboxEntryRow: View {
 }
 
 /// Hosts a `MissionControlInbox` for the shell's inbox sheet: it LIVE-tracks the
-/// active sessions the board surfaces (CE3.1-F4) so their outstanding prompts
-/// aggregate here — following sessions that activate/deactivate while the sheet is
+/// active executions the board surfaces (CE3.1-F4) so their outstanding prompts
+/// aggregate here — following executions that activate/deactivate while the sheet is
 /// open, not a point-in-time snapshot — and tears the subscriptions down on dismissal.
 /// The tracking/diff logic lives in the tested `MissionControlInbox`; this only wires
 /// the board to it.
@@ -79,7 +79,7 @@ struct InboxContainer: View {
 
   var body: some View {
     MissionControlInboxView(inbox: inbox)
-      .onAppear { inbox.trackActiveSessions(of: model.board) }
+      .onAppear { inbox.trackActiveExecutions(of: model.board) }
       .onDisappear { inbox.stop() }
   }
 }

@@ -3,7 +3,7 @@
 ///
 /// Each `payload` struct mirrors one procedure's request shape; the streamed and
 /// request/response success values are owned types (``Snapshot``, the
-/// ``OffsetEvent`` envelope over ``WorkGraphEvent``, ``SessionEvent``, a bare
+/// ``OffsetEvent`` envelope over ``WorkGraphEvent``, ``ExecutionEvent``, a bare
 /// ``WorkstreamId``) already mirrored elsewhere in this module.
 
 /// The lifecycle action a `control` command applies to a workstream.
@@ -57,7 +57,7 @@ public struct WorkstreamPlan: Codable, Equatable, Sendable {
 /// in. Mirror of `@sprinter/contract`'s `ResumeContext`.
 ///
 /// It is the optional half of BOTH feed payloads (``EventsPayload``,
-/// ``SessionEventsPayload``): absent means "replay from the ORIGIN", present means
+/// ``ExecutionEventsPayload``): absent means "replay from the ORIGIN", present means
 /// "resume", and there is no third state.
 ///
 /// **Why one value and not two optional fields.** A durable offset is meaningless
@@ -132,51 +132,51 @@ public struct RetryIssuePayload: Codable, Equatable, Sendable {
   public init(issueId: IssueId) { self.issueId = issueId }
 }
 
-/// Payload of `sessionEvents` (streams the ``OffsetSessionEvent`` envelope) — the session
+/// Payload of `executionEvents` (streams the ``OffsetExecutionEvent`` envelope) — the execution
 /// id plus the OPTIONAL ``ResumeContext``. A request with no `resume` (`nil`) replays the
-/// session's durable transcript from the ORIGIN; present resumes STRICTLY AFTER that
-/// durable per-session offset.
+/// execution's durable transcript from the ORIGIN; present resumes STRICTLY AFTER that
+/// durable per-execution offset.
 ///
-/// The per-session transcript log is dropped and restarted by a schema-version bump
+/// The per-execution transcript log is dropped and restarted by a schema-version bump
 /// exactly as the work-graph log is, so its cursor is generation-scoped in exactly the
 /// same way and carries the SAME ``ResumeContext`` as ``EventsPayload`` — the guard is
-/// not weaker for the session channel, and it is not weaker STRUCTURALLY: a cursor here
+/// not weaker for the execution channel, and it is not weaker STRUCTURALLY: a cursor here
 /// can no more travel without its generation than one on `events` can. The optional wire
 /// key is OMITTED when `nil` (never `null`), which Swift synthesized `Codable` matches
 /// exactly.
-public struct SessionEventsPayload: Codable, Equatable, Sendable {
-  public let sessionId: SessionId
+public struct ExecutionEventsPayload: Codable, Equatable, Sendable {
+  public let executionId: ExecutionId
   public let resume: ResumeContext?
-  public init(sessionId: SessionId, resume: ResumeContext? = nil) {
-    self.sessionId = sessionId
+  public init(executionId: ExecutionId, resume: ResumeContext? = nil) {
+    self.executionId = executionId
     self.resume = resume
   }
 }
 
-/// Payload of `sessionSend`.
-public struct SessionSendPayload: Codable, Equatable, Sendable {
-  public let sessionId: SessionId
-  public let input: SessionInput
+/// Payload of `executionSend`.
+public struct ExecutionSendPayload: Codable, Equatable, Sendable {
+  public let executionId: ExecutionId
+  public let input: ExecutionInput
 
-  public init(sessionId: SessionId, input: SessionInput) {
-    self.sessionId = sessionId
+  public init(executionId: ExecutionId, input: ExecutionInput) {
+    self.executionId = executionId
     self.input = input
   }
 }
 
 /// Payload of `interrupt`.
 public struct InterruptPayload: Codable, Equatable, Sendable {
-  public let sessionId: SessionId
-  public init(sessionId: SessionId) { self.sessionId = sessionId }
+  public let executionId: ExecutionId
+  public init(executionId: ExecutionId) { self.executionId = executionId }
 }
 
 /// Payload of `answerUiRequest`.
 public struct AnswerUiRequestPayload: Codable, Equatable, Sendable {
-  public let sessionId: SessionId
+  public let executionId: ExecutionId
   public let response: UiResponse
 
-  public init(sessionId: SessionId, response: UiResponse) {
-    self.sessionId = sessionId
+  public init(executionId: ExecutionId, response: UiResponse) {
+    self.executionId = executionId
     self.response = response
   }
 }
@@ -187,9 +187,9 @@ public struct AnswerUiRequestPayload: Codable, Equatable, Sendable {
 public enum ContractError: Codable, Equatable, Sendable, Error {
   case workstreamNotFound(id: WorkstreamId)
   case issueNotFound(id: IssueId)
-  case sessionNotFound(id: SessionId)
+  case executionNotFound(id: ExecutionId)
   case planRejected(reason: String)
-  /// A resume cursor (`events`' or `sessionEvents`') does NOT belong to the daemon's
+  /// A resume cursor (`events`' or `executionEvents`') does NOT belong to the daemon's
   /// CURRENT store generation, so there is no incremental resume from it.
   ///
   /// The daemon's store never migrates: a schema-version bump DROPS the database and
@@ -235,8 +235,8 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
       self = .workstreamNotFound(id: try container.decode(WorkstreamId.self, forKey: .id))
     case "IssueNotFound":
       self = .issueNotFound(id: try container.decode(IssueId.self, forKey: .id))
-    case "SessionNotFound":
-      self = .sessionNotFound(id: try container.decode(SessionId.self, forKey: .id))
+    case "ExecutionNotFound":
+      self = .executionNotFound(id: try container.decode(ExecutionId.self, forKey: .id))
     case "PlanRejected":
       self = .planRejected(reason: try container.decode(String.self, forKey: .reason))
     case "ResyncRequired":
@@ -262,8 +262,8 @@ public enum ContractError: Codable, Equatable, Sendable, Error {
     case .issueNotFound(let id):
       try container.encode("IssueNotFound", forKey: .tag)
       try container.encode(id, forKey: .id)
-    case .sessionNotFound(let id):
-      try container.encode("SessionNotFound", forKey: .tag)
+    case .executionNotFound(let id):
+      try container.encode("ExecutionNotFound", forKey: .tag)
       try container.encode(id, forKey: .id)
     case .planRejected(let reason):
       try container.encode("PlanRejected", forKey: .tag)

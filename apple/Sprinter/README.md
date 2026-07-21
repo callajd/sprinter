@@ -24,12 +24,12 @@ tracks it.
 - `SprinterMissionControl` — Mission Control board + activity view model (BE2.1),
   projecting the `Workstream ⊃ Epic ⊃ Issue` hierarchy from the port-based
   `WorkGraphResync` feed.
-- `SprinterSession` — the one reusable interactive-session view model (BE3.1, D9):
+- `SprinterExecution` — the one reusable interactive-execution view model (BE3.1, D9):
   the view-facing transcript with input/interrupt and inline
   `extension_ui_request` handling.
 - `SprinterInspector` — the transcript↔PR view model (BE4.1): the reused
-  `SprinterSession` transcript (incl. the diff transform) paired with the PR the
-  session produced, resolved over the `Snapshot`.
+  `SprinterExecution` transcript (incl. the diff transform) paired with the PR the
+  execution produced, resolved over the `Snapshot`.
 - `SprinterAppSupport` — the app composition layer (CE3.1): daemon-endpoint
   resolution, live-backend wiring (`BackendConnector` → `WorkGraphResync`), and
   the top-level `AppModel` the SwiftUI shell renders.
@@ -40,7 +40,7 @@ tracks it.
 
 **Test targets** (`Tests/`): one per source target except the executable —
 `SprinterContractTests`, `SprinterBackendTests`, `SprinterMissionControlTests`,
-`SprinterSessionTests`, `SprinterInspectorTests`, `SprinterAppSupportTests`. All
+`SprinterExecutionTests`, `SprinterInspectorTests`, `SprinterAppSupportTests`. All
 run offline against FAKE in-memory transports / scripted `Backend`s — no live
 daemon, network, or socket in the gate. `SprinterContractTests` additionally
 decodes `Goldens/` — JSON generated FROM the TS contract by

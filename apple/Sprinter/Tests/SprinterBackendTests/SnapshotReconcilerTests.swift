@@ -40,17 +40,17 @@ struct SnapshotReconcilerTests {
   func appendsNewJob() {
     let job = Job(
       id: JobId(rawValue: "job-1"), issueId: IssueId(rawValue: "iss-1"), kind: .implement,
-      status: .running, sessionId: Fixtures.sessionId, transcriptRef: nil, pullRequest: nil)
+      status: .running, executionId: Fixtures.executionId, transcriptRef: nil, pullRequest: nil)
     let result = reconciler.reconcile(Fixtures.snapshot, applying: .jobChanged(job))
     #expect(result.jobs == [job])
   }
 
-  @Test("a new session delta appends when absent")
-  func appendsNewSession() {
-    let session = Session(
-      id: Fixtures.sessionId, jobId: JobId(rawValue: "job-1"), status: .active)
-    let result = reconciler.reconcile(Fixtures.snapshot, applying: .sessionChanged(session))
-    #expect(result.sessions == [session])
+  @Test("a new execution delta appends when absent")
+  func appendsNewExecution() {
+    let execution = Execution(
+      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .active)
+    let result = reconciler.reconcile(Fixtures.snapshot, applying: .executionChanged(execution))
+    #expect(result.executions == [execution])
   }
 
   @Test("an agent delta appends a revision, then appends the revision that retires it")
@@ -93,19 +93,20 @@ struct SnapshotReconcilerTests {
 
   @Test("folding a sequence of deltas keeps the state consistent")
   func foldsSequence() {
-    let session = Session(id: Fixtures.sessionId, jobId: JobId(rawValue: "job-1"), status: .active)
-    let idle = Session(id: Fixtures.sessionId, jobId: JobId(rawValue: "job-1"), status: .idle)
+    let execution = Execution(
+      id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .active)
+    let idle = Execution(id: Fixtures.executionId, jobId: JobId(rawValue: "job-1"), status: .idle)
     var state = Fixtures.snapshot
     for event in [
-      WorkGraphEvent.sessionChanged(session),
+      WorkGraphEvent.executionChanged(execution),
       WorkGraphEvent.issueChanged(Fixtures.issueInReview),
-      WorkGraphEvent.sessionChanged(idle)
+      WorkGraphEvent.executionChanged(idle)
     ] {
       state = reconciler.reconcile(state, applying: event)
     }
-    // The later session delta replaced the earlier (no duplicate), the issue delta
+    // The later execution delta replaced the earlier (no duplicate), the issue delta
     // applied, and the append happened exactly once.
-    #expect(state.sessions == [idle])
+    #expect(state.executions == [idle])
     #expect(state.issues == [Fixtures.issueInReview])
   }
 }

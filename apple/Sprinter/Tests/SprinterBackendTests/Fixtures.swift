@@ -56,7 +56,7 @@ enum Fixtures {
     ],
     issues: [issue],
     jobs: [],
-    sessions: [],
+    executions: [],
     agents: [],
     generation: generation)
 
@@ -125,16 +125,16 @@ enum Fixtures {
     ],
     issues: [issueInReview],
     jobs: [],
-    sessions: [],
+    executions: [],
     agents: [],
     generation: generationAfterReset)
 
-  // ── Session channel ─────────────────────────────────────────────────────────
+  // ── Execution channel ─────────────────────────────────────────────────────────
 
-  static let sessionId = SessionId(rawValue: "sess-1")
+  static let executionId = ExecutionId(rawValue: "exe-1")
 
-  static let sessionInput = SessionInput(text: "ship it", images: nil, mode: .prompt)
+  static let executionInput = ExecutionInput(text: "ship it", images: nil, mode: .prompt)
 
-  static let uiRequestEvent = SessionEvent.uiRequestRaised(
+  static let uiRequestEvent = ExecutionEvent.uiRequestRaised(
     id: "req-1", kind: .confirm, prompt: "Merge the PR?", options: nil)
 }

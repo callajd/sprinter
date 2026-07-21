@@ -1,0 +1,183 @@
+import SprinterBackend
+import SprinterContract
+import Testing
+
+@testable import SprinterExecution
+
+@Suite("Execution view model")
+@MainActor
+struct ExecutionViewModelTests {
+  private static let execution = ExecutionId(rawValue: "execution-a")
+
+  /// The transcript builds live off a scripted feed: assorted variants — message
+  /// deltas, a tool call/result, a notice, and a durable `EntryAppended` — project
+  /// into the view-facing transcript, driven by a fake `Backend`, no daemon.
+  @Test("the transcript builds from the scripted feed")
+  func transcriptBuildsFromFeed() async throws {
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: Self.execution)
+    model.start()
+
+    backend.emit(.turnStarted)
+    backend.emit(.messageStarted(messageId: "m1"))
+    backend.emit(.messageDelta(messageId: "m1", text: "Hello", reasoning: nil))
+    backend.emit(.toolStarted(id: "t1", name: "read", input: .string("x")))
+    backend.emit(.toolCompleted(id: "t1", output: .string("y"), isError: false))
+    backend.emit(.notice(id: "n-headsup", level: .info, message: "heads up"))
+    backend.emit(.entryAppended(entry: .userMessage(id: "u1", text: "and this")))
+
+    #expect(await waitUntil(model) { $0.count == 4 })
+    let transcript = model.transcript
+    #expect(transcript.isTurnActive)
+    #expect(
+      transcript.items.map(\.id) == ["message:m1", "tool:t1", "notice:key:n-headsup", "message:u1"]
+    )
+
+    model.stop()
+    await backend.close()
+  }
+
+  /// A SETTLED execution: the daemon's durable-transcript replay COMPLETES.
+  /// The fake emits only the durable transcript-grade entries the daemon journaled —
+  /// `EntryAppended` records and a `Notice` — then ENDS the feed (replay done, no live
+  /// tail). The view model folds them into the transcript and the feed lifecycle settles
+  /// to `.ended` (read-only), so the Inspector renders a settled execution's replayed
+  /// transcript rather than the old `ExecutionNotFound`.
+  @Test("renders a settled execution's replayed transcript, then ends read-only")
+  func rendersSettledReplayedTranscript() async throws {
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: Self.execution)
+    model.start()
+
+    backend.emit(.entryAppended(entry: .userMessage(id: "u1", text: "please fix the bug")))
+    backend.emit(.entryAppended(entry: .assistantMessage(id: "a1", text: "on it", reasoning: nil)))
+    backend.emit(.notice(id: "n1", level: .info, message: "started"))
+    backend.finish()  // settled: the durable replay completes, no live tail
+
+    #expect(await waitUntil(model) { $0.count == 3 })
+    let transcript = model.transcript
+    #expect(transcript.items.map(\.id) == ["message:u1", "message:a1", "notice:key:n1"])
+    #expect(!transcript.isTurnActive)
+
+    // The feed ended cleanly (settled → read-only): `.ended`, not `.dropped`.
+    #expect(await waitUntilLifecycle(model, .ended))
+    #expect(model.terminationError == nil)
+
+    await backend.close()
+  }
+
+  /// `send` drives `executionSend` through the execution channel with the exact
+  /// `ExecutionInput` (the fake observes it), and resolves successfully.
+  @Test("send drives executionSend with the exact input")
+  func sendDrivesInput() async throws {
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: Self.execution)
+    var observed = backend.sent.makeAsyncIterator()
+
+    let input = ExecutionInput(text: "steer left", images: nil, mode: .steer)
+    try await model.send(input)
+
+    #expect(await observed.next() == input)
+    await backend.close()
+  }
+
+  /// `interrupt` drives `interrupt` through the execution channel (the fake observes
+  /// the execution id), and resolves successfully.
+  @Test("interrupt drives interrupt through the execution channel")
+  func interruptDrivesAbort() async throws {
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: Self.execution)
+    var observed = backend.interrupted.makeAsyncIterator()
+
+    try await model.interrupt()
+
+    #expect(await observed.next() == Self.execution)
+    await backend.close()
+  }
+
+  /// `send`/`interrupt` surface the mirrored `ExecutionNotFound` for an unknown
+  /// execution, rather than silently succeeding.
+  @Test("send and interrupt surface the mirrored ExecutionNotFound")
+  func actionsSurfaceExecutionNotFound() async throws {
+    let unknown = ExecutionId(rawValue: "ghost")
+    // The backend only knows `execution`; the model drives the unknown `ghost`.
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: unknown)
+
+    await #expect(throws: ContractError.executionNotFound(id: unknown)) {
+      try await model.send(ExecutionInput(text: "hi", images: nil, mode: .prompt))
+    }
+    await #expect(throws: ContractError.executionNotFound(id: unknown)) {
+      try await model.interrupt()
+    }
+    await backend.close()
+  }
+
+  /// An inline `extension_ui_request` surfaces in `outstandingRequests`, and
+  /// answering it drives the neutral `UiResponse` back (the fake observes it) and
+  /// clears the prompt — the round-trip.
+  @Test("an inline UI request is answered and clears")
+  func uiRequestRoundTrip() async throws {
+    let backend = ExecutionFakeBackend(knownExecution: Self.execution)
+    let model = ExecutionViewModel(backend: backend, executionId: Self.execution)
+    var observed = backend.answered.makeAsyncIterator()
+    model.start()
+
+    backend.emit(
+      .uiRequestRaised(id: "req-1", kind: .select, prompt: "branch?", options: ["main", "dev"]))
+    #expect(await waitUntilRequests(model) { $0.count == 1 })
+    let request = try #require(model.outstandingRequests.first)
+    #expect(request.id == "req-1")
+    #expect(request.kind == .select)
+    #expect(request.prompt == "branch?")
+    #expect(request.options == ["main", "dev"])
+
+    try await model.answer(requestId: "req-1", .value(value: "dev"))
+
+    // The fake observed exactly the neutral UiResponse, keyed to the request id.
+    let response = try #require(await observed.next())
+    #expect(response == UiResponse(requestId: "req-1", answer: .value(value: "dev")))
+
+    // The answered prompt left the outstanding set.
+    #expect(await waitUntilRequests(model) { $0.isEmpty })
+
+    model.stop()
+    await backend.close()
+  }
+
+  /// Polls the main-actor model until `predicate` holds over its transcript items.
+  private func waitUntil(
+    _ model: ExecutionViewModel,
+    _ predicate: ([TranscriptItem]) -> Bool
+  ) async -> Bool {
+    for _ in 0..<100_000 {
+      if predicate(model.transcript.items) { return true }
+      await Task.yield()
+    }
+    return false
+  }
+
+  /// Polls the main-actor model until its feed `lifecycle` reaches `expected`.
+  private func waitUntilLifecycle(
+    _ model: ExecutionViewModel,
+    _ expected: ExecutionLifecycle
+  ) async -> Bool {
+    for _ in 0..<100_000 {
+      if model.lifecycle == expected { return true }
+      await Task.yield()
+    }
+    return false
+  }
+
+  /// Polls the main-actor model until `predicate` holds over its outstanding requests.
+  private func waitUntilRequests(
+    _ model: ExecutionViewModel,
+    _ predicate: ([OutstandingUiRequest]) -> Bool
+  ) async -> Bool {
+    for _ in 0..<100_000 {
+      if predicate(model.outstandingRequests) { return true }
+      await Task.yield()
+    }
+    return false
+  }
+}

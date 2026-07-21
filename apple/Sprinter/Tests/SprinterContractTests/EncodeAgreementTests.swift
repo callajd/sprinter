@@ -42,7 +42,9 @@ struct EncodeAgreementTests {
   /// this matters most. Epics DE2–DE4 add `Execution`, `Session`, `Workspace`,
   /// `PullRequest`, `Spec`, `SpecRevision` and the transcript variants under the same
   /// invariant, so the table is required to be EXACTLY the bundle's goldens: add a golden
-  /// without adding its case here and this fails.
+  /// without adding its case here and this fails. (`Session` here is DE2.4's UNIT OF WORK —
+  /// a forward reference to a type that does not exist yet, not the process-level type #103
+  /// renamed to `Execution`. Do not rename it.)
   ///
   /// This pins the NAME set only. The TYPE each name is paired with is pinned from the
   /// other side — every `Golden.decode` call site checks the type it asks for against the

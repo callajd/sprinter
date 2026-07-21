@@ -31,25 +31,25 @@ import { RpcTest } from "effect/unstable/rpc";
 import { TestClock } from "effect/testing";
 import { expect } from "vitest";
 import {
+  ExecutionNotFound,
   IssueNotFound,
   PlanRejected,
   ResyncRequired,
-  SessionNotFound,
   SprinterRpc,
   WorkstreamNotFound,
 } from "@sprinter/contract";
 import {
   Agent,
   Epic,
+  Execution,
+  type ExecutionEvent,
+  type ExecutionId,
+  type ExecutionInput,
   Issue,
   Job,
   type JobResult,
   Repository,
   RepositoryKey,
-  Session,
-  type SessionEvent,
-  type SessionId,
-  type SessionInput,
   StoreGenerationId,
   type UiResponse,
   Workstream,
@@ -57,16 +57,16 @@ import {
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
 import { CodeHost, CodeHostError } from "@sprinter/repository";
-import { PiTransportError, type SessionHandle } from "@sprinter/runner";
+import { PiTransportError, type ExecutionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers, RESOLVE_TIMEOUT } from "./rpc-handlers.ts";
-import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
+import { layer as layerExecutionEvents, ExecutionEvents } from "./execution-events.ts";
 import {
-  layer as layerSessionRegistry,
-  SESSION_RESOLVE_TIMEOUT,
-  SessionRegistry,
-} from "./session-registry.ts";
+  EXECUTION_RESOLVE_TIMEOUT,
+  ExecutionRegistry,
+  layer as layerExecutionRegistry,
+} from "./execution-registry.ts";
 import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-events.ts";
 
 // ── fixtures (owned domain values, decoded — no casts) ────────────────────────
@@ -99,8 +99,8 @@ const queuedJob = Schema.decodeUnknownSync(Job)({
   kind: "implement",
   status: "queued",
 });
-const session = Schema.decodeUnknownSync(Session)({
-  id: "ses-1",
+const execution = Schema.decodeUnknownSync(Execution)({
+  id: "exe-1",
   jobId: "job-1",
   status: "completed",
 });
@@ -126,7 +126,7 @@ const agent = Schema.decodeUnknownSync(Agent)({
   supersedes: "agt-1",
   retiredAt: "2026-07-20T12:00:00.000Z",
 });
-// A durable RUNNING Job for `job-1` — genuinely mid-dispatch. The session-channel
+// A durable RUNNING Job for `job-1` — genuinely mid-dispatch. The execution-channel
 // gate keys on the JOB status (CE4.1 FIX A), so a running Job routes to the bounded
 // wait that bridges the register-after-dispatch window.
 const midDispatchJob = Schema.decodeUnknownSync(Job)({
@@ -137,8 +137,8 @@ const midDispatchJob = Schema.decodeUnknownSync(Job)({
 });
 // A CRASH-ORPHANED Job: `startup-reconcile` settled a stale `running` Job it could not
 // resume by writing ONLY the Job row (terminal `cancelled`), and NEVER settled the
-// Session row — so its Session stays NON-TERMINAL. The Job-status gate must fail this
-// FAST despite the live Session row (the exact regression a Session-row gate missed).
+// Execution row — so its Execution stays NON-TERMINAL. The Job-status gate must fail this
+// FAST despite the live Execution row (the exact regression an Execution-row gate missed).
 const orphanedJob = Schema.decodeUnknownSync(Job)({
   id: "job-1",
   issueId: "iss-1",
@@ -385,8 +385,8 @@ interface Ctx {
   readonly client: Client;
   readonly store: Context.Service.Shape<typeof StateStore>;
   readonly feed: Context.Service.Shape<typeof WorkGraphEvents>;
-  readonly sessionFeed: Context.Service.Shape<typeof SessionEvents>;
-  readonly sessions: Context.Service.Shape<typeof SessionRegistry>;
+  readonly executionFeed: Context.Service.Shape<typeof ExecutionEvents>;
+  readonly executions: Context.Service.Shape<typeof ExecutionRegistry>;
   readonly dispatched: Queue.Dequeue<Job>;
 }
 
@@ -406,9 +406,9 @@ const harness = <A, E>(
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry, codeHost).pipe(
+        Layer.mergeAll(layerJournaling(layerMemory), runner, layerExecutionRegistry, codeHost).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
-          Layer.provideMerge(layerSessionEvents),
+          Layer.provideMerge(layerExecutionEvents),
         ),
       ),
     );
@@ -416,9 +416,9 @@ const harness = <A, E>(
       const client = yield* clientEffect();
       const store = yield* StateStore;
       const feed = yield* WorkGraphEvents;
-      const sessionFeed = yield* SessionEvents;
-      const sessions = yield* SessionRegistry;
-      return yield* body({ client, store, feed, sessionFeed, sessions, dispatched });
+      const executionFeed = yield* ExecutionEvents;
+      const executions = yield* ExecutionRegistry;
+      return yield* body({ client, store, feed, executionFeed, executions, dispatched });
     }).pipe(Effect.provide(app));
   }).pipe(Effect.scoped);
 
@@ -439,7 +439,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
     Effect.gen(function* () {
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
-      yield* store.jobs.putSession(session);
+      yield* store.jobs.putExecution(execution);
       yield* store.agents.putAgent(agentHead);
       yield* store.agents.putAgent(agent);
 
@@ -448,7 +448,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       expect(snapshot.epics).toEqual([epic]);
       expect(snapshot.issues).toEqual([issue]);
       expect(snapshot.jobs).toEqual([queuedJob]);
-      expect(snapshot.sessions).toEqual([session]);
+      expect(snapshot.executions).toEqual([execution]);
       // The REGISTRY layer hydrates too, whole and flat (never a per-repo slice),
       // and a persisted revision round-trips through the wire schema with both of
       // its optional keys intact — a retired, superseding revision is exactly what
@@ -468,7 +468,7 @@ it.effect("snapshot of an empty daemon is empty", () =>
         epics: [],
         issues: [],
         jobs: [],
-        sessions: [],
+        executions: [],
         agents: [],
         // Empty of DATA, but never of CONTEXT: the generation is what tells a client
         // which coordinate space the (currently empty) offset log belongs to, so an
@@ -525,11 +525,11 @@ it.effect("snapshot never carries a workstream whose repository is missing", () 
                 JobRunner,
                 JobRunner.of({ dispatch: () => Effect.succeed(succeededResult) }),
               ),
-              layerSessionRegistry,
+              layerExecutionRegistry,
               fakeCodeHost,
             ).pipe(
               Layer.provideMerge(layerWorkGraphEvents),
-              Layer.provideMerge(layerSessionEvents),
+              Layer.provideMerge(layerExecutionEvents),
             ),
           ),
         ),
@@ -985,7 +985,7 @@ it.effect("control fails with WorkstreamNotFound for an unknown workstream", () 
 
 // ── retryIssue ────────────────────────────────────────────────────────────────
 
-it.effect("retryIssue re-dispatches the issue's existing job, reusing its session id", () =>
+it.effect("retryIssue re-dispatches the issue's existing job, reusing its execution id", () =>
   harness(({ client, store, dispatched }) =>
     Effect.gen(function* () {
       yield* seedGraph(store);
@@ -994,7 +994,7 @@ it.effect("retryIssue re-dispatches the issue's existing job, reusing its sessio
         issueId: "iss-1",
         kind: "implement",
         status: "failed",
-        sessionId: "ses-1",
+        executionId: "exe-1",
       });
       yield* store.jobs.putJob(priorJob);
 
@@ -1002,8 +1002,8 @@ it.effect("retryIssue re-dispatches the issue's existing job, reusing its sessio
 
       const dispatchedJob = yield* Queue.take(dispatched);
       expect(dispatchedJob.id).toBe("job-1");
-      // Reuses the SAME session id — the JobRunner re-attaches (1 Job = 1 session).
-      expect(dispatchedJob.sessionId).toBe("ses-1");
+      // Reuses the SAME execution id — the JobRunner re-attaches (1 Job = 1 execution).
+      expect(dispatchedJob.executionId).toBe("exe-1");
     }),
   ),
 );
@@ -1031,12 +1031,12 @@ it.effect("retryIssue is a no-op when the issue's latest job is still in flight"
         issueId: "iss-1",
         kind: "implement",
         status: "running",
-        sessionId: "ses-1",
+        executionId: "exe-1",
       });
       yield* store.jobs.putJob(runningJob);
 
       // Retrying a running job must NOT fork a second dispatch racing the same
-      // session rows — nothing is dispatched.
+      // execution rows — nothing is dispatched.
       yield* client.retryIssue({ issueId: issue.id });
       expect(yield* Queue.size(dispatched)).toBe(0);
     }),
@@ -1090,11 +1090,11 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
       // repository the workstream is anchored to).
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
-      yield* store.jobs.putSession(session);
+      yield* store.jobs.putExecution(execution);
 
       // Subscribe with a cursor PAST the first three entries (offset 3): the served
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
-      // offset 3 — the issue/job/session deltas — never re-sending the earlier ones.
+      // offset 3 — the issue/job/execution deltas — never re-sending the earlier ones.
       const replay = yield* client
         .events({ resume: { sinceOffset: 3, generation: store.generation } })
         .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
@@ -1103,7 +1103,7 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
       expect(replay.map((item) => item.event._tag)).toEqual([
         "IssueChanged",
         "JobChanged",
-        "SessionChanged",
+        "ExecutionChanged",
       ]);
       // The response envelope carries the durable offsets: all STRICTLY GREATER than
       // the supplied cursor (3) and contiguous (4, 5, 6) — the coordinate the client
@@ -1113,26 +1113,26 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
   ),
 );
 
-// ── session channel (AE4.2 — bridge a live SessionHandle) ─────────────────────
+// ── execution channel (AE4.2 — bridge a live ExecutionHandle) ────────────────────────────────
 
-const sessionId = session.id;
+const executionId = execution.id;
 
-// DURABLE, transcript-grade session events — the only ones the durable `sessionEvents`
+// DURABLE, transcript-grade execution events — the only ones the durable `executionEvents`
 // channel carries: `EntryAppended` records and reconcilable `Notice`s.
-const entryAppended: SessionEvent = {
+const entryAppended: ExecutionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "AssistantMessage", id: "a1", text: "on it" },
 };
-const noticeEvent: SessionEvent = { _tag: "Notice", id: "n1", level: "info", message: "started" };
-const entryAppended2: SessionEvent = {
+const noticeEvent: ExecutionEvent = { _tag: "Notice", id: "n1", level: "info", message: "started" };
+const entryAppended2: ExecutionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "AssistantMessage", id: "a2", text: "done" },
 };
 // EPHEMERAL live deltas — the live driving modality the ONE channel must also carry: they
 // ride the feed offset-less, are never persisted, and never advance the resume cursor.
-const turnStarted: SessionEvent = { _tag: "TurnStarted" };
-const messageDelta: SessionEvent = { _tag: "MessageDelta", messageId: "a2", text: "do" };
-const uiRequest: SessionEvent = {
+const turnStarted: ExecutionEvent = { _tag: "TurnStarted" };
+const messageDelta: ExecutionEvent = { _tag: "MessageDelta", messageId: "a2", text: "do" };
+const uiRequest: ExecutionEvent = {
   _tag: "UiRequestRaised",
   id: "u1",
   kind: "confirm",
@@ -1140,24 +1140,24 @@ const uiRequest: SessionEvent = {
 };
 
 /**
- * A fake live {@link SessionHandle}: a caller-supplied owned `SessionEvent` stream
+ * A fake live {@link ExecutionHandle}: a caller-supplied owned `ExecutionEvent` stream
  * for `events`, and queues/deferred that RECORD the neutral inputs driven into it
  * so a test can observe the round-trip (input sent, turn interrupted, UI answered).
  * No Pi type appears — the fake speaks only the owned neutral surface.
  */
-interface FakeSession {
-  readonly handle: SessionHandle;
-  readonly sent: Queue.Dequeue<SessionInput>;
+interface FakeExecution {
+  readonly handle: ExecutionHandle;
+  readonly sent: Queue.Dequeue<ExecutionInput>;
   readonly answered: Queue.Dequeue<UiResponse>;
   readonly interrupted: Deferred.Deferred<void>;
 }
 
-const makeFakeSession = (events: ReadonlyArray<SessionEvent>): Effect.Effect<FakeSession> =>
+const makeFakeExecution = (events: ReadonlyArray<ExecutionEvent>): Effect.Effect<FakeExecution> =>
   Effect.gen(function* () {
-    const sent = yield* Queue.unbounded<SessionInput>();
+    const sent = yield* Queue.unbounded<ExecutionInput>();
     const answered = yield* Queue.unbounded<UiResponse>();
     const interrupted = yield* Deferred.make<void>();
-    const handle: SessionHandle = {
+    const handle: ExecutionHandle = {
       pid: ChildProcessSpawner.ProcessId(4242),
       events: Stream.fromIterable(events),
       send: (input) => Queue.offer(sent, input).pipe(Effect.asVoid),
@@ -1168,23 +1168,23 @@ const makeFakeSession = (events: ReadonlyArray<SessionEvent>): Effect.Effect<Fak
     return { handle, sent, answered, interrupted };
   });
 
-// A SETTLED session (durable Job + Session rows terminal, NO live handle): the Inspector
-// opens its channel to VIEW the transcript. `sessionEvents` replays the whole durable
-// transcript as `OffsetSessionEvent`s and COMPLETES — never the old `SessionNotFound` for a
-// settled session (the gap this closes) — and a `sinceOffset` cursor resumes strictly after.
-it.effect("sessionEvents replays a SETTLED session's durable transcript and completes", () =>
+// A SETTLED execution (durable Job + Execution rows terminal, NO live handle): the Inspector
+// opens its channel to VIEW the transcript. `executionEvents` replays the whole durable
+// transcript as `OffsetExecutionEvent`s and COMPLETES — never the old `ExecutionNotFound` for a
+// settled execution (the gap this closes) — and a `sinceOffset` cursor resumes strictly after.
+it.effect("executionEvents replays a SETTLED execution's durable transcript and completes", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putSession(session); // `completed` (terminal)
+      yield* store.jobs.putExecution(execution); // `completed` (terminal)
       yield* store.jobs.putJob(orphanedJob); // terminal Job, no live handle
-      yield* store.sessionLog.append(sessionId, entryAppended);
-      yield* store.sessionLog.append(sessionId, noticeEvent);
-      yield* store.sessionLog.append(sessionId, entryAppended2);
+      yield* store.executionLog.append(executionId, entryAppended);
+      yield* store.executionLog.append(executionId, noticeEvent);
+      yield* store.executionLog.append(executionId, entryAppended2);
 
-      const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      const received = yield* client.executionEvents({ executionId }).pipe(Stream.runCollect);
       expect(received.map((i) => i.event)).toEqual([entryAppended, noticeEvent, entryAppended2]);
       // A settled replay is DURABLE-ONLY: every item is offset-BEARING and monotonic (the
-      // durable per-session coordinate).
+      // durable per-execution coordinate).
       const offsets = received.flatMap((i) => (i.offset === undefined ? [] : [i.offset]));
       expect(offsets.length).toBe(received.length);
       expect(offsets).toEqual([...offsets].sort((a, b) => a - b));
@@ -1192,7 +1192,10 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
       // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
       const cursor = offsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
+        .executionEvents({
+          executionId,
+          resume: { sinceOffset: cursor, generation: store.generation },
+        })
         .pipe(Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
@@ -1200,16 +1203,16 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
   ),
 );
 
-// The SESSION channel carries the identical stale-generation hazard as the work-graph feed
-// — `session_event_log` is `AUTOINCREMENT` too, and a schema-version bump drops it — so it
+// The EXECUTION channel carries the identical stale-generation hazard as the work-graph feed
+// — `execution_event_log` is `AUTOINCREMENT` too, and a schema-version bump drops it — so it
 // gets the identical guard, not a weaker one. These pin BOTH halves of it.
-it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
+it.effect("executionEvents REFUSES a cursor from a PRIOR store generation", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putSession(session);
+      yield* store.jobs.putExecution(execution);
       yield* store.jobs.putJob(orphanedJob);
-      yield* store.sessionLog.append(sessionId, entryAppended);
-      yield* store.sessionLog.append(sessionId, noticeEvent);
+      yield* store.executionLog.append(executionId, entryAppended);
+      yield* store.executionLog.append(executionId, noticeEvent);
 
       // A cursor WITHIN this transcript's extent — an extent check alone would wave it
       // through — but minted under a generation this store never had. Resuming it would
@@ -1218,7 +1221,7 @@ it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
         "00000000-dead-4000-8000-000000000000",
       );
       const failure = yield* client
-        .sessionEvents({ sessionId, resume: { sinceOffset: 1, generation: deadGeneration } })
+        .executionEvents({ executionId, resume: { sinceOffset: 1, generation: deadGeneration } })
         .pipe(Stream.runCollect, Effect.flip);
       expect(failure).toBeInstanceOf(ResyncRequired);
       if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
@@ -1230,14 +1233,14 @@ it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
   ),
 );
 
-it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
+it.effect("executionEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      yield* store.jobs.putSession(session);
+      yield* store.jobs.putExecution(execution);
       yield* store.jobs.putJob(orphanedJob);
-      yield* store.sessionLog.append(sessionId, entryAppended);
+      yield* store.executionLog.append(executionId, entryAppended);
 
-      // The session channel's half of the zero-offset door. A zero cursor used to skip the
+      // The execution channel's half of the zero-offset door. A zero cursor used to skip the
       // generation comparison outright — it reads as "the origin" numerically — so a
       // request from a DEAD generation was served a resume against a transcript its
       // coordinates never indexed. It is now an ordinary resume: the PRESENCE of the
@@ -1246,7 +1249,7 @@ it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B
         "00000000-dead-4000-8000-000000000000",
       );
       const failure = yield* client
-        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: deadGeneration } })
+        .executionEvents({ executionId, resume: { sinceOffset: 0, generation: deadGeneration } })
         .pipe(Stream.runCollect, Effect.flip);
       expect(failure).toBeInstanceOf(ResyncRequired);
       if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
@@ -1256,46 +1259,46 @@ it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B
       // A zero cursor under the CURRENT generation is a REAL resume and is honoured —
       // closing the door costs a legitimate client nothing.
       const fromZero = yield* client
-        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: store.generation } })
+        .executionEvents({ executionId, resume: { sinceOffset: 0, generation: store.generation } })
         .pipe(Stream.runCollect);
       expect(fromZero.map((i) => i.event)).toEqual([entryAppended]);
 
       // The ORIGIN request names no coordinate, so it is valid in EVERY generation and is
       // never refused — a first connect (and today's client, which sends no cursor) is
       // untouched by the guard.
-      const replayed = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+      const replayed = yield* client.executionEvents({ executionId }).pipe(Stream.runCollect);
       expect(replayed.map((i) => i.event)).toEqual([entryAppended]);
     }),
   ),
 );
 
-// An UNKNOWN session id under the CURRENT generation is a `SessionNotFound`, NOT a
-// `ResyncRequired`. A never-seen session has a per-session extent of `0`, so an extent check
+// An UNKNOWN execution id under the CURRENT generation is an `ExecutionNotFound`, NOT a
+// `ResyncRequired`. A never-seen execution has a per-execution extent of `0`, so an extent check
 // run BEFORE the existence verdict refused every non-zero cursor — and `ResyncRequired` means
 // "discard ALL retained state and re-hydrate the whole store", a wildly over-broad answer to
-// one bad session id. The generation half of the guard is unaffected (the two tests above pin
-// it); only the extent half now waits for the session to be known to exist.
+// one bad execution id. The generation half of the guard is unaffected (the two tests above pin
+// it); only the extent half now waits for the execution to be known to exist.
 it.effect(
-  "sessionEvents answers an UNKNOWN session with SessionNotFound, never ResyncRequired",
+  "executionEvents answers an UNKNOWN execution with ExecutionNotFound, never ResyncRequired",
   () =>
     harness(({ client, store }) =>
       Effect.gen(function* () {
         const failure = yield* client
-          .sessionEvents({
-            sessionId,
+          .executionEvents({
+            executionId,
             resume: { sinceOffset: 7, generation: store.generation },
           })
           .pipe(Stream.runCollect, Effect.flip);
-        expect(failure).toBeInstanceOf(SessionNotFound);
+        expect(failure).toBeInstanceOf(ExecutionNotFound);
 
-        // For a session that DOES exist, a cursor past the transcript's end under the current
+        // For an execution that DOES exist, a cursor past the transcript's end under the current
         // generation is still a resync — the extent half is deferred, not dropped.
-        yield* store.jobs.putSession(session);
+        yield* store.jobs.putExecution(execution);
         yield* store.jobs.putJob(orphanedJob);
-        yield* store.sessionLog.append(sessionId, entryAppended);
+        yield* store.executionLog.append(executionId, entryAppended);
         const beyond = yield* client
-          .sessionEvents({
-            sessionId,
+          .executionEvents({
+            executionId,
             resume: { sinceOffset: 99, generation: store.generation },
           })
           .pipe(Stream.runCollect, Effect.flip);
@@ -1309,80 +1312,84 @@ it.effect(
     ),
 );
 
-// A LIVE session (a registered handle → `resolveLive` resolves it): `sessionEvents` replays
+// A LIVE execution (a registered handle → `resolveLive` resolves it): `executionEvents` replays
 // the durable transcript so far, THEN tails new durable entries as the fold journals them —
 // replay and live tail one offset coordinate. Uses `it.live` + a settle so the live append
 // lands after the subscription (no TestClock: the registered handle resolves without waiting).
-it.live("sessionEvents replays a LIVE session's transcript, then tails new durable entries", () =>
-  harness(({ client, store, sessions }) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      // A STILL-RUNNING session: its terminal `result` stays pending, so the live tail keeps
-      // tailing new durable entries (it completes only once the session settles).
-      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
-      yield* sessions.register(sessionId, liveHandle);
-      // One durable entry already in the transcript before the client attaches.
-      yield* store.sessionLog.append(sessionId, entryAppended);
+it.live(
+  "executionEvents replays a LIVE execution's transcript, then tails new durable entries",
+  () =>
+    harness(({ client, store, executions }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeExecution([]);
+        // A STILL-RUNNING execution: its terminal `result` stays pending, so the live tail keeps
+        // tailing new durable entries (it completes only once the execution settles).
+        const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+        yield* executions.register(executionId, liveHandle);
+        // One durable entry already in the transcript before the client attaches.
+        yield* store.executionLog.append(executionId, entryAppended);
 
-      const collecting = yield* client
-        .sessionEvents({ sessionId })
-        .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
-      // Let the replay drain and the live subscription settle before the live append.
-      yield* Effect.sleep("20 millis");
-      // A durable entry appended AFTER attach arrives on the live tail (one coordinate).
-      yield* store.sessionLog.append(sessionId, entryAppended2);
+        const collecting = yield* client
+          .executionEvents({ executionId })
+          .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
+        // Let the replay drain and the live subscription settle before the live append.
+        yield* Effect.sleep("20 millis");
+        // A durable entry appended AFTER attach arrives on the live tail (one coordinate).
+        yield* store.executionLog.append(executionId, entryAppended2);
 
-      const received = yield* Fiber.join(collecting);
-      expect(received.map((i) => i.event)).toEqual([entryAppended, entryAppended2]);
-      const [first, second] = received.map((i) => i.offset);
-      expect(first !== undefined && second !== undefined && second > first).toBe(true);
-    }),
-  ),
+        const received = yield* Fiber.join(collecting);
+        expect(received.map((i) => i.event)).toEqual([entryAppended, entryAppended2]);
+        const [first, second] = received.map((i) => i.offset);
+        expect(first !== undefined && second !== undefined && second > first).toBe(true);
+      }),
+    ),
 );
 
-// The live tail must COMPLETE when the session settles (mirroring the old `handle.events`,
-// which closed on session end) rather than hang open on the durable feed. The fake handle's
+// The live tail must COMPLETE when the execution settles (mirroring the old `handle.events`,
+// which closed on execution end) rather than hang open on the durable feed. The fake handle's
 // terminal `result` is already settled, so the live tail interrupts right after replay — the
 // stream replays the durable transcript and completes (a `runCollect` that never returns
 // would hang the test, so completing at all proves the bound).
-it.effect("sessionEvents completes when a live session settles (no hang on the durable feed)", () =>
-  harness(({ client, store, sessions }) =>
-    Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]); // result is already `Completed` → settled
-      yield* sessions.register(sessionId, fake.handle);
-      yield* store.sessionLog.append(sessionId, entryAppended);
+it.effect(
+  "executionEvents completes when a live execution settles (no hang on the durable feed)",
+  () =>
+    harness(({ client, store, executions }) =>
+      Effect.gen(function* () {
+        const fake = yield* makeFakeExecution([]); // result is already `Completed` → settled
+        yield* executions.register(executionId, fake.handle);
+        yield* store.executionLog.append(executionId, entryAppended);
 
-      const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
-      expect(received.map((i) => i.event)).toEqual([entryAppended]);
-    }),
-  ),
+        const received = yield* client.executionEvents({ executionId }).pipe(Stream.runCollect);
+        expect(received.map((i) => i.event)).toEqual([entryAppended]);
+      }),
+    ),
 );
 
-// The ONE channel serves BOTH modalities: a LIVE driving session must receive its EPHEMERAL
+// The ONE channel serves BOTH modalities: a LIVE driving execution must receive its EPHEMERAL
 // deltas (turn lifecycle, message partials, `UiRequestRaised`) AND its DURABLE entries,
 // interleaved in emission order — ephemerals offset-LESS, durables offset-STAMPED. This is
 // the exact regression the correction fixes (the prior pass dropped every ephemeral).
-it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable entries", () =>
-  harness(({ client, store, sessions }) =>
+it.live("executionEvents forwards a LIVE execution's ephemeral deltas AND durable entries", () =>
+  harness(({ client, store, executions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      // A STILL-RUNNING session: `result` stays pending so the live tail keeps forwarding.
-      const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
-      yield* sessions.register(sessionId, liveHandle);
+      const fake = yield* makeFakeExecution([]);
+      // A STILL-RUNNING execution: `result` stays pending so the live tail keeps forwarding.
+      const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+      yield* executions.register(executionId, liveHandle);
 
       // Collect the full interleaved flow off the live tail (nothing durable pre-attach).
       const collecting = yield* client
-        .sessionEvents({ sessionId })
+        .executionEvents({ executionId })
         .pipe(Stream.take(5), Stream.runCollect, Effect.forkChild);
       yield* Effect.sleep("20 millis"); // let the subscription settle before emitting
 
       // Tee a mix through the decorated store exactly as the JobRunner fold does: ephemeral
       // deltas via `publishEphemeral` (offset-less), durable entries via `append` (offset).
-      yield* store.sessionLog.publishEphemeral(sessionId, turnStarted);
-      yield* store.sessionLog.append(sessionId, entryAppended);
-      yield* store.sessionLog.publishEphemeral(sessionId, messageDelta);
-      yield* store.sessionLog.publishEphemeral(sessionId, uiRequest);
-      yield* store.sessionLog.append(sessionId, entryAppended2);
+      yield* store.executionLog.publishEphemeral(executionId, turnStarted);
+      yield* store.executionLog.append(executionId, entryAppended);
+      yield* store.executionLog.publishEphemeral(executionId, messageDelta);
+      yield* store.executionLog.publishEphemeral(executionId, uiRequest);
+      yield* store.executionLog.append(executionId, entryAppended2);
 
       const received = yield* Fiber.join(collecting);
       // ALL five arrive, in emission order (no ephemeral dropped — the design regression fixed).
@@ -1404,7 +1411,10 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
       // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
       const cursor = durableOffsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
+        .executionEvents({
+          executionId,
+          resume: { sinceOffset: cursor, generation: store.generation },
+        })
         .pipe(Stream.take(1), Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
@@ -1412,33 +1422,33 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
   ),
 );
 
-// Existence is the Session ROW, not the transcript length. A session that NEVER existed —
-// no live handle AND no row — is the ONLY `sessionEvents` miss.
+// Existence is the Execution ROW, not the transcript length. An execution that NEVER existed —
+// no live handle AND no row — is the ONLY `executionEvents` miss.
 it.effect(
-  "sessionEvents fails SessionNotFound only when the session never existed (no row, no handle)",
+  "executionEvents fails ExecutionNotFound only when the execution never existed (no row, no handle)",
   () =>
     harness(({ client }) =>
       Effect.gen(function* () {
         const exit = yield* client
-          .sessionEvents({ sessionId })
+          .executionEvents({ executionId })
           .pipe(Stream.runCollect, Effect.exit);
         expect(Exit.isFailure(exit)).toBe(true);
       }),
     ),
 );
 
-// A SETTLED session that emitted ZERO durable events still EXISTS (its Session row is
-// terminal): `sessionEvents` replays an EMPTY transcript and COMPLETES — NOT the old
-// `SessionNotFound`, which would make the Inspector error on a legitimate empty session.
+// A SETTLED execution that emitted ZERO durable events still EXISTS (its Execution row is
+// terminal): `executionEvents` replays an EMPTY transcript and COMPLETES — NOT the old
+// `ExecutionNotFound`, which would make the Inspector error on a legitimate empty execution.
 it.effect(
-  "sessionEvents completes with an empty transcript for a settled session that emitted nothing",
+  "executionEvents completes with an empty transcript for a settled execution that emitted nothing",
   () =>
     harness(({ client, store }) =>
       Effect.gen(function* () {
-        yield* store.jobs.putSession(session); // terminal row, NO durable entries, no live handle
+        yield* store.jobs.putExecution(execution); // terminal row, NO durable entries, no live handle
         yield* store.jobs.putJob(orphanedJob);
 
-        const received = yield* client.sessionEvents({ sessionId }).pipe(Stream.runCollect);
+        const received = yield* client.executionEvents({ executionId }).pipe(Stream.runCollect);
         expect(received.length).toBe(0);
       }),
     ),
@@ -1450,26 +1460,30 @@ it.effect(
 // so the daemon must not emit it twice. A genuinely-newer entry (offset above the high-water)
 // still passes, proving the tail keeps running.
 it.live(
-  "sessionEvents does not re-deliver a durable event already covered by replay (no id-less Notice dup)",
+  "executionEvents does not re-deliver a durable event already covered by replay (no id-less Notice dup)",
   () =>
-    harness(({ client, store, sessions, sessionFeed }) =>
+    harness(({ client, store, executions, executionFeed }) =>
       Effect.gen(function* () {
-        const fake = yield* makeFakeSession([]);
-        const liveHandle: SessionHandle = { ...fake.handle, result: Effect.never };
-        yield* sessions.register(sessionId, liveHandle);
-        const idlessNotice: SessionEvent = { _tag: "Notice", level: "info", message: "started" };
+        const fake = yield* makeFakeExecution([]);
+        const liveHandle: ExecutionHandle = { ...fake.handle, result: Effect.never };
+        yield* executions.register(executionId, liveHandle);
+        const idlessNotice: ExecutionEvent = { _tag: "Notice", level: "info", message: "started" };
         // The id-less notice is in the durable transcript before attach → covered by REPLAY.
-        const persisted = yield* store.sessionLog.append(sessionId, idlessNotice);
+        const persisted = yield* store.executionLog.append(executionId, idlessNotice);
 
         const collecting = yield* client
-          .sessionEvents({ sessionId })
+          .executionEvents({ executionId })
           .pipe(Stream.take(2), Stream.runCollect, Effect.forkChild);
         yield* Effect.sleep("20 millis"); // replay drains + subscription settles
 
         // The overlap: the SAME durable item (offset ≤ high-water) is ALSO on the live feed.
-        yield* sessionFeed.publish({ sessionId, offset: persisted.offset, event: idlessNotice });
+        yield* executionFeed.publish({
+          executionId,
+          offset: persisted.offset,
+          event: idlessNotice,
+        });
         // A genuinely-new durable entry (offset > high-water) DOES pass.
-        yield* store.sessionLog.append(sessionId, entryAppended2);
+        yield* store.executionLog.append(executionId, entryAppended2);
 
         const received = yield* Fiber.join(collecting);
         // Only the replayed notice + the new entry — the re-published duplicate was filtered out.
@@ -1478,14 +1492,14 @@ it.live(
     ),
 );
 
-it.effect("sessionSend drives the input into the live session", () =>
-  harness(({ client, sessions }) =>
+it.effect("executionSend drives the input into the live execution", () =>
+  harness(({ client, executions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      yield* sessions.register(sessionId, fake.handle);
+      const fake = yield* makeFakeExecution([]);
+      yield* executions.register(executionId, fake.handle);
 
-      const input: SessionInput = { text: "go", mode: "prompt" };
-      yield* client.sessionSend({ sessionId, input });
+      const input: ExecutionInput = { text: "go", mode: "prompt" };
+      yield* client.executionSend({ executionId, input });
 
       const driven = yield* Queue.take(fake.sent);
       expect(driven).toEqual(input);
@@ -1493,38 +1507,38 @@ it.effect("sessionSend drives the input into the live session", () =>
   ),
 );
 
-it.effect("a session infra failure becomes a defect, never a leaked SessionNotFound", () =>
-  harness(({ client, sessions }) =>
+it.effect("an execution infra failure becomes a defect, never a leaked ExecutionNotFound", () =>
+  harness(({ client, executions }) =>
     Effect.gen(function* () {
-      // A live, REGISTERED session whose `send` fails with an infra error
+      // A live, REGISTERED execution whose `send` fails with an infra error
       // (PiTransportError). The handler `orDie`s it, so it must NOT surface as the
-      // typed contract error `SessionNotFound` — the error channel stays exactly
-      // SessionNotFound (INV-CONTRACT), and infra failures cross as defects.
-      const failing = yield* makeFakeSession([]);
-      const handle: SessionHandle = {
+      // typed contract error `ExecutionNotFound` — the error channel stays exactly
+      // ExecutionNotFound (INV-CONTRACT), and infra failures cross as defects.
+      const failing = yield* makeFakeExecution([]);
+      const handle: ExecutionHandle = {
         ...failing.handle,
         send: () => Effect.fail(new PiTransportError({ reason: "closed", detail: "gone" })),
       };
-      yield* sessions.register(sessionId, handle);
+      yield* executions.register(executionId, handle);
 
       const exit = yield* client
-        .sessionSend({ sessionId, input: { text: "go", mode: "prompt" } })
+        .executionSend({ executionId, input: { text: "go", mode: "prompt" } })
         .pipe(Effect.exit);
       expect(Exit.isFailure(exit)).toBe(true);
       const leaked = Exit.isFailure(exit) ? Cause.findErrorOption(exit.cause) : Option.none();
-      // The session IS registered, so any SessionNotFound here would be a leak.
-      expect(Option.isSome(leaked) && leaked.value instanceof SessionNotFound).toBe(false);
+      // The execution IS registered, so any ExecutionNotFound here would be a leak.
+      expect(Option.isSome(leaked) && leaked.value instanceof ExecutionNotFound).toBe(false);
     }),
   ),
 );
 
-it.effect("interrupt aborts the live session's in-flight turn", () =>
-  harness(({ client, sessions }) =>
+it.effect("interrupt aborts the live execution's in-flight turn", () =>
+  harness(({ client, executions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      yield* sessions.register(sessionId, fake.handle);
+      const fake = yield* makeFakeExecution([]);
+      yield* executions.register(executionId, fake.handle);
 
-      yield* client.interrupt({ sessionId });
+      yield* client.interrupt({ executionId });
       // The fake resolves this deferred only when its `interrupt` is called.
       yield* Deferred.await(fake.interrupted);
     }),
@@ -1532,66 +1546,66 @@ it.effect("interrupt aborts the live session's in-flight turn", () =>
 );
 
 it.effect("answerUiRequest completes the extension_ui_request round-trip", () =>
-  harness(({ client, sessions }) =>
+  harness(({ client, executions }) =>
     Effect.gen(function* () {
-      const fake = yield* makeFakeSession([]);
-      yield* sessions.register(sessionId, fake.handle);
+      const fake = yield* makeFakeExecution([]);
+      yield* executions.register(executionId, fake.handle);
 
       // The client answers an outstanding UI request, keyed by the request id it echoes…
       const response: UiResponse = {
         requestId: "req-1",
         answer: { _tag: "Confirmed", confirmed: true },
       };
-      yield* client.answerUiRequest({ sessionId, response });
+      yield* client.answerUiRequest({ executionId, response });
 
-      // …and the neutral UiResponse reaches the live session.
+      // …and the neutral UiResponse reaches the live execution.
       const observed = yield* Queue.take(fake.answered);
       expect(observed).toEqual(response);
     }),
   ),
 );
 
-// A durable NON-TERMINAL session row (`starting`) — the register-after-dispatch window
+// A durable NON-TERMINAL execution row (`starting`) — the register-after-dispatch window
 // state: `JobRunner.dispatch` persists this BEFORE `run` registers the handle, so a
 // client reacting to the `running` delta arrives with the row already durable but the
 // handle not yet registered.
-const startingSession = Schema.decodeUnknownSync(Session)({
-  id: "ses-1",
+const startingExecution = Schema.decodeUnknownSync(Execution)({
+  id: "exe-1",
   jobId: "job-1",
   status: "starting",
 });
-// A NON-TERMINAL (`active`) Session row whose Job has since settled — the crash-orphaned
+// A NON-TERMINAL (`active`) Execution row whose Job has since settled — the crash-orphaned
 // limbo `startup-reconcile` leaves (Job-only settle). Pairs with {@link orphanedJob}.
-const activeSession = Schema.decodeUnknownSync(Session)({
-  id: "ses-1",
+const activeExecution = Schema.decodeUnknownSync(Execution)({
+  id: "exe-1",
   jobId: "job-1",
   status: "active",
 });
 
 // The register-after-dispatch window: `JobRunner.dispatch` persists the `starting`
-// Session + `running` Job BEFORE `run` registers the session handle, so a client
-// reacting to the `running` delta can open the session channel before registration.
+// Execution + `running` Job BEFORE `run` registers the execution handle, so a client
+// reacting to the `running` delta can open the execution channel before registration.
 // Because the durable JOB is `running` (NON-TERMINAL) at that point, the handler's
-// durable-state gate routes to `SessionRegistry.resolve`, which bounded-WAITS out that
+// durable-state gate routes to `ExecutionRegistry.resolve`, which bounded-WAITS out that
 // window rather than erroring — so the app needs no retry (CE4.1 FIX A: gate on Job).
 it.effect(
-  "a session-channel handler WAITS out the register-after-dispatch window (mid-dispatch job)",
+  "an execution-channel handler WAITS out the register-after-dispatch window (mid-dispatch job)",
   () =>
-    harness(({ client, store, sessions }) =>
+    harness(({ client, store, executions }) =>
       Effect.gen(function* () {
-        // Seed the durable mid-dispatch state: Session row + a RUNNING Job → gate waits.
-        yield* store.jobs.putSession(startingSession);
+        // Seed the durable mid-dispatch state: Execution row + a RUNNING Job → gate waits.
+        yield* store.jobs.putExecution(startingExecution);
         yield* store.jobs.putJob(midDispatchJob);
-        const fake = yield* makeFakeSession([]);
-        const input: SessionInput = { text: "go", mode: "prompt" };
+        const fake = yield* makeFakeExecution([]);
+        const input: ExecutionInput = { text: "go", mode: "prompt" };
 
-        // Open the channel BEFORE the session is registered — the handler must park, not
-        // fail with SessionNotFound. Registration lands next; the parked send then drives
-        // the live session. Event-driven, so no TestClock advance is needed here.
-        const fiber = yield* Effect.forkChild(client.sessionSend({ sessionId, input }), {
+        // Open the channel BEFORE the execution is registered — the handler must park, not
+        // fail with ExecutionNotFound. Registration lands next; the parked send then drives
+        // the live execution. Event-driven, so no TestClock advance is needed here.
+        const fiber = yield* Effect.forkChild(client.executionSend({ executionId, input }), {
           startImmediately: true,
         });
-        yield* sessions.register(sessionId, fake.handle);
+        yield* executions.register(executionId, fake.handle);
         yield* Fiber.join(fiber);
 
         const driven = yield* Queue.take(fake.sent);
@@ -1600,31 +1614,31 @@ it.effect(
     ),
 );
 
-// FIX A (the regression this closes) — a CRASH-ORPHANED session: `startup-reconcile`
+// FIX A (the regression this closes) — a CRASH-ORPHANED execution: `startup-reconcile`
 // settled its stale `running` Job to a TERMINAL status (`cancelled`) by writing ONLY
-// the Job row, leaving the Session row NON-TERMINAL (`active`). A gate that keyed on the
-// SESSION row would see `active` and stall the full 5s bound; the Job-status gate sees
+// the Job row, leaving the Execution row NON-TERMINAL (`active`). A gate that keyed on the
+// EXECUTION row would see `active` and stall the full 5s bound; the Job-status gate sees
 // `cancelled` (terminal) and FAILS FAST. Proven by driving the send INLINE with NO clock
 // advance and asserting virtual time is unchanged: had it entered the bounded wait, the
 // TestClock would deadlock (no advance ever comes) — completing at all, at time zero,
 // proves the fail-fast on the exact BE4.1 path FIX A targets.
 it.effect(
-  "a CRASH-ORPHANED session fails FAST — no 5s stall (Job terminal, Session row still active)",
+  "a CRASH-ORPHANED execution fails FAST — no 5s stall (Job terminal, Execution row still active)",
   () =>
     harness(({ client, store }) =>
       Effect.gen(function* () {
-        // Session row NON-TERMINAL (`active`) but its Job terminal (`cancelled`) — the
+        // Execution row NON-TERMINAL (`active`) but its Job terminal (`cancelled`) — the
         // durable limbo `startup-reconcile` leaves after settling a non-resumable job.
-        yield* store.jobs.putSession(activeSession);
+        yield* store.jobs.putExecution(activeExecution);
         yield* store.jobs.putJob(orphanedJob);
 
         const before = yield* Clock.currentTimeMillis;
         const error = yield* client
-          .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+          .executionSend({ executionId, input: { text: "hi", mode: "prompt" } })
           .pipe(Effect.flip);
         const after = yield* Clock.currentTimeMillis;
 
-        expect(error).toBeInstanceOf(SessionNotFound);
+        expect(error).toBeInstanceOf(ExecutionNotFound);
         // No virtual time consumed → the bounded wait was never entered.
         expect(after).toBe(before);
       }),
@@ -1634,14 +1648,14 @@ it.effect(
 // CE4.1-R4 (the queued-orphan this closes) — `startup-reconcile` settled a stale `running`
 // Job to `queued` under a paused/`blocked` Workstream. `queued` IS mid-dispatch, so the
 // JOB-only gate would bounded-WAIT and stall the full 5s bound. The root fix ALSO settles
-// the Session row to a terminal status (`interrupted`), and the gate now fails fast on a
-// terminal Session row even while the Job is `queued` — proven by no virtual time consumed.
+// the Execution row to a terminal status (`interrupted`), and the gate now fails fast on a
+// terminal Execution row even while the Job is `queued` — proven by no virtual time consumed.
 it.effect(
-  "a QUEUED-ORPHAN session fails FAST — no 5s stall (Job queued, Session row settled terminal)",
+  "a QUEUED-ORPHAN execution fails FAST — no 5s stall (Job queued, Execution row settled terminal)",
   () =>
     harness(({ client, store }) =>
       Effect.gen(function* () {
-        // Job re-queued for a later `control resume` (mid-dispatch), but its Session row
+        // Job re-queued for a later `control resume` (mid-dispatch), but its Execution row
         // was settled `interrupted` by the reconcile root fix — the airtight gate.
         const queuedOrphanJob = Schema.decodeUnknownSync(Job)({
           id: "job-1",
@@ -1649,124 +1663,128 @@ it.effect(
           kind: "implement",
           status: "queued",
         });
-        const interruptedSession = Schema.decodeUnknownSync(Session)({
-          id: "ses-1",
+        const interruptedExecution = Schema.decodeUnknownSync(Execution)({
+          id: "exe-1",
           jobId: "job-1",
           status: "interrupted",
         });
-        yield* store.jobs.putSession(interruptedSession);
+        yield* store.jobs.putExecution(interruptedExecution);
         yield* store.jobs.putJob(queuedOrphanJob);
 
         const before = yield* Clock.currentTimeMillis;
         const error = yield* client
-          .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+          .executionSend({ executionId, input: { text: "hi", mode: "prompt" } })
           .pipe(Effect.flip);
         const after = yield* Clock.currentTimeMillis;
 
-        expect(error).toBeInstanceOf(SessionNotFound);
+        expect(error).toBeInstanceOf(ExecutionNotFound);
         // No virtual time consumed → the bounded wait was never entered despite the
-        // `queued` (mid-dispatch) Job — the terminal Session row short-circuits it.
+        // `queued` (mid-dispatch) Job — the terminal Execution row short-circuits it.
         expect(after).toBe(before);
       }),
     ),
 );
 
-// FIX A — a fully SETTLED session (durable Job AND Session row both terminal): the same
+// FIX A — a fully SETTLED execution (durable Job AND Execution row both terminal): the same
 // `!isMidDispatchJob → get` branch fails fast, the classic BE4.1 Inspector-on-settled-job
 // path. No clock advance; virtual time unchanged.
-it.effect("a SETTLED session's channel fails FAST — no 5s stall (Job terminal)", () =>
+it.effect("a SETTLED execution's channel fails FAST — no 5s stall (Job terminal)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
-      // `session` fixture is `completed` (terminal); its Job is terminal too.
-      yield* store.jobs.putSession(session);
+      // `execution` fixture is `completed` (terminal); its Job is terminal too.
+      yield* store.jobs.putExecution(execution);
       yield* store.jobs.putJob(orphanedJob);
 
       const before = yield* Clock.currentTimeMillis;
       const error = yield* client
-        .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+        .executionSend({ executionId, input: { text: "hi", mode: "prompt" } })
         .pipe(Effect.flip);
       const after = yield* Clock.currentTimeMillis;
 
-      expect(error).toBeInstanceOf(SessionNotFound);
+      expect(error).toBeInstanceOf(ExecutionNotFound);
       // No virtual time consumed → the bounded wait was never entered.
       expect(after).toBe(before);
     }),
   ),
 );
 
-// FIX A — a NEVER-EXISTED session has NO durable row at all. The gate must route to
+// FIX A — a NEVER-EXISTED execution has NO durable row at all. The gate must route to
 // `get` and FAIL FAST across all four procedures, again with no clock advance.
-it.effect("session-channel procedures fail FAST for a never-existed session (no durable row)", () =>
-  harness(({ client }) =>
-    Effect.gen(function* () {
-      const missing: SessionId = Schema.decodeUnknownSync(Session)({
-        id: "ses-x",
-        jobId: "job-1",
-        status: "starting",
-      }).id;
+it.effect(
+  "execution-channel procedures fail FAST for a never-existed execution (no durable row)",
+  () =>
+    harness(({ client }) =>
+      Effect.gen(function* () {
+        const missing: ExecutionId = Schema.decodeUnknownSync(Execution)({
+          id: "exe-x",
+          jobId: "job-1",
+          status: "starting",
+        }).id;
 
-      // No durable row and nothing registered → each procedure fails immediately (no
-      // TestClock advance): the durable-state gate never enters the bounded wait.
-      const before = yield* Clock.currentTimeMillis;
-      const sendError = yield* client
-        .sessionSend({ sessionId: missing, input: { text: "hi", mode: "prompt" } })
-        .pipe(Effect.flip);
-      const interruptError = yield* client.interrupt({ sessionId: missing }).pipe(Effect.flip);
-      const answerError = yield* client
-        .answerUiRequest({
-          sessionId: missing,
-          response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
-        })
-        .pipe(Effect.flip);
-      const streamError = yield* client
-        .sessionEvents({ sessionId: missing })
-        .pipe(Stream.runHead, Effect.flip);
-      const after = yield* Clock.currentTimeMillis;
+        // No durable row and nothing registered → each procedure fails immediately (no
+        // TestClock advance): the durable-state gate never enters the bounded wait.
+        const before = yield* Clock.currentTimeMillis;
+        const sendError = yield* client
+          .executionSend({ executionId: missing, input: { text: "hi", mode: "prompt" } })
+          .pipe(Effect.flip);
+        const interruptError = yield* client.interrupt({ executionId: missing }).pipe(Effect.flip);
+        const answerError = yield* client
+          .answerUiRequest({
+            executionId: missing,
+            response: { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } },
+          })
+          .pipe(Effect.flip);
+        const streamError = yield* client
+          .executionEvents({ executionId: missing })
+          .pipe(Stream.runHead, Effect.flip);
+        const after = yield* Clock.currentTimeMillis;
 
-      expect(sendError).toBeInstanceOf(SessionNotFound);
-      expect(interruptError).toBeInstanceOf(SessionNotFound);
-      expect(answerError).toBeInstanceOf(SessionNotFound);
-      expect(streamError).toBeInstanceOf(SessionNotFound);
-      expect(after).toBe(before);
-    }),
-  ),
+        expect(sendError).toBeInstanceOf(ExecutionNotFound);
+        expect(interruptError).toBeInstanceOf(ExecutionNotFound);
+        expect(answerError).toBeInstanceOf(ExecutionNotFound);
+        expect(streamError).toBeInstanceOf(ExecutionNotFound);
+        expect(after).toBe(before);
+      }),
+    ),
 );
 
-// FIX A — a genuinely mid-dispatch session (durable row NON-TERMINAL) whose handle
+// FIX A — a genuinely mid-dispatch execution (durable row NON-TERMINAL) whose handle
 // NEVER registers: the gate routes to the bounded wait, which must fail with
-// `SessionNotFound` AFTER the bound (never hang). Advancing the TestClock past the bound
+// `ExecutionNotFound` AFTER the bound (never hang). Advancing the TestClock past the bound
 // fires the parked wait exactly.
-it.effect("a mid-dispatch session whose handle never registers fails AFTER the bound", () =>
+it.effect("a mid-dispatch execution whose handle never registers fails AFTER the bound", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
       // Durable Job is `running` (NON-TERMINAL) → the gate waits; nothing ever registers.
-      yield* store.jobs.putSession(startingSession);
+      yield* store.jobs.putExecution(startingExecution);
       yield* store.jobs.putJob(midDispatchJob);
 
       const sendFiber = yield* Effect.forkChild(
-        client.sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } }).pipe(Effect.flip),
+        client
+          .executionSend({ executionId, input: { text: "hi", mode: "prompt" } })
+          .pipe(Effect.flip),
         { startImmediately: true },
       );
       const streamFiber = yield* Effect.forkChild(
-        client.sessionEvents({ sessionId }).pipe(Stream.runHead, Effect.flip),
+        client.executionEvents({ executionId }).pipe(Stream.runHead, Effect.flip),
         { startImmediately: true },
       );
 
-      yield* TestClock.adjust(SESSION_RESOLVE_TIMEOUT);
+      yield* TestClock.adjust(EXECUTION_RESOLVE_TIMEOUT);
 
-      expect(yield* Fiber.join(sendFiber)).toBeInstanceOf(SessionNotFound);
-      expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(SessionNotFound);
+      expect(yield* Fiber.join(sendFiber)).toBeInstanceOf(ExecutionNotFound);
+      expect(yield* Fiber.join(streamFiber)).toBeInstanceOf(ExecutionNotFound);
     }),
   ),
 );
 
 // FIX B (revised #76) — a TRANSIENT `StateStoreError` on the resolve-path durable read
-// must be surfaced as a DEFECT, NOT folded into the typed `SessionNotFound` channel.
-// Conflating a store hiccup with a genuine registry miss is the #76 bug (a live session
+// must be surfaced as a DEFECT, NOT folded into the typed `ExecutionNotFound` channel.
+// Conflating a store hiccup with a genuine registry miss is the #76 bug (a live execution
 // mis-classified as settled); `resolveLive` now `Effect.die`s the store error. A StateStore
-// whose `getSession` fails transiently is substituted for the memory store; the send must
+// whose `getExecution` fails transiently is substituted for the memory store; the send must
 // die with the `StateStoreError` defect and leak NO typed error (INV-CONTRACT: the channel
-// stays exactly `SessionNotFound`, so a store failure crosses only as a defect).
+// stays exactly `ExecutionNotFound`, so a store failure crosses only as a defect).
 it.effect("a transient store read failure surfaces as a DEFECT, never a typed error", () =>
   Effect.gen(function* () {
     const failingStore = Layer.effect(
@@ -1777,8 +1795,8 @@ it.effect("a transient store read failure surfaces as a DEFECT, never a typed er
           ...base,
           jobs: {
             ...base.jobs,
-            getSession: () =>
-              Effect.fail(new StateStoreError({ operation: "getSession", detail: "transient" })),
+            getExecution: () =>
+              Effect.fail(new StateStoreError({ operation: "getExecution", detail: "transient" })),
           },
         });
       }),
@@ -1789,9 +1807,9 @@ it.effect("a transient store read failure surfaces as a DEFECT, never a typed er
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(failingStore, runner, layerSessionRegistry, fakeCodeHost).pipe(
+        Layer.mergeAll(failingStore, runner, layerExecutionRegistry, fakeCodeHost).pipe(
           Layer.provideMerge(layerWorkGraphEvents),
-          Layer.provideMerge(layerSessionEvents),
+          Layer.provideMerge(layerExecutionEvents),
         ),
       ),
     );
@@ -1799,7 +1817,7 @@ it.effect("a transient store read failure surfaces as a DEFECT, never a typed er
     yield* Effect.gen(function* () {
       const client = yield* clientEffect();
       const exit = yield* client
-        .sessionSend({ sessionId, input: { text: "hi", mode: "prompt" } })
+        .executionSend({ executionId, input: { text: "hi", mode: "prompt" } })
         .pipe(Effect.exit);
       expect(Exit.isFailure(exit)).toBe(true);
       const cause = Exit.isFailure(exit) ? exit.cause : Cause.empty;
@@ -1811,23 +1829,23 @@ it.effect("a transient store read failure surfaces as a DEFECT, never a typed er
   }),
 );
 
-// FIX B (revised #76) — the CORE regression: a genuinely LIVE session whose `resolveLive`
+// FIX B (revised #76) — the CORE regression: a genuinely LIVE execution whose `resolveLive`
 // hits a transient `StateStoreError` must NOT be mis-classified as settled and silently
-// completed as a truncated durable replay (dropping the live tail). The session's durable
+// completed as a truncated durable replay (dropping the live tail). The execution's durable
 // row is NON-TERMINAL and it has a registered handle + a durable transcript, so before the
-// fix `resolveLive`'s store error folded to `SessionNotFound` → `succeedNone` → `live`
+// fix `resolveLive`'s store error folded to `ExecutionNotFound` → `succeedNone` → `live`
 // `None` → the stream replayed only the durable prefix and COMPLETED. Now it must DEFECT.
 //
-// Deterministic + non-hanging: `getSession` fails EXACTLY on its first call (the
+// Deterministic + non-hanging: `getExecution` fails EXACTLY on its first call (the
 // `resolveLive` read) and delegates thereafter, so with the fix the stream dies at once
 // (no handle wait), and were the fix reverted the second read would succeed and the stream
 // would COMPLETE as a truncated success — which this assertion (a defect, not a success)
 // would catch.
 it.effect(
-  "a transient store error on a LIVE session's resolveLive DEFECTS, not a truncated replay",
+  "a transient store error on a LIVE execution's resolveLive DEFECTS, not a truncated replay",
   () =>
     Effect.gen(function* () {
-      // `armed` trips the FIRST `getSession` (resolveLive's read) into a transient failure,
+      // `armed` trips the FIRST `getExecution` (resolveLive's read) into a transient failure,
       // then disarms so the handler's later reads delegate to the real memory store.
       const armed = yield* Ref.make(true);
       const failingStore = Layer.effect(
@@ -1838,14 +1856,14 @@ it.effect(
             ...base,
             jobs: {
               ...base.jobs,
-              getSession: (id) =>
+              getExecution: (id) =>
                 Ref.getAndSet(armed, false).pipe(
                   Effect.flatMap((wasArmed) =>
                     wasArmed
                       ? Effect.fail(
-                          new StateStoreError({ operation: "getSession", detail: "transient" }),
+                          new StateStoreError({ operation: "getExecution", detail: "transient" }),
                         )
-                      : base.jobs.getSession(id),
+                      : base.jobs.getExecution(id),
                   ),
                 ),
             },
@@ -1858,30 +1876,30 @@ it.effect(
       );
       const app = handlers.pipe(
         Layer.provideMerge(
-          Layer.mergeAll(failingStore, runner, layerSessionRegistry, fakeCodeHost).pipe(
+          Layer.mergeAll(failingStore, runner, layerExecutionRegistry, fakeCodeHost).pipe(
             Layer.provideMerge(layerWorkGraphEvents),
-            Layer.provideMerge(layerSessionEvents),
+            Layer.provideMerge(layerExecutionEvents),
           ),
         ),
       );
 
       yield* Effect.gen(function* () {
         const store = yield* StateStore;
-        const sessions = yield* SessionRegistry;
-        // A genuinely LIVE session: NON-TERMINAL row, mid-dispatch Job, a registered handle
+        const executions = yield* ExecutionRegistry;
+        // A genuinely LIVE execution: NON-TERMINAL row, mid-dispatch Job, a registered handle
         // (result pending so the live tail would keep tailing), and a durable transcript that
         // the buggy path would replay-and-complete.
-        const fake = yield* makeFakeSession([]);
-        yield* sessions.register(sessionId, { ...fake.handle, result: Effect.never });
+        const fake = yield* makeFakeExecution([]);
+        yield* executions.register(executionId, { ...fake.handle, result: Effect.never });
         yield* Ref.set(armed, false); // seed with the store DISARMED …
-        yield* store.jobs.putSession(startingSession);
+        yield* store.jobs.putExecution(startingExecution);
         yield* store.jobs.putJob(midDispatchJob);
-        yield* store.sessionLog.append(sessionId, entryAppended);
+        yield* store.executionLog.append(executionId, entryAppended);
         yield* Ref.set(armed, true); // … then arm for the resolveLive read under test.
 
         const client = yield* clientEffect();
         const exit = yield* client
-          .sessionEvents({ sessionId })
+          .executionEvents({ executionId })
           .pipe(Stream.runCollect, Effect.exit);
         // Must DEFECT (loud), never a truncated-replay success that drops the live tail.
         expect(Exit.isFailure(exit)).toBe(true);

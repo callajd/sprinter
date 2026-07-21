@@ -13,13 +13,13 @@ export type {
   AgentWrite,
   EventLogStore,
   JobStore,
-  SessionLogStore,
+  ExecutionLogStore,
   WorkGraphStore,
 } from "./store.ts";
 export {
   AppendEvent,
   PersistedEvent,
-  PersistedSessionEvent,
+  PersistedExecutionEvent,
   StateStore,
   StateStoreError,
 } from "./store.ts";

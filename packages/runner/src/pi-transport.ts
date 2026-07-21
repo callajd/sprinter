@@ -13,7 +13,7 @@
  * This module deliberately traffics in Pi wire types (`PiServerMessage`,
  * `PiRpcCommand`, …) — it is the substrate INSIDE the runner package. Per
  * INV-BOUNDARY, those Pi types do NOT reach the package's public surface
- * (`index.ts`); the neutral `SessionHandle` + `SessionEvent` translation that
+ * (`index.ts`); the neutral `ExecutionHandle` + `ExecutionEvent` translation that
  * everything above the runner consumes lands in AE1.2 and is built ON this. The
  * correlation/lifecycle shape mirrors Pi's `rpc-process.ts` as a reference and
  * imports nothing from it (D12).
@@ -34,7 +34,7 @@ import {
 
 /**
  * A Pi server message that is NOT a correlated RPC response — a streaming
- * session event, an extension UI request, or an extension error. These flow to
+ * execution event, an extension UI request, or an extension error. These flow to
  * {@link PiTransport.events}; responses are consumed by the id-correlation
  * machinery instead.
  */
@@ -88,7 +88,7 @@ export interface PiTransport {
   /** The operating-system process id of the spawned `pi`. */
   readonly pid: ChildProcessSpawner.ProcessId;
   /**
-   * The stream of non-response server messages (session events, UI requests,
+   * The stream of non-response server messages (execution events, UI requests,
    * extension errors), in emission order. Fails with {@link PiTransportError}
    * if a stdout line fails to decode; ends when `pi`'s stdout closes.
    */

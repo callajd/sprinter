@@ -4,14 +4,14 @@ import SwiftUI
 
 /// Thin Mission Control board View (CE3.1): renders `MissionControlBoard.workstreams` —
 /// the already-projected `Workstream ⊃ Epic ⊃ Issue` tree — as a list and forwards a
-/// session selection. All projection logic lives in the tested view model.
+/// execution selection. All projection logic lives in the tested view model.
 ///
 /// It reads the tree declaratively and makes NO monotonic assumption about status: the
 /// live tail can momentarily deliver a stale value that self-corrects (the CE2 carried
 /// out-of-order constraint), so the View simply re-renders whatever the model holds now.
 struct MissionControlBoardView: View {
   let board: MissionControlBoard
-  let onSelectSession: (SessionId) -> Void
+  let onSelectExecution: (ExecutionId) -> Void
 
   var body: some View {
     List {
@@ -38,9 +38,9 @@ struct MissionControlBoardView: View {
   @ViewBuilder
   private func issueRow(_ issue: BoardIssue) -> some View {
     let title = "#\(issue.number) \(issue.title)"
-    if let session = issue.activity?.sessionId {
+    if let execution = issue.activity?.executionId {
       Button {
-        onSelectSession(session)
+        onSelectExecution(execution)
       } label: {
         statusRow(title, status: issue.status)
       }

@@ -1,7 +1,7 @@
 import { it } from "@effect/vitest";
 import { Schema } from "effect";
 import { expect } from "vitest";
-import { makeSession, PiRpcError, PiTransportError, SessionResult } from "./index.ts";
+import { makeExecution, PiRpcError, PiTransportError, ExecutionResult } from "./index.ts";
 
 it("exposes the neutral transport error types from the barrel", () => {
   const rpcError = new PiRpcError({ command: "prompt", error: "boom" });
@@ -13,11 +13,11 @@ it("exposes the neutral transport error types from the barrel", () => {
   expect(transportError.reason).toBe("closed");
 });
 
-it("exposes the neutral session factory and result from the barrel", () => {
-  expect(typeof makeSession).toBe("function");
+it("exposes the neutral execution factory and result from the barrel", () => {
+  expect(typeof makeExecution).toBe("function");
 
-  const completed = Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" });
+  const completed = Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Completed" });
   expect(completed._tag).toBe("Completed");
-  const failed = Schema.decodeUnknownSync(SessionResult)({ _tag: "Failed", error: "boom" });
+  const failed = Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Failed", error: "boom" });
   expect(failed._tag).toBe("Failed");
 });

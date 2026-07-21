@@ -17,8 +17,8 @@
  *   1. the daemon **re-dispatches** the persisted in-flight Job on boot
  *      (`StartupReconcile` → the file-backed durability of CE1.2), driving it to a terminal
  *      settle — the work CONTINUES across the restart rather than being lost;
- *   2. **1 Job = 1 session re-attached by id** — the resume re-attaches the SAME persisted
- *      session id (`UNIQUE(session.jobId)`), never a new session, so the work is not
+ *   2. **1 Job = 1 execution re-attached by id** — the resume re-attaches the SAME persisted
+ *      execution id (`UNIQUE(execution.jobId)`), never a new execution, so the work is not
  *      DUPLICATED;
  *   3. the app **resyncs** on reconnect — a fresh client (the app re-dialing the restarted
  *      daemon) resumes the `events` feed from its last-applied durable **offset** (the
@@ -42,12 +42,12 @@ import { RpcClient, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import { BunFileSystem, BunServices, BunSocket } from "@effect/platform-bun";
 import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
-import { Epic, Issue, Job, Session, SessionId, Workstream } from "@sprinter/domain";
+import { Epic, Issue, Job, Execution, ExecutionId, Workstream } from "@sprinter/domain";
 import { Repository as DomainRepository } from "@sprinter/domain";
 import { CodeHost, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
 import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
-import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
+import { EXECUTION_RESOLVE_TIMEOUT } from "./execution-registry.ts";
 
 // ── hard timeout so a hung socket/daemon/reconnect/event fails fast, never blocks ──
 const HARD_TIMEOUT = "15 seconds";
@@ -117,7 +117,7 @@ const RESPONDS_TO = new Set(["prompt", "steer", "follow_up", "abort", "get_state
 
 interface ScriptedPi {
   readonly layer: Layer.Layer<ChildProcessSpawner.ChildProcessSpawner>;
-  /** Resolves once the daemon has spawned the (single) session process. */
+  /** Resolves once the daemon has spawned the (single) execution process. */
   readonly awaitSpawn: Effect.Effect<void>;
   /** Push one raw NDJSON server message onto the stand-in's stdout. */
   readonly emit: (message: unknown) => Effect.Effect<void>;
@@ -237,7 +237,7 @@ const seedJob = decode(Job, {
   kind: "implement",
   status: "queued",
 });
-const SESSION_ID = decode(SessionId, "session-job-seed");
+const EXECUTION_ID = decode(ExecutionId, "execution-job-seed");
 
 // ── the harness daemon graph: the REAL main.ts graph, fake leaves substituted ──
 const harnessDaemon = (config: DaemonConfig, pi: ScriptedPi) =>
@@ -253,7 +253,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
   repository: { owner: "callajd", repo: "sprinter", token: "unused-in-sandbox" },
-  sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+  executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
 });
 
 const clientLayer = (socketPath: string) =>
@@ -263,7 +263,7 @@ const clientLayer = (socketPath: string) =>
   );
 
 it.effect(
-  "survives a daemon restart mid-flight: re-dispatches the in-flight Job, re-attaches its session, and the app resyncs by offset (no work lost or duplicated)",
+  "survives a daemon restart mid-flight: re-dispatches the in-flight Job, re-attaches its execution, and the app resyncs by offset (no work lost or duplicated)",
   () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem;
@@ -316,7 +316,7 @@ it.effect(
       }).pipe(Effect.provide(harnessDaemon(config, piA)), Effect.scoped);
 
       // The daemon (phase-1 scope) is now torn down: socket unbound, SQLite closed with the
-      // Job durably `running` (never settled — the session was held live at the kill).
+      // Job durably `running` (never settled — the execution was held live at the kill).
 
       // ── PHASE 2 — restart + read: a FRESH daemon on the SAME file + socket. Its boot
       //    `StartupReconcile` re-dispatches the persisted `running` Job; a fresh client (the
@@ -374,12 +374,12 @@ it.effect(
           const finalJob = snap.jobs.find((j) => j.id === "job-seed");
           expect(finalJob?.status).toBe("succeeded");
           expect(finalJob?.transcriptRef).toBeDefined();
-          // …with EXACTLY ONE session, re-attached under the SAME persisted id (1 Job = 1
-          // session; the resume upserted the same id, it did not fork a second session).
-          const jobSessions = snap.sessions.filter((s) => s.jobId === "job-seed");
-          expect(jobSessions.length).toBe(1);
-          expect(jobSessions[0]?.id).toBe(SESSION_ID);
-          expect(jobSessions[0]?.status).toBe("completed");
+          // …with EXACTLY ONE execution, re-attached under the SAME persisted id (1 Job = 1
+          // execution; the resume upserted the same id, it did not fork a second execution).
+          const jobExecutions = snap.executions.filter((s) => s.jobId === "job-seed");
+          expect(jobExecutions.length).toBe(1);
+          expect(jobExecutions[0]?.id).toBe(EXECUTION_ID);
+          expect(jobExecutions[0]?.status).toBe("completed");
         }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
       }).pipe(Effect.provide(harnessDaemon(config, piB)), Effect.scoped);
     }).pipe(Effect.provide(BunFileSystem.layer)),
@@ -411,10 +411,10 @@ it.effect(
         issueId: "issue-seed",
         kind: "implement",
         status: "running",
-        sessionId: "session-job-wal",
+        executionId: "execution-job-wal",
       });
-      const startingSession = decode(Session, {
-        id: "session-job-wal",
+      const startingExecution = decode(Execution, {
+        id: "execution-job-wal",
         jobId: "job-wal",
         status: "active",
       });
@@ -427,7 +427,7 @@ it.effect(
         yield* writer.workGraph.putWorkstream(seedWorkstream);
         yield* writer.workGraph.putEpic(seedEpic);
         yield* writer.workGraph.putIssue(seedIssue);
-        yield* writer.jobs.putSession(startingSession);
+        yield* writer.jobs.putExecution(startingExecution);
         yield* writer.jobs.putJob(runningJob);
 
         // …and a SEPARATE reader store B, opened on the SAME file while A is still open,
@@ -436,9 +436,9 @@ it.effect(
           const reader = yield* StateStore;
           const reloaded = Option.getOrThrow(yield* reader.jobs.getJob(runningJob.id));
           expect(reloaded.status).toBe("running");
-          expect(reloaded.sessionId).toBe("session-job-wal");
-          const session = Option.getOrThrow(yield* reader.jobs.getSessionForJob(runningJob.id));
-          expect(session.id).toBe(startingSession.id);
+          expect(reloaded.executionId).toBe("execution-job-wal");
+          const execution = Option.getOrThrow(yield* reader.jobs.getExecutionForJob(runningJob.id));
+          expect(execution.id).toBe(startingExecution.id);
         }).pipe(Effect.provide(layerStateSqlite({ filename })), Effect.orDie);
       }).pipe(Effect.provide(layerStateSqlite({ filename })), Effect.orDie);
     }).pipe(Effect.provide(BunFileSystem.layer)),

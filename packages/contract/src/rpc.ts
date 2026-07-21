@@ -6,7 +6,7 @@
  * (INV-PORT / INV-NAMING): no Pi concept and no FE2.2 owned-Pi wire schema
  * (`packages/domain/src/pi/`) appears here — that adapter-internal wire stays out
  * of the client contract. It is **maximally reactive** (D17 / INV-REACTIVE): the
- * work-graph `events` feed and the `sessionEvents` feed are STREAMING RPCs
+ * work-graph `events` feed and the `executionEvents` feed are STREAMING RPCs
  * (`RpcSchema.Stream`), not polled request/response. It is **small and stable**
  * (D10 / INV-CONTRACT): every procedure is hand-mirrored in Swift (FE2.4), and the
  * goldens (frozen from this contract) are what keep the two sides in lockstep —
@@ -16,7 +16,7 @@
  *  1. **snapshot** — request/response, hydrates full state on connect;
  *  2. **events** — streaming work-graph deltas;
  *  3. **commands** — create-workstream-from-plan, control, retry-issue;
- *  4. **session channel** — streaming `sessionEvents`, plus `sessionSend`,
+ *  4. **execution channel** — streaming `executionEvents`, plus `executionSend`,
  *     `interrupt`, and `answerUiRequest`.
  */
 import { Schema } from "effect";
@@ -24,16 +24,16 @@ import { Rpc, RpcGroup } from "effect/unstable/rpc";
 import {
   Agent,
   Epic,
+  Execution,
+  ExecutionEvent,
+  ExecutionId,
+  ExecutionInput,
   Issue,
   IssueId,
   Job,
   NonNegativeInt,
   Repository,
   RepositoryKey,
-  Session,
-  SessionEvent,
-  SessionId,
-  SessionInput,
   StoreGenerationId,
   UiResponse,
   Workstream,
@@ -53,10 +53,13 @@ export class IssueNotFound extends Schema.TaggedErrorClass<IssueNotFound>()("Iss
   id: IssueId,
 }) {}
 
-/** A session command or subscription targeted a session the daemon does not know. */
-export class SessionNotFound extends Schema.TaggedErrorClass<SessionNotFound>()("SessionNotFound", {
-  id: SessionId,
-}) {}
+/** An execution command or subscription targeted an execution the daemon does not know. */
+export class ExecutionNotFound extends Schema.TaggedErrorClass<ExecutionNotFound>()(
+  "ExecutionNotFound",
+  {
+    id: ExecutionId,
+  },
+) {}
 
 /** The submitted plan could not be turned into a workstream. */
 export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanRejected", {
@@ -64,14 +67,14 @@ export class PlanRejected extends Schema.TaggedErrorClass<PlanRejected>()("PlanR
 }) {}
 
 /**
- * A resume cursor (the `sinceOffset` inside `events`' or `sessionEvents`'
+ * A resume cursor (the `sinceOffset` inside `events`' or `executionEvents`'
  * {@link ResumeContext}) does NOT belong to
  * the daemon's current store generation, so there is no incremental resume from it:
  * the client must throw away everything it retained and re-hydrate from `snapshot`.
  *
  * The daemon's store never migrates (INV-FRESH): bumping its schema version DROPS
  * the database and recreates it, which restarts the durable `event_log` /
- * `session_event_log` offsets at `1` and destroys every row the client's retained
+ * `execution_event_log` offsets at `1` and destroys every row the client's retained
  * state was built from. The local app and the local daemon run together, so this
  * happens UNDER a live client — one that reconnects holding a cursor from the
  * previous generation and a retained snapshot full of entities that no longer exist.
@@ -124,7 +127,7 @@ export class ResyncRequired extends Schema.TaggedErrorClass<ResyncRequired>()("R
 /**
  * A client's RESUME CONTEXT: the durable cursor it wants to continue strictly after,
  * TOGETHER with the {@link StoreGenerationId} that cursor is a coordinate in. It is
- * the optional half of both feed payloads (`events`, `sessionEvents`) — ABSENT means
+ * the optional half of both feed payloads (`events`, `executionEvents`) — ABSENT means
  * "replay from the ORIGIN", PRESENT means "resume", and there is no third state.
  *
  * **Why one value and not two optional fields (INV-SUM).** A cursor is meaningless
@@ -159,7 +162,7 @@ export type ResumeContext = typeof ResumeContext.Type;
 
 /**
  * The full owned state, hydrated on connect by the `snapshot` RPC: every planning
- * node (`Workstream ⊃ Epic ⊃ Issue`), the execution nodes (`Job`, `Session`), and
+ * node (`Workstream ⊃ Epic ⊃ Issue`), the execution nodes (`Job`, `Execution`), and
  * the REGISTRY layer (`agents`). Composed exclusively of FE2.1 domain types
  * (INV-PORT).
  *
@@ -179,7 +182,7 @@ export type ResumeContext = typeof ResumeContext.Type;
  * `generation` is the identity of the STORE GENERATION this state was read from —
  * the coordinate space its durable offsets live in. It is carried here because a
  * snapshot is where a client's resume context BEGINS: the client retains it and
- * hands it back on every cursor-bearing `events` / `sessionEvents` request, so the
+ * hands it back on every cursor-bearing `events` / `executionEvents` request, so the
  * daemon can refuse a cursor from a generation it destroyed instead of resuming the
  * client incrementally against a log the cursor never belonged to (see
  * {@link ResyncRequired}). Nothing may parse or order it — equality only.
@@ -190,7 +193,7 @@ export const Snapshot = Schema.Struct({
   epics: Schema.Array(Epic),
   issues: Schema.Array(Issue),
   jobs: Schema.Array(Job),
-  sessions: Schema.Array(Session),
+  executions: Schema.Array(Execution),
   agents: Schema.Array(Agent),
   generation: StoreGenerationId,
 });
@@ -226,7 +229,7 @@ export const WorkGraphEvent = Schema.TaggedUnion({
   EpicChanged: { epic: Epic },
   IssueChanged: { issue: Issue },
   JobChanged: { job: Job },
-  SessionChanged: { session: Session },
+  ExecutionChanged: { execution: Execution },
   AgentChanged: { agent: Agent },
 });
 export type WorkGraphEvent = (typeof WorkGraphEvent)["Type"];
@@ -258,18 +261,18 @@ export const OffsetEvent = Schema.Struct({
 export type OffsetEvent = (typeof OffsetEvent)["Type"];
 
 /**
- * One streamed `sessionEvents` item: a {@link SessionEvent} paired with an OPTIONAL DURABLE
- * per-session `offset`. This ONE channel serves BOTH session modalities —
+ * One streamed `executionEvents` item: an {@link ExecutionEvent} paired with an OPTIONAL DURABLE
+ * per-execution `offset`. This ONE channel serves BOTH execution modalities —
  * live driving AND settled-transcript replay — so `offset` is optional, the one deliberate
  * divergence from the work-graph {@link OffsetEvent} (whose offset is ALWAYS present because
- * every work-graph event is durable). Sessions carry a SUPERSET: the durable transcript
+ * every work-graph event is durable). Executions carry a SUPERSET: the durable transcript
  * grade PLUS the ephemeral live deltas. Semantics of `offset`:
  *
  * - **PRESENT** ⇒ the event is DURABLE and transcript-grade (an `EntryAppended` record or a
- *   reconcilable `Notice`): it was journaled to the session's durable transcript log at this
+ *   reconcilable `Notice`): it was journaled to the execution's durable transcript log at this
  *   offset, it is REPLAYABLE, and it ADVANCES the reconnect resume cursor. The offset is a
- *   durable per-session coordinate shared by BOTH the replay (the durable log `tail`) and the
- *   live tail (new durable entries fanned out as the session runs), so replay and live are one
+ *   durable per-execution coordinate shared by BOTH the replay (the durable log `tail`) and the
+ *   live tail (new durable entries fanned out as the execution runs), so replay and live are one
  *   coordinate space and a client CAN resume from any offset-bearing item's offset.
  * - **ABSENT** ⇒ the event is an EPHEMERAL live delta (message/tool partials, turn lifecycle,
  *   `UiRequestRaised`, status/retry/compaction): it is forwarded to the consumer to drive the
@@ -284,11 +287,11 @@ export type OffsetEvent = (typeof OffsetEvent)["Type"];
  * item its live counterpart built) exactly as `OffsetEvent` overlap is absorbed by upsert
  * idempotency.
  */
-export const OffsetSessionEvent = Schema.Struct({
+export const OffsetExecutionEvent = Schema.Struct({
   offset: Schema.optionalKey(NonNegativeInt),
-  event: SessionEvent,
+  event: ExecutionEvent,
 });
-export type OffsetSessionEvent = (typeof OffsetSessionEvent)["Type"];
+export type OffsetExecutionEvent = (typeof OffsetExecutionEvent)["Type"];
 
 /**
  * The plan the `createWorkstreamFromPlan` command turns into a new workstream:
@@ -322,7 +325,7 @@ export type ControlAction = (typeof ControlAction)["Type"];
 //
 // Each procedure is a named `Rpc` so its per-procedure payload/success/error
 // types are preserved (the group's `requests` map erases them to a union). The
-// `events` and `sessionEvents` feeds are `stream: true`, so their success/error
+// `events` and `executionEvents` feeds are `stream: true`, so their success/error
 // is wrapped in `RpcSchema.Stream` — they are streaming, not polled
 // (INV-REACTIVE).
 
@@ -377,63 +380,63 @@ export const retryIssue = Rpc.make("retryIssue", {
   error: IssueNotFound,
 });
 
-// (4) session channel — streaming events + send/interrupt/answer.
+// (4) execution channel — streaming events + send/interrupt/answer.
 //
-// `sessionEvents` replays a session's DURABLE transcript then live-tails it — the
-// session-channel mirror of `events`, but a UNIFIED dual-modality feed. Each
-// streamed item is an {@link OffsetSessionEvent} — a {@link SessionEvent} PLUS an OPTIONAL
-// durable per-session offset. Durable, transcript-grade events (`EntryAppended`/`Notice`)
+// `executionEvents` replays an execution's DURABLE transcript then live-tails it — the
+// execution-channel mirror of `events`, but a UNIFIED dual-modality feed. Each
+// streamed item is an {@link OffsetExecutionEvent} — an {@link ExecutionEvent} PLUS an OPTIONAL
+// durable per-execution offset. Durable, transcript-grade events (`EntryAppended`/`Notice`)
 // carry the offset the client feeds back to resume; ephemeral live deltas (turn lifecycle,
 // message/tool partials, `UiRequestRaised`, …) ride the SAME channel offset-less so a live
-// driving session still receives its full reactive flow. The request payload carries an
+// driving execution still receives its full reactive flow. The request payload carries an
 // OPTIONAL {@link ResumeContext}: a request with NO `resume` (a PRESENT but empty
-// payload beyond `sessionId`) replays the session's DURABLE transcript from the ORIGIN,
+// payload beyond `executionId`) replays the execution's DURABLE transcript from the ORIGIN,
 // present resumes STRICTLY AFTER that offset (only offset-bearing events are replayable). A
-// SETTLED session replays its durable transcript and the stream COMPLETES (no longer
-// `SessionNotFound`); a LIVE session replays the durable prefix then tails both new durable
-// entries and ephemeral deltas; a session that never existed (no durable transcript AND no
-// live handle) is `SessionNotFound`. Only `sessionEvents` gains durable replay —
-// `sessionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled session is read-only,
-// so they still fail `SessionNotFound`).
+// SETTLED execution replays its durable transcript and the stream COMPLETES (no longer
+// `ExecutionNotFound`); a LIVE execution replays the durable prefix then tails both new durable
+// entries and ephemeral deltas; an execution that never existed (no durable transcript AND no
+// live handle) is `ExecutionNotFound`. Only `executionEvents` gains durable replay —
+// `executionSend`/`interrupt`/`answerUiRequest` stay LIVE-only (a settled execution is read-only,
+// so they still fail `ExecutionNotFound`).
 //
-// `session_event_log` is dropped and restarted at offset `1` by a schema-version bump
-// exactly as `event_log` is, so a per-session cursor is a generation-scoped coordinate
+// `execution_event_log` is dropped and restarted at offset `1` by a schema-version bump
+// exactly as `event_log` is, so a per-execution cursor is a generation-scoped coordinate
 // too — and it gets the SAME guard, structurally, not a weaker one because today's
 // client happens not to resume: it carries the very same {@link ResumeContext}, so a
 // cursor here can no more travel without its generation than one on `events` can, and a
 // stale generation is refused with {@link ResyncRequired} at every offset. Hence the
-// two-error channel — the existence question (`SessionNotFound`) and the generation
+// two-error channel — the existence question (`ExecutionNotFound`) and the generation
 // question are independent.
 //
 // LATENT, NOT LIVE — stated so the guard is not mistaken for an exercised path. NO
 // shipped client resumes this feed today: the Swift `RpcBackend` builds the payload
-// with `sessionId` only and never a `resume`, and `InteractiveSession` has no
-// `ResyncRequired` handling, so in practice the session feed is ORIGIN-ONLY and the
+// with `executionId` only and never a `resume`, and `InteractiveExecution` has no
+// `ResyncRequired` handling, so in practice the execution feed is ORIGIN-ONLY and the
 // generation check here has no end-to-end path to fire on. It is defined now, and
 // tested TS-side, because the coordinate really is generation-scoped and retrofitting
 // a cursor guard onto a wire shape already in use is the expensive order to do it in.
 // A resuming client is what makes it live; until one exists, treat it as correct and
 // unexercised rather than as load-bearing today.
-export const sessionEvents = Rpc.make("sessionEvents", {
+export const executionEvents = Rpc.make("executionEvents", {
   payload: {
-    sessionId: SessionId,
+    executionId: ExecutionId,
     resume: Schema.optionalKey(ResumeContext),
   },
-  success: OffsetSessionEvent,
-  error: Schema.Union([SessionNotFound, ResyncRequired]),
+  success: OffsetExecutionEvent,
+  error: Schema.Union([ExecutionNotFound, ResyncRequired]),
   stream: true,
 });
-export const sessionSend = Rpc.make("sessionSend", {
-  payload: { sessionId: SessionId, input: SessionInput },
-  error: SessionNotFound,
+export const executionSend = Rpc.make("executionSend", {
+  payload: { executionId: ExecutionId, input: ExecutionInput },
+  error: ExecutionNotFound,
 });
 export const interrupt = Rpc.make("interrupt", {
-  payload: { sessionId: SessionId },
-  error: SessionNotFound,
+  payload: { executionId: ExecutionId },
+  error: ExecutionNotFound,
 });
 export const answerUiRequest = Rpc.make("answerUiRequest", {
-  payload: { sessionId: SessionId, response: UiResponse },
-  error: SessionNotFound,
+  payload: { executionId: ExecutionId, response: UiResponse },
+  error: ExecutionNotFound,
 });
 
 // ── The RPC group (contract) ─────────────────────────────────────────────────
@@ -448,8 +451,8 @@ export const SprinterRpc = RpcGroup.make(
   createWorkstreamFromPlan,
   control,
   retryIssue,
-  sessionEvents,
-  sessionSend,
+  executionEvents,
+  executionSend,
   interrupt,
   answerUiRequest,
 );

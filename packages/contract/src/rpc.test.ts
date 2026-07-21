@@ -4,13 +4,13 @@ import { RpcSchema } from "effect/unstable/rpc";
 import { expect } from "vitest";
 import {
   Agent,
+  Execution,
+  ExecutionEvent,
+  ExecutionId,
+  ExecutionInput,
   Issue,
   IssueId,
   Job,
-  Session,
-  SessionEvent,
-  SessionId,
-  SessionInput,
   UiResponse,
   Workstream,
   WorkstreamId,
@@ -23,13 +23,13 @@ import {
   events,
   interrupt,
   IssueNotFound,
-  OffsetSessionEvent,
+  OffsetExecutionEvent,
   PlanRejected,
   ResyncRequired,
   retryIssue,
-  SessionNotFound,
-  sessionEvents,
-  sessionSend,
+  ExecutionNotFound,
+  executionEvents,
+  executionSend,
   Snapshot,
   snapshot,
   SprinterRpc,
@@ -45,8 +45,8 @@ const ALL_TAGS = [
   "createWorkstreamFromPlan",
   "control",
   "retryIssue",
-  "sessionEvents",
-  "sessionSend",
+  "executionEvents",
+  "executionSend",
   "interrupt",
   "answerUiRequest",
 ] as const;
@@ -76,7 +76,7 @@ const issue = {
   dependsOn: ["iss-0"],
 };
 const job = { id: "job-1", issueId: "iss-1", kind: "implement", status: "running" };
-const session = { id: "ses-1", jobId: "job-1", status: "active" };
+const execution = { id: "exe-1", jobId: "job-1", status: "active" };
 const agent = {
   id: "agt-1",
   name: "implementer",
@@ -91,7 +91,7 @@ it("carries every model of the contract as a procedure", () => {
 
 it("streams the reactive feeds and not the request/response models (INV-REACTIVE)", () => {
   expect(RpcSchema.isStreamSchema(events.successSchema)).toBe(true);
-  expect(RpcSchema.isStreamSchema(sessionEvents.successSchema)).toBe(true);
+  expect(RpcSchema.isStreamSchema(executionEvents.successSchema)).toBe(true);
 
   expect(RpcSchema.isStreamSchema(snapshot.successSchema)).toBe(false);
   expect(RpcSchema.isStreamSchema(createWorkstreamFromPlan.successSchema)).toBe(false);
@@ -105,7 +105,7 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
     epics: [{ id: "ep-1", workstreamId: "ws-1", name: "FE2", status: "active", issues: ["iss-1"] }],
     issues: [issue],
     jobs: [job],
-    sessions: [session],
+    executions: [execution],
     agents: [agent, { ...agent, id: "agt-2", supersedes: "agt-1" }],
     generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
   };
@@ -189,10 +189,10 @@ it("makes a cursor without its generation UNREPRESENTABLE, at every offset (INV-
   expect(() =>
     Schema.decodeUnknownSync(events.payloadSchema)({ resume: { generation } }),
   ).toThrow();
-  // Same on the session channel — no weaker shape for the second feed.
+  // Same on the execution channel — no weaker shape for the second feed.
   expect(() =>
-    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
-      sessionId: "ses-1",
+    Schema.decodeUnknownSync(executionEvents.payloadSchema)({
+      executionId: "exe-1",
       resume: { sinceOffset: 4 },
     }),
   ).toThrow();
@@ -215,13 +215,13 @@ it("pairs a resume cursor with the STORE GENERATION it was minted in", () => {
     resume: { sinceOffset: 12, generation },
   });
   expect(resume.resume?.generation).toBe(generation);
-  // The SAME pairing on the session channel: its per-session log is dropped by a schema
+  // The SAME pairing on the execution channel: its per-execution log is dropped by a schema
   // bump exactly as the work-graph log is, so its cursor is generation-scoped too.
-  const sessionResume = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
-    sessionId: "ses-1",
+  const executionResume = Schema.decodeUnknownSync(executionEvents.payloadSchema)({
+    executionId: "exe-1",
     resume: { sinceOffset: 4, generation },
   });
-  expect(sessionResume.resume?.generation).toBe(generation);
+  expect(executionResume.resume?.generation).toBe(generation);
 
   // The whole context is OPTIONAL because an ORIGIN request (a first connect) has none.
   expect(Schema.decodeUnknownSync(events.payloadSchema)({}).resume).toBeUndefined();
@@ -238,7 +238,7 @@ it("pairs a resume cursor with the STORE GENERATION it was minted in", () => {
       epics: [],
       issues: [],
       jobs: [],
-      sessions: [],
+      executions: [],
       agents: [],
     }),
   ).toThrow();
@@ -259,16 +259,16 @@ it("pairs a resume cursor with the STORE GENERATION it was minted in", () => {
   // an offset-only rule could not detect at all.
   expect(refusal.sinceOffset).toBeLessThanOrEqual(refusal.maxOffset);
 
-  // `sessionEvents` therefore has a TWO-error channel: the existence question and the
+  // `executionEvents` therefore has a TWO-error channel: the existence question and the
   // generation question are independent, and both must be expressible on it.
   expect(
-    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
-      _tag: "SessionNotFound",
-      id: "ses-9",
+    Schema.decodeUnknownSync(executionEvents.successSchema.error)({
+      _tag: "ExecutionNotFound",
+      id: "exe-9",
     }),
-  ).toBeInstanceOf(SessionNotFound);
+  ).toBeInstanceOf(ExecutionNotFound);
   expect(
-    Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
+    Schema.decodeUnknownSync(executionEvents.successSchema.error)({
       _tag: "ResyncRequired",
       sinceOffset: 2,
       maxOffset: 3,
@@ -353,91 +353,95 @@ it("retries an issue by id, failing with IssueNotFound", () => {
   expect(err).toBeInstanceOf(IssueNotFound);
 });
 
-it("streams the offset-stamped durable transcript over sessionEvents, keyed by session id", () => {
-  // The streamed success is the OffsetSessionEvent envelope: a durable,
-  // transcript-grade SessionEvent PLUS the durable per-session offset the client feeds back
+it("streams the offset-stamped durable transcript over executionEvents, keyed by execution id", () => {
+  // The streamed success is the OffsetExecutionEvent envelope: a durable,
+  // transcript-grade ExecutionEvent PLUS the durable per-execution offset the client feeds back
   // as `resume.sinceOffset`. It mirrors the `events` feed's OffsetEvent envelope.
-  const payload = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
-  expect(payload.sessionId).toBe(Schema.decodeUnknownSync(SessionId)("ses-1"));
+  const payload = Schema.decodeUnknownSync(executionEvents.payloadSchema)({ executionId: "exe-1" });
+  expect(payload.executionId).toBe(Schema.decodeUnknownSync(ExecutionId)("exe-1"));
 
   const event = {
     _tag: "EntryAppended",
     entry: { _tag: "AssistantMessage", id: "a1", text: "hi" },
   };
   const item = { offset: 7, event };
-  const decoded = Schema.decodeUnknownSync(sessionEvents.successSchema.success)(item);
-  expect(decoded).toEqual(Schema.decodeUnknownSync(OffsetSessionEvent)(item));
+  const decoded = Schema.decodeUnknownSync(executionEvents.successSchema.success)(item);
+  expect(decoded).toEqual(Schema.decodeUnknownSync(OffsetExecutionEvent)(item));
   expect(decoded.offset).toBe(7);
-  expect(decoded.event).toEqual(Schema.decodeUnknownSync(SessionEvent)(event));
+  expect(decoded.event).toEqual(Schema.decodeUnknownSync(ExecutionEvent)(event));
 
   // A negative offset is rejected (NonNegativeInt), matching the `events` envelope.
   expect(() =>
-    Schema.decodeUnknownSync(sessionEvents.successSchema.success)({ offset: -1, event }),
+    Schema.decodeUnknownSync(executionEvents.successSchema.success)({ offset: -1, event }),
   ).toThrow();
 
-  // The stream error is the neutral SessionNotFound.
-  const err = Schema.decodeUnknownSync(sessionEvents.successSchema.error)({
-    _tag: "SessionNotFound",
-    id: "ses-1",
+  // The stream error is the neutral ExecutionNotFound.
+  const err = Schema.decodeUnknownSync(executionEvents.successSchema.error)({
+    _tag: "ExecutionNotFound",
+    id: "exe-1",
   });
-  expect(err).toBeInstanceOf(SessionNotFound);
+  expect(err).toBeInstanceOf(ExecutionNotFound);
 });
 
-it("carries an OPTIONAL resume context on the sessionEvents request", () => {
-  // Present cursor: resume STRICTLY AFTER that durable per-session offset.
-  const withCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
-    sessionId: "ses-1",
+it("carries an OPTIONAL resume context on the executionEvents request", () => {
+  // Present cursor: resume STRICTLY AFTER that durable per-execution offset.
+  const withCursor = Schema.decodeUnknownSync(executionEvents.payloadSchema)({
+    executionId: "exe-1",
     resume: { sinceOffset: 12, generation },
   });
   expect(withCursor.resume?.sinceOffset).toBe(12);
 
-  // Absent cursor: the KEY is omitted (present-but-empty beyond `sessionId`) → replay the
-  // session's durable transcript from the ORIGIN.
-  const noCursor = Schema.decodeUnknownSync(sessionEvents.payloadSchema)({ sessionId: "ses-1" });
+  // Absent cursor: the KEY is omitted (present-but-empty beyond `executionId`) → replay the
+  // execution's durable transcript from the ORIGIN.
+  const noCursor = Schema.decodeUnknownSync(executionEvents.payloadSchema)({
+    executionId: "exe-1",
+  });
   expect(noCursor.resume).toBeUndefined();
 
   // A negative cursor is rejected (NonNegativeInt).
   expect(() =>
-    Schema.decodeUnknownSync(sessionEvents.payloadSchema)({
-      sessionId: "ses-1",
+    Schema.decodeUnknownSync(executionEvents.payloadSchema)({
+      executionId: "exe-1",
       resume: { sinceOffset: -1, generation },
     }),
   ).toThrow();
 
-  // Through the wire JSON codec: a request with sessionId and NO resume key decodes to
-  // the origin-replay case (mirrors the `events` B1 seam for the session channel).
-  const codec = Schema.toCodecJson(sessionEvents.payloadSchema);
-  expect(Schema.decodeUnknownSync(codec)({ sessionId: "ses-1" }).resume).toBeUndefined();
+  // Through the wire JSON codec: a request with executionId and NO resume key decodes to
+  // the origin-replay case (mirrors the `events` B1 seam for the execution channel).
+  const codec = Schema.toCodecJson(executionEvents.payloadSchema);
+  expect(Schema.decodeUnknownSync(codec)({ executionId: "exe-1" }).resume).toBeUndefined();
   expect(
-    Schema.decodeUnknownSync(codec)({ sessionId: "ses-1", resume: { sinceOffset: 3, generation } })
-      .resume?.sinceOffset,
+    Schema.decodeUnknownSync(codec)({
+      executionId: "exe-1",
+      resume: { sinceOffset: 3, generation },
+    }).resume?.sinceOffset,
   ).toBe(3);
 });
 
-it("drives input into a session via sessionSend", () => {
+it("drives input into an execution via executionSend", () => {
   const input = { text: "go", mode: "prompt" };
-  const payload = Schema.decodeUnknownSync(sessionSend.payloadSchema)({
-    sessionId: "ses-1",
+  const payload = Schema.decodeUnknownSync(executionSend.payloadSchema)({
+    executionId: "exe-1",
     input,
   });
-  expect(payload.input).toEqual(Schema.decodeUnknownSync(SessionInput)(input));
+  expect(payload.input).toEqual(Schema.decodeUnknownSync(ExecutionInput)(input));
 
-  const err = Schema.decodeUnknownSync(sessionSend.errorSchema)({
-    _tag: "SessionNotFound",
-    id: "ses-1",
+  const err = Schema.decodeUnknownSync(executionSend.errorSchema)({
+    _tag: "ExecutionNotFound",
+    id: "exe-1",
   });
-  expect(err).toBeInstanceOf(SessionNotFound);
+  expect(err).toBeInstanceOf(ExecutionNotFound);
 });
 
-it("interrupts a session by id", () => {
-  const payload = Schema.decodeUnknownSync(interrupt.payloadSchema)({ sessionId: "ses-1" });
-  expect(payload.sessionId).toBe("ses-1");
+it("interrupts an execution by id", () => {
+  const payload = Schema.decodeUnknownSync(interrupt.payloadSchema)({ executionId: "exe-1" });
+  expect(payload.executionId).toBe("exe-1");
 });
 
 it("answers an outstanding UI request via answerUiRequest", () => {
   const response = { requestId: "req-1", answer: { _tag: "Confirmed", confirmed: true } };
   const payload = Schema.decodeUnknownSync(answerUiRequest.payloadSchema)({
-    sessionId: "ses-1",
+    executionId: "exe-1",
     response,
   });
   expect(payload.response).toEqual(Schema.decodeUnknownSync(UiResponse)(response));
@@ -453,7 +457,7 @@ it("rejects a payload that is not an owned domain value", () => {
       epics: [],
       issues: [{ id: "iss-1" }],
       jobs: [],
-      sessions: [],
+      executions: [],
       agents: [],
       generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
     }),
@@ -465,7 +469,7 @@ it("rejects a payload that is not an owned domain value", () => {
       epics: [],
       issues: [],
       jobs: [],
-      sessions: [],
+      executions: [],
       agents: [{ ...agent, retiredAt: "yesterday" }],
       generation: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b",
     }),
@@ -477,6 +481,6 @@ it("rejects a payload that is not an owned domain value", () => {
 it("uses only owned domain fixtures", () => {
   expect(Schema.decodeUnknownSync(Issue)(issue).epicId).toBe("ep-1");
   expect(Schema.decodeUnknownSync(Job)(job).kind).toBe("implement");
-  expect(Schema.decodeUnknownSync(Session)(session).status).toBe("active");
+  expect(Schema.decodeUnknownSync(Execution)(execution).status).toBe("active");
   expect(Schema.decodeUnknownSync(Agent)(agent).tools).toEqual(["read", "edit"]);
 });

@@ -53,19 +53,19 @@ enum BoardFixtures {
     status: .active,
     epics: [EpicId(rawValue: "ep-a")])
 
-  /// A running job on `iss-a`, with an active session — the per-agent activity the
+  /// A running job on `iss-a`, with an active execution — the per-agent activity the
   /// board surfaces.
   static let runningJob = Job(
     id: JobId(rawValue: "job-a"),
     issueId: IssueId(rawValue: "iss-a"),
     kind: .implement,
     status: .running,
-    sessionId: SessionId(rawValue: "sess-a"),
+    executionId: ExecutionId(rawValue: "exe-a"),
     transcriptRef: nil,
     pullRequest: nil)
 
-  static let activeSession = Session(
-    id: SessionId(rawValue: "sess-a"),
+  static let activeExecution = Execution(
+    id: ExecutionId(rawValue: "exe-a"),
     jobId: JobId(rawValue: "job-a"),
     status: .active)
 
@@ -101,7 +101,7 @@ enum BoardFixtures {
     epics: [epicA, epicB],
     issues: [issueA, issueB],
     jobs: [runningJob],
-    sessions: [activeSession],
+    executions: [activeExecution],
     agents: [],
     generation: StoreGenerationId(rawValue: "gen-test"))
 
@@ -130,24 +130,24 @@ enum BoardFixtures {
       pullRequest: nil)
   }
 
-  /// An `implement` job on `issue`, optionally carrying a session.
-  static func job(_ id: String, issue: String, status: JobStatus, session: String?) -> Job {
+  /// An `implement` job on `issue`, optionally carrying an execution.
+  static func job(_ id: String, issue: String, status: JobStatus, execution: String?) -> Job {
     Job(
       id: JobId(rawValue: id),
       issueId: IssueId(rawValue: issue),
       kind: .implement,
       status: status,
-      sessionId: session.map { SessionId(rawValue: $0) },
+      executionId: execution.map { ExecutionId(rawValue: $0) },
       transcriptRef: nil,
       pullRequest: nil)
   }
 
   /// A one-workstream / one-epic snapshot whose epic lists `issueIds`, wired to the
-  /// given jobs and sessions — the minimal shape for the activity-derivation cases.
+  /// given jobs and executions — the minimal shape for the activity-derivation cases.
   static func singleEpicSnapshot(
     issueIds: [String],
     jobs: [Job],
-    sessions: [Session]
+    executions: [Execution]
   ) -> Snapshot {
     Snapshot(
       repositories: [repositoryA],
@@ -169,7 +169,7 @@ enum BoardFixtures {
       ],
       issues: issueIds.map { issue($0) },
       jobs: jobs,
-      sessions: sessions,
+      executions: executions,
       agents: [],
       generation: StoreGenerationId(rawValue: "gen-test"))
   }

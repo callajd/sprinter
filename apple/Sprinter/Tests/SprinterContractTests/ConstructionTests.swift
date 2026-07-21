@@ -92,8 +92,8 @@ struct ConstructionTests {
       issueId: IssueId(rawValue: "iss-1"),
       kind: .implement,
       status: .running,
-      sessionId: SessionId(rawValue: "ses-1"),
-      transcriptRef: "transcripts/ses-1.jsonl",
+      executionId: ExecutionId(rawValue: "exe-1"),
+      transcriptRef: "transcripts/exe-1.jsonl",
       pullRequest: PullRequestRef(
         number: 15, url: "https://github.com/callajd/sprinter/pull/15", merged: true))
     #expect(built == (try Golden.decode(Job.self, from: "job-full")))
@@ -106,17 +106,17 @@ struct ConstructionTests {
       issueId: IssueId(rawValue: "iss-2"),
       kind: .review,
       status: .queued,
-      sessionId: nil,
+      executionId: nil,
       transcriptRef: nil,
       pullRequest: nil)
     #expect(built == (try Golden.decode(Job.self, from: "job-minimal")))
   }
 
-  @Test("builds a session equal to the golden")
-  func buildsSession() throws {
-    let built = Session(
-      id: SessionId(rawValue: "ses-1"), jobId: JobId(rawValue: "job-1"), status: .active)
-    #expect(built == (try Golden.decode(Session.self, from: "session")))
+  @Test("builds an execution equal to the golden")
+  func buildsExecution() throws {
+    let built = Execution(
+      id: ExecutionId(rawValue: "exe-1"), jobId: JobId(rawValue: "job-1"), status: .active)
+    #expect(built == (try Golden.decode(Execution.self, from: "execution")))
   }
 
   @Test("builds a snapshot equal to the golden")
@@ -128,7 +128,7 @@ struct ConstructionTests {
       epics: decoded.epics,
       issues: decoded.issues,
       jobs: decoded.jobs,
-      sessions: decoded.sessions,
+      executions: decoded.executions,
       agents: decoded.agents,
       generation: decoded.generation)
     #expect(built == decoded)
@@ -148,10 +148,10 @@ struct ConstructionTests {
     #expect(built == golden[0])
   }
 
-  @Test("builds a session input equal to the golden")
-  func buildsSessionInput() throws {
-    let built = SessionInput(text: "kick it off", images: ["img-ref-1"], mode: .prompt)
-    let golden = try Golden.decode([SessionInput].self, from: "session-inputs")
+  @Test("builds an execution input equal to the golden")
+  func buildsExecutionInput() throws {
+    let built = ExecutionInput(text: "kick it off", images: ["img-ref-1"], mode: .prompt)
+    let golden = try Golden.decode([ExecutionInput].self, from: "execution-inputs")
     #expect(built == golden[0])
   }
 
@@ -189,22 +189,23 @@ struct ConstructionTests {
     let retry = RetryIssuePayload(issueId: IssueId(rawValue: "iss-1"))
     #expect(retry == (try Golden.decode(RetryIssuePayload.self, from: "payload-retry-issue")))
 
-    // The `sessionEvents` resume context — both wire forms (present + absent origin
+    // The `executionEvents` resume context — both wire forms (present + absent origin
     // replay). A present context ALWAYS carries the STORE GENERATION its cursor was
     // minted in, because they are one value; an origin request omits the whole key.
     let generation = StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b")
-    let subscribe = SessionEventsPayload(
-      sessionId: SessionId(rawValue: "ses-1"),
+    let subscribe = ExecutionEventsPayload(
+      executionId: ExecutionId(rawValue: "exe-1"),
       resume: ResumeContext(sinceOffset: 12, generation: generation))
     #expect(
-      subscribe == (try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")))
-    let subscribeFromOrigin = SessionEventsPayload(sessionId: SessionId(rawValue: "ses-1"))
+      subscribe
+        == (try Golden.decode(ExecutionEventsPayload.self, from: "payload-execution-events")))
+    let subscribeFromOrigin = ExecutionEventsPayload(executionId: ExecutionId(rawValue: "exe-1"))
     #expect(
       subscribeFromOrigin
         == (try Golden.decode(
-          SessionEventsPayload.self, from: "payload-session-events-no-offset")))
+          ExecutionEventsPayload.self, from: "payload-execution-events-no-offset")))
 
-    let interrupt = InterruptPayload(sessionId: SessionId(rawValue: "ses-1"))
+    let interrupt = InterruptPayload(executionId: ExecutionId(rawValue: "exe-1"))
     #expect(interrupt == (try Golden.decode(InterruptPayload.self, from: "payload-interrupt")))
 
     // The `events` resume context — both wire forms (present + absent origin replay).
@@ -219,13 +220,13 @@ struct ConstructionTests {
 
   @Test("builds the send/answer payloads equal to their goldens")
   func buildsSendPayloads() throws {
-    let send = SessionSendPayload(
-      sessionId: SessionId(rawValue: "ses-1"),
-      input: SessionInput(text: "go", images: nil, mode: .prompt))
-    #expect(send == (try Golden.decode(SessionSendPayload.self, from: "payload-session-send")))
+    let send = ExecutionSendPayload(
+      executionId: ExecutionId(rawValue: "exe-1"),
+      input: ExecutionInput(text: "go", images: nil, mode: .prompt))
+    #expect(send == (try Golden.decode(ExecutionSendPayload.self, from: "payload-execution-send")))
 
     let answer = AnswerUiRequestPayload(
-      sessionId: SessionId(rawValue: "ses-1"),
+      executionId: ExecutionId(rawValue: "exe-1"),
       response: UiResponse(requestId: "req-1", answer: .confirmed(confirmed: true)))
     #expect(
       answer

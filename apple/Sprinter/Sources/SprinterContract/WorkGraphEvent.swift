@@ -14,7 +14,7 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
   case epicChanged(Epic)
   case issueChanged(Issue)
   case jobChanged(Job)
-  case sessionChanged(Session)
+  case executionChanged(Execution)
   case agentChanged(Agent)
 
   private enum CodingKeys: String, CodingKey {
@@ -24,7 +24,7 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     case epic
     case issue
     case job
-    case session
+    case execution
     case agent
   }
 
@@ -42,8 +42,8 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
       self = .issueChanged(try container.decode(Issue.self, forKey: .issue))
     case "JobChanged":
       self = .jobChanged(try container.decode(Job.self, forKey: .job))
-    case "SessionChanged":
-      self = .sessionChanged(try container.decode(Session.self, forKey: .session))
+    case "ExecutionChanged":
+      self = .executionChanged(try container.decode(Execution.self, forKey: .execution))
     case "AgentChanged":
       self = .agentChanged(try container.decode(Agent.self, forKey: .agent))
     default:
@@ -73,9 +73,9 @@ public enum WorkGraphEvent: Codable, Equatable, Sendable {
     case .jobChanged(let value):
       try container.encode("JobChanged", forKey: .tag)
       try container.encode(value, forKey: .job)
-    case .sessionChanged(let value):
-      try container.encode("SessionChanged", forKey: .tag)
-      try container.encode(value, forKey: .session)
+    case .executionChanged(let value):
+      try container.encode("ExecutionChanged", forKey: .tag)
+      try container.encode(value, forKey: .execution)
     case .agentChanged(let value):
       try container.encode("AgentChanged", forKey: .tag)
       try container.encode(value, forKey: .agent)

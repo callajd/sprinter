@@ -3,23 +3,23 @@ import SprinterContract
 /// A live agent working an ``Issue`` — the "per-agent activity" the board surfaces
 /// alongside static status (BE2.1).
 ///
-/// It is derived from the snapshot's ``Job``/``Session`` model: an issue is being
+/// It is derived from the snapshot's ``Job``/``Execution`` model: an issue is being
 /// worked when it has a `running` ``Job`` (or a `queued`/other job whose
-/// ``Session`` is `active`). The activity names the job driving the work, its
-/// ``JobKind``, and the session (if any) carrying the transcript — enough for the
+/// ``Execution`` is `active`). The activity names the job driving the work, its
+/// ``JobKind``, and the execution (if any) carrying the transcript — enough for the
 /// board to show *which* agent is live, not merely that the issue is `inProgress`.
 public struct IssueActivity: Sendable, Equatable {
   /// The job whose live execution this activity reflects.
   public let jobId: JobId
   /// What the live agent is doing (implement / review / …).
   public let kind: JobKind
-  /// The session carrying the run's transcript, when one has started.
-  public let sessionId: SessionId?
+  /// The execution carrying the run's transcript, when one has started.
+  public let executionId: ExecutionId?
 
-  public init(jobId: JobId, kind: JobKind, sessionId: SessionId?) {
+  public init(jobId: JobId, kind: JobKind, executionId: ExecutionId?) {
     self.jobId = jobId
     self.kind = kind
-    self.sessionId = sessionId
+    self.executionId = executionId
   }
 }
 

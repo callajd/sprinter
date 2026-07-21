@@ -48,7 +48,7 @@ struct MissionControlBoardTests {
       epics: [BoardFixtures.epicB],
       issues: [BoardFixtures.issueB],
       jobs: [],
-      sessions: [],
+      executions: [],
       agents: [],
       generation: StoreGenerationId(rawValue: "gen-test"))
     board.apply(onlyB)

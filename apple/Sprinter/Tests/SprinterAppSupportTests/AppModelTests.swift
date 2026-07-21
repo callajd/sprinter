@@ -120,11 +120,11 @@ struct AppModelTests {
     #expect(await waitUntil { fake.wasClosed })
   }
 
-  /// A daemon RESTART (the session backend drops) is SELF-HEALED: the reconnect loop
+  /// A daemon RESTART (the execution backend drops) is SELF-HEALED: the reconnect loop
   /// observes the drop via the connection's liveness watch and RE-DIALS a fresh backend, so
   /// the shell recovers to `.connected` instead of staying stuck on a dead/`nil` backend
-  /// (CE3.1-F2 restart watch-item — the session-channel side of restart safety).
-  @Test("a dropped session backend is re-dialed (restart self-heal)")
+  /// (CE3.1-F2 restart watch-item — the execution-channel side of restart safety).
+  @Test("a dropped execution backend is re-dialed (restart self-heal)")
   func reDialsAfterDrop() async throws {
     let model = AppModel(
       daemon: DaemonConnection(connect: { FakeBackend(snapshot: AppSupportFixtures.snapshot) }),
@@ -134,7 +134,7 @@ struct AppModelTests {
     #expect(await waitUntil { model.connectionState == .connected })
     let first = try #require(model.backend as? FakeBackend)
 
-    // The daemon goes away mid-connection: drop the current session backend.
+    // The daemon goes away mid-connection: drop the current execution backend.
     first.simulateDrop()
 
     // The loop re-dials → a fresh, DISTINCT backend, connected again (not stuck on nil).
