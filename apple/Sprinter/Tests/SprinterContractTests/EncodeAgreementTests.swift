@@ -39,7 +39,7 @@ struct EncodeAgreementTests {
   /// The scope guard (D3). Pairing a golden with its mirror type is knowledge only
   /// `GoldenCase.all` holds, so a golden missing from it would simply never be checked in
   /// the encode direction — silently, and exactly for a NEWLY MIRRORED type, which is when
-  /// this matters most. Epics DE2–DE4 add `Execution`, `Session`, `Workspace`,
+  /// this matters most. Epics DE2–DE4 add `Execution`, `Execution`, `Workspace`,
   /// `PullRequest`, `Spec`, `SpecRevision` and the transcript variants under the same
   /// invariant, so the table is required to be EXACTLY the bundle's goldens: add a golden
   /// without adding its case here and this fails.

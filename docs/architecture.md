@@ -8,7 +8,7 @@
 ## 1. Purpose
 
 Sprinter is a control plane for agentic software development. A human plans work
-in an interactive session; that plan becomes a dependency DAG of Issues/Epics
+in an interactive execution; that plan becomes a dependency DAG of Issues/Epics
 grouped into Workstreams; a durable daemon schedules and runs each Issue by
 driving a Pi agent as a cognitive worker; and a GUI monitors everything and pairs
 each agent's transcript with the PR it produced. Multiple workstreams run
@@ -18,7 +18,7 @@ concurrently across multiple repositories.
 
 | Concept | Definition | Execution |
 |---|---|---|
-| **Issue** | one ~PR-sized feature | one agent **session** → one branch → one PR |
+| **Issue** | one ~PR-sized feature | one agent **execution** → one branch → one PR |
 | **Epic** | a related set of Issues | scheduled group |
 | **Workstream** | a related set of Epics, one spec, one repo | top-level unit driven to done |
 
@@ -26,20 +26,20 @@ Issues/Epics/Workstreams form a **DAG** on their dependencies. The daemon owns
 topo-order, the ready-set, and parallelism limits. Work is **repo-scoped** per
 workstream; concurrency across repos is unbounded by design.
 
-### Job = Session = Transcript = PR
+### Job = Execution = Transcript = PR
 
-The unit of execution is a **Job**: one bounded cognitive task, run as one Pi
-**session**, producing one durable **transcript**, paired 1:1 with one **PR**.
+The unit of execution is a **Job**: one bounded cognitive task, run as one
+**Execution**, producing one durable **transcript**, paired 1:1 with one **PR**.
 Job kinds are an open set — `implement`, `review`, `resolve-conflict`,
 `address-findings`, `plan`, … The daemon core is agnostic to the kind; kind
 lives in per-kind handlers.
 
-### Cognitive worker ↔ interactive session is a spectrum
+### Cognitive worker ↔ interactive execution is a spectrum
 
-Every session runs **headless by default** but is **promotable to interactive**
-and is always **interruptible**. "Planning" is simply a session started
+Every execution runs **headless by default** but is **promotable to interactive**
+and is always **interruptible**. "Planning" is simply an execution started
 interactive whose product is a plan. There is no separate interactive subsystem —
-one mechanism, pointed at different sessions.
+one mechanism, pointed at different executions.
 
 ## 3. Topology
 
@@ -83,7 +83,7 @@ which host). Layers mix freely (e.g. local execution + hosted state + a GitHub
 > **We make the agent runtime itself a provider (D16, amends D1).**
 > `ExecutionRunner` is the abstract agent-runtime port; `pi --mode rpc`
 > (`PiAgentRunner`) is its first and only current adapter. Our core depends on the
-> owned, provider-neutral session model, never on Pi — we mirror Pi's (already
+> owned, provider-neutral execution model, never on Pi — we mirror Pi's (already
 > model-provider-general) event shape as our owned `Schema` and translate it at the
 > adapter boundary. And **we keep everything maximally reactive end-to-end (D17,
 > INV-REACTIVE)** — we run a push spine from Pi stdout → `Stream` → `PubSub` →
@@ -95,16 +95,16 @@ import { Context, Effect, Layer, Stream, Scope, Schema } from "effect"
 
 // ── ExecutionRunner ────────────────────────────────────────────────
 export class ExecutionRunner extends Context.Service<ExecutionRunner, {
-  // Start a session (headless by default); the handle is Scope-managed.
-  readonly run: (job: Job) => Effect.Effect<SessionHandle, SpawnError, Scope.Scope>
-  // Re-attach to a persisted session (resume path).
-  readonly resume: (ref: SessionRef) => Effect.Effect<SessionHandle, SpawnError, Scope.Scope>
+  // Start an execution (headless by default); the handle is Scope-managed.
+  readonly run: (job: Job) => Effect.Effect<ExecutionHandle, SpawnError, Scope.Scope>
+  // Re-attach to a persisted execution (resume path).
+  readonly resume: (ref: ExecutionRef) => Effect.Effect<ExecutionHandle, SpawnError, Scope.Scope>
 }>()("sprinter/execution/ExecutionRunner") {}
 
-export interface SessionHandle {
-  readonly sessionId: SessionId
-  readonly events: Stream.Stream<SessionEvent>                      // owned; translated from Pi's AgentSessionEvent
-  readonly send: (input: SessionInput) => Effect.Effect<void>        // prompt | steer | follow_up
+export interface ExecutionHandle {
+  readonly executionId: ExecutionId
+  readonly events: Stream.Stream<ExecutionEvent>                      // owned; translated from Pi's AgentSessionEvent
+  readonly send: (input: ExecutionInput) => Effect.Effect<void>        // prompt | steer | follow_up
   readonly interrupt: Effect.Effect<void>                           // abort
   readonly result: Effect.Effect<JobResult>                         // settles when the job ends
 }
@@ -112,7 +112,7 @@ export interface SessionHandle {
 // ── StateStore ─────────────────────────────────────────────────────
 export class StateStore extends Context.Service<StateStore, {
   readonly workGraph: WorkGraphStore     // workstream/epic/issue + status + deps
-  readonly jobs: JobStore                // job/session registry, transcript refs
+  readonly jobs: JobStore                // job/execution registry, transcript refs
   readonly events: EventLogStore         // append-only projection feed
 }>()("sprinter/state/StateStore") {}
 
@@ -141,7 +141,7 @@ export class Repository extends Context.Service<Repository, {
 | `Repository` | GitHub.com → GitHub Enterprise, other hosts |
 | `Backend` *(client)* | local daemon → remote/hosted daemon |
 
-Per-session/per-job resources (child process, subscriber set) are
+Per-execution/per-job resources (child process, subscriber set) are
 candidates for `LayerMap.Service`, which builds and tears down layers keyed by
 an id — a natural fit for "one resource bundle per running job."
 
@@ -179,9 +179,9 @@ reimplement them natively in Effect.
 // illustrative flow, effect/unstable/process
 // 1. ChildProcess.make("pi", "--mode", "rpc") |> setCwd(cwd) |> setEnv(...)
 // 2. spawn under Scope (ChildProcessSpawner) → auto-kill on scope close
-// 3. stdout: Ndjson decode → Schema.decode(AgentSessionEvent) → translate to SessionEvent
-//            → published to a per-session PubSub (SessionHandle.events subscribes)
-// 4. stdin:  SessionInput → Schema.encode → Ndjson encode → child.stdin
+// 3. stdout: Ndjson decode → Schema.decode(AgentSessionEvent) → translate to ExecutionEvent
+//            → published to a per-execution PubSub (ExecutionHandle.events subscribes)
+// 4. stdin:  ExecutionInput → Schema.encode → Ndjson encode → child.stdin
 //            correlate responses by `id` (Deferred per pending command)
 // 5. interrupt: send `abort`, then process kill on scope close
 ```
@@ -241,9 +241,9 @@ models**:
    out to many attached clients.
 3. **Commands** — the write path: create-workstream-from-plan, start / pause /
    resume / cancel, retry a failed Issue.
-4. **Interactive session channel** — for the "every session interactive" and
+4. **Interactive execution channel** — for the "every execution interactive" and
    "planning in the app" requirements:
-   - a streaming RPC to follow a specific session's events (incl. Pi
+   - a streaming RPC to follow a specific execution's events (incl. Pi
      `extension_ui_request`s the agent raises mid-run — the "agent is waiting on
      you" inbox),
    - request/response RPCs to `send` (`prompt`/`steer`/`follow_up`),
@@ -258,8 +258,8 @@ export class SprinterRpc extends RpcGroup.make(
   Rpc.make("events",            { success: RpcSchema.Stream(DomainEvent, Never) }),   // live subscription
   Rpc.make("createWorkstream",  { payload: PlanRef, success: WorkstreamId, error: PlanError }),
   Rpc.make("controlWorkstream", { payload: ControlCmd, success: Void }),
-  Rpc.make("sessionEvents",     { payload: SessionId, success: RpcSchema.Stream(SessionEvent, Never) }),
-  Rpc.make("sessionSend",       { payload: SessionInput }),
+  Rpc.make("executionEvents",     { payload: ExecutionId, success: RpcSchema.Stream(ExecutionEvent, Never) }),
+  Rpc.make("executionSend",       { payload: ExecutionInput }),
   Rpc.make("answerUiRequest",   { payload: UiResponse }),
 ) {}
 ```
@@ -277,15 +277,15 @@ contract keep the two sides in lockstep (both live in one repo and land together
 
 The client is **three surfaces over one contract**, not a monolith:
 
-1. **Interactive session** — drive and interrupt *any* session. Reused for
-   **planning** (a fresh interactive session whose output materializes into the
+1. **Interactive execution** — drive and interrupt *any* execution. Reused for
+   **planning** (a fresh interactive execution whose output materializes into the
    work graph) *and* for "taking the wheel" of any in-flight Job. Subscribes to
-   `sessionEvents`; issues `sessionSend`/`interrupt`/`answerUiRequest`.
+   `executionEvents`; issues `executionSend`/`interrupt`/`answerUiRequest`.
 2. **Mission Control** — the cross-repo DAG/board: workstream → epic → issue with
    live status (ongoing / paused / complete), per-agent activity, token/cost
    budgets, and the "agent is waiting on you" inbox. Driven by `snapshot` +
    `events`.
-3. **Inspector** — the transcript↔PR paired view: an agent's complete session
+3. **Inspector** — the transcript↔PR paired view: an agent's complete execution
    rendered alongside the PR it produced. Transcript rendering is an open choice
    (§10): render natively from Pi session entries vs. embed Pi's `export-html`.
 
@@ -296,7 +296,7 @@ The client is **three surfaces over one contract**, not a monolith:
 | Tier | State | Backing | Survives |
 |---|---|---|---|
 | Work graph | workstream/epic/issue, DAG, status | StateStore (GitHub = leaf Issues/PRs) | everything |
-| Execution | in-flight session, transcript | Pi session JSONL | daemon restart (resumable) |
+| Execution | in-flight execution, transcript | Pi session JSONL | daemon restart (resumable) |
 | Live process | running `pi` child, active stream | — | nothing (reconstructed) |
 | Client connection | attached view | — | nothing (reattaches) |
 
@@ -322,7 +322,7 @@ process health.
 
 1. **Pi binary provisioning** — global install vs. bundled pinned binary vs.
    daemon-managed; and the schema↔pi version-compat policy.
-2. **Transcript rendering in the Inspector** — native from session entries
+2. **Transcript rendering in the Inspector** — native from execution entries
    (interactive, more work) vs. embed Pi `export-html` (fast, static).
 3. **StateStore first adapter** — which backing to implement first *behind* the
    backing-agnostic `StateStore` Service (a SQL adapter, e.g. SQLite, vs. eventlog
@@ -337,11 +337,11 @@ process health.
 ## 11. Build sequence (proposed slices)
 
 1. **Owned Pi protocol schema** + `ExecutionRunner` local adapter (`LocalPiRunner`):
-   spawn, NDJSON bridge, `SessionHandle`, resume. The Pi-specific heart.
+   spawn, NDJSON bridge, `ExecutionHandle`, resume. The Pi-specific heart.
 2. **StateStore** + the DAG scheduler on the durable `Workflow` spine.
 3. **`ControlPlaneTransport`** RpcGroup + the snapshot/subscription/command/
-   session models; reconnect + resync protocol.
-4. **SwiftUI client** — Mission Control first, then Interactive session, then
+   execution models; reconnect + resync protocol.
+4. **SwiftUI client** — Mission Control first, then Interactive execution, then
    Inspector.
 5. **Remote adapters** — cluster evaluation for `ExecutionRunner` and transport.
 

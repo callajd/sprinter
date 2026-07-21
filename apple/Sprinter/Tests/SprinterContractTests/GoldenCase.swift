@@ -109,7 +109,7 @@ extension GoldenCase {
   /// value types (`Timestamp`-shaped strings, `CommitSha`, `BranchName` — in scope for
   /// ENCODE SHAPE, out of scope for validation), because the containers that embed the
   /// optional-bearing types are where a nesting mistake would actually show up.
-  static let all: [GoldenCase] = readModel + registry + sessionModel + commands
+  static let all: [GoldenCase] = readModel + registry + executionModel + commands
 
   /// The owned read model and the STATE layer, plus the hydration snapshot.
   private static let readModel: [GoldenCase] = [
@@ -124,7 +124,7 @@ extension GoldenCase {
     GoldenCase("issue-no-pr", Issue.self),
     GoldenCase("job-full", Job.self),
     GoldenCase("job-minimal", Job.self),
-    GoldenCase("session", Session.self),
+    GoldenCase("execution", Execution.self),
     GoldenCase("pull-request-ref", PullRequestRef.self),
     GoldenCase("work-graph-events", [WorkGraphEvent].self),
     GoldenCase("offset-events", [OffsetEvent].self)
@@ -137,13 +137,13 @@ extension GoldenCase {
     GoldenCase("agent-retired", Agent.self)
   ]
 
-  /// The session channel: its events, transcript records and neutral I/O types.
-  private static let sessionModel: [GoldenCase] = [
-    GoldenCase("session-events", [SessionEvent].self),
-    GoldenCase("offset-session-events", [OffsetSessionEvent].self),
+  /// The execution channel: its events, transcript records and neutral I/O types.
+  private static let executionModel: [GoldenCase] = [
+    GoldenCase("execution-events", [ExecutionEvent].self),
+    GoldenCase("offset-execution-events", [OffsetExecutionEvent].self),
     GoldenCase("transcript-entries", [TranscriptEntry].self),
     GoldenCase("usages", [Usage].self),
-    GoldenCase("session-inputs", [SessionInput].self),
+    GoldenCase("execution-inputs", [ExecutionInput].self),
     GoldenCase("ui-responses", [UiResponse].self),
     GoldenCase("json-values", [JSONValue].self)
   ]
@@ -154,13 +154,13 @@ extension GoldenCase {
     GoldenCase("control-actions", [ControlAction].self),
     GoldenCase("payload-events", EventsPayload.self),
     GoldenCase("payload-events-no-offset", EventsPayload.self),
-    GoldenCase("payload-session-events", SessionEventsPayload.self),
-    GoldenCase("payload-session-events-no-offset", SessionEventsPayload.self),
+    GoldenCase("payload-execution-events", ExecutionEventsPayload.self),
+    GoldenCase("payload-execution-events-no-offset", ExecutionEventsPayload.self),
     GoldenCase(
       "payload-create-workstream-from-plan", CreateWorkstreamFromPlanPayload.self),
     GoldenCase("payload-control", ControlPayload.self),
     GoldenCase("payload-retry-issue", RetryIssuePayload.self),
-    GoldenCase("payload-session-send", SessionSendPayload.self),
+    GoldenCase("payload-execution-send", ExecutionSendPayload.self),
     GoldenCase("payload-interrupt", InterruptPayload.self),
     GoldenCase("payload-answer-ui-request", AnswerUiRequestPayload.self),
     GoldenCase("response-workstream-id", WorkstreamId.self),

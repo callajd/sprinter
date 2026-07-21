@@ -52,32 +52,32 @@
 import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "effect";
 import {
   type OffsetEvent,
-  type OffsetSessionEvent,
+  type OffsetExecutionEvent,
   type ResumeContext,
   ResyncRequired,
   WorkGraphEvent,
 } from "@sprinter/contract";
 import {
   type Agent,
+  type ExecutionEvent,
+  type ExecutionId,
   type NonNegativeInt,
   observationsAgree,
   type Repository,
-  type SessionEvent,
-  type SessionId,
 } from "@sprinter/domain";
 import {
   type AgentWrite,
   type PersistedEvent,
-  type PersistedSessionEvent,
+  type PersistedExecutionEvent,
   StateStore,
   type StateStoreError,
 } from "@sprinter/state";
-import { SessionEvents } from "./session-events.ts";
+import { ExecutionEvents } from "./execution-events.ts";
 import { WorkGraphEvents } from "./work-graph-events.ts";
 
 type Store = Context.Service.Shape<typeof StateStore>;
 type Feed = Context.Service.Shape<typeof WorkGraphEvents>;
-type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
+type ExecutionFeed = Context.Service.Shape<typeof ExecutionEvents>;
 
 // ── journaling + publishing decorator ─────────────────────────────────────────
 
@@ -263,48 +263,48 @@ const putRepositoryAndJournal = (
 };
 
 /**
- * Persist one durable, transcript-grade {@link SessionEvent} to the session's durable
- * transcript log (minting its per-session offset), THEN fan it out live on the
- * {@link SessionEvents} feed stamped with that same offset. The session log's `append` is a
+ * Persist one durable, transcript-grade {@link ExecutionEvent} to the execution's durable
+ * transcript log (minting its per-execution offset), THEN fan it out live on the
+ * {@link ExecutionEvents} feed stamped with that same offset. The execution log's `append` is a
  * single atomic write (no separate node write to bind), so there is no transaction to wrap;
  * the live publish happens AFTER the durable append commits, so the live tail and the
- * durable replay share ONE per-session coordinate space — the property the `sinceOffset`
- * reconnect resume relies on. Mirrors {@link putAndJournal} for the session channel.
+ * durable replay share ONE per-execution coordinate space — the property the `sinceOffset`
+ * reconnect resume relies on. Mirrors {@link putAndJournal} for the execution channel.
  */
 const appendAndPublish =
-  (base: Store, sessionFeed: SessionFeed) =>
+  (base: Store, executionFeed: ExecutionFeed) =>
   (
-    sessionId: SessionId,
-    event: SessionEvent,
-  ): Effect.Effect<PersistedSessionEvent, StateStoreError> =>
-    base.sessionLog
-      .append(sessionId, event)
+    executionId: ExecutionId,
+    event: ExecutionEvent,
+  ): Effect.Effect<PersistedExecutionEvent, StateStoreError> =>
+    base.executionLog
+      .append(executionId, event)
       .pipe(
         Effect.tap((persisted) =>
-          sessionFeed.publish({ sessionId, offset: persisted.offset, event }),
+          executionFeed.publish({ executionId, offset: persisted.offset, event }),
         ),
       );
 
 /**
- * Fan one EPHEMERAL live session event out on the {@link SessionEvents} feed OFFSET-LESS,
- * WITHOUT persisting it — the live-only half of the session channel's dual modality.
+ * Fan one EPHEMERAL live execution event out on the {@link ExecutionEvents} feed OFFSET-LESS,
+ * WITHOUT persisting it — the live-only half of the execution channel's dual modality.
  * Where {@link appendAndPublish} persists a durable entry and publishes it stamped with
  * its minted offset, this publishes with NO offset (the item omits the key), so the event
  * reaches every live subscriber to drive the reactive flow but never joins the durable
  * transcript and never advances the `sinceOffset` reconnect cursor. Total (it cannot fail).
  */
 const publishEphemeralLive =
-  (sessionFeed: SessionFeed) =>
-  (sessionId: SessionId, event: SessionEvent): Effect.Effect<void> =>
-    sessionFeed.publish({ sessionId, event });
+  (executionFeed: ExecutionFeed) =>
+  (executionId: ExecutionId, event: ExecutionEvent): Effect.Effect<void> =>
+    executionFeed.publish({ executionId, event });
 
 /**
  * Build the journaling store shape: delegate to `base`, then for each `put*` journal
  * its delta durably AND publish it live stamped with the durable offset, and for each
- * durable session-transcript `append` publish it live on the {@link SessionEvents} feed
- * stamped with its per-session offset.
+ * durable execution-transcript `append` publish it live on the {@link ExecutionEvents} feed
+ * stamped with its per-execution offset.
  */
-const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
+const journaling = (base: Store, feed: Feed, executionFeed: ExecutionFeed): Store =>
   StateStore.of({
     // The REGISTRY layer journals through the SAME seam as the work graph: an
     // append is durable-plus-live in one transaction, fanned out as `AgentChanged`.
@@ -354,23 +354,23 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
         putAndJournal(base, feed, base.jobs.putJob(job), { _tag: "JobChanged", job }),
       getJob: base.jobs.getJob,
       listJobsForIssue: base.jobs.listJobsForIssue,
-      putSession: (session) =>
-        putAndJournal(base, feed, base.jobs.putSession(session), {
-          _tag: "SessionChanged",
-          session,
+      putExecution: (execution) =>
+        putAndJournal(base, feed, base.jobs.putExecution(execution), {
+          _tag: "ExecutionChanged",
+          execution,
         }),
-      getSession: base.jobs.getSession,
-      getSessionForJob: base.jobs.getSessionForJob,
+      getExecution: base.jobs.getExecution,
+      getExecutionForJob: base.jobs.getExecutionForJob,
     },
     events: base.events,
-    sessionLog: {
-      append: appendAndPublish(base, sessionFeed),
-      publishEphemeral: publishEphemeralLive(sessionFeed),
-      read: base.sessionLog.read,
-      tail: base.sessionLog.tail,
+    executionLog: {
+      append: appendAndPublish(base, executionFeed),
+      publishEphemeral: publishEphemeralLive(executionFeed),
+      read: base.executionLog.read,
+      tail: base.executionLog.tail,
       // Pure reads — no live fan-out — so they delegate straight to the base store.
-      countEntries: base.sessionLog.countEntries,
-      maxOffset: base.sessionLog.maxOffset,
+      countEntries: base.executionLog.countEntries,
+      maxOffset: base.executionLog.maxOffset,
     },
     // The generation is a property of the DURABLE store, not of journaling: this
     // decorator adds a live fan-out over the same tables, so it reports the base
@@ -391,14 +391,14 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
  */
 export const layerJournaling = <RIn>(
   baseLayer: Layer.Layer<StateStore, StateStoreError, RIn>,
-): Layer.Layer<StateStore, StateStoreError, RIn | WorkGraphEvents | SessionEvents> =>
+): Layer.Layer<StateStore, StateStoreError, RIn | WorkGraphEvents | ExecutionEvents> =>
   Layer.effect(
     StateStore,
     Effect.gen(function* () {
       const base = yield* StateStore;
       const feed = yield* WorkGraphEvents;
-      const sessionFeed = yield* SessionEvents;
-      return journaling(base, feed, sessionFeed);
+      const executionFeed = yield* ExecutionEvents;
+      return journaling(base, feed, executionFeed);
     }),
   ).pipe(Layer.provide(baseLayer));
 
@@ -551,33 +551,33 @@ export const resyncEvents = (
     ),
   );
 
-// ── session-transcript durable replay ─────────────────────────────────────────
+// ── execution-transcript durable replay ──────────────────────────────────────────────────────
 
 /**
- * The session-transcript durable replay stream: every persisted {@link OffsetSessionEvent}
- * for `sessionId` with an offset strictly greater than `offset`, in offset order — the
- * per-session {@link SessionLogStore.tail} primitive a `sessionEvents` client resumes from
- * its last-seen cursor. The session-channel mirror of {@link resyncFrom}.
+ * The execution-transcript durable replay stream: every persisted {@link OffsetExecutionEvent}
+ * for `executionId` with an offset strictly greater than `offset`, in offset order — the
+ * per-execution {@link ExecutionLogStore.tail} primitive a `executionEvents` client resumes from
+ * its last-seen cursor. The execution-channel mirror of {@link resyncFrom}.
  *
  * A persisted transcript entry already IS an offset-paired owned value
- * ({@link PersistedSessionEvent} is structurally an {@link OffsetSessionEvent}), so no
+ * ({@link PersistedExecutionEvent} is structurally an {@link OffsetExecutionEvent}), so no
  * per-entry decode is needed — unlike the work-graph log's open `kind`/`payload` envelope,
- * the transcript log is typed to the owned `SessionEvent`. A store read failure is a defect
+ * the transcript log is typed to the owned `ExecutionEvent`. A store read failure is a defect
  * (`orDie`) rather than a stream error, keeping the feed's error channel exactly the
- * contract's `SessionNotFound` (raised only by the liveness gate, never the durable read).
+ * contract's `ExecutionNotFound` (raised only by the liveness gate, never the durable read).
  */
-export const resyncSessionFrom = (
+export const resyncExecutionFrom = (
   store: Store,
-  sessionId: SessionId,
+  executionId: ExecutionId,
   offset: number,
-): Stream.Stream<OffsetSessionEvent> =>
+): Stream.Stream<OffsetExecutionEvent> =>
   Stream.unwrap(
-    store.sessionLog.tail(sessionId, offset).pipe(
+    store.executionLog.tail(executionId, offset).pipe(
       Effect.orDie,
       Effect.map((entries) =>
         Stream.fromIterable(
           entries.map(
-            (entry): OffsetSessionEvent => ({ offset: entry.offset, event: entry.event }),
+            (entry): OffsetExecutionEvent => ({ offset: entry.offset, event: entry.event }),
           ),
         ),
       ),

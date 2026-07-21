@@ -6,7 +6,7 @@ import SprinterContract
 /// It serves a fixed baseline ``Snapshot`` and lets the test push live
 /// ``WorkGraphEvent`` deltas on demand, so a real ``WorkGraphResync`` can be driven
 /// end to end without a daemon or network. Only the feed surface the board uses
-/// (`snapshot` + `events`) is scripted; the write/session methods are unused here
+/// (`snapshot` + `events`) is scripted; the write/execution methods are unused here
 /// and throw, since the board is a read-only projection.
 final class ScriptedBackend: Backend {
   private let baseline: Snapshot
@@ -29,7 +29,7 @@ final class ScriptedBackend: Backend {
 
   func close() async { continuation.finish() }
 
-  // MARK: - Unused write / session surface (the board only reads)
+  // MARK: - Unused write / execution surface (the board only reads)
 
   func createWorkstreamFromPlan(_ plan: WorkstreamPlan) async throws -> WorkstreamId {
     throw ContractError.planRejected(reason: "unsupported in ScriptedBackend")
@@ -43,19 +43,19 @@ final class ScriptedBackend: Backend {
     throw ContractError.issueNotFound(id: issueId)
   }
 
-  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+  func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<ExecutionEvent, any Error> {
     AsyncThrowingStream { $0.finish() }
   }
 
-  func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 
-  func interrupt(sessionId: SessionId) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func interrupt(executionId: ExecutionId) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 
-  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 }

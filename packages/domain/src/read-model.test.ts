@@ -9,7 +9,7 @@ import {
   isTerminal,
   Job,
   PullRequestRef,
-  Session,
+  Execution,
   Workstream,
 } from "./read-model.ts";
 
@@ -41,7 +41,7 @@ const issueWithoutPr = {
   id: "issue-8",
   epicId: "epic-fe2",
   number: 8,
-  title: "FE2.1 — Domain + neutral session schemas",
+  title: "FE2.1 — Domain + neutral execution schemas",
   status: "in_progress",
   dependsOn: [],
 };
@@ -63,12 +63,12 @@ const jobMinimal = {
 const jobFull = {
   ...jobMinimal,
   status: "succeeded",
-  sessionId: "sess-1",
+  executionId: "sess-1",
   transcriptRef: "transcripts/sess-1.jsonl",
   pr: { number: 42, url: "https://github.com/callajd/sprinter/pull/42", merged: false },
 };
 
-const session = { id: "sess-1", jobId: "job-1", status: "active" };
+const execution = { id: "sess-1", jobId: "job-1", status: "active" };
 
 it.effect("round-trips the whole read model (with and without optional keys)", () =>
   Effect.gen(function* () {
@@ -79,7 +79,7 @@ it.effect("round-trips the whole read model (with and without optional keys)", (
     yield* assertRoundTrip(PullRequestRef, issueWithPr.pr);
     yield* assertRoundTrip(Job, jobMinimal);
     yield* assertRoundTrip(Job, jobFull);
-    yield* assertRoundTrip(Session, session);
+    yield* assertRoundTrip(Execution, execution);
   }),
 );
 
@@ -95,7 +95,7 @@ it.effect("rejects representative invalid inputs", () =>
       [Issue, { ...issueWithoutPr, status: "merged" }],
       [Job, { ...jobMinimal, kind: "unknown-kind" }],
       [Job, { ...jobMinimal, status: "done" }],
-      [Session, { ...session, status: "paused" }],
+      [Execution, { ...execution, status: "paused" }],
       [PullRequestRef, { number: -1, url: "x", merged: true }],
     ];
     yield* Effect.forEach(invalids, ([schema, raw]) =>

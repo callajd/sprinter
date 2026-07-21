@@ -7,7 +7,7 @@
  * the fixtures pinning their present/absent forms — and prose does not fail a build. A new
  * `Schema.optionalKey` field whose fixture always populates it would leave the whole
  * omission-vs-`null` question unasked for that field, silently, while every gate stayed
- * green. Epics DE2–DE4 add `Execution`, `Session`, `Workspace`, `PullRequest`, `Spec`,
+ * green. Epics DE2–DE4 add `Execution`, `Execution`, `Workspace`, `PullRequest`, `Spec`,
  * `SpecRevision` and the transcript variants under exactly that risk.
  *
  * So the property is derived from the SCHEMAS instead of asserted about the files, at
@@ -27,7 +27,7 @@
  *
  * The walk is schema-directed and the census is keyed by the field's DECLARATION (see
  * {@link Census}), so a field is one entry however many goldens embed its type and by
- * whatever route: `Job.sessionId` reached through `job-minimal` and through
+ * whatever route: `Job.executionId` reached through `job-minimal` and through
  * `snapshot.jobs[1]` is the same entry, and its two forms may be pinned by different
  * goldens.
  *

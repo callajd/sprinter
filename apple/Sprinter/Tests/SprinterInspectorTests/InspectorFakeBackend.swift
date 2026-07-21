@@ -5,29 +5,29 @@ import SprinterContract
 /// A deterministic, offline fake ``Backend`` for BE4.1's inspector tests.
 ///
 /// It drives BOTH sides the inspector pairs, without a daemon or network:
-/// - the **session channel** — a fresh live ``SessionEvent`` feed per
-///   `sessionEvents` call (BE1's single-consumer feed re-subscribed on a restart),
+/// - the **execution channel** — a fresh live ``ExecutionEvent`` feed per
+///   `executionEvents` call (BE1's single-consumer feed re-subscribed on a restart),
 ///   whose current stream a test emits/finishes onto;
 /// - the **work graph** — a fixed baseline ``Snapshot`` served by `snapshot` plus an
 ///   `events` subscription a test pushes ``WorkGraphEvent`` deltas onto, so a real
 ///   ``WorkGraphResync`` folds them into fresh snapshots.
 ///
-/// A `sessionEvents` for an unknown session id fails with
-/// ``ContractError/sessionNotFound(id:)``, so the not-found path is exercised too.
+/// A `executionEvents` for an unknown execution id fails with
+/// ``ContractError/executionNotFound(id:)``, so the not-found path is exercised too.
 final class InspectorFakeBackend: Backend {
-  private let knownSession: SessionId
+  private let knownExecution: ExecutionId
   private let baseline: Snapshot
 
-  private let session = Locked(SessionFeed())
+  private let execution = Locked(ExecutionFeed())
   private let workGraph = Locked(WorkGraphFeed())
 
-  init(knownSession: SessionId, snapshot: Snapshot) {
-    self.knownSession = knownSession
+  init(knownExecution: ExecutionId, snapshot: Snapshot) {
+    self.knownExecution = knownExecution
     self.baseline = snapshot
-    // Prepare the first session feed eagerly so an `emit` right after `start()` is
+    // Prepare the first execution feed eagerly so an `emit` right after `start()` is
     // buffered, not lost, before the model's feed task subscribes.
-    let (stream, continuation) = AsyncThrowingStream<SessionEvent, any Error>.makeStream()
-    session.withLock {
+    let (stream, continuation) = AsyncThrowingStream<ExecutionEvent, any Error>.makeStream()
+    execution.withLock {
       $0.pending = stream
       $0.continuation = continuation
     }
@@ -38,20 +38,20 @@ final class InspectorFakeBackend: Backend {
     }
   }
 
-  // MARK: - Session feed control
+  // MARK: - Execution feed control
 
-  /// The number of live session feeds vended so far (one per `start`; a restart
+  /// The number of live execution feeds vended so far (one per `start`; a restart
   /// adds one).
-  var sessionFeedCount: Int { session.withLock { $0.count } }
+  var executionFeedCount: Int { execution.withLock { $0.count } }
 
-  /// Raises one event on the current live session feed.
-  func emit(_ event: SessionEvent) {
-    session.withLock { _ = $0.continuation?.yield(event) }
+  /// Raises one event on the current live execution feed.
+  func emit(_ event: ExecutionEvent) {
+    execution.withLock { _ = $0.continuation?.yield(event) }
   }
 
-  /// Ends the current live session feed cleanly (the session ended).
-  func finishSession() {
-    session.withLock { $0.continuation?.finish() }
+  /// Ends the current live execution feed cleanly (the execution ended).
+  func finishExecution() {
+    execution.withLock { $0.continuation?.finish() }
   }
 
   // MARK: - Work-graph feed control
@@ -79,41 +79,41 @@ final class InspectorFakeBackend: Backend {
     }
   }
 
-  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
-    guard sessionId == knownSession else {
+  func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<ExecutionEvent, any Error> {
+    guard executionId == knownExecution else {
       return AsyncThrowingStream {
-        $0.finish(throwing: ContractError.sessionNotFound(id: sessionId))
+        $0.finish(throwing: ContractError.executionNotFound(id: executionId))
       }
     }
-    return session.withLock { state in
+    return execution.withLock { state in
       state.count += 1
       if let pending = state.pending {
         state.pending = nil
         return pending
       }
-      let (stream, continuation) = AsyncThrowingStream<SessionEvent, any Error>.makeStream()
+      let (stream, continuation) = AsyncThrowingStream<ExecutionEvent, any Error>.makeStream()
       state.continuation = continuation
       return stream
     }
   }
 
   func close() async {
-    session.withLock { $0.continuation?.finish() }
+    execution.withLock { $0.continuation?.finish() }
     workGraph.withLock { $0.continuation?.finish() }
   }
 
   // MARK: - Unused write / input surface (the inspector reads two feeds)
 
-  func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
-    try requireKnown(sessionId)
+  func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws {
+    try requireKnown(executionId)
   }
 
-  func interrupt(sessionId: SessionId) async throws {
-    try requireKnown(sessionId)
+  func interrupt(executionId: ExecutionId) async throws {
+    try requireKnown(executionId)
   }
 
-  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
-    try requireKnown(sessionId)
+  func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws {
+    try requireKnown(executionId)
   }
 
   func createWorkstreamFromPlan(_ plan: WorkstreamPlan) async throws -> WorkstreamId {
@@ -128,13 +128,15 @@ final class InspectorFakeBackend: Backend {
     throw ContractError.issueNotFound(id: issueId)
   }
 
-  private func requireKnown(_ sessionId: SessionId) throws {
-    guard sessionId == knownSession else { throw ContractError.sessionNotFound(id: sessionId) }
+  private func requireKnown(_ executionId: ExecutionId) throws {
+    guard executionId == knownExecution else {
+      throw ContractError.executionNotFound(id: executionId)
+    }
   }
 
-  private struct SessionFeed {
-    var pending: AsyncThrowingStream<SessionEvent, any Error>?
-    var continuation: AsyncThrowingStream<SessionEvent, any Error>.Continuation?
+  private struct ExecutionFeed {
+    var pending: AsyncThrowingStream<ExecutionEvent, any Error>?
+    var continuation: AsyncThrowingStream<ExecutionEvent, any Error>.Continuation?
     var count = 0
   }
 

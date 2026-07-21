@@ -1,12 +1,12 @@
 import SprinterAppSupport
 import SprinterBackend
 import SprinterContract
+import SprinterExecution
 import SprinterInspector
-import SprinterSession
 import SwiftUI
 
-/// Thin inspector View (CE3.1): pairs the reused session transcript with the PR pane.
-/// `InspectorViewModel` owns both feeds (the session channel and the work-graph feed that
+/// Thin inspector View (CE3.1): pairs the reused execution transcript with the PR pane.
+/// `InspectorViewModel` owns both feeds (the execution channel and the work-graph feed that
 /// keeps the PR pane live); this View renders them and owns the start/stop lifecycle for
 /// the selection it is shown for. The PR pane is read declaratively — `merged` flips as
 /// deltas fold in, with no monotonic assumption (the CE2 carried out-of-order constraint).
@@ -16,7 +16,7 @@ struct InspectorView: View {
 
   var body: some View {
     HSplitView {
-      SessionView(model: model.transcript)
+      ExecutionView(model: model.transcript)
         .frame(minWidth: 380)
       pullRequestPane
         .frame(minWidth: 260)
@@ -53,14 +53,14 @@ struct InspectorView: View {
 }
 
 /// Builds the `InspectorViewModel` and its fresh work-graph feed once per selection (keyed
-/// by the session id upstream), so a new selection gets a new single-consumer feed rather
+/// by the execution id upstream), so a new selection gets a new single-consumer feed rather
 /// than re-consuming a spent one.
 struct InspectorContainer: View {
   @State private var inspector: InspectorViewModel
   private let feed: WorkGraphResync
 
-  init(model: AppModel, backend: any Backend, sessionId: SessionId) {
-    _inspector = State(initialValue: InspectorViewModel(backend: backend, sessionId: sessionId))
+  init(model: AppModel, backend: any Backend, executionId: ExecutionId) {
+    _inspector = State(initialValue: InspectorViewModel(backend: backend, executionId: executionId))
     self.feed = model.makeWorkGraphFeed()
   }
 

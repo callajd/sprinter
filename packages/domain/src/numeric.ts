@@ -1,5 +1,5 @@
 /**
- * Shared numeric-constraint schemas for the owned domain (read model + session
+ * Shared numeric-constraint schemas for the owned domain (read model + execution
  * model). `pi/wire.ts` keeps its own copies deliberately — that module stays
  * dependency-free to remain a self-contained foreign wire mirror.
  */

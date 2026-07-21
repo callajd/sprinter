@@ -11,47 +11,49 @@ import Testing
 @Suite("Mission Control inbox lifecycle")
 @MainActor
 struct MissionControlInboxLifecycleTests {
-  private static let sessionA = SessionId(rawValue: "session-a")
-  private static let sessionB = SessionId(rawValue: "session-b")
+  private static let executionA = ExecutionId(rawValue: "execution-a")
+  private static let executionB = ExecutionId(rawValue: "execution-b")
 
   /// `stop()` is FINAL against a board mutation racing the inbox's release: after
-  /// `stop()`, a board change that re-fires the armed `trackActiveSessions` `onChange`
-  /// must NOT re-track or re-`start()` any session — no feed is re-subscribed, so a
-  /// prompt on a would-be-tracked session surfaces nothing. Guards the `isStopped`
+  /// `stop()`, a board change that re-fires the armed `trackActiveExecutions` `onChange`
+  /// must NOT re-track or re-`start()` any execution — no feed is re-subscribed, so a
+  /// prompt on a would-be-tracked execution surfaces nothing. Guards the `isStopped`
   /// short-circuit (the fix for the one-shot `onChange` re-arming after teardown).
-  @Test("after stop, a board mutation does not re-track or re-subscribe any session")
+  @Test("after stop, a board mutation does not re-track or re-subscribe any execution")
   func stopIsFinalAgainstBoardMutation() async throws {
-    let backend = InboxFakeBackend(sessionIds: [Self.sessionA, Self.sessionB])
+    let backend = InboxFakeBackend(executionIds: [Self.executionA, Self.executionB])
     let board = MissionControlBoard()
     board.apply(
       BoardFixtures.singleEpicSnapshot(
         issueIds: ["iss"],
-        jobs: [BoardFixtures.job("job", issue: "iss", status: .running, session: "session-a")],
-        sessions: []))
+        jobs: [BoardFixtures.job("job", issue: "iss", status: .running, execution: "execution-a")],
+        executions: []))
     let inbox = MissionControlInbox(backend: backend)
-    inbox.trackActiveSessions(of: board)
+    inbox.trackActiveExecutions(of: board)
 
-    // session-a is tracked live — confirm a prompt surfaces, so tracking is genuinely on.
+    // execution-a is tracked live — confirm a prompt surfaces, so tracking is genuinely on.
     backend.emit(
-      .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "A?", options: nil), on: Self.sessionA)
-    #expect(await waitUntil(inbox) { $0.map(\.sessionId) == [Self.sessionA] })
+      .uiRequestRaised(id: "req-a", kind: .confirm, prompt: "A?", options: nil), on: Self.executionA
+    )
+    #expect(await waitUntil(inbox) { $0.map(\.executionId) == [Self.executionA] })
 
     // Tear the inbox down (a dismissed sheet).
     inbox.stop()
     #expect(inbox.entries.isEmpty)
 
-    // The board changes WHILE the stopped inbox's `onChange` is still armed: session-b
-    // becomes the live agent. A pre-fix inbox re-fires `trackActiveSessions` → track(b)
+    // The board changes WHILE the stopped inbox's `onChange` is still armed: execution-b
+    // becomes the live agent. A pre-fix inbox re-fires `trackActiveExecutions` → track(b)
     // → start(b), re-subscribing a feed `stop()` should have made impossible.
     board.apply(
       BoardFixtures.singleEpicSnapshot(
         issueIds: ["iss"],
-        jobs: [BoardFixtures.job("job2", issue: "iss", status: .running, session: "session-b")],
-        sessions: []))
+        jobs: [BoardFixtures.job("job2", issue: "iss", status: .running, execution: "execution-b")],
+        executions: []))
 
-    // A prompt on session-b must surface NOTHING: it was never (re-)tracked or started.
+    // A prompt on execution-b must surface NOTHING: it was never (re-)tracked or started.
     backend.emit(
-      .uiRequestRaised(id: "req-b", kind: .confirm, prompt: "B?", options: nil), on: Self.sessionB)
+      .uiRequestRaised(id: "req-b", kind: .confirm, prompt: "B?", options: nil), on: Self.executionB
+    )
     #expect(await staysEmpty(inbox))
 
     // Second stop is idempotent.
@@ -62,7 +64,7 @@ struct MissionControlInboxLifecycleTests {
   }
 
   /// Polls the main-actor inbox until `predicate` holds over its entries, yielding
-  /// between checks so each session's feed-ingestion task can run. Returns `false` if
+  /// between checks so each execution's feed-ingestion task can run. Returns `false` if
   /// the bound is exhausted.
   private func waitUntil(
     _ inbox: MissionControlInbox,
@@ -76,7 +78,7 @@ struct MissionControlInboxLifecycleTests {
   }
 
   /// Yields many times and asserts the inbox's entries stay empty throughout — proof NO
-  /// session was (re-)tracked/subscribed after `stop()`: were a feed live, its emitted
+  /// execution was (re-)tracked/subscribed after `stop()`: were a feed live, its emitted
   /// prompt would surface within these yields. Returns `false` the moment an entry
   /// appears.
   private func staysEmpty(_ inbox: MissionControlInbox) async -> Bool {

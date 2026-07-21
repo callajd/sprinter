@@ -1,19 +1,19 @@
 /**
  * The owned domain read model — `Workstream ⊃ Epic ⊃ Issue`, plus `Job` and
- * `Session`, as Effect `Schema` (architecture §2).
+ * `Execution`, as Effect `Schema` (architecture §2).
  *
  * These are OUR types with plain names (INV-NAMING). They encode the
  * `workstream → epic → Issue → PR` mapping structurally: a workstream lists its
  * epics, an epic names its parent workstream and lists its issues, an issue
  * names its parent epic and carries the one PR that closes it. The execution
- * unit is a {@link Job} — 1 Job = 1 session = 1 transcript = 1 PR — so a job
- * carries the session running it, its transcript reference, and its PR.
+ * unit is a {@link Job} — 1 Job = 1 execution = 1 transcript = 1 PR — so a job
+ * carries the execution running it, its transcript reference, and its PR.
  *
  * These schemas are pure descriptions of shape; they reference no backing store
  * or running instance (INV-PORT).
  */
 import { Schema } from "effect";
-import { EpicId, IssueId, JobId, RepositoryId, SessionId, WorkstreamId } from "./ids.ts";
+import { EpicId, ExecutionId, IssueId, JobId, RepositoryId, WorkstreamId } from "./ids.ts";
 import { PositiveInt } from "./numeric.ts";
 
 /**
@@ -61,8 +61,8 @@ export type JobKind = (typeof JobKind)["Type"];
 export const JobStatus = Schema.Literals(["queued", "running", "succeeded", "failed", "cancelled"]);
 export type JobStatus = (typeof JobStatus)["Type"];
 
-/** Session lifecycle status. */
-export const SessionStatus = Schema.Literals([
+/** Execution lifecycle status. */
+export const ExecutionStatus = Schema.Literals([
   "starting",
   "active",
   "idle",
@@ -70,7 +70,7 @@ export const SessionStatus = Schema.Literals([
   "completed",
   "failed",
 ]);
-export type SessionStatus = (typeof SessionStatus)["Type"];
+export type ExecutionStatus = (typeof ExecutionStatus)["Type"];
 
 /**
  * A reference to the pull request that closes an {@link Issue} (and is produced
@@ -133,9 +133,9 @@ export const Workstream = Schema.Struct({
 export type Workstream = (typeof Workstream)["Type"];
 
 /**
- * A Job: one bounded cognitive task, run as one {@link Session}, producing one
+ * A Job: one bounded cognitive task, run as one {@link Execution}, producing one
  * durable transcript, paired 1:1 with one PR. Names the issue it advances, and —
- * as it runs — carries the session executing it, its transcript reference, and
+ * as it runs — carries the execution running it, its transcript reference, and
  * its PR.
  */
 export const Job = Schema.Struct({
@@ -143,22 +143,22 @@ export const Job = Schema.Struct({
   issueId: IssueId,
   kind: JobKind,
   status: JobStatus,
-  sessionId: Schema.optionalKey(SessionId),
+  executionId: Schema.optionalKey(ExecutionId),
   transcriptRef: Schema.optionalKey(Schema.NonEmptyString),
   pr: Schema.optionalKey(PullRequestRef),
 });
 export type Job = (typeof Job)["Type"];
 
-/** A Session: one agent run executing a {@link Job}. */
-export const Session = Schema.Struct({
-  id: SessionId,
+/** An Execution: one agent run executing a {@link Job}. */
+export const Execution = Schema.Struct({
+  id: ExecutionId,
   jobId: JobId,
-  status: SessionStatus,
+  status: ExecutionStatus,
 });
-export type Session = (typeof Session)["Type"];
+export type Execution = (typeof Execution)["Type"];
 
 /**
- * The terminal result of a {@link Job}, captured when its {@link Session} settles
+ * The terminal result of a {@link Job}, captured when its {@link Execution} settles
  * — the minimal, OPEN result envelope (D6). The daemon core treats it as opaque;
  * per-kind handlers own and interpret the `payload`. It carries only:
  *
@@ -169,8 +169,8 @@ export type Session = (typeof Session)["Type"];
  *   Job kind owns and narrows (`unknown` here; the core never inspects it).
  * - `error` — optional, neutral, human-readable failure detail on a failed job.
  *
- * This is a pure description of shape; it references no runner, session instance,
- * or backing store (INV-PORT). The Job runner (AE3) maps a settled session's
+ * This is a pure description of shape; it references no runner, execution instance,
+ * or backing store (INV-PORT). The Job runner (AE3) maps a settled execution's
  * outcome onto this envelope.
  */
 export const JobResult = Schema.Struct({

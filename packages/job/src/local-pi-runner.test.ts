@@ -6,7 +6,7 @@
  *
  *   - the **terminal-result contract**: a real `pi --mode rpc` stays alive after a
  *     turn, so the adapter must make the dispatch one-shot — the handle's `events`
- *     END at the first `SessionIdle` (Pi's `agent_settled`) and its `result`
+ *     END at the first `ExecutionIdle` (Pi's `agent_settled`) and its `result`
  *     resolves `Completed`, so `JobRunner.dispatch` never hangs;
  *   - a transport teardown resolves `result` as `Failed` (with a neutral detail);
  *   - a spawn failure is translated into the owned {@link ExecutionRunnerError} at
@@ -29,7 +29,7 @@ import { Ndjson } from "effect/unstable/encoding";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
 import { Job } from "@sprinter/domain";
-import { SessionResult } from "@sprinter/runner";
+import { ExecutionResult } from "@sprinter/runner";
 import { ExecutionRunner, layerInheritCwd, layerLocalPi } from "./index.ts";
 
 /**
@@ -106,7 +106,7 @@ it.effect("makes the dispatch one-shot: events end at agent_settled and result i
         expect(handle.pid).toBe(ChildProcessSpawner.ProcessId(4321));
 
         // A raw pi would keep emitting after the turn; the adapter truncates at the
-        // first SessionIdle so this collect TERMINATES rather than hanging.
+        // first ExecutionIdle so this collect TERMINATES rather than hanging.
         const collecting = yield* Effect.forkChild(Stream.runCollect(handle.events));
         yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
         yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
@@ -114,10 +114,10 @@ it.effect("makes the dispatch one-shot: events end at agent_settled and result i
         yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
 
         const events = yield* Fiber.join(collecting);
-        expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "SessionIdle" }]);
+        expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "ExecutionIdle" }]);
 
         const result = yield* handle.result;
-        expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+        expect(result).toEqual(Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Completed" }));
       }),
     ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
   }),
@@ -140,7 +140,7 @@ it.effect("settles Completed when pi output closes cleanly before any settle", (
         expect(events).toEqual([{ _tag: "TurnStarted" }]);
 
         const result = yield* handle.result;
-        expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+        expect(result).toEqual(Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Completed" }));
       }),
     ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
   }),
@@ -164,7 +164,7 @@ it.effect(
           //     prompt — the gate must DROP it (never truncate/complete here);
           //  2. the prompt drives a turn (`turn_start`), the agent works, and it
           //     settles — NOW the one-shot truncates, after real work.
-          // A broken gate would truncate at (1), ending the collect as `[SessionIdle]`
+          // A broken gate would truncate at (1), ending the collect as `[ExecutionIdle]`
           // (or `[]`) with the later events ignored — which this assertion catches.
           yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
           yield* Queue.offer(fake.stdoutRaw, { type: "turn_start" });
@@ -172,10 +172,10 @@ it.effect(
 
           const events = yield* Fiber.join(collecting);
           // The pre-prompt settle was dropped; the terminal settle follows a real turn.
-          expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "SessionIdle" }]);
+          expect(events).toEqual([{ _tag: "TurnStarted" }, { _tag: "ExecutionIdle" }]);
 
           const result = yield* handle.result;
-          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+          expect(result).toEqual(Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Completed" }));
         }),
       ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
     }),
@@ -203,7 +203,7 @@ it.effect(
           yield* Queue.offer(fake.stdoutRaw, { type: "agent_settled" });
 
           const result = yield* handle.result;
-          expect(result).toEqual(Schema.decodeUnknownSync(SessionResult)({ _tag: "Completed" }));
+          expect(result).toEqual(Schema.decodeUnknownSync(ExecutionResult)({ _tag: "Completed" }));
         }),
       ).pipe(Effect.provide(runnerLayer), Effect.provide(fake.layer));
     }),

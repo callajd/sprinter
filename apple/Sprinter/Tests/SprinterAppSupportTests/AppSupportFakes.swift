@@ -5,7 +5,7 @@ import SprinterContract
 /// A deterministic, offline fake ``Backend`` for the composition tests: it serves a
 /// fixed baseline ``Snapshot`` and keeps its `events` subscription open so a real
 /// ``WorkGraphResync`` (and the ``AppModel`` board it feeds) can be driven end to end
-/// without a daemon or network. The write/session surface is unused here and throws.
+/// without a daemon or network. The write/execution surface is unused here and throws.
 ///
 /// It supports MULTIPLE concurrent `events()` consumers (each a fresh stream), because a
 /// single connection is now consumed by BOTH the board feed and the ``AppModel`` reconnect
@@ -40,7 +40,7 @@ final class FakeBackend: Backend, @unchecked Sendable {
     feeds.finishAll()
   }
 
-  // MARK: - Unused write / session surface
+  // MARK: - Unused write / execution surface
 
   func createWorkstreamFromPlan(_ plan: WorkstreamPlan) async throws -> WorkstreamId {
     throw ContractError.planRejected(reason: "unsupported in FakeBackend")
@@ -54,20 +54,20 @@ final class FakeBackend: Backend, @unchecked Sendable {
     throw ContractError.issueNotFound(id: issueId)
   }
 
-  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+  func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<ExecutionEvent, any Error> {
     AsyncThrowingStream { $0.finish() }
   }
 
-  func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 
-  func interrupt(sessionId: SessionId) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func interrupt(executionId: ExecutionId) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 
-  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
-    throw ContractError.sessionNotFound(id: sessionId)
+  func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws {
+    throw ContractError.executionNotFound(id: executionId)
   }
 }
 
@@ -290,7 +290,7 @@ enum AppSupportFixtures {
         pullRequest: nil)
     ],
     jobs: [],
-    sessions: [],
+    executions: [],
     agents: [],
     generation: StoreGenerationId(rawValue: "gen-test"))
 }

@@ -1,4 +1,4 @@
-import SprinterSession
+import SprinterExecution
 
 /// One line of a **refined** file diff (CE3.2): the intra-hunk LCS pass over BE4's
 /// coarse ``DiffLine``s, so a line present unchanged on both sides renders once as

@@ -101,7 +101,7 @@ actor RpcConnection {
   ///
   /// Default-DENY: a tag not named here is treated as mutating, so a new procedure is safe
   /// until someone establishes it is read-only. Only `snapshot` qualifies today; the two
-  /// streaming tags (`events`, `sessionEvents`) are read-only too, but their abandonment path
+  /// streaming tags (`events`, `executionEvents`) are read-only too, but their abandonment path
   /// is ``interruptIfPending(_:)``, not this one.
   private static let daemonInterruptibleTags: Set<String> = ["snapshot"]
 

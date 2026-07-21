@@ -100,35 +100,37 @@ public struct RpcBackend: Backend {
     }
   }
 
-  // MARK: - Session channel (BE1.2)
+  // MARK: - Execution channel (BE1.2)
 
-  public func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error> {
+  public func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<
+    ExecutionEvent, any Error
+  > {
     AsyncThrowingStream { continuation in
       let task = Task {
         do {
-          // The wire carries the ``OffsetSessionEvent`` envelope — ONE channel
-          // serving BOTH modalities: DURABLE transcript-grade events carry a per-session
+          // The wire carries the ``OffsetExecutionEvent`` envelope — ONE channel
+          // serving BOTH modalities: DURABLE transcript-grade events carry a per-execution
           // `offset`, EPHEMERAL live deltas ride offset-less. Send a PRESENT
-          // ``SessionEventsPayload`` with NO `resume` key (→ origin replay of the durable
+          // ``ExecutionEventsPayload`` with NO `resume` key (→ origin replay of the durable
           // transcript, then live tail), then UNWRAP `.event` and yield EVERY event — durable
-          // and ephemeral alike — to the existing ``SessionEvent`` fold (unchanged), which folds
+          // and ephemeral alike — to the existing ``ExecutionEvent`` fold (unchanged), which folds
           // durable entries into the transcript and applies ephemeral deltas live. Tracking the
-          // offset for a reconnect resume is deferred — ``InteractiveSession`` is a single,
+          // offset for a reconnect resume is deferred — ``InteractiveExecution`` is a single,
           // non-reconnecting subscription — so only the wire is made offset-aware here (the
           // optional `offset` is unwrapped away); resume via a ``ResumeContext`` layers on later,
           // exactly as ``WorkGraphResync`` did for the `events` feed.
           //
-          // So this client is ORIGIN-ONLY on the session feed, and consequently the
-          // daemon's `sessionEvents` generation guard is LATENT: no `resume` is ever sent,
-          // ``InteractiveSession`` has no `ResyncRequired` handling, and there is no
+          // So this client is ORIGIN-ONLY on the execution feed, and consequently the
+          // daemon's `executionEvents` generation guard is LATENT: no `resume` is ever sent,
+          // ``InteractiveExecution`` has no `ResyncRequired` handling, and there is no
           // end-to-end path on which that error can be raised. The guard is defined and
-          // tested TS-side because the per-session offset really is a generation-scoped
+          // tested TS-side because the per-execution offset really is a generation-scoped
           // coordinate — retrofitting it onto a wire shape already in use is the expensive
           // order — not because anything here exercises it. A resuming client is what makes
           // it live, and that client is the one that must also handle ``ResyncRequired``.
-          let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
-          for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {
-            continuation.yield(try fromJSONValue(OffsetSessionEvent.self, value).event)
+          let payload = try toJSONValue(ExecutionEventsPayload(executionId: executionId))
+          for try await value in await connection.stream(tag: "executionEvents", payload: payload) {
+            continuation.yield(try fromJSONValue(OffsetExecutionEvent.self, value).event)
           }
           continuation.finish()
         } catch {
@@ -139,18 +141,19 @@ public struct RpcBackend: Backend {
     }
   }
 
-  public func sessionSend(sessionId: SessionId, input: SessionInput) async throws {
-    let payload = try toJSONValue(SessionSendPayload(sessionId: sessionId, input: input))
-    _ = try await connection.request(tag: "sessionSend", payload: payload)
+  public func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws {
+    let payload = try toJSONValue(ExecutionSendPayload(executionId: executionId, input: input))
+    _ = try await connection.request(tag: "executionSend", payload: payload)
   }
 
-  public func interrupt(sessionId: SessionId) async throws {
-    let payload = try toJSONValue(InterruptPayload(sessionId: sessionId))
+  public func interrupt(executionId: ExecutionId) async throws {
+    let payload = try toJSONValue(InterruptPayload(executionId: executionId))
     _ = try await connection.request(tag: "interrupt", payload: payload)
   }
 
-  public func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws {
-    let payload = try toJSONValue(AnswerUiRequestPayload(sessionId: sessionId, response: response))
+  public func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws {
+    let payload = try toJSONValue(
+      AnswerUiRequestPayload(executionId: executionId, response: response))
     _ = try await connection.request(tag: "answerUiRequest", payload: payload)
   }
 

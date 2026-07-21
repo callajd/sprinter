@@ -10,8 +10,8 @@
  * - **reconcile roll-up with one host error isolated** — a single Issue's host
  *   failure (a 404/403/429) does not abort the whole roll-up; the remaining Issues
  *   still land (carried AE3.2 / #27 F4);
- * - **running-Job resume onto the SAME session id** — a Job persisted `running` is
- *   re-dispatched carrying its persisted `sessionId`, never a new one;
+ * - **running-Job resume onto the SAME execution id** — a Job persisted `running` is
+ *   re-dispatched carrying its persisted `executionId`, never a new one;
  * - **no double-run** — an already-terminal Job is not re-dispatched, and a Job
  *   whose Issue reconciled to landed is not re-run;
  * - **control state respected** — no Job of a `done`/`blocked` Workstream is
@@ -27,12 +27,12 @@ import { Effect, Layer, Option, Queue, Schema } from "effect";
 import { expect } from "vitest";
 import {
   Epic,
+  Execution,
   Issue,
   Job,
   type JobResult,
   PositiveInt,
   PullRequestRef,
-  Session,
   Workstream,
 } from "@sprinter/domain";
 import { Repository as DomainRepository } from "@sprinter/domain";
@@ -100,12 +100,12 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
     issueId: "issue-1",
     kind: "implement",
     status: "running",
-    sessionId: "session-job-1",
+    executionId: "execution-job-1",
     ...over,
   });
 
-const session = (over: Partial<(typeof Session)["Encoded"]> = {}) =>
-  decode(Session, { id: "session-job-1", jobId: "job-1", status: "active", ...over });
+const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
+  decode(Execution, { id: "execution-job-1", jobId: "job-1", status: "active", ...over });
 
 const pullRef = (number: number, merged: boolean): PullRequestRef =>
   decode(PullRequestRef, {
@@ -287,10 +287,10 @@ it.effect("isolates one Issue's host error and still lands the rest of the roll-
 );
 
 // ============================================================================
-// running-Job resume onto the SAME persisted session id
+// running-Job resume onto the SAME persisted execution id
 // ============================================================================
 
-it.effect("resumes a running Job onto its persisted session id, never a new one", () =>
+it.effect("resumes a running Job onto its persisted execution id, never a new one", () =>
   Effect.gen(function* () {
     const dispatched = yield* Queue.unbounded<Job>();
     yield* Effect.gen(function* () {
@@ -299,7 +299,7 @@ it.effect("resumes a running Job onto its persisted session id, never a new one"
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putSession(session());
+      yield* store.jobs.putExecution(execution());
       yield* store.jobs.putJob(job());
 
       const startup = yield* StartupReconcile;
@@ -308,10 +308,10 @@ it.effect("resumes a running Job onto its persisted session id, never a new one"
       expect(summary.skipped).toStrictEqual([]);
 
       // The in-flight job was re-dispatched (in the background), carrying its
-      // PERSISTED session id — `Queue.take` awaits the forked resume fiber.
+      // PERSISTED execution id — `Queue.take` awaits the forked resume fiber.
       const redispatched = yield* Queue.take(dispatched);
       expect(redispatched.id).toBe("job-1");
-      expect(redispatched.sessionId).toBe("session-job-1");
+      expect(redispatched.executionId).toBe("execution-job-1");
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
@@ -333,7 +333,7 @@ it.effect("does not re-dispatch an already-terminal Job", () =>
       yield* store.workGraph.putWorkstream(workstream());
       yield* store.workGraph.putEpic(epic());
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putSession(session({ status: "completed" }));
+      yield* store.jobs.putExecution(execution({ status: "completed" }));
       yield* store.jobs.putJob(job({ status: "succeeded" }));
 
       const startup = yield* StartupReconcile;
@@ -363,7 +363,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream());
         yield* store.workGraph.putEpic(epic());
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putSession(session());
+        yield* store.jobs.putExecution(execution());
         yield* store.jobs.putJob(job());
 
         const startup = yield* StartupReconcile;
@@ -378,8 +378,8 @@ it.effect(
         expect(yield* Queue.size(dispatched)).toBe(0);
         const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
         expect(j1.status).toBe("succeeded");
-        // ROOT FIX (CE4.1-R4): a landed Job's SESSION row is settled to `completed`.
-        const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+        // ROOT FIX (CE4.1-R4): a landed Job's EXECUTION row is settled to `completed`.
+        const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
         expect(s1.status).toBe("completed");
       }).pipe(
         Effect.provide(
@@ -409,7 +409,7 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
       yield* store.workGraph.putEpic(epic({ status: "blocked" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putSession(session());
+      yield* store.jobs.putExecution(execution());
       yield* store.jobs.putJob(job());
 
       const startup = yield* StartupReconcile;
@@ -424,10 +424,10 @@ it.effect("does not re-dispatch Jobs of a blocked Workstream; re-queues them for
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("queued");
-      // ROOT FIX (CE4.1-R4): the SESSION row is settled to a terminal status alongside
-      // the re-queued Job, so no NON-TERMINAL session orphan survives to stall the
-      // session-resolve gate. A later resume re-attaches this same id back to `starting`.
-      const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+      // ROOT FIX (CE4.1-R4): the EXECUTION row is settled to a terminal status alongside
+      // the re-queued Job, so no NON-TERMINAL execution orphan survives to stall the
+      // execution-resolve gate. A later resume re-attaches this same id back to `starting`.
+      const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
       expect(s1.status).toBe("interrupted");
     }).pipe(
       Effect.provide(
@@ -446,7 +446,7 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       yield* store.workGraph.putWorkstream(workstream({ status: "cancelled" }));
       yield* store.workGraph.putEpic(epic({ status: "cancelled" }));
       yield* store.workGraph.putIssue(issue(1));
-      yield* store.jobs.putSession(session());
+      yield* store.jobs.putExecution(execution());
       yield* store.jobs.putJob(job());
 
       const startup = yield* StartupReconcile;
@@ -461,8 +461,8 @@ it.effect("settles a running Job of a cancelled Workstream to cancelled, not res
       expect(yield* Queue.size(dispatched)).toBe(0);
       const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
       expect(j1.status).toBe("cancelled");
-      // ROOT FIX (CE4.1-R4): the SESSION row is settled terminal alongside the Job.
-      const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+      // ROOT FIX (CE4.1-R4): the EXECUTION row is settled terminal alongside the Job.
+      const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
       expect(s1.status).toBe("interrupted");
     }).pipe(
       Effect.provide(
@@ -486,7 +486,7 @@ it.effect(
         yield* store.workGraph.putWorkstream(workstream({ status: "done" }));
         yield* store.workGraph.putEpic(epic({ status: "done" }));
         yield* store.workGraph.putIssue(issue(1));
-        yield* store.jobs.putSession(session());
+        yield* store.jobs.putExecution(execution());
         yield* store.jobs.putJob(job());
 
         const startup = yield* StartupReconcile;
@@ -499,8 +499,8 @@ it.effect(
         expect(yield* Queue.size(dispatched)).toBe(0);
         const j1 = Option.getOrThrow(yield* store.jobs.getJob(job().id));
         expect(j1.status).toBe("cancelled");
-        // ROOT FIX (CE4.1-R4): its SESSION row is settled terminal alongside the Job.
-        const s1 = Option.getOrThrow(yield* store.jobs.getSessionForJob(job().id));
+        // ROOT FIX (CE4.1-R4): its EXECUTION row is settled terminal alongside the Job.
+        const s1 = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
         expect(s1.status).toBe("interrupted");
       }).pipe(
         Effect.provide(
@@ -525,11 +525,11 @@ it.effect("isolates a resume failure so the other in-flight Jobs still resume", 
       yield* store.workGraph.putIssue(issue(1));
       yield* store.workGraph.putIssue(issue(2, { id: "issue-2" }));
       // Two running jobs; job-1's dispatch fails, job-2's succeeds.
-      yield* store.jobs.putSession(session());
+      yield* store.jobs.putExecution(execution());
       yield* store.jobs.putJob(job());
-      yield* store.jobs.putSession(session({ id: "session-job-2", jobId: "job-2" }));
+      yield* store.jobs.putExecution(execution({ id: "execution-job-2", jobId: "job-2" }));
       yield* store.jobs.putJob(
-        job({ id: "job-2", issueId: "issue-2", sessionId: "session-job-2" }),
+        job({ id: "job-2", issueId: "issue-2", executionId: "execution-job-2" }),
       );
 
       const startup = yield* StartupReconcile;

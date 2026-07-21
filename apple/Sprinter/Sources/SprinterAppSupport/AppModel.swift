@@ -6,7 +6,7 @@ import SprinterMissionControl
 /// The app's top-level composition root (CE3.1): the `@Observable @MainActor` model the
 /// SwiftUI shell renders. It owns the live Mission Control board (fed by a
 /// ``WorkGraphResync`` over the ``DaemonConnection`` seam) and the connection lifecycle
-/// that yields the ``Backend`` the session-channel Views (inbox / session / planner /
+/// that yields the ``Backend`` the execution-channel Views (inbox / execution / planner /
 /// inspector) drive.
 ///
 /// It is platform-neutral (Foundation + Observation, no AppKit/UIKit, no `#if os(...)`):
@@ -14,16 +14,16 @@ import SprinterMissionControl
 /// them and manages the connect lifecycle, so the testable wiring is verified by
 /// `make check` (INV-COV) while the SwiftUI Views stay thin at the platform edge.
 ///
-/// **Self-healing session backend (CE4.2 / CE3.1-F2 restart watch-item).** The board feed
+/// **Self-healing execution backend (CE4.2 / CE3.1-F2 restart watch-item).** The board feed
 /// already reconnects on its own (``WorkGraphResync`` owns a reconnect loop); before
-/// CE4.2 the session-channel ``Backend`` was dialed exactly ONCE, so a daemon RESTART left
+/// CE4.2 the execution-channel ``Backend`` was dialed exactly ONCE, so a daemon RESTART left
 /// the shell stuck — either on `backend == nil` (a first connect that failed was never
 /// retried) or on a DEAD backend (a drop after a successful connect was never noticed). The
 /// connect lifecycle is now a supervised RECONNECT LOOP: it retries a failed connect with a
 /// widening ``ReconnectBackoff`` (so a daemon that starts LATE is still reached), and — once
 /// connected — watches the connection's liveness (the `events` feed ends/throws when the
 /// daemon goes away) and RE-DIALS on a drop, publishing a fresh ``Backend`` so the
-/// session-channel Views rebuild against the restarted daemon. So ``RootView`` recovers
+/// execution-channel Views rebuild against the restarted daemon. So ``RootView`` recovers
 /// across a restart instead of staying stuck.
 @Observable
 @MainActor
@@ -36,7 +36,7 @@ public final class AppModel {
     /// The connect attempt is in flight (the initial state, before ``start()`` resolves,
     /// and again between a drop and the next successful re-dial).
     case connecting
-    /// A ``Backend`` is connected; the session-channel Views can be built from it.
+    /// A ``Backend`` is connected; the execution-channel Views can be built from it.
     case connected
     /// The most recent connect attempt failed — the rendered reason to surface. The loop
     /// keeps retrying underneath (with backoff), so this is not a terminal dead-end.
@@ -50,8 +50,8 @@ public final class AppModel {
   /// The daemon-connection state, observed by the shell chrome.
   public private(set) var connectionState: ConnectionState = .connecting
 
-  /// The connected ``Backend`` once a connect resolves, else `nil`. The session-channel
-  /// Views (inbox / session / planner / inspector transcript) are constructed from it and
+  /// The connected ``Backend`` once a connect resolves, else `nil`. The execution-channel
+  /// Views (inbox / execution / planner / inspector transcript) are constructed from it and
   /// are rebuilt when a restart re-dials a fresh backend. Not `Equatable`; observation
   /// tracks the reference identity, so a re-dial swapping the instance re-renders the Views.
   public private(set) var backend: (any Backend)?
@@ -67,7 +67,7 @@ public final class AppModel {
   }
 
   /// Starts the app: subscribes the board to a fresh live feed and launches the supervised
-  /// backend reconnect loop for the session-channel Views. Idempotent — a second call does
+  /// backend reconnect loop for the execution-channel Views. Idempotent — a second call does
   /// not launch a second loop while one is already running (the board's own `start` is
   /// idempotent too).
   public func start() {
@@ -80,7 +80,7 @@ public final class AppModel {
 
   /// The supervised connect lifecycle: dial the daemon, publish the ``Backend``, watch it
   /// for a drop, and RE-DIAL — retrying a failed connect with a widening backoff. Runs until
-  /// ``stop()`` cancels it, so the session channel self-heals across a daemon restart.
+  /// ``stop()`` cancels it, so the execution channel self-heals across a daemon restart.
   private func runConnectionLoop() async {
     while !Task.isCancelled {
       do {

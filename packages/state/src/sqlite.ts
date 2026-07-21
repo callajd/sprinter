@@ -72,7 +72,7 @@
  * - The dependency DAG (`Issue.dependsOn`) is stored as real edges in a dedicated
  *   `issue_dependency` table and reconstructed, ordered, on read — the DAG is
  *   persisted as edges, not as an opaque blob.
- * - Optional links (`Issue.pr`, `Job.sessionId` / `Job.transcriptRef` / `Job.pr`)
+ * - Optional links (`Issue.pr`, `Job.executionId` / `Job.transcriptRef` / `Job.pr`)
  *   are nullable columns; `PullRequestRef` is stored as a JSON column.
  * - The event feed is an `AUTOINCREMENT` table; the auto-assigned rowid is the
  *   monotonic offset.
@@ -104,10 +104,10 @@ import {
   type RepositoryRef,
   RepositoryRefs,
   RepositorySegment,
-  Session,
-  SessionEvent,
-  SessionId,
-  SessionStatus,
+  Execution,
+  ExecutionEvent,
+  ExecutionId,
+  ExecutionStatus,
   StoreGenerationId,
   Timestamp,
   WorkstreamId,
@@ -118,11 +118,11 @@ import {
   type AgentStore,
   type AppendEvent,
   type EventLogStore,
+  type ExecutionLogStore,
   type JobStore,
   type PersistedEvent,
-  type PersistedSessionEvent,
+  type PersistedExecutionEvent,
   type RepositoryStore,
-  type SessionLogStore,
   StateStore,
   StateStoreError,
   type WorkGraphStore,
@@ -312,11 +312,11 @@ const isSameAgentRow = (stored: AgentColumns, next: AgentColumns): boolean =>
   stored.supersedes === next.supersedes &&
   stored.retiredAt === next.retiredAt;
 
-/** A session row — no optional or JSON columns. */
-const SessionRow = Schema.Struct({
-  id: SessionId,
+/** An execution row — no optional or JSON columns. */
+const ExecutionRow = Schema.Struct({
+  id: ExecutionId,
   jobId: JobId,
-  status: SessionStatus,
+  status: ExecutionStatus,
 });
 
 /**
@@ -342,13 +342,13 @@ const IssueRow = Schema.Struct({
 /** A single `issue_dependency` edge row (the `depends_on` target). */
 const DependencyRow = Schema.Struct({ dependsOn: IssueId });
 
-/** A job row: `sessionId` / `transcriptRef` are nullable; `pr` is a nullable JSON column. */
+/** A job row: `executionId` / `transcriptRef` are nullable; `pr` is a nullable JSON column. */
 const JobRow = Schema.Struct({
   id: JobId,
   issueId: IssueId,
   kind: JobKind,
   status: JobStatus,
-  sessionId: Schema.NullOr(SessionId),
+  executionId: Schema.NullOr(ExecutionId),
   transcriptRef: Schema.NullOr(Schema.NonEmptyString),
   pr: PrColumn,
 });
@@ -361,14 +361,14 @@ const EventRow = Schema.Struct({
 });
 
 /**
- * A session-transcript-log row: `event` is a JSON column holding the owned
- * {@link SessionEvent}; `offset` is the auto-assigned rowid (monotonic per session by
- * ascending read, globally unique across sessions). The `sessionId` scoping column is
- * a query predicate, not part of the reconstructed {@link PersistedSessionEvent}.
+ * An execution-transcript-log row: `event` is a JSON column holding the owned
+ * {@link ExecutionEvent}; `offset` is the auto-assigned rowid (monotonic per execution by
+ * ascending read, globally unique across executions). The `executionId` scoping column is
+ * a query predicate, not part of the reconstructed {@link PersistedExecutionEvent}.
  */
-const SessionEventRow = Schema.Struct({
+const ExecutionEventRow = Schema.Struct({
   offset: NonNegativeInt,
-  event: Schema.fromJsonString(SessionEvent),
+  event: Schema.fromJsonString(ExecutionEvent),
 });
 
 /** The single row returned by an event append's `RETURNING "offset"`. */
@@ -426,6 +426,15 @@ const GENERATION_KEY = "generation";
  * longer exists. There is no window in which the reference dangles — the referencing
  * table does not outlive the referenced one.
  *
+ * Version 6 is the process-level RENAME `Session` → `Execution` (DE2.1): the
+ * `session` table becomes `execution`, `session_event_log` becomes
+ * `execution_event_log` with its scoping column `"sessionId"` → `"executionId"`
+ * and its index `session_event_log_session` → `execution_event_log_execution`,
+ * the `session_job` unique index becomes `execution_job`, and `job."sessionId"`
+ * becomes `job."executionId"`. No column was added, removed or retyped — but a
+ * renamed table IS a shape change, and there is no migration ladder, so it drops
+ * and recreates like any other (INV-FRESH).
+ *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
@@ -433,7 +442,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -643,38 +652,38 @@ const createSchema = Effect.gen(function* () {
       "issueId" TEXT NOT NULL,
       kind TEXT NOT NULL,
       status TEXT NOT NULL,
-      "sessionId" TEXT,
+      "executionId" TEXT,
       "transcriptRef" TEXT,
       pr TEXT
     )`;
   yield* sql`CREATE INDEX job_issue ON job ("issueId")`;
-  yield* sql`CREATE TABLE session (
+  yield* sql`CREATE TABLE execution (
       id TEXT PRIMARY KEY NOT NULL,
       "jobId" TEXT NOT NULL,
       status TEXT NOT NULL
     )`;
-  // UNIQUE enforces the domain invariant 1 Job = 1 session (conventions): at most
-  // one session per job, so `getSessionForJob` is deterministic by construction and
-  // a stray second session for a job fails at the backing (surfacing as a
+  // UNIQUE enforces the domain invariant 1 Job = 1 execution (conventions): at most
+  // one execution per job, so `getExecutionForJob` is deterministic by construction and
+  // a stray second execution for a job fails at the backing (surfacing as a
   // StateStoreError) rather than silently returning an arbitrary row.
-  yield* sql`CREATE UNIQUE INDEX session_job ON session ("jobId")`;
+  yield* sql`CREATE UNIQUE INDEX execution_job ON execution ("jobId")`;
   yield* sql`CREATE TABLE event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL,
       payload TEXT NOT NULL
     )`;
-  // The durable per-session transcript log: one append-only row per
-  // durable, transcript-grade session event, scoped by "sessionId". The AUTOINCREMENT
-  // rowid is the monotonic offset — globally unique, so a re-dispatch of the same session
+  // The durable per-execution transcript log: one append-only row per
+  // durable, transcript-grade execution event, scoped by "executionId". The AUTOINCREMENT
+  // rowid is the monotonic offset — globally unique, so a re-dispatch of the same execution
   // id APPENDS with fresh higher offsets rather than reusing or resetting the sequence
-  // (never a duplicated/corrupted offset). The `session_event_log_session` index keeps a
-  // per-session ordered read/tail cheap.
-  yield* sql`CREATE TABLE session_event_log (
+  // (never a duplicated/corrupted offset). The `execution_event_log_execution` index keeps a
+  // per-execution ordered read/tail cheap.
+  yield* sql`CREATE TABLE execution_event_log (
       "offset" INTEGER PRIMARY KEY AUTOINCREMENT,
-      "sessionId" TEXT NOT NULL,
+      "executionId" TEXT NOT NULL,
       event TEXT NOT NULL
     )`;
-  yield* sql`CREATE INDEX session_event_log_session ON session_event_log ("sessionId")`;
+  yield* sql`CREATE INDEX execution_event_log_execution ON execution_event_log ("executionId")`;
 });
 
 /** The single row returned by `PRAGMA user_version`. */
@@ -1314,7 +1323,7 @@ const make = Effect.gen(function* () {
           issueId: r.issueId,
           kind: r.kind,
           status: r.status,
-          ...(r.sessionId !== null ? { sessionId: r.sessionId } : {}),
+          ...(r.executionId !== null ? { executionId: r.executionId } : {}),
           ...(r.transcriptRef !== null ? { transcriptRef: r.transcriptRef } : {}),
           ...(r.pr !== null ? { pr: r.pr } : {}),
         }),
@@ -1322,22 +1331,22 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail(operation)),
     );
 
-  const putSession = SqlSchema.void({
-    Request: Session,
+  const putExecution = SqlSchema.void({
+    Request: Execution,
     execute: (row) =>
-      sql`INSERT INTO session ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
+      sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id"])}`,
   });
 
-  const getSessionQuery = SqlSchema.findOneOption({
-    Request: SessionId,
-    Result: SessionRow,
-    execute: (id) => sql`SELECT * FROM session WHERE id = ${id}`,
+  const getExecutionQuery = SqlSchema.findOneOption({
+    Request: ExecutionId,
+    Result: ExecutionRow,
+    execute: (id) => sql`SELECT * FROM execution WHERE id = ${id}`,
   });
 
-  const getSessionForJobQuery = SqlSchema.findOneOption({
+  const getExecutionForJobQuery = SqlSchema.findOneOption({
     Request: JobId,
-    Result: SessionRow,
-    execute: (jobId) => sql`SELECT * FROM session WHERE "jobId" = ${jobId}`,
+    Result: ExecutionRow,
+    execute: (jobId) => sql`SELECT * FROM execution WHERE "jobId" = ${jobId}`,
   });
 
   const jobs: JobStore = {
@@ -1349,7 +1358,7 @@ const make = Effect.gen(function* () {
           issueId: job.issueId,
           kind: job.kind,
           status: job.status,
-          sessionId: job.sessionId ?? null,
+          executionId: job.executionId ?? null,
           transcriptRef: job.transcriptRef ?? null,
           pr,
         };
@@ -1372,10 +1381,11 @@ const make = Effect.gen(function* () {
           Effect.forEach(rows, (row) => hydrateJob(row, "listJobsForIssue")),
         ),
       ),
-    putSession: (session) => putSession(session).pipe(Effect.mapError(fail("putSession"))),
-    getSession: (id) => getSessionQuery(id).pipe(Effect.mapError(fail("getSession"))),
-    getSessionForJob: (jobId) =>
-      getSessionForJobQuery(jobId).pipe(Effect.mapError(fail("getSessionForJob"))),
+    putExecution: (execution) =>
+      putExecution(execution).pipe(Effect.mapError(fail("putExecution"))),
+    getExecution: (id) => getExecutionQuery(id).pipe(Effect.mapError(fail("getExecution"))),
+    getExecutionForJob: (jobId) =>
+      getExecutionForJobQuery(jobId).pipe(Effect.mapError(fail("getExecutionForJob"))),
   };
 
   // ── EventLogStore ─────────────────────────────────────────────────────────
@@ -1415,51 +1425,51 @@ const make = Effect.gen(function* () {
     ),
   };
 
-  // ── SessionLogStore ─────────────────────────────────────────────────────────
+  // ── ExecutionLogStore ──────────────────────────────────────────────────────────────────────
 
-  const sessionLog: SessionLogStore = {
-    append: (sessionId, event) =>
+  const executionLog: ExecutionLogStore = {
+    append: (executionId, event) =>
       Effect.gen(function* () {
-        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(SessionEvent))(event);
+        const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(ExecutionEvent))(event);
         const rows =
-          yield* sql`INSERT INTO session_event_log ${sql.insert({ sessionId, event: encoded })} RETURNING "offset"`;
+          yield* sql`INSERT INTO execution_event_log ${sql.insert({ executionId, event: encoded })} RETURNING "offset"`;
         const decoded = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(OffsetRow))(rows);
-        const persisted: PersistedSessionEvent = { offset: decoded[0].offset, event };
+        const persisted: PersistedExecutionEvent = { offset: decoded[0].offset, event };
         return persisted;
-      }).pipe(Effect.mapError(fail("sessionLog.append"))),
+      }).pipe(Effect.mapError(fail("executionLog.append"))),
     // The base store owns DURABILITY, not the live feed: an ephemeral delta is not persisted
     // here, so this is a total no-op. The daemon's journaling decorator overrides it to fan
-    // the delta out on the `SessionEvents` feed offset-less.
+    // the delta out on the `ExecutionEvents` feed offset-less.
     publishEphemeral: () => Effect.void,
-    read: (sessionId) =>
-      sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} ORDER BY "offset"`.pipe(
-        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),
-        Effect.mapError(fail("sessionLog.read")),
+    read: (executionId) =>
+      sql`SELECT "offset", event FROM execution_event_log WHERE "executionId" = ${executionId} ORDER BY "offset"`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(ExecutionEventRow))),
+        Effect.mapError(fail("executionLog.read")),
       ),
-    tail: (sessionId, offset) =>
-      sql`SELECT "offset", event FROM session_event_log WHERE "sessionId" = ${sessionId} AND "offset" > ${offset} ORDER BY "offset"`.pipe(
-        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(SessionEventRow))),
-        Effect.mapError(fail("sessionLog.tail")),
+    tail: (executionId, offset) =>
+      sql`SELECT "offset", event FROM execution_event_log WHERE "executionId" = ${executionId} AND "offset" > ${offset} ORDER BY "offset"`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(ExecutionEventRow))),
+        Effect.mapError(fail("executionLog.tail")),
       ),
     // A `COUNT(*)` with a `json_extract` tag filter — the count is computed in SQLite and
     // never materializes or JSON/Schema-decodes the transcript rows (unlike `read`), so it
-    // stays cheap on a long or many-times-retried session.
-    countEntries: (sessionId) =>
-      sql`SELECT COUNT(*) AS n FROM session_event_log WHERE "sessionId" = ${sessionId} AND json_extract(event, '$._tag') = 'EntryAppended'`.pipe(
+    // stays cheap on a long or many-times-retried execution.
+    countEntries: (executionId) =>
+      sql`SELECT COUNT(*) AS n FROM execution_event_log WHERE "executionId" = ${executionId} AND json_extract(event, '$._tag') = 'EntryAppended'`.pipe(
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
         Effect.map((rows) => rows[0].n),
-        Effect.mapError(fail("sessionLog.countEntries")),
+        Effect.mapError(fail("executionLog.countEntries")),
       ),
-    // The per-session extent, answered by the backing over the `session_event_log_session`
+    // The per-execution extent, answered by the backing over the `execution_event_log_execution`
     // index — no row is materialized or JSON-decoded, which is the whole point: the
-    // `sessionEvents` cursor guard runs BEFORE the transcript read, so a request that is
+    // `executionEvents` cursor guard runs BEFORE the transcript read, so a request that is
     // about to be refused never pays for one. `COALESCE` turns the SQL `NULL` an
-    // entry-less session yields into `0`, below every durable offset (strictly `> 0`).
-    maxOffset: (sessionId) =>
-      sql`SELECT COALESCE(MAX("offset"), 0) AS n FROM session_event_log WHERE "sessionId" = ${sessionId}`.pipe(
+    // entry-less execution yields into `0`, below every durable offset (strictly `> 0`).
+    maxOffset: (executionId) =>
+      sql`SELECT COALESCE(MAX("offset"), 0) AS n FROM execution_event_log WHERE "executionId" = ${executionId}`.pipe(
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
         Effect.map((rows) => rows[0].n),
-        Effect.mapError(fail("sessionLog.maxOffset")),
+        Effect.mapError(fail("executionLog.maxOffset")),
       ),
   };
 
@@ -1491,7 +1501,7 @@ const make = Effect.gen(function* () {
     workGraph: putWorkGraph,
     jobs,
     events,
-    sessionLog,
+    executionLog,
     generation,
     withTransaction,
   });

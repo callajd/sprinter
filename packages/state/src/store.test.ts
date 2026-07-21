@@ -7,7 +7,7 @@
  * append-only `Agent` registry (append + read, no delete, and no rewrite of a
  * stored revision), the work graph (`Workstream ⊃ Epic ⊃ Issue`), the dependency
  * DAG (`Issue.dependsOn`) as real replaceable edges, the `Job` model and the
- * `Issue → Job → session → PR` mapping, and the append-only event feed
+ * `Issue → Job → execution → PR` mapping, and the append-only event feed
  * (append / ordered read / tail-from-offset). It also covers absent-optional
  * elision, missing-node `Option.none`, and upsert idempotency.
  *
@@ -26,7 +26,7 @@ import {
   Repository,
   RepositoryId,
   RepositoryKey,
-  Session,
+  Execution,
   Workstream,
 } from "@sprinter/domain";
 import {
@@ -117,8 +117,8 @@ const job = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
     ...over,
   });
 
-const session = (over: Partial<(typeof Session)["Encoded"]> = {}) =>
-  decode(Session, { id: "session-1", jobId: "job-1", status: "active", ...over });
+const execution = (over: Partial<(typeof Execution)["Encoded"]> = {}) =>
+  decode(Execution, { id: "execution-1", jobId: "job-1", status: "active", ...over });
 
 const agent = (over: Partial<(typeof Agent)["Encoded"]> = {}) =>
   decode(Agent, {
@@ -868,12 +868,12 @@ it.effect("elides absent optional fields on an issue without a PR", () =>
 // JobStore
 // ============================================================================
 
-it.effect("round-trips a Job with its full session/transcript/PR mapping", () =>
+it.effect("round-trips a Job with its full execution/transcript/PR mapping", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const jb = yield* job({
       status: "succeeded",
-      sessionId: "session-1",
+      executionId: "execution-1",
       transcriptRef: "transcript://job-1",
       pr: prRef,
     });
@@ -891,39 +891,41 @@ it.effect("elides a Job's absent optional links", () =>
     yield* store.jobs.putJob(jb);
     const read = Option.getOrThrow(yield* store.jobs.getJob(jb.id));
     expect(read).toStrictEqual(jb);
-    expect("sessionId" in read).toBe(false);
+    expect("executionId" in read).toBe(false);
     expect("transcriptRef" in read).toBe(false);
     expect("pr" in read).toBe(false);
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("maps a session to and from its job", () =>
+it.effect("maps an execution to and from its job", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
-    const se = yield* session();
-    yield* store.jobs.putSession(se);
-    expect(Option.getOrThrow(yield* store.jobs.getSession(se.id))).toStrictEqual(se);
-    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(se.jobId))).toStrictEqual(se);
+    const se = yield* execution();
+    yield* store.jobs.putExecution(se);
+    expect(Option.getOrThrow(yield* store.jobs.getExecution(se.id))).toStrictEqual(se);
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(se.jobId))).toStrictEqual(se);
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("enforces 1 Job = 1 session, surfacing the backing failure as StateStoreError", () =>
+it.effect("enforces 1 Job = 1 execution, surfacing the backing failure as StateStoreError", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
-    const first = yield* session({ id: "session-1", jobId: "job-1" });
-    yield* store.jobs.putSession(first);
-    // A second, DISTINCT session for the same job violates the 1-session-per-job
+    const first = yield* execution({ id: "execution-1", jobId: "job-1" });
+    yield* store.jobs.putExecution(first);
+    // A second, DISTINCT execution for the same job violates the 1-execution-per-job
     // invariant. This drives a real backing (UNIQUE-constraint) failure — the one
     // place a SQL error is produced — and asserts INV-PORT: it crosses the port as
     // the owned StateStoreError (operation named), never as a SQL/SQLite type.
     const error = yield* store.jobs
-      .putSession(yield* session({ id: "session-2", jobId: "job-1" }))
+      .putExecution(yield* execution({ id: "execution-2", jobId: "job-1" }))
       .pipe(Effect.flip);
     expect(error).toBeInstanceOf(StateStoreError);
-    expect(error.operation).toBe("putSession");
+    expect(error.operation).toBe("putExecution");
     expect(error.detail.length).toBeGreaterThan(0);
-    // The first session remains the deterministic answer for the job.
-    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(first.jobId)).id).toBe("session-1");
+    // The first execution remains the deterministic answer for the job.
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(first.jobId)).id).toBe(
+      "execution-1",
+    );
   }).pipe(Effect.provide(layerMemory)),
 );
 
@@ -978,13 +980,13 @@ it.effect("returns None for every missing node", () =>
     const ep = yield* epic();
     const iss = yield* issue();
     const jb = yield* job();
-    const se = yield* session();
+    const se = yield* execution();
     expect(yield* store.workGraph.getWorkstream(ws.id)).toStrictEqual(Option.none());
     expect(yield* store.workGraph.getEpic(ep.id)).toStrictEqual(Option.none());
     expect(yield* store.workGraph.getIssue(iss.id)).toStrictEqual(Option.none());
     expect(yield* store.jobs.getJob(jb.id)).toStrictEqual(Option.none());
-    expect(yield* store.jobs.getSession(se.id)).toStrictEqual(Option.none());
-    expect(yield* store.jobs.getSessionForJob(jb.id)).toStrictEqual(Option.none());
+    expect(yield* store.jobs.getExecution(se.id)).toStrictEqual(Option.none());
+    expect(yield* store.jobs.getExecutionForJob(jb.id)).toStrictEqual(Option.none());
     expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
     expect(yield* store.workGraph.listEpics(ws.id)).toStrictEqual([]);
     expect(yield* store.workGraph.listIssues(ep.id)).toStrictEqual([]);

@@ -1,5 +1,5 @@
 /// A durable, transcript-grade record — mirror of the contract's `TranscriptEntry`
-/// tagged union, carried by the `EntryAppended` ``SessionEvent`` so a client
+/// tagged union, carried by the `EntryAppended` ``ExecutionEvent`` so a client
 /// reconciles live deltas into the persisted record (INV-REACTIVE).
 ///
 /// Tool `input`/`output` are arbitrary JSON (``JSONValue``); `reasoning` is an

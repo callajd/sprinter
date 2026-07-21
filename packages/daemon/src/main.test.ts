@@ -39,7 +39,7 @@ import {
   probeSocket,
   unlinkStaleSocket,
 } from "./main.ts";
-import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
+import { EXECUTION_RESOLVE_TIMEOUT } from "./execution-registry.ts";
 import { StartupReconcile } from "./startup-reconcile.ts";
 
 // ── substitutable leaves (fakes) ──────────────────────────────────────────────
@@ -131,7 +131,7 @@ const testConfig = (dir: string): DaemonConfig => ({
   socketPath: `${dir}/daemon.sock`,
   workspaceRoot: `${dir}/worktrees`,
   repository: { owner: "callajd", repo: "sprinter", token: "test-token" },
-  sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+  executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
 });
 
 /** The full graph with the leaves substituted by fakes/real-Bun services. */
@@ -160,8 +160,8 @@ it("configFromEnv maps the environment with sensible defaults and the required t
     socketPath: "/run/sprinter.sock",
     workspaceRoot: "/srv/worktrees",
     repository: { owner: "acme", repo: "widgets", token: "ghp_secret" },
-    // No explicit override → the session-resolve bound falls back to the default.
-    sessionResolveTimeout: SESSION_RESOLVE_TIMEOUT,
+    // No explicit override → the execution-resolve bound falls back to the default.
+    executionResolveTimeout: EXECUTION_RESOLVE_TIMEOUT,
   });
 
   // Only GITHUB_TOKEN supplied: everything else falls back to the local defaults.
@@ -170,26 +170,26 @@ it("configFromEnv maps the environment with sensible defaults and the required t
   expect(defaults.socketPath).toBe("./sprinter.sock");
   expect(defaults.workspaceRoot).toBe("./worktrees");
   expect(defaults.repository).toEqual({ owner: "callajd", repo: "sprinter", token: "ghp_secret" });
-  expect(Duration.equals(defaults.sessionResolveTimeout, SESSION_RESOLVE_TIMEOUT)).toBe(true);
+  expect(Duration.equals(defaults.executionResolveTimeout, EXECUTION_RESOLVE_TIMEOUT)).toBe(true);
 });
 
-it("configFromEnv reads the session-resolve bound override, ignoring nonsense (FIX B knob)", () => {
+it("configFromEnv reads the execution-resolve bound override, ignoring nonsense (FIX B knob)", () => {
   // A valid positive millisecond override raises the bound — the operational knob for a
   // slow `pi` cold-start (FIX B).
   const raised = configFromEnv({
     GITHUB_TOKEN: "ghp_secret",
-    SPRINTER_SESSION_RESOLVE_TIMEOUT_MS: "12000",
+    SPRINTER_EXECUTION_RESOLVE_TIMEOUT_MS: "12000",
   });
-  expect(Duration.equals(raised.sessionResolveTimeout, Duration.millis(12000))).toBe(true);
+  expect(Duration.equals(raised.executionResolveTimeout, Duration.millis(12000))).toBe(true);
 
   // Blank / non-numeric / non-positive values fall back to the default rather than a
   // nonsensical bound (never breaks the sane cold-start allowance).
   for (const bad of ["", "   ", "abc", "0", "-5", "1.5"]) {
     const cfg = configFromEnv({
       GITHUB_TOKEN: "ghp_secret",
-      SPRINTER_SESSION_RESOLVE_TIMEOUT_MS: bad,
+      SPRINTER_EXECUTION_RESOLVE_TIMEOUT_MS: bad,
     });
-    expect(Duration.equals(cfg.sessionResolveTimeout, SESSION_RESOLVE_TIMEOUT)).toBe(true);
+    expect(Duration.equals(cfg.executionResolveTimeout, EXECUTION_RESOLVE_TIMEOUT)).toBe(true);
   }
 });
 

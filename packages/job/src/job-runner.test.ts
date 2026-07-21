@@ -1,21 +1,27 @@
 /**
  * `JobRunner` coverage (AE3.1) — the single-Issue Job runner exercised against
- * FAKES: a fake {@link ExecutionRunner} handing back a canned {@link SessionHandle}
+ * FAKES: a fake {@link ExecutionRunner} handing back a canned {@link ExecutionHandle}
  * and the in-memory {@link StateStore} adapter (`layerMemory`). Deterministic and
  * offline — no `pi` process, no filesystem (INV-PORT): the runner depends only on
  * the two ports and the runner's neutral handle surface.
  *
  * The suite proves the dispatch → terminal `JobResult` capture → persisted rows
- * flow for BOTH a succeeding and a failing session, plus the 1 Job = 1 session
- * re-attach invariant (a re-dispatch upserts the SAME session id, never a new one).
+ * flow for BOTH a succeeding and a failing execution, plus the 1 Job = 1 execution
+ * re-attach invariant (a re-dispatch upserts the SAME execution id, never a new one).
  */
 import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { expect } from "vitest";
-import { Issue, Job, type SessionEvent, SessionId, type SessionInput } from "@sprinter/domain";
-import { PiTransportError, type SessionHandle, type SessionResult } from "@sprinter/runner";
+import {
+  type ExecutionEvent,
+  ExecutionId,
+  type ExecutionInput,
+  Issue,
+  Job,
+} from "@sprinter/domain";
+import { PiTransportError, type ExecutionHandle, type ExecutionResult } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { ExecutionRunner, ExecutionRunnerError, JobRunner, layer } from "./index.ts";
 
@@ -29,25 +35,25 @@ const decode = <S extends Schema.Top>(schema: S, raw: S["Encoded"]) =>
 const makeJob = (over: Partial<(typeof Job)["Encoded"]> = {}) =>
   decode(Job, { id: "job-1", issueId: "issue-22", kind: "implement", status: "queued", ...over });
 
-const entryEvent: SessionEvent = {
+const entryEvent: ExecutionEvent = {
   _tag: "EntryAppended",
   entry: { _tag: "UserMessage", id: "u1", text: "hi" },
 };
-const turnStarted: SessionEvent = { _tag: "TurnStarted" };
+const turnStarted: ExecutionEvent = { _tag: "TurnStarted" };
 // A durable, transcript-grade `Notice` (offset-bearing) and an ephemeral `MessageDelta`
 // (offset-less) — used to prove the fold routes BOTH modalities, dropping nothing.
-const noticeEvent: SessionEvent = { _tag: "Notice", id: "n1", level: "info", message: "go" };
-const messageDelta: SessionEvent = { _tag: "MessageDelta", messageId: "u1", text: "h" };
+const noticeEvent: ExecutionEvent = { _tag: "Notice", id: "n1", level: "info", message: "go" };
+const messageDelta: ExecutionEvent = { _tag: "MessageDelta", messageId: "u1", text: "h" };
 
 /**
- * A {@link StateStore} decorator over `layerMemory` that RECORDS every `sessionLog.append`
- * (durable) and `sessionLog.publishEphemeral` (ephemeral) call while delegating to the base —
+ * A {@link StateStore} decorator over `layerMemory` that RECORDS every `executionLog.append`
+ * (durable) and `executionLog.publishEphemeral` (ephemeral) call while delegating to the base —
  * so a test can assert the JobRunner fold routes durable entries to `append` and ephemeral
  * deltas to `publishEphemeral`, teeing the whole flow.
  */
 const recordingStore = (
-  appended: Ref.Ref<ReadonlyArray<SessionEvent>>,
-  published: Ref.Ref<ReadonlyArray<SessionEvent>>,
+  appended: Ref.Ref<ReadonlyArray<ExecutionEvent>>,
+  published: Ref.Ref<ReadonlyArray<ExecutionEvent>>,
 ): Layer.Layer<StateStore, StateStoreError> =>
   Layer.effect(
     StateStore,
@@ -55,26 +61,26 @@ const recordingStore = (
       const base = yield* StateStore;
       return StateStore.of({
         ...base,
-        sessionLog: {
-          ...base.sessionLog,
-          append: (sessionId, event) =>
+        executionLog: {
+          ...base.executionLog,
+          append: (executionId, event) =>
             Ref.update(appended, (xs) => [...xs, event]).pipe(
-              Effect.andThen(base.sessionLog.append(sessionId, event)),
+              Effect.andThen(base.executionLog.append(executionId, event)),
             ),
-          publishEphemeral: (sessionId, event) =>
+          publishEphemeral: (executionId, event) =>
             Ref.update(published, (xs) => [...xs, event]).pipe(
-              Effect.andThen(base.sessionLog.publishEphemeral(sessionId, event)),
+              Effect.andThen(base.executionLog.publishEphemeral(executionId, event)),
             ),
         },
       });
     }),
   ).pipe(Layer.provide(layerMemory));
 
-/** A fake {@link SessionHandle}: a canned event stream and terminal result; the drive/answer verbs are inert. */
+/** A fake {@link ExecutionHandle}: a canned event stream and terminal result; the drive/answer verbs are inert. */
 const fakeHandle = (
-  events: Stream.Stream<SessionEvent, PiTransportError>,
-  result: SessionResult,
-): SessionHandle => ({
+  events: Stream.Stream<ExecutionEvent, PiTransportError>,
+  result: ExecutionResult,
+): ExecutionHandle => ({
   pid: ChildProcessSpawner.ProcessId(4242),
   events,
   send: () => Effect.void,
@@ -83,23 +89,23 @@ const fakeHandle = (
   result: Effect.succeed(result),
 });
 
-/** As {@link fakeHandle}, but records every {@link SessionInput} driven in via `send`. */
+/** As {@link fakeHandle}, but records every {@link ExecutionInput} driven in via `send`. */
 const recordingHandle = (
-  events: Stream.Stream<SessionEvent, PiTransportError>,
-  result: SessionResult,
-  sent: Ref.Ref<ReadonlyArray<SessionInput>>,
-): SessionHandle => ({
+  events: Stream.Stream<ExecutionEvent, PiTransportError>,
+  result: ExecutionResult,
+  sent: Ref.Ref<ReadonlyArray<ExecutionInput>>,
+): ExecutionHandle => ({
   ...fakeHandle(events, result),
   send: (input) => Ref.update(sent, (xs) => [...xs, input]),
 });
 
 /** A fake {@link ExecutionRunner} that hands back a fixed handle for every job. */
-const fakeRunner = (handle: SessionHandle): Layer.Layer<ExecutionRunner> =>
+const fakeRunner = (handle: ExecutionHandle): Layer.Layer<ExecutionRunner> =>
   Layer.succeed(ExecutionRunner, ExecutionRunner.of({ run: () => Effect.succeed(handle) }));
 
 /** Provide the runner-under-test plus its two faked ports; expose `StateStore` for assertions. */
 const provide =
-  (handle: SessionHandle) =>
+  (handle: ExecutionHandle) =>
   <A, E>(effect: Effect.Effect<A, E, JobRunner | StateStore | Scope>) =>
     provideRunner(fakeRunner(handle))(effect);
 
@@ -126,7 +132,7 @@ it("exposes the owned ExecutionRunnerError with a neutral shape", () => {
 });
 
 // ============================================================================
-// Succeeding session
+// Succeeding execution
 // ============================================================================
 
 it.effect("dispatches a job, captures a succeeded JobResult, and persists terminal rows", () =>
@@ -139,21 +145,21 @@ it.effect("dispatches a job, captures a succeeded JobResult, and persists termin
     expect(result.status).toBe("succeeded");
     expect("error" in result).toBe(false);
     expect(result.payload).toStrictEqual({
-      transcriptRef: "transcript://session-job-1",
+      transcriptRef: "transcript://execution-job-1",
       entries: 1,
     });
 
     const store = yield* StateStore;
     const persistedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
     expect(persistedJob.status).toBe("succeeded");
-    expect(persistedJob.sessionId).toBe("session-job-1");
-    expect(persistedJob.transcriptRef).toBe("transcript://session-job-1");
+    expect(persistedJob.executionId).toBe("execution-job-1");
+    expect(persistedJob.transcriptRef).toBe("transcript://execution-job-1");
 
-    const forJob = Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id));
-    expect(forJob.id).toBe("session-job-1");
+    const forJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    expect(forJob.id).toBe("execution-job-1");
     expect(forJob.status).toBe("completed");
-    // Reading the same session by its id round-trips identically.
-    const byId = Option.getOrThrow(yield* store.jobs.getSession(forJob.id));
+    // Reading the same execution by its id round-trips identically.
+    const byId = Option.getOrThrow(yield* store.jobs.getExecution(forJob.id));
     expect(byId).toStrictEqual(forJob);
   }).pipe(provide(fakeHandle(Stream.make(turnStarted, entryEvent), { _tag: "Completed" }))),
 );
@@ -166,9 +172,9 @@ it.effect(
   "tees the whole fold — durable entries via append, ephemeral deltas via publishEphemeral",
   () =>
     Effect.gen(function* () {
-      const appended = yield* Ref.make<ReadonlyArray<SessionEvent>>([]);
-      const published = yield* Ref.make<ReadonlyArray<SessionEvent>>([]);
-      // A session emitting a MIX of ephemeral (TurnStarted, MessageDelta) and durable
+      const appended = yield* Ref.make<ReadonlyArray<ExecutionEvent>>([]);
+      const published = yield* Ref.make<ReadonlyArray<ExecutionEvent>>([]);
+      // An execution emitting a MIX of ephemeral (TurnStarted, MessageDelta) and durable
       // (EntryAppended, Notice) events, interleaved.
       const handle = fakeHandle(Stream.make(turnStarted, entryEvent, messageDelta, noticeEvent), {
         _tag: "Completed",
@@ -181,10 +187,10 @@ it.effect(
 
         // Only the durable events reached the durable transcript log (ephemerals never persist).
         const store = yield* StateStore;
-        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+        const executionId = yield* Schema.decodeUnknownEffect(ExecutionId)("execution-job-1").pipe(
           Effect.orDie,
         );
-        const persisted = yield* store.sessionLog.read(sessionId);
+        const persisted = yield* store.executionLog.read(executionId);
         expect(persisted.map((e) => e.event)).toEqual([entryEvent, noticeEvent]);
       }).pipe(
         Effect.scoped,
@@ -199,36 +205,36 @@ it.effect(
     }),
 );
 
-// A TRANSIENT `sessionLog.append` failure must drop ONLY that entry and keep folding — never
+// A TRANSIENT `executionLog.append` failure must drop ONLY that entry and keep folding — never
 // tear down the whole writer and silently truncate every SUBSEQUENT durable entry (a data-loss
 // path for a durability feature). A store whose append fails ONCE (on the middle entry) still
 // persists the entries BEFORE and AFTER it.
 it.effect(
-  "a transient sessionLog.append failure drops one entry but keeps folding (no truncation)",
+  "a transient executionLog.append failure drops one entry but keeps folding (no truncation)",
   () =>
     Effect.gen(function* () {
       const first = entryEvent;
-      const poison: SessionEvent = {
+      const poison: ExecutionEvent = {
         _tag: "EntryAppended",
         entry: { _tag: "AssistantMessage", id: "poison", text: "x" },
       };
-      const third: SessionEvent = {
+      const third: ExecutionEvent = {
         _tag: "EntryAppended",
         entry: { _tag: "AssistantMessage", id: "third", text: "z" },
       };
-      // A StateStore whose `sessionLog.append` fails transiently for the poison entry only.
+      // A StateStore whose `executionLog.append` fails transiently for the poison entry only.
       const failAppendOnPoison: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
         StateStore,
         Effect.gen(function* () {
           const base = yield* StateStore;
           return StateStore.of({
             ...base,
-            sessionLog: {
-              ...base.sessionLog,
-              append: (sessionId, event) =>
+            executionLog: {
+              ...base.executionLog,
+              append: (executionId, event) =>
                 event === poison
                   ? Effect.fail(new StateStoreError({ operation: "append", detail: "transient" }))
-                  : base.sessionLog.append(sessionId, event),
+                  : base.executionLog.append(executionId, event),
             },
           });
         }),
@@ -240,10 +246,10 @@ it.effect(
         yield* runner.dispatch(job);
 
         const store = yield* StateStore;
-        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+        const executionId = yield* Schema.decodeUnknownEffect(ExecutionId)("execution-job-1").pipe(
           Effect.orDie,
         );
-        const persisted = yield* store.sessionLog.read(sessionId);
+        const persisted = yield* store.executionLog.read(executionId);
         // The poison entry was dropped, but folding CONTINUED — `first` and `third` both persisted.
         expect(persisted.map((e) => e.event)).toEqual([first, third]);
       }).pipe(
@@ -310,7 +316,7 @@ it.effect("drives a prompt built from the real Issue content (number + title), n
     });
     yield* store.workGraph.putIssue(issue);
 
-    const sent = yield* Ref.make<ReadonlyArray<SessionInput>>([]);
+    const sent = yield* Ref.make<ReadonlyArray<ExecutionInput>>([]);
     const handle = recordingHandle(Stream.make(turnStarted), { _tag: "Completed" }, sent);
 
     // Dispatch against the SAME (outer) `StateStore` — the JobRunner + fake runner
@@ -333,10 +339,10 @@ it.effect("drives a prompt built from the real Issue content (number + title), n
 );
 
 // ============================================================================
-// Failing session
+// Failing execution
 // ============================================================================
 
-it.effect("dispatches a job, captures a failed JobResult, and persists a failed session", () =>
+it.effect("dispatches a job, captures a failed JobResult, and persists a failed execution", () =>
   Effect.gen(function* () {
     const job = yield* makeJob();
 
@@ -348,7 +354,7 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
     // The one entry emitted BEFORE the stream tore down is preserved — the count is
     // held in a Ref, so a teardown of the fold no longer discards it.
     expect(result.payload).toStrictEqual({
-      transcriptRef: "transcript://session-job-1",
+      transcriptRef: "transcript://execution-job-1",
       entries: 1,
     });
 
@@ -356,9 +362,9 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
     const persistedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
     expect(persistedJob.status).toBe("failed");
 
-    const persistedSession = Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id));
-    expect(persistedSession.status).toBe("failed");
-    expect(persistedSession.id).toBe("session-job-1");
+    const persistedExecution = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    expect(persistedExecution.status).toBe("failed");
+    expect(persistedExecution.id).toBe("execution-job-1");
   }).pipe(
     provide(
       fakeHandle(
@@ -377,7 +383,7 @@ it.effect("dispatches a job, captures a failed JobResult, and persists a failed 
 // Failure paths through dispatch move the durable rows OUT of limbo (no stuck running)
 // ============================================================================
 
-it.effect("fails and persists a failed terminal when the runner cannot start the session", () =>
+it.effect("fails and persists a failed terminal when the runner cannot start the execution", () =>
   Effect.gen(function* () {
     const job = yield* makeJob();
     const runner = yield* JobRunner;
@@ -389,7 +395,7 @@ it.effect("fails and persists a failed terminal when the runner cannot start the
     // limbo — the durable rows are moved to a failed terminal.
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id)).status).toBe("failed");
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
   }).pipe(
     provideRunner(
       Layer.succeed(
@@ -403,7 +409,7 @@ it.effect("fails and persists a failed terminal when the runner cannot start the
   ),
 );
 
-it.effect("fails and persists a failed terminal when driving the session fails", () =>
+it.effect("fails and persists a failed terminal when driving the execution fails", () =>
   Effect.gen(function* () {
     const job = yield* makeJob();
     const runner = yield* JobRunner;
@@ -413,7 +419,7 @@ it.effect("fails and persists a failed terminal when driving the session fails",
 
     const store = yield* StateStore;
     expect(Option.getOrThrow(yield* store.jobs.getJob(job.id)).status).toBe("failed");
-    expect(Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id)).status).toBe("failed");
+    expect(Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id)).status).toBe("failed");
   }).pipe(
     provide({
       ...fakeHandle(Stream.empty, { _tag: "Completed" }),
@@ -424,33 +430,33 @@ it.effect("fails and persists a failed terminal when driving the session fails",
 );
 
 // ============================================================================
-// 1 Job = 1 session — re-dispatch re-attaches the SAME session id
+// 1 Job = 1 execution — re-dispatch re-attaches the SAME execution id
 // ============================================================================
 
-it.effect("re-dispatch re-attaches the same session id, never a second session", () =>
+it.effect("re-dispatch re-attaches the same execution id, never a second execution", () =>
   Effect.gen(function* () {
     const job = yield* makeJob();
 
     const runner = yield* JobRunner;
     yield* runner.dispatch(job);
 
-    // A restart reloads the persisted job — which now carries its sessionId — and
+    // A restart reloads the persisted job — which now carries its executionId — and
     // re-dispatches. `dispatch` must reuse that SAME id (upsert), not mint a new one.
     const store = yield* StateStore;
     const reloaded = Option.getOrThrow(yield* store.jobs.getJob(job.id));
-    expect(reloaded.sessionId).toBe("session-job-1");
+    expect(reloaded.executionId).toBe("execution-job-1");
 
     const second = yield* runner.dispatch(reloaded);
     expect(second.status).toBe("succeeded");
 
-    const forJob = Option.getOrThrow(yield* store.jobs.getSessionForJob(job.id));
-    expect(forJob.id).toBe("session-job-1");
+    const forJob = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    expect(forJob.id).toBe("execution-job-1");
   }).pipe(provide(fakeHandle(Stream.make(entryEvent), { _tag: "Completed" }))),
 );
 
 // ============================================================================
 // Merged single-transcript on re-dispatch (issue #77) — a retry APPENDS to the
-// SAME per-session log (offsets monotonic, never reset), and `entries` counts the
+// SAME per-execution log (offsets monotonic, never reset), and `entries` counts the
 // MERGED transcript across runs, not just the latest run.
 // ============================================================================
 
@@ -460,17 +466,17 @@ it.effect(
     Effect.gen(function* () {
       const job = yield* makeJob();
       const store = yield* StateStore;
-      const sessionId = yield* Schema.decodeUnknownEffect(SessionId)("session-job-1").pipe(
+      const executionId = yield* Schema.decodeUnknownEffect(ExecutionId)("execution-job-1").pipe(
         Effect.orDie,
       );
 
-      // Two runs of the SAME job (same session id), each emitting one distinct durable
+      // Two runs of the SAME job (same execution id), each emitting one distinct durable
       // entry, so the merged transcript is unambiguously the concatenation of both runs.
-      const run1Entry: SessionEvent = {
+      const run1Entry: ExecutionEvent = {
         _tag: "EntryAppended",
         entry: { _tag: "UserMessage", id: "run-1", text: "first run" },
       };
-      const run2Entry: SessionEvent = {
+      const run2Entry: ExecutionEvent = {
         _tag: "EntryAppended",
         entry: { _tag: "AssistantMessage", id: "run-2", text: "second run" },
       };
@@ -487,14 +493,14 @@ it.effect(
       );
       // After run 1 the count reflects run 1's single entry.
       expect(first.payload).toStrictEqual({
-        transcriptRef: "transcript://session-job-1",
+        transcriptRef: "transcript://execution-job-1",
         entries: 1,
       });
 
-      // A restart reloads the persisted job (now carrying its sessionId) and
-      // re-dispatches against the SAME session id.
+      // A restart reloads the persisted job (now carrying its executionId) and
+      // re-dispatches against the SAME execution id.
       const reloaded = Option.getOrThrow(yield* store.jobs.getJob(job.id));
-      expect(reloaded.sessionId).toBe("session-job-1");
+      expect(reloaded.executionId).toBe("execution-job-1");
 
       const second = yield* Effect.gen(function* () {
         const runner = yield* JobRunner;
@@ -506,7 +512,7 @@ it.effect(
       );
 
       // (a) The durable transcript APPENDED: both runs' entries present, in order.
-      const durable = yield* store.sessionLog.read(sessionId);
+      const durable = yield* store.executionLog.read(executionId);
       expect(durable.map((e) => e.event)).toEqual([run1Entry, run2Entry]);
       // Offsets are monotonically increasing and DISTINCT — the re-dispatch never reset
       // the sequence (run 2's offset is strictly greater than run 1's).
@@ -516,7 +522,7 @@ it.effect(
 
       // (b) `entries` counts the MERGED transcript (both runs), not just the latest run.
       expect(second.payload).toStrictEqual({
-        transcriptRef: "transcript://session-job-1",
+        transcriptRef: "transcript://execution-job-1",
         entries: 2,
       });
     }).pipe(Effect.scoped, Effect.provide(layerMemory)),

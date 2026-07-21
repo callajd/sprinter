@@ -33,7 +33,7 @@ public struct UiAnswerMismatch: Error, Equatable {
 ///
 /// This lives here, in a covered target, because the mapping is load-bearing: the daemon
 /// does **not** re-derive the answer variant from the request kind — its
-/// `encodeUiResponse` (`@sprinter/runner` `session-handle.ts`) encodes whatever variant it
+/// `encodeUiResponse` (`@sprinter/runner` `execution-handle.ts`) encodes whatever variant it
 /// receives verbatim into Pi's `extension_ui_response`. So sending the correct variant per
 /// kind is entirely the client's responsibility:
 ///

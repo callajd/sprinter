@@ -1,15 +1,15 @@
 import SprinterContract
 
-/// Deterministic read-model fixtures for the inspector tests — one session whose
+/// Deterministic read-model fixtures for the inspector tests — one execution whose
 /// job resolves to a PR two different ways, plus the "no PR yet" variant.
 enum InspectorFixtures {
-  static let sessionId = SessionId(rawValue: "session-1")
+  static let executionId = ExecutionId(rawValue: "execution-1")
   static let jobId = JobId(rawValue: "job-1")
   static let issueId = IssueId(rawValue: "issue-1")
 
-  static let session = Session(id: sessionId, jobId: jobId, status: .active)
+  static let execution = Execution(id: executionId, jobId: jobId, status: .active)
 
-  /// The job's own closing PR (the `session.jobId → job.pullRequest` path).
+  /// The job's own closing PR (the `execution.jobId → job.pullRequest` path).
   static let jobPullRequest = PullRequestRef(
     number: 42, url: "https://example.com/pull/42", merged: false)
 
@@ -33,7 +33,7 @@ enum InspectorFixtures {
       issueId: issueId,
       kind: .implement,
       status: .running,
-      sessionId: sessionId,
+      executionId: executionId,
       transcriptRef: nil,
       pullRequest: pullRequest)
   }
@@ -46,7 +46,7 @@ enum InspectorFixtures {
       epics: [],
       issues: [issue],
       jobs: [jobWithPullRequest(pullRequest)],
-      sessions: [session],
+      executions: [execution],
       agents: [],
       generation: StoreGenerationId(rawValue: "gen-test"))
   }
@@ -69,7 +69,7 @@ enum InspectorFixtures {
           pullRequest: pullRequest)
       ],
       jobs: [jobWithPullRequest(nil)],
-      sessions: [session],
+      executions: [execution],
       agents: [],
       generation: StoreGenerationId(rawValue: "gen-test"))
   }

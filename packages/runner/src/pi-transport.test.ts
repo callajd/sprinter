@@ -40,7 +40,7 @@ import { PiClientMessage } from "@sprinter/domain/pi/wire";
 import { make } from "./pi-transport.ts";
 
 /** A realistic `get_state` snapshot, exactly as `pi` shapes it on the wire. */
-const sessionStateData = {
+const executionStateData = {
   thinkingLevel: "off",
   isStreaming: false,
   isCompacting: false,
@@ -203,7 +203,7 @@ it.effect("correlates a command to its response by id, decoding real NDJSON both
           type: "response",
           command: "get_state",
           success: true,
-          data: sessionStateData,
+          data: executionStateData,
         });
 
         const response = yield* Fiber.join(fiber);
@@ -389,7 +389,7 @@ it.effect("drops a response whose id matches no outstanding request", () =>
           type: "response",
           command: "get_state",
           success: true,
-          data: sessionStateData,
+          data: executionStateData,
         });
         yield* Queue.offer(fake.stdoutRaw, { type: "agent_start" });
         const events = yield* Fiber.join(collecting);

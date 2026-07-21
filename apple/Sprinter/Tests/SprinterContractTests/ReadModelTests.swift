@@ -15,7 +15,7 @@ struct ReadModelTests {
     #expect(snapshot.epics.count == 1)
     #expect(snapshot.issues.count == 2)
     #expect(snapshot.jobs.count == 2)
-    #expect(snapshot.sessions.count == 1)
+    #expect(snapshot.executions.count == 1)
     // The REGISTRY layer rides the snapshot whole — every revision, retired included
     // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED), in
     // the lexicographic-by-id order the daemon's `listAgents` pins.
@@ -112,8 +112,8 @@ struct ReadModelTests {
     let job = try Golden.decode(Job.self, from: "job-full")
     #expect(job.kind == .implement)
     #expect(job.status == .running)
-    #expect(job.sessionId == SessionId(rawValue: "ses-1"))
-    #expect(job.transcriptRef == "transcripts/ses-1.jsonl")
+    #expect(job.executionId == ExecutionId(rawValue: "exe-1"))
+    #expect(job.transcriptRef == "transcripts/exe-1.jsonl")
     #expect(job.pullRequest?.merged == true)
     #expect(try Golden.roundTrip(job) == job)
   }
@@ -123,19 +123,19 @@ struct ReadModelTests {
     let job = try Golden.decode(Job.self, from: "job-minimal")
     #expect(job.kind == .review)
     #expect(job.status == .queued)
-    #expect(job.sessionId == nil)
+    #expect(job.executionId == nil)
     #expect(job.transcriptRef == nil)
     #expect(job.pullRequest == nil)
     #expect(try Golden.roundTrip(job) == job)
   }
 
-  @Test("decodes a session")
-  func decodesSession() throws {
-    let session = try Golden.decode(Session.self, from: "session")
-    #expect(session.id == SessionId(rawValue: "ses-1"))
-    #expect(session.jobId == JobId(rawValue: "job-1"))
-    #expect(session.status == .active)
-    #expect(try Golden.roundTrip(session) == session)
+  @Test("decodes an execution")
+  func decodesExecution() throws {
+    let execution = try Golden.decode(Execution.self, from: "execution")
+    #expect(execution.id == ExecutionId(rawValue: "exe-1"))
+    #expect(execution.jobId == JobId(rawValue: "job-1"))
+    #expect(execution.status == .active)
+    #expect(try Golden.roundTrip(execution) == execution)
   }
 
   @Test("decodes a standalone pull-request ref")

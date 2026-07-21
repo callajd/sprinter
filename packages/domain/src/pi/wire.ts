@@ -7,7 +7,7 @@
  * foreign location (`packages/domain/src/pi/`), deliberately kept OUT of the
  * `@sprinter/domain` barrel so it never leaks into the client-facing RPC surface
  * (FE2.3's `RpcGroup` must not import it). The adapter translates these foreign
- * shapes → our neutral `SessionEvent`/`SessionInput`/`UiResponse` at the
+ * shapes → our neutral `ExecutionEvent`/`ExecutionInput`/`UiResponse` at the
  * boundary; that translation lands in Track A (INV-NAMING, INV-PORT).
  *
  * It is AUTHORED AGAINST, and never imports (D12), the Pi source of truth:
@@ -470,7 +470,7 @@ const promptLike = {
 
 /**
  * The command subset the adapter SENDS: the three input modes
- * (`prompt`/`steer`/`follow_up`) our `SessionInput` maps to, plus `abort`
+ * (`prompt`/`steer`/`follow_up`) our `ExecutionInput` maps to, plus `abort`
  * (interrupt), `get_state` (handshake), and `new_session`.
  */
 export const PiRpcCommand = Schema.Union([

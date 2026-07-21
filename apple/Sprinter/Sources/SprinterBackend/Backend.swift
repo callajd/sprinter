@@ -55,27 +55,27 @@ public protocol Backend: Sendable {
   /// subscription.
   func events(resume: ResumeContext?) -> OffsetEventStream
 
-  // MARK: - Session channel (BE1.2 / D9)
+  // MARK: - Execution channel (BE1.2 / D9)
 
-  /// The live session feed: a stream of owned ``SessionEvent`` for `sessionId`
+  /// The live execution feed: a stream of owned ``ExecutionEvent`` for `executionId`
   /// (turn lifecycle, message/tool deltas, `UiRequestRaised`, …), fed until the
   /// daemon ends the subscription. An unknown `_tag` is a decode failure, never a
   /// silent drop.
-  func sessionEvents(sessionId: SessionId) -> AsyncThrowingStream<SessionEvent, any Error>
+  func executionEvents(executionId: ExecutionId) -> AsyncThrowingStream<ExecutionEvent, any Error>
 
-  /// Drives input INTO a session (a fresh prompt, a mid-turn steer, or a
-  /// follow-up); throws ``ContractError/sessionNotFound(id:)`` for an unknown
-  /// session.
-  func sessionSend(sessionId: SessionId, input: SessionInput) async throws
+  /// Drives input INTO an execution (a fresh prompt, a mid-turn steer, or a
+  /// follow-up); throws ``ContractError/executionNotFound(id:)`` for an unknown
+  /// execution.
+  func executionSend(executionId: ExecutionId, input: ExecutionInput) async throws
 
-  /// Interrupts a running session (D9 — every session is interruptible); throws
-  /// ``ContractError/sessionNotFound(id:)`` for an unknown session.
-  func interrupt(sessionId: SessionId) async throws
+  /// Interrupts a running execution (D9 — every execution is interruptible); throws
+  /// ``ContractError/executionNotFound(id:)`` for an unknown execution.
+  func interrupt(executionId: ExecutionId) async throws
 
   /// Answers an outstanding `UiRequestRaised` with the neutral ``UiResponse`` that
-  /// keys the answer to its request id; throws ``ContractError/sessionNotFound(id:)``
-  /// for an unknown session.
-  func answerUiRequest(sessionId: SessionId, response: UiResponse) async throws
+  /// keys the answer to its request id; throws ``ContractError/executionNotFound(id:)``
+  /// for an unknown execution.
+  func answerUiRequest(executionId: ExecutionId, response: UiResponse) async throws
 
   /// Tears the connection down deterministically: cancels the inbound receive
   /// loop, closes the underlying transport, and fails every in-flight request with

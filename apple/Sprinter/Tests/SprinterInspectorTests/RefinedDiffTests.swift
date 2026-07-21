@@ -1,5 +1,5 @@
 import SprinterContract
-import SprinterSession
+import SprinterExecution
 import Testing
 
 @testable import SprinterInspector

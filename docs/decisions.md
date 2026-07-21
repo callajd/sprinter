@@ -46,15 +46,15 @@ Services/Layers, `Schema`, `Stream`, `Scope`, `Fiber`, `PubSub`, and the
 
 ### D8 — Daemon↔client contract on `effect/unstable/rpc`
 Transport-agnostic RPC (`RpcGroup`) carries four models: query/snapshot,
-streaming subscription, commands, and the interactive-session channel. Transport
+streaming subscription, commands, and the interactive-execution channel. Transport
 is a swappable detail we do not care about.
 
-### D9 — Every session is interactive/interruptible; planning is in the app
-No hard split between headless worker and interactive session. Every session runs
+### D9 — Every execution is interactive/interruptible; planning is in the app
+No hard split between headless worker and interactive execution. Every execution runs
 headless by default, is promotable to interactive (`prompt`/`steer`/`follow_up`)
-and always interruptible (`abort`). Planning is just an interactive session whose
+and always interruptible (`abort`). Planning is just an interactive execution whose
 product materializes into the work graph. → the UI needs **one** reusable
-interactive-session surface, not a bespoke planner.
+interactive-execution surface, not a bespoke planner.
 
 ### D10 — Native macOS client in SwiftUI
 Truly native, and no Rust backend (ruled out Tauri). Consequence: the Mac client
@@ -130,15 +130,15 @@ D1 held Pi as the *exclusive* runtime; we amend it. We treat the agent runtime a
 an **abstract provider** — the `ExecutionRunner` port — and make `pi --mode rpc`
 its first, and for now **only**, adapter (`PiAgentRunner`). We extend D14 (we make
 the provider abstraction universal) onto the runtime itself: our core depends on
-the **owned, provider-neutral session model**, never on Pi. We treat "where it
+the **owned, provider-neutral execution model**, never on Pi. We treat "where it
 runs" (local/remote) as a separate adapter sub-axis *within* an adapter, distinct
 from "which engine."
 
-*Key nuance:* Pi's own event/session abstractions **already generalize across
+*Key nuance:* Pi's own event/execution abstractions **already generalize across
 model providers** (Pi drives many underlying models), so they themselves make a
 good neutral abstraction. We therefore **mirror Pi's shape as our owned Effect
 `Schema`** — we give our types plain names and translate the foreign
-`Rpc*`/`AgentSessionEvent` → our `SessionEvent`/`SessionInput`/`UiResponse` at the
+`Rpc*`/`AgentSessionEvent` → our `ExecutionEvent`/`ExecutionInput`/`UiResponse` at the
 adapter boundary — rather than reinventing a different denominator. We do **not**
 import Pi's types (D12); FE2.2 validates the owned **Pi-protocol** schema against
 real `pi --mode rpc` output (the neutral model is what the Pi adapter translates
@@ -151,13 +151,13 @@ never ripples to the contract.
 ### D17 — Maximally reactive end-to-end (INV-REACTIVE)
 **We push everything reactively from the agent harness to the UI render — we never
 poll where a stream fits.** We build the reactive spine as: Pi stdout (NDJSON) →
-Effect `Stream` → per-session `PubSub` → streaming RPC (`RpcSchema.Stream` over
+Effect `Stream` → per-execution `PubSub` → streaming RPC (`RpcSchema.Stream` over
 `effect/unstable/rpc`) → client subscription → reactive UI render (SwiftUI
 `@Observable`; the eventual web client the same way). We thread INV-REACTIVE into
 every layer's acceptance:
-- we make the contract's `events` (work-graph deltas) and `sessionEvents` channels
+- we make the contract's `events` (work-graph deltas) and `executionEvents` channels
   **streaming-first**, not request/response polling;
-- we make the owned `SessionEvent` stream carry the **full reactive flow** —
+- we make the owned `ExecutionEvent` stream carry the **full reactive flow** —
   fine-grained message/tool **deltas** *and* the durable transcript **entries** —
   so a client renders live and reconciles deltas into the transcript-grade record;
 - we compose the daemon side with `Stream`/`PubSub`/`Scope`, not poll loops;

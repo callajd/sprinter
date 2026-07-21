@@ -14,7 +14,7 @@
  * - {@link ExecutionRunner} — CE1.1's real `LocalPi` adapter (`@sprinter/job`
  *   `layerLocalPi`) over a per-Job worktree router (`layerWorktreeRouter`, CE1.1-F2),
  *   spawning `pi` through the Bun `ChildProcessSpawner`.
- * - {@link JobRunner}, {@link CodeHost}, {@link SessionRegistry},
+ * - {@link JobRunner}, {@link CodeHost}, {@link ExecutionRegistry},
  *   {@link WorkGraphEvents} — the remaining ports, each an Effect `Layer`.
  * - {@link handlers} — the `SprinterRpc` server handlers, served by
  *   `RpcServer.layer` over a `SocketServer` transport (NDJSON framing) — the ONLY
@@ -39,9 +39,12 @@ import { layerFetch as layerRepository, type RepositoryConfig } from "@sprinter/
 import { layer as layerStateSqlite } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
 import { handlers } from "./rpc-handlers.ts";
-import { layer as layerSessionEvents } from "./session-events.ts";
-import { layerWith as layerSessionRegistry, SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
-import { layerRegisterSessions } from "./session-runner.ts";
+import { layer as layerExecutionEvents } from "./execution-events.ts";
+import {
+  EXECUTION_RESOLVE_TIMEOUT,
+  layerWith as layerExecutionRegistry,
+} from "./execution-registry.ts";
+import { layerRegisterExecutions } from "./execution-runner.ts";
 import { layer as layerStartupReconcile, StartupReconcile } from "./startup-reconcile.ts";
 import { layer as layerWorkGraphEvents } from "./work-graph-events.ts";
 
@@ -62,13 +65,13 @@ export interface DaemonConfig {
   /** The single bound repository the daemon reconciles against (repo-scoped, D14). */
   readonly repository: RepositoryConfig;
   /**
-   * The hard bound the session-channel handlers wait for a genuinely mid-dispatch
-   * session's handle to register before failing `SessionNotFound` (the
+   * The hard bound the execution-channel handlers wait for a genuinely mid-dispatch
+   * execution's handle to register before failing `ExecutionNotFound` (the
    * register-after-dispatch window — a `pi` spawn + RPC handshake). Defaults to
-   * {@link SESSION_RESOLVE_TIMEOUT} (5s); the operational knob to RAISE if a real `pi`
-   * cold-start exceeds it (a spurious `SessionNotFound` with no other lever otherwise).
+   * {@link EXECUTION_RESOLVE_TIMEOUT} (5s); the operational knob to RAISE if a real `pi`
+   * cold-start exceeds it (a spurious `ExecutionNotFound` with no other lever otherwise).
    */
-  readonly sessionResolveTimeout: Duration.Duration;
+  readonly executionResolveTimeout: Duration.Duration;
 }
 
 /**
@@ -97,21 +100,23 @@ export const configFromEnv = (env: Readonly<Record<string, string | undefined>>)
       repo: env["SPRINTER_REPO_NAME"] ?? "sprinter",
       token,
     },
-    sessionResolveTimeout: sessionResolveTimeoutFrom(env["SPRINTER_SESSION_RESOLVE_TIMEOUT_MS"]),
+    executionResolveTimeout: executionResolveTimeoutFrom(
+      env["SPRINTER_EXECUTION_RESOLVE_TIMEOUT_MS"],
+    ),
   };
 };
 
 /**
- * Resolve the session-resolve bound from an optional millisecond env override,
- * defaulting to {@link SESSION_RESOLVE_TIMEOUT}. A missing, blank, non-numeric, or
+ * Resolve the execution-resolve bound from an optional millisecond env override,
+ * defaulting to {@link EXECUTION_RESOLVE_TIMEOUT}. A missing, blank, non-numeric, or
  * non-positive value falls back to the default rather than a nonsensical bound — the
  * knob only ever RAISES a sane cold-start allowance, never breaks it (INV-NOCAST: the
  * parse is a total `Number` check, no assertion).
  */
-const sessionResolveTimeoutFrom = (raw: string | undefined): Duration.Duration => {
-  if (raw === undefined || raw.trim() === "") return SESSION_RESOLVE_TIMEOUT;
+const executionResolveTimeoutFrom = (raw: string | undefined): Duration.Duration => {
+  if (raw === undefined || raw.trim() === "") return EXECUTION_RESOLVE_TIMEOUT;
   const ms = Number(raw);
-  return Number.isInteger(ms) && ms > 0 ? Duration.millis(ms) : SESSION_RESOLVE_TIMEOUT;
+  return Number.isInteger(ms) && ms > 0 ? Duration.millis(ms) : EXECUTION_RESOLVE_TIMEOUT;
 };
 
 // ── port sub-graphs ───────────────────────────────────────────────────────────
@@ -122,46 +127,46 @@ const sessionResolveTimeoutFrom = (raw: string | undefined): Duration.Duration =
  * journals each mutation to the offset log AND fans it out live on the
  * {@link WorkGraphEvents} feed stamped with the durable offset it committed at — so
  * the live tail and the durable replay share one coordinate space and the
- * offset-based resync is gap-free. The SAME decorator fans each durable session-transcript
- * append out on the {@link SessionEvents} feed stamped with its per-session offset.
- * Requires `WorkGraphEvents` + `SessionEvents` (both provided by {@link portsLayer}).
+ * offset-based resync is gap-free. The SAME decorator fans each durable execution-transcript
+ * append out on the {@link ExecutionEvents} feed stamped with its per-execution offset.
+ * Requires `WorkGraphEvents` + `ExecutionEvents` (both provided by {@link portsLayer}).
  */
 export const stateStoreLayer = (config: DaemonConfig) =>
   layerJournaling(layerStateSqlite({ filename: config.databasePath }));
 
 /**
  * The real {@link ExecutionRunner}: CE1.1's `LocalPi` adapter over a per-Job
- * worktree router (CE1.1-F2), DECORATED so every started session is registered in
- * the {@link SessionRegistry} (CE4.1, `./session-runner.ts`) — the wire that makes a
- * dispatched session reachable over the contract's session channel. Requires the
+ * worktree router (CE1.1-F2), DECORATED so every started execution is registered in
+ * the {@link ExecutionRegistry} (CE4.1, `./execution-runner.ts`) — the wire that makes a
+ * dispatched execution reachable over the contract's execution channel. Requires the
  * `ChildProcessSpawner`, the `FileSystem`/`Path` the router uses (the daemon edge
  * `BunServices` provides them; a test substitutes a fake spawner), and the
- * `SessionRegistry` ({@link portsLayer} provides it). Selecting real-vs-fake is a
+ * `ExecutionRegistry` ({@link portsLayer} provides it). Selecting real-vs-fake is a
  * `Layer` substitution (INV-EFFECT-DI).
  */
 export const executionRunnerLayer = (config: DaemonConfig) =>
-  layerRegisterSessions(
+  layerRegisterExecutions(
     layerLocalPi.pipe(Layer.provide(layerWorktreeRouter(config.workspaceRoot))),
   );
 
 /**
  * The full port sub-graph MINUS the leaf adapters (`CodeHost`, the process
  * spawner, the filesystem) that a test substitutes: the `StateStore`,
- * `ExecutionRunner`, `SessionRegistry`, `WorkGraphEvents`, `JobRunner`, and
+ * `ExecutionRunner`, `ExecutionRegistry`, `WorkGraphEvents`, `JobRunner`, and
  * `StartupReconcile` services, cross-wired. Requires `CodeHost` +
  * `ChildProcessSpawner`/`FileSystem`/`Path`.
  *
- * The {@link SessionRegistry} is provided BENEATH (`provideMerge`) rather than merged
+ * The {@link ExecutionRegistry} is provided BENEATH (`provideMerge`) rather than merged
  * as a sibling, because the registering {@link executionRunnerLayer} decorator (CE4.1)
  * now DEPENDS on it — one registry instance feeds both the `ExecutionRunner` (which
- * registers dispatched handles) and the handlers (which resolve them), so the session
- * a command dispatches is the very session the session channel drives.
+ * registers dispatched handles) and the handlers (which resolve them), so the execution
+ * a command dispatches is the very execution the execution channel drives.
  */
 const portsLayer = (config: DaemonConfig) =>
   Layer.mergeAll(stateStoreLayer(config), executionRunnerLayer(config)).pipe(
-    Layer.provideMerge(layerSessionRegistry(config.sessionResolveTimeout)),
+    Layer.provideMerge(layerExecutionRegistry(config.executionResolveTimeout)),
     Layer.provideMerge(layerWorkGraphEvents),
-    Layer.provideMerge(layerSessionEvents),
+    Layer.provideMerge(layerExecutionEvents),
   );
 
 /**
@@ -189,7 +194,7 @@ export const appLayer = (config: DaemonConfig) =>
  * Run {@link StartupReconcile} once at boot: reconcile the durable graph against the
  * host and re-dispatch persisted in-flight work (AE5). A background resume fibers
  * onto the daemon scope, so `run` returns promptly and boot never blocks on a
- * session. Requires only the `StartupReconcile` port.
+ * execution. Requires only the `StartupReconcile` port.
  */
 export const bootLayer = Layer.effectDiscard(
   Effect.gen(function* () {

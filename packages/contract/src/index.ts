@@ -5,6 +5,6 @@
  * built over the FE2.1 owned domain schemas, the neutral error types, and the
  * aggregate request/response + streamed-event schemas ({@link ./rpc.ts}).
  * Provider-neutral (D16) and maximally reactive (D17): the surface speaks only
- * owned domain types and streams its `events` and `sessionEvents` feeds.
+ * owned domain types and streams its `events` and `executionEvents` feeds.
  */
 export * from "./rpc.ts";

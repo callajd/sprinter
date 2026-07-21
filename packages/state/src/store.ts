@@ -21,8 +21,8 @@
  * - {@link WorkGraphStore} — the work graph `Workstream ⊃ Epic ⊃ Issue` plus the
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
- * - {@link JobStore} — the `Job` model and the `Issue → Job → session → PR`
- *   mapping (1 Job = 1 session = 1 transcript = 1 PR), plus {@link Session}.
+ * - {@link JobStore} — the `Job` model and the `Issue → Job → execution → PR`
+ *   mapping (1 Job = 1 execution = 1 transcript = 1 PR), plus {@link Execution}.
  * - {@link EventLogStore} — an append-only durable event feed (append / ordered
  *   read / tail-from-offset): the durable event record distinct from the reactive
  *   in-memory stream, supporting D17 reconciliation and AE4's snapshot.
@@ -38,6 +38,9 @@ import {
   AgentId,
   type Epic,
   EpicId,
+  type Execution,
+  ExecutionEvent,
+  ExecutionId,
   type Issue,
   IssueId,
   type Job,
@@ -46,9 +49,6 @@ import {
   type Repository,
   RepositoryId,
   type RepositoryKey,
-  type Session,
-  SessionEvent,
-  SessionId,
   type StoreGenerationId,
   type Workstream,
   WorkstreamId,
@@ -109,22 +109,22 @@ export const PersistedEvent = Schema.Struct({
 export type PersistedEvent = (typeof PersistedEvent)["Type"];
 
 /**
- * A persisted DURABLE session-transcript entry: an owned, transcript-grade
- * {@link SessionEvent} stamped with its monotonic per-session `offset` — the
- * session-channel analogue of {@link PersistedEvent}. The `offset` is the durable
- * cursor a consumer reads the session's transcript in order by and tails from a known
- * position (the `sessionEvents` durable replay). Unlike the open
+ * A persisted DURABLE execution-transcript entry: an owned, transcript-grade
+ * {@link ExecutionEvent} stamped with its monotonic per-execution `offset` — the
+ * execution-channel analogue of {@link PersistedEvent}. The `offset` is the durable
+ * cursor a consumer reads the execution's transcript in order by and tails from a known
+ * position (the `executionEvents` durable replay). Unlike the open
  * {@link PersistedEvent} envelope, the transcript log is TYPED to the owned
- * `SessionEvent` — its only producer is the session fold, so it persists the owned value
+ * `ExecutionEvent` — its only producer is the execution fold, so it persists the owned value
  * directly rather than an opaque `kind`/`payload` pair.
  */
-export const PersistedSessionEvent = Schema.Struct({
-  /** The entry's monotonic position in the session's transcript; the tail cursor. */
+export const PersistedExecutionEvent = Schema.Struct({
+  /** The entry's monotonic position in the execution's transcript; the tail cursor. */
   offset: NonNegativeInt,
-  /** The durable, transcript-grade session event persisted at this offset. */
-  event: SessionEvent,
+  /** The durable, transcript-grade execution event persisted at this offset. */
+  event: ExecutionEvent,
 });
-export type PersistedSessionEvent = (typeof PersistedSessionEvent)["Type"];
+export type PersistedExecutionEvent = (typeof PersistedExecutionEvent)["Type"];
 
 // ============================================================================
 // Capability groups
@@ -376,13 +376,13 @@ export interface WorkGraphStore {
 }
 
 /**
- * Persist and read the {@link Job} model and the `Issue → Job → session → PR`
- * mapping (1 Job = 1 session = 1 transcript = 1 PR). `putJob` carries a job's
- * optional `sessionId` / `transcriptRef` / `pr`; {@link Session} rows are stored
- * alongside so a job can be resolved to its running session (and back).
+ * Persist and read the {@link Job} model and the `Issue → Job → execution → PR`
+ * mapping (1 Job = 1 execution = 1 transcript = 1 PR). `putJob` carries a job's
+ * optional `executionId` / `transcriptRef` / `pr`; {@link Execution} rows are stored
+ * alongside so a job can be resolved to its running execution (and back).
  */
 export interface JobStore {
-  /** Upsert a {@link Job} (with its optional session / transcript / PR links). */
+  /** Upsert a {@link Job} (with its optional execution / transcript / PR links). */
   readonly putJob: (job: Job) => Effect.Effect<void, StateStoreError>;
   /** Read a {@link Job} by id, if present. */
   readonly getJob: (id: JobId) => Effect.Effect<Option.Option<Job>, StateStoreError>;
@@ -391,18 +391,20 @@ export interface JobStore {
     issueId: IssueId,
   ) => Effect.Effect<ReadonlyArray<Job>, StateStoreError>;
   /**
-   * Upsert a {@link Session} (by session id). At most one session may exist per
-   * job (1 Job = 1 session); attaching a second, distinct session to a job that
+   * Upsert an {@link Execution} (by execution id). At most one execution may exist per
+   * job (1 Job = 1 execution); attaching a second, distinct execution to a job that
    * already has one fails with {@link StateStoreError}. A restart re-attaches by
-   * upserting the SAME session id, not a new one.
+   * upserting the SAME execution id, not a new one.
    */
-  readonly putSession: (session: Session) => Effect.Effect<void, StateStoreError>;
-  /** Read a {@link Session} by id, if present. */
-  readonly getSession: (id: SessionId) => Effect.Effect<Option.Option<Session>, StateStoreError>;
-  /** Read the session executing a given job (the `Job → session` mapping), if present. */
-  readonly getSessionForJob: (
+  readonly putExecution: (execution: Execution) => Effect.Effect<void, StateStoreError>;
+  /** Read an {@link Execution} by id, if present. */
+  readonly getExecution: (
+    id: ExecutionId,
+  ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
+  /** Read the execution executing a given job (the `Job → execution` mapping), if present. */
+  readonly getExecutionForJob: (
     jobId: JobId,
-  ) => Effect.Effect<Option.Option<Session>, StateStoreError>;
+  ) => Effect.Effect<Option.Option<Execution>, StateStoreError>;
 }
 
 /**
@@ -435,70 +437,73 @@ export interface EventLogStore {
 }
 
 /**
- * The append-only durable SESSION-TRANSCRIPT log, keyed per session (1 Job = 1 session
- * = 1 transcript). It is the session-channel analogue of {@link EventLogStore}: `append`
- * stamps a session's next transcript entry with a monotonic `offset` and returns the
- * persisted entry; `read` returns a session's whole transcript in order; `tail` returns a
- * session's entries strictly after a given offset — the primitive the `sessionEvents`
- * durable replay resumes from. It makes a SETTLED session's transcript
+ * The append-only durable EXECUTION-TRANSCRIPT log, keyed per execution (1 Job = 1 execution
+ * = 1 transcript). It is the execution-channel analogue of {@link EventLogStore}: `append`
+ * stamps an execution's next transcript entry with a monotonic `offset` and returns the
+ * persisted entry; `read` returns an execution's whole transcript in order; `tail` returns a
+ * execution's entries strictly after a given offset — the primitive the `executionEvents`
+ * durable replay resumes from. It makes a SETTLED execution's transcript
  * viewable: the entries persist independently of any live handle, so they replay after the
- * session ends.
+ * execution ends.
  *
- * Only DURABLE, transcript-grade {@link SessionEvent}s are APPENDED here (the
+ * Only DURABLE, transcript-grade {@link ExecutionEvent}s are APPENDED here (the
  * `EntryAppended` records and reconcilable `Notice`s the transcript folds), never the
- * ephemeral streaming deltas. Offsets are monotonic per session; a re-dispatch of the same
- * session id APPENDS (never resets the sequence), so the offset sequence is never
+ * ephemeral streaming deltas. Offsets are monotonic per execution; a re-dispatch of the same
+ * execution id APPENDS (never resets the sequence), so the offset sequence is never
  * duplicated or corrupted.
  *
  * The EPHEMERAL live deltas (turn lifecycle, message/tool partials, `UiRequestRaised`, …)
  * are NOT persisted — they take {@link publishEphemeral}, the offset-less live-only path that
- * lets the session fold tee its WHOLE reactive flow to the reactive feed without bloating the
+ * lets the execution fold tee its WHOLE reactive flow to the reactive feed without bloating the
  * durable transcript. The base store no-ops it (it owns durability, not the
  * live feed); the daemon's journaling decorator overrides it to fan the delta out on the
- * `SessionEvents` feed offset-less, exactly as its `append` override fans a durable entry out
+ * `ExecutionEvents` feed offset-less, exactly as its `append` override fans a durable entry out
  * offset-stamped.
  */
-export interface SessionLogStore {
+export interface ExecutionLogStore {
   /**
-   * Append one durable transcript entry for `sessionId`, returning it stamped with its
-   * assigned {@link PersistedSessionEvent.offset}.
+   * Append one durable transcript entry for `executionId`, returning it stamped with its
+   * assigned {@link PersistedExecutionEvent.offset}.
    */
   readonly append: (
-    sessionId: SessionId,
-    event: SessionEvent,
-  ) => Effect.Effect<PersistedSessionEvent, StateStoreError>;
+    executionId: ExecutionId,
+    event: ExecutionEvent,
+  ) => Effect.Effect<PersistedExecutionEvent, StateStoreError>;
   /**
-   * Fan out one EPHEMERAL, non-durable live session event WITHOUT persisting it — the
+   * Fan out one EPHEMERAL, non-durable live execution event WITHOUT persisting it — the
    * offset-less live-delta path. Total (it cannot fail): the base store no-ops
    * it, and the decorator's feed publish cannot fail. It NEVER mints an offset and NEVER
    * touches the durable transcript, so it does not perturb the `sinceOffset` reconnect resume.
    */
-  readonly publishEphemeral: (sessionId: SessionId, event: SessionEvent) => Effect.Effect<void>;
-  /** A session's entire transcript in memory, ordered by ascending offset. */
+  readonly publishEphemeral: (
+    executionId: ExecutionId,
+    event: ExecutionEvent,
+  ) => Effect.Effect<void>;
+  /** An execution's entire transcript in memory, ordered by ascending offset. */
   readonly read: (
-    sessionId: SessionId,
-  ) => Effect.Effect<ReadonlyArray<PersistedSessionEvent>, StateStoreError>;
-  /** A session's entries with an offset strictly greater than `offset`, ordered ascending. */
+    executionId: ExecutionId,
+  ) => Effect.Effect<ReadonlyArray<PersistedExecutionEvent>, StateStoreError>;
+  /** An execution's entries with an offset strictly greater than `offset`, ordered ascending. */
   readonly tail: (
-    sessionId: SessionId,
+    executionId: ExecutionId,
     offset: number,
-  ) => Effect.Effect<ReadonlyArray<PersistedSessionEvent>, StateStoreError>;
+  ) => Effect.Effect<ReadonlyArray<PersistedExecutionEvent>, StateStoreError>;
   /**
-   * The count of DURABLE `EntryAppended` records in a session's transcript — computed in the
+   * The count of DURABLE `EntryAppended` records in an execution's transcript — computed in the
    * store WITHOUT materializing or decoding the transcript rows (cheap for a long / retried
-   * session, unlike counting over {@link read}). Counts the whole merged log (a re-dispatch
+   * execution, unlike counting over {@link read}). Counts the whole merged log (a re-dispatch
    * APPENDS), so it matches the transcript the Inspector renders.
    */
-  readonly countEntries: (sessionId: SessionId) => Effect.Effect<number, StateStoreError>;
+  readonly countEntries: (executionId: ExecutionId) => Effect.Effect<number, StateStoreError>;
   /**
-   * The highest offset this session's transcript currently holds (`0` when it has none)
-   * — the per-session mirror of {@link EventLogStore.maxOffset}, and for the same
-   * reason: the `sessionEvents` feed must validate a client's resume cursor BEFORE it
+   * The highest offset this execution's transcript currently holds (`0` when it has none)
+   * — the per-execution mirror of {@link EventLogStore.maxOffset}, and for the same
+   * reason: the `executionEvents` feed must validate a client's resume cursor BEFORE it
    * does any work, and reading the whole transcript just to look at its last offset
    * makes a request that is about to be REFUSED the most expensive one the channel
    * serves. Answered from the backing's index, without materializing or decoding a row.
    */
-  readonly maxOffset: (sessionId: SessionId) => Effect.Effect<NonNegativeInt, StateStoreError>;
+  readonly maxOffset: (executionId: ExecutionId) => Effect.Effect<NonNegativeInt, StateStoreError>;
 }
 
 // ============================================================================
@@ -521,12 +526,12 @@ export class StateStore extends Context.Service<
     readonly repositories: RepositoryStore;
     /** The work-graph capability group. */
     readonly workGraph: WorkGraphStore;
-    /** The Job / Session / mapping capability group. */
+    /** The Job / Execution / mapping capability group. */
     readonly jobs: JobStore;
     /** The durable event-feed capability group. */
     readonly events: EventLogStore;
-    /** The durable per-session transcript-log capability group. */
-    readonly sessionLog: SessionLogStore;
+    /** The durable per-execution transcript-log capability group. */
+    readonly executionLog: ExecutionLogStore;
     /**
      * The identity of the STORE GENERATION this instance is open on — minted when
      * the schema was CREATED and destroyed with it.
@@ -540,7 +545,7 @@ export class StateStore extends Context.Service<
      * re-read it.
      *
      * It is what makes a durable OFFSET interpretable. Offsets (`EventLogStore` /
-     * `SessionLogStore`) are positions in THIS generation's logs and restart at `1`
+     * `ExecutionLogStore`) are positions in THIS generation's logs and restart at `1`
      * when a generation is replaced, so an offset alone cannot say which coordinate
      * space it belongs to. Pairing an offset with this id is what lets the daemon
      * refuse a client's cursor from a destroyed generation instead of resuming it

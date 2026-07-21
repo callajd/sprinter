@@ -8,8 +8,8 @@
     "id": "iss-9"
   },
   {
-    "_tag": "SessionNotFound",
-    "id": "ses-9"
+    "_tag": "ExecutionNotFound",
+    "id": "exe-9"
   },
   {
     "_tag": "PlanRejected",

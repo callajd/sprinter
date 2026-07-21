@@ -1,11 +1,11 @@
 import Observation
 import SprinterBackend
 import SprinterContract
-import SprinterSession
+import SprinterExecution
 
-/// The **Inspector view model** (BE4.1): given a ``SessionId``, it pairs the full
-/// transcript the session produced with the PR that session produced — a
-/// transcript pane + a PR pane + the session↔PR link.
+/// The **Inspector view model** (BE4.1): given an ``ExecutionId``, it pairs the full
+/// transcript the execution produced with the PR that execution produced — a
+/// transcript pane + a PR pane + the execution↔PR link.
 ///
 /// It is `@Observable @MainActor` and platform-neutral (Foundation + Observation,
 /// no AppKit/UIKit): the SwiftUI shell (convergence, not this epic) observes it and
@@ -14,12 +14,12 @@ import SprinterSession
 /// DTOs (INV-CONTRACT).
 ///
 /// Both sides are **reused, not re-solved**:
-/// - the **transcript** is a wholesale ``SprinterSession/SessionViewModel`` — the
+/// - the **transcript** is a wholesale ``SprinterExecution/ExecutionViewModel`` — the
 ///   same `TranscriptProjection` fold (messages/reasoning, tool calls incl.
 ///   diff-bearing edits, notices/status/retry/compaction); the inspector adds no
 ///   parallel renderer, only the ``TranscriptToolCall/fileDiff`` transform over the
 ///   existing tool-call item;
-/// - the **PR pane** is projected by the pure ``SessionPullRequestResolver`` off the
+/// - the **PR pane** is projected by the pure ``ExecutionPullRequestResolver`` off the
 ///   same ``WorkGraphResync`` snapshot feed BE2's board consumes, mirroring
 ///   ``MissionControlBoard``'s `consume`/`apply` lifecycle.
 ///
@@ -31,15 +31,15 @@ import SprinterSession
 @Observable
 @MainActor
 public final class InspectorViewModel {
-  /// The session this inspector pairs with — the session↔PR link's session side.
-  public let sessionId: SessionId
+  /// The execution this inspector pairs with — the execution↔PR link's execution side.
+  public let executionId: ExecutionId
 
-  /// The reused interactive-session view model rendering the full transcript
+  /// The reused interactive-execution view model rendering the full transcript
   /// (messages, tool calls incl. diffs, thinking). Its `transcript` is the same
   /// `TranscriptProjection` fold BE3.1 ships — the inspector does NOT re-solve it.
-  public let transcript: SessionViewModel
+  public let transcript: ExecutionViewModel
 
-  /// The PR the session produced, resolved from the work-graph snapshot and kept
+  /// The PR the execution produced, resolved from the work-graph snapshot and kept
   /// live off the feed. Starts ``PullRequestPaneState/unresolved`` until the first
   /// snapshot arrives.
   public private(set) var pullRequest: PullRequestPane
@@ -48,17 +48,17 @@ public final class InspectorViewModel {
   /// ``pullRequest`` (and the transcript) drive the view.
   @ObservationIgnored private var driver: Task<Void, Never>?
 
-  public init(backend: any Backend, sessionId: SessionId) {
-    self.sessionId = sessionId
-    self.transcript = SessionViewModel(backend: backend, sessionId: sessionId)
-    self.pullRequest = PullRequestPane(sessionId: sessionId, issueId: nil, state: .unresolved)
+  public init(backend: any Backend, executionId: ExecutionId) {
+    self.executionId = executionId
+    self.transcript = ExecutionViewModel(backend: backend, executionId: executionId)
+    self.pullRequest = PullRequestPane(executionId: executionId, issueId: nil, state: .unresolved)
   }
 
   /// Re-resolves the PR pane from one baseline-consistent snapshot, replacing the
   /// prior pane. The pure, synchronous core — directly testable and reused by
   /// ``consume``.
   public func apply(_ snapshot: Snapshot) {
-    pullRequest = SessionPullRequestResolver.resolve(sessionId: sessionId, in: snapshot)
+    pullRequest = ExecutionPullRequestResolver.resolve(executionId: executionId, in: snapshot)
   }
 
   /// Consumes the port-based work-graph feed to completion, re-resolving the PR pane
@@ -70,7 +70,7 @@ public final class InspectorViewModel {
     }
   }
 
-  /// Starts BOTH live feeds: the transcript's session feed and the work-graph feed
+  /// Starts BOTH live feeds: the transcript's execution feed and the work-graph feed
   /// that keeps the PR pane current. **Idempotent** — the transcript's `start` is a
   /// no-op while already subscribed, and the work-graph driver is not respun while
   /// running (``WorkGraphResync`` is single-consumer; re-consuming it would blank the

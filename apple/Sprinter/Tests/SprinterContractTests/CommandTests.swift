@@ -71,31 +71,31 @@ struct CommandTests {
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionEvents payload with a resume context")
-  func decodesSessionEventsPayload() throws {
-    let payload = try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")
-    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
-    // The session channel's cursor is generation-scoped in exactly the same way (its
-    // per-session log is dropped by a schema bump too), so it carries the SAME nested
+  @Test("decodes the executionEvents payload with a resume context")
+  func decodesExecutionEventsPayload() throws {
+    let payload = try Golden.decode(ExecutionEventsPayload.self, from: "payload-execution-events")
+    #expect(payload.executionId == ExecutionId(rawValue: "exe-1"))
+    // The execution channel's cursor is generation-scoped in exactly the same way (its
+    // per-execution log is dropped by a schema bump too), so it carries the SAME nested
     // value — the guard is not weaker here, structurally or otherwise.
     #expect(payload.resume?.sinceOffset == 12)
     #expect(payload.resume?.generation == generation)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionEvents payload with the resume context absent (origin replay)")
-  func decodesSessionEventsPayloadNoOffset() throws {
+  @Test("decodes the executionEvents payload with the resume context absent (origin replay)")
+  func decodesExecutionEventsPayloadNoOffset() throws {
     let payload = try Golden.decode(
-      SessionEventsPayload.self, from: "payload-session-events-no-offset")
-    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+      ExecutionEventsPayload.self, from: "payload-execution-events-no-offset")
+    #expect(payload.executionId == ExecutionId(rawValue: "exe-1"))
     #expect(payload.resume == nil)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionSend payload")
-  func decodesSessionSendPayload() throws {
-    let payload = try Golden.decode(SessionSendPayload.self, from: "payload-session-send")
-    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+  @Test("decodes the executionSend payload")
+  func decodesExecutionSendPayload() throws {
+    let payload = try Golden.decode(ExecutionSendPayload.self, from: "payload-execution-send")
+    #expect(payload.executionId == ExecutionId(rawValue: "exe-1"))
     #expect(payload.input.mode == .prompt)
     #expect(try Golden.roundTrip(payload) == payload)
   }
@@ -103,14 +103,14 @@ struct CommandTests {
   @Test("decodes the interrupt payload")
   func decodesInterruptPayload() throws {
     let payload = try Golden.decode(InterruptPayload.self, from: "payload-interrupt")
-    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+    #expect(payload.executionId == ExecutionId(rawValue: "exe-1"))
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
   @Test("decodes the answerUiRequest payload")
   func decodesAnswerPayload() throws {
     let payload = try Golden.decode(AnswerUiRequestPayload.self, from: "payload-answer-ui-request")
-    #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
+    #expect(payload.executionId == ExecutionId(rawValue: "exe-1"))
     #expect(payload.response.answer == .confirmed(confirmed: true))
     #expect(try Golden.roundTrip(payload) == payload)
   }
@@ -128,7 +128,7 @@ struct CommandTests {
     #expect(errors.count == 5)
     #expect(errors[0] == .workstreamNotFound(id: WorkstreamId(rawValue: "ws-9")))
     #expect(errors[1] == .issueNotFound(id: IssueId(rawValue: "iss-9")))
-    #expect(errors[2] == .sessionNotFound(id: SessionId(rawValue: "ses-9")))
+    #expect(errors[2] == .executionNotFound(id: ExecutionId(rawValue: "exe-9")))
     #expect(errors[3] == .planRejected(reason: "empty spec"))
     // The resume refusal shared by BOTH cursor-bearing feeds: the client's cursor belongs
     // to a store generation the daemon dropped, so it must re-hydrate from `snapshot`.

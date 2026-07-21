@@ -53,8 +53,8 @@ public struct JobId: StringIdentifier {
   public init(rawValue: String) { self.rawValue = rawValue }
 }
 
-/// Identifies a ``Session`` — one agent run executing a ``Job``.
-public struct SessionId: StringIdentifier {
+/// Identifies an ``Execution`` — one agent run executing a ``Job``.
+public struct ExecutionId: StringIdentifier {
   public let rawValue: String
   public init(rawValue: String) { self.rawValue = rawValue }
 }
