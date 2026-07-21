@@ -30,6 +30,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Schema } from "effect";
+import { assertGoldenCoverage, type WrittenGolden } from "./golden-coverage.ts";
 import {
   Agent,
   Epic,
@@ -73,14 +74,29 @@ export const COMMITTED_GOLDENS_DIR = join(here, "..", "Tests", "SprinterContract
 const goldensDir = process.argv[2] ?? COMMITTED_GOLDENS_DIR;
 mkdirSync(goldensDir, { recursive: true });
 
+/**
+ * Every golden written by this run, with the schema it went through — the input to the
+ * ABSENT-FORM guard at the bottom of the file (`assertGoldenCoverage`, issue #89 N3).
+ */
+const written: WrittenGolden[] = [];
+
+/** Write already-encoded wire JSON, and register it for the coverage census. */
+const writeEncoded = <S extends Schema.Codec<unknown, unknown>>(
+  name: string,
+  schema: S,
+  encoded: unknown,
+): void => {
+  writeFileSync(join(goldensDir, `${name}.json`), `${JSON.stringify(encoded, null, 2)}\n`);
+  written.push({ name, ast: schema.ast, encoded });
+};
+
 /** Encode a value through its schema (validating it) and write the wire JSON. */
 const write = <S extends Schema.Codec<unknown, unknown>>(
   name: string,
   schema: S,
   value: unknown,
 ): void => {
-  const encoded = Schema.encodeUnknownSync(schema)(value);
-  writeFileSync(join(goldensDir, `${name}.json`), `${JSON.stringify(encoded, null, 2)}\n`);
+  writeEncoded(name, schema, Schema.encodeUnknownSync(schema)(value));
 };
 
 // ── Owned domain node fixtures (also embedded in the snapshot) ───────────────
@@ -423,9 +439,22 @@ const encodedErrors = [
     }),
   ),
 ];
-writeFileSync(
-  join(goldensDir, "contract-errors.json"),
-  `${JSON.stringify(encodedErrors, null, 2)}\n`,
+// Written from the ALREADY-ENCODED objects (they were encoded one schema at a time
+// above), but registered against the union of the five error schemas so the coverage
+// census sees every variant — an error case that stopped being represented here would
+// fail generation rather than quietly leave the mirror's variant unexercised.
+writeEncoded(
+  "contract-errors",
+  Schema.Array(
+    Schema.Union([
+      WorkstreamNotFound,
+      IssueNotFound,
+      SessionNotFound,
+      PlanRejected,
+      ResyncRequired,
+    ]),
+  ),
+  encodedErrors,
 );
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
@@ -484,6 +513,15 @@ write("json-values", Schema.Array(Schema.Unknown), [
 
 // `createWorkstreamFromPlan` answers with a bare `WorkstreamId` (a JSON string).
 write("response-workstream-id", createWorkstreamFromPlan.successSchema, "ws-1");
+
+// ── The ABSENT-FORM guard (issue #89, finding N3) ────────────────────────────
+//
+// Runs AFTER every fixture is written, over the schemas they were written through: each
+// `Schema.optionalKey` reachable from a golden must be CARRIED by one golden and OMITTED
+// by another, and each tagged-union case must appear somewhere. A new optional field or
+// union case therefore cannot land without a fixture that pins it — the check is derived
+// from the contract, not from a hand-kept list that goes stale.
+assertGoldenCoverage(written);
 
 // `process.stdout.write`, not `console.log`: this script is inside the lint gate
 // (`check:lint` covers `apple/Sprinter/scripts`), and it matches how `check-goldens.ts`
