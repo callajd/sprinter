@@ -60,7 +60,14 @@ Notes threaded to the contract's own decisions:
   retired revision's `name`/`model`/`version`/`tools` verbatim and differs only in
   `id`, `supersedes` and `retiredAt` (the `StateStore` port enforces it), so the
   mirror never sees a retirement that rewrote content (nor one that retires an
-  already-retired revision — a lineage goes out of service once). Because a retirement
+  already-retired revision — a lineage goes out of service once). Those rules are
+  **order-independent**, because `supersedes` is a **referential** link in the
+  daemon's store: a revision may only name an ALREADY-STORED predecessor, so a
+  writer cannot skip a rule by appending a successor before the revision it
+  supersedes. The same constraint, plus the port's rejection of a self-reference,
+  makes the `supersedes` relation **acyclic by construction** — walking it backwards
+  from any revision terminates at the original, and every `supersedes` a client
+  receives resolves inside the collection it arrived in. Because a retirement
   is a NEW revision, `Agent.isRetired` is a question about ONE RECORD: the revision it
   retires stays un-stamped forever. "Is this agent still in service" is
   `isLineageRetired(_:in:)`, mirrored on both sides, and it is the one a view wants. `retiredAt` is the domain's
@@ -110,7 +117,13 @@ Notes threaded to the contract's own decisions:
   bump too.
   `RpcBackend` unwraps `.event` to the existing `SessionEvent` consumer. Ephemeral live
   deltas ride the same channel offset-less (offset present ⇒ durable/replayable, absent ⇒
-  ephemeral).
+  ephemeral). **The session feed is ORIGIN-ONLY until a resuming client exists**:
+  `RpcBackend` builds the `sessionEvents` payload with `sessionId` and no `resume`, and
+  `InteractiveSession` has no `ResyncRequired` handling, so the generation guard on this
+  feed is enforced TS-side and has no end-to-end path to fire on today. It is
+  **latent-but-correct** — defined up front because the per-session offset genuinely is a
+  generation-scoped coordinate, not because it is exercised. The work-graph `events` feed
+  is the one that resumes in practice.
 
 ## What the gate checks
 

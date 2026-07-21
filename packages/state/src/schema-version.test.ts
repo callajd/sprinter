@@ -76,6 +76,7 @@ const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   1: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
   2: "4fe63e6cce2cfabc2382c99d73347aec6a08fdbf58e42791be6cfeb93f960eac",
   3: "e005c3b880ba0bb3f0cb1645504d09d31ed3dd91ab9174b7ea1e03764fa84f7b",
+  4: "ac07e2636d90f3fa43cf7265cc16747c29ba0af4b822461873b1f1ec24fd9572",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */
@@ -226,6 +227,47 @@ it.effect("mints a FRESH generation on every drop-and-recreate, and only then", 
     const afterReset = yield* withStore(filename, (store) => Effect.succeed(store.generation));
     expect(afterReset).not.toBe(first);
   }).pipe(Effect.scoped),
+);
+
+it.effect(
+  "enforces foreign keys on EVERY connection, including a reopen that skips the reset",
+  () =>
+    Effect.gen(function* () {
+      const filename = yield* dbFile;
+      const value = yield* agent;
+
+      // SQLite defaults `PRAGMA foreign_keys` OFF and the setting is PER-CONNECTION, not
+      // a property of the file — declaring the key in the DDL enforces nothing on its
+      // own. So the case that matters is the SECOND open: `applySchema` sees a matching
+      // `user_version` and returns EARLY, running no DDL at all, and a connection that
+      // only turned the pragma on as part of building the schema would silently serve
+      // writes with `agent.supersedes` unenforced — which is exactly the state in which
+      // every lineage rule becomes bypassable by reversing the write order.
+      yield* withStore(filename, (store) => store.agents.putAgent(value).pipe(Effect.orDie));
+
+      const rejected = yield* withStore(filename, (store) =>
+        Effect.gen(function* () {
+          const dangling = yield* Schema.decodeUnknownEffect(Agent)({
+            id: "agt-2",
+            name: "implementer",
+            model: "claude-opus-4-8",
+            version: "1.0.0",
+            tools: ["read"],
+            supersedes: "agt-absent",
+          }).pipe(Effect.orDie);
+          // `flip` makes the REJECTION the success; a write that succeeded would flip
+          // into the error channel and `orDie` would fail the test rather than pass it.
+          return yield* store.agents.putAgent(dangling).pipe(Effect.flip, Effect.orDie);
+        }),
+      );
+      expect(rejected.operation).toBe("putAgent");
+
+      // And nothing landed: the reopened store still holds exactly the original revision.
+      const after = yield* withStore(filename, (store) =>
+        store.agents.listAgents.pipe(Effect.orDie),
+      );
+      expect(after).toStrictEqual([value]);
+    }).pipe(Effect.scoped),
 );
 
 it.effect("resets a database left by the retired migration ladder (user_version 0)", () =>

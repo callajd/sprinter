@@ -375,6 +375,16 @@ export const retryIssue = Rpc.make("retryIssue", {
 // stale generation is refused with {@link ResyncRequired} at every offset. Hence the
 // two-error channel — the existence question (`SessionNotFound`) and the generation
 // question are independent.
+//
+// LATENT, NOT LIVE — stated so the guard is not mistaken for an exercised path. NO
+// shipped client resumes this feed today: the Swift `RpcBackend` builds the payload
+// with `sessionId` only and never a `resume`, and `InteractiveSession` has no
+// `ResyncRequired` handling, so in practice the session feed is ORIGIN-ONLY and the
+// generation check here has no end-to-end path to fire on. It is defined now, and
+// tested TS-side, because the coordinate really is generation-scoped and retrofitting
+// a cursor guard onto a wire shape already in use is the expensive order to do it in.
+// A resuming client is what makes it live; until one exists, treat it as correct and
+// unexercised rather than as load-bearing today.
 export const sessionEvents = Rpc.make("sessionEvents", {
   payload: {
     sessionId: SessionId,

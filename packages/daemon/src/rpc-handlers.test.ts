@@ -101,6 +101,17 @@ const session = Schema.decodeUnknownSync(Session)({
   jobId: "job-1",
   status: "completed",
 });
+// The lineage HEAD the retirement below supersedes. It has to be stored first and it
+// has to carry the same content: `supersedes` is a referential link in the store (a
+// revision may only name an already-stored predecessor) and a retirement is
+// lifecycle-only (it repeats the retired revision's content verbatim).
+const agentHead = Schema.decodeUnknownSync(Agent)({
+  id: "agt-1",
+  name: "implementer",
+  model: "claude-opus-4-8",
+  version: "1.1.0",
+  tools: ["read", "edit"],
+});
 // A RETIRING registry revision: a new id carrying BOTH `supersedes` (the head it
 // retires) and the `retiredAt` stamp — the only shape a retirement takes.
 const agent = Schema.decodeUnknownSync(Agent)({
@@ -192,6 +203,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       yield* seedGraph(store);
       yield* store.jobs.putJob(queuedJob);
       yield* store.jobs.putSession(session);
+      yield* store.agents.putAgent(agentHead);
       yield* store.agents.putAgent(agent);
 
       const snapshot = yield* client.snapshot();
@@ -204,7 +216,7 @@ it.effect("snapshot hydrates the full persisted work graph", () =>
       // and a persisted revision round-trips through the wire schema with both of
       // its optional keys intact — a retired, superseding revision is exactly what
       // a client must be able to resolve a historical execution against.
-      expect(snapshot.agents).toEqual([agent]);
+      expect(snapshot.agents).toEqual([agentHead, agent]);
     }),
   ),
 );

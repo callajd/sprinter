@@ -164,18 +164,27 @@ export type AgentWrite = "appended" | "unchanged";
  * grows the durable log without bound — `putAgent` REPORTS which happened
  * ({@link AgentWrite}) rather than collapsing both to `void`.
  *
- * Two writer obligations from `registry.ts` are ENFORCED here rather than left to
- * review, because both are checkable from a single append plus the stored rows:
+ * Every `supersedes` rule from `registry.ts` is ENFORCED here rather than left to
+ * review — none of them is a writer obligation any more:
  *
- * - `supersedes !== id` — a revision cannot supersede itself, the one `supersedes`
- *   cycle a single write can create (the full acyclicity precondition stays the
- *   writer's).
+ * - `supersedes` must name an ALREADY-STORED revision. This is the load-bearing one,
+ *   because the three rules below are all decided by READING the superseded row: while
+ *   a DANGLING `supersedes` was storable, a writer bypassed all of them for free by
+ *   reversing the write order — append the successor first (nothing to check against)
+ *   and its predecessor second (an ordinary first revision) — and assembled a
+ *   resurrection, a content-rewriting retirement, or a `supersedes` CYCLE out of
+ *   appends each of which this port accepted. Enforced by the adapter as a real
+ *   FOREIGN KEY, so the shape those attacks are built from does not exist and every
+ *   rule below is order-independent.
+ * - `supersedes !== id` — a revision cannot supersede itself. This is the ONE edge a
+ *   referential constraint accepts (a row satisfies a key against itself), and with
+ *   it closed no cycle of any length is constructible: a longer one needs an edge
+ *   naming a revision that does not exist yet. Acyclicity is therefore structural,
+ *   not a precondition anyone owes.
  * - a RETIRING revision (one carrying BOTH `supersedes` and `retiredAt`) must carry
  *   the SAME `name` / `model` / `version` / `tools` as the revision it supersedes.
  *   Retirement is LIFECYCLE-ONLY; fusing a content edit into it would make the two
- *   operations indistinguishable in the history. Checkable only when the superseded
- *   revision is actually stored — a dangling `supersedes` is the writer's problem,
- *   as it already is for acyclicity.
+ *   operations indistinguishable in the history.
  * - NOTHING may supersede an ALREADY-RETIRED revision — an edit no more than a
  *   retirement. A lineage goes out of service ONCE, and `retiredAt` is its terminal
  *   state. A second RETIRING append would leave two revisions each carrying a
@@ -217,9 +226,9 @@ export interface AgentStore {
    * written ({@link AgentWrite}). A byte-identical re-append of an already stored id
    * is an idempotent no-op and answers `"unchanged"`; a DIFFERING re-append of that
    * id fails with {@link StateStoreError}, as does a revision whose `supersedes`
-   * names itself, a RETIRING revision that rewrites the superseded revision's
-   * content, and a RETIRING revision that retires an already-retired revision. It
-   * never rewrites or removes a stored revision.
+   * names itself or names a revision that is NOT STORED, a RETIRING revision that
+   * rewrites the superseded revision's content, and ANY revision superseding an
+   * already-retired one. It never rewrites or removes a stored revision.
    */
   readonly putAgent: (agent: Agent) => Effect.Effect<AgentWrite, StateStoreError>;
   /** Read one {@link Agent} revision by id, if present. */

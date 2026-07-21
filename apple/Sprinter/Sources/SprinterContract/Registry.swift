@@ -27,6 +27,14 @@
 ///
 /// Retired-ness is read off ``retiredAt``'s presence (``isRetired``) — there is
 /// deliberately no `AgentStatus` enum to keep in sync with it (INV-SUM).
+///
+/// A client may rely on the LINEAGE structure it receives being well formed, in every
+/// order the daemon could have written it: the daemon's store holds `supersedes` as a
+/// REFERENTIAL link (a revision may only name an already-stored predecessor), rejects a
+/// self-reference, and allows at most one successor per revision. So a `supersedes` here
+/// always resolves within the same collection, walking it backwards terminates, and no
+/// retirement that rewrote content or resurrected a retired lineage can reach the
+/// mirror — none of that depends on the order the revisions were appended in.
 public struct Agent: Codable, Equatable, Sendable {
   /// Identifies this REVISION of the agent (a new revision has a new id).
   public let id: AgentId
@@ -113,8 +121,12 @@ public struct Agent: Codable, Equatable, Sendable {
 ///   folding this over a whole registry is O(n²). Fine for a lookup; if a view ever
 ///   folds it across every revision, build the successor index once at the call site.
 ///
-/// The walk visits each revision at most once, so it terminates even on the cyclic
-/// `supersedes` structure the precondition forbids.
+/// The walk visits each revision at most once, so it terminates. Nothing the daemon can
+/// send is cyclic in the first place — its store enforces `supersedes` as a REFERENTIAL
+/// link (a revision may only name an already-stored predecessor) and rejects a
+/// self-reference, which together make the relation acyclic by construction rather than
+/// by a writer's promise — but this takes an arbitrary `Sequence`, so it terminates on a
+/// hand-built collection too.
 public func isLineageRetired(_ agent: Agent, in all: some Sequence<Agent>) -> Bool {
   var successors: [AgentId: Agent] = [:]
   for revision in all {

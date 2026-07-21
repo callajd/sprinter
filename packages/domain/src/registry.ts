@@ -40,9 +40,11 @@
  *
  * This is not a convention — the `StateStore` port ENFORCES it on `putAgent` (it
  * reads the superseded revision and rejects a retiring append whose non-lifecycle
- * fields differ). The port can only check it when the superseded revision is
- * actually stored; a retiring revision naming an ABSENT `supersedes` is the same
- * dangling-chain case the acyclicity precondition already leaves to the writer.
+ * fields differ). And it is enforced UNCONDITIONALLY, not only when the superseded
+ * revision happens to be stored: `supersedes` is a real referential constraint in
+ * the adapter, so a revision naming an ABSENT predecessor cannot be written at all.
+ * That is what makes the rule order-independent — appending the retirement FIRST,
+ * with nothing yet to compare it against, is not a way around it.
  *
  * ## Durability is scoped to a STORE GENERATION
  *
@@ -74,14 +76,26 @@
  * execution volume — and recorded here so it is a known cost rather than a surprise.
  * If it ever needs bounding, the remedy is a narrower READ, never a delete.
  *
- * PRECONDITION on `supersedes` (the port rejects the self-reference case; the rest
- * is the writer's obligation): the `supersedes` chain must be an ACYCLIC path
- * ending at an original revision. A revision may not supersede itself, and may not
- * supersede a revision that (transitively) supersedes it. Nothing in the store
- * enforces reachability, so a consumer walking the chain backwards
- * ({@link isOriginalRevision}) is walking a structure the WRITER must keep
- * well-formed: a cycle would make that walk non-terminating, and a dangling
- * `supersedes` would make it stop at a revision that is not the original.
+ * ## The `supersedes` chain is an ACYCLIC path, BY CONSTRUCTION
+ *
+ * Every `supersedes` chain is a finite path ending at an original revision: a
+ * revision may not supersede itself, may not supersede a revision that
+ * (transitively) supersedes it, and may not name a revision that does not exist.
+ *
+ * This used to be stated as a PRECONDITION the writer owed, with only the
+ * self-reference case checked — and an unenforceable obligation is one that gets
+ * violated. It is now structural, and both halves are needed:
+ *
+ * - `supersedes` is a REFERENTIAL constraint in the store: a revision can only name
+ *   a predecessor that is ALREADY stored. Closing a cycle of length ≥ 2 requires an
+ *   edge pointing at a revision that does not exist yet, so no write ORDER produces
+ *   one — and a dangling `supersedes` is unstorable for the same reason.
+ * - the self-reference (the one edge a referential constraint accepts, since a row
+ *   satisfies a key against itself) is rejected by the `StateStore` port.
+ *
+ * So a consumer walking the chain backwards ({@link isOriginalRevision}) walks a
+ * structure the STORE keeps well-formed: the walk terminates, and it terminates at a
+ * revision that really is the original.
  *
  * Retired-ness is read off `retiredAt`'s PRESENCE ({@link isRetired}) — there is
  * deliberately no `AgentStatus` enum, because a status enum paired with an
@@ -105,9 +119,9 @@ import { Timestamp } from "./time.ts";
  * - `model` / `version` — the model it drives and the revision of its definition.
  * - `tools` — the tool names it is permitted to use, in declaration order.
  * - `supersedes` — the PREVIOUS revision this record replaces, absent on the first
- *   revision. The append-only edit link (never a mutation in place). It must name a
- *   DIFFERENT revision and must not close a cycle — see the module docstring's
- *   precondition.
+ *   revision. The append-only edit link (never a mutation in place). It names a
+ *   DIFFERENT, ALREADY-STORED revision and cannot close a cycle — see the module
+ *   docstring; that is enforced, not assumed.
  * - `retiredAt` — the instant the agent was retired, absent while it is in
  *   service. Retirement is a stamp, NOT a status enum (INV-SUM), and NOT a delete:
  *   a retired agent's record stays readable — for the life of the store generation
@@ -137,9 +151,10 @@ export const isRetired = (agent: Agent): boolean => agent.retiredAt !== undefine
 /**
  * True when `agent` is the FIRST revision of its lineage — it replaces nothing.
  * Later revisions carry `supersedes`, so the chain is walked backwards from any
- * revision until this returns true. That walk TERMINATES only under the module
- * docstring's acyclicity precondition, which the writer owns; this predicate reads
- * one revision and cannot observe the chain.
+ * revision until this returns true. This predicate reads ONE revision and cannot
+ * observe the chain, but the walk built out of it terminates for every history the
+ * store can hold: `supersedes` is acyclic BY CONSTRUCTION (see the module
+ * docstring), not by a writer's promise.
  */
 export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes === undefined;
 
@@ -179,8 +194,10 @@ export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes ==
  * site and pass it in (a sibling taking a prepared index), not to memoize inside.
  *
  * Termination: the walk visits each revision at most once (it stops on re-visiting
- * one), so it terminates even if a caller hands it the cyclic `supersedes` structure
- * the module docstring's precondition forbids.
+ * one). Nothing from the STORE can be cyclic — `supersedes` is acyclic by
+ * construction (see the module docstring) — but this takes an arbitrary `Iterable`,
+ * so it terminates on a hand-built cyclic collection too rather than trusting its
+ * caller to have come from a store.
  */
 export const isLineageRetired = (agent: Agent, all: Iterable<Agent>): boolean => {
   const successors = new Map<AgentId, Agent>();

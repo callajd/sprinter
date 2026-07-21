@@ -317,20 +317,111 @@ it.effect("lets a NON-retiring revision change content freely — that is what a
   }).pipe(Effect.provide(layerMemory)),
 );
 
-it.effect("accepts a retiring revision whose superseded revision is not stored", () =>
+it.effect("rejects a revision whose superseded revision is not stored — no dangling link", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
-    // The content rule is only CHECKABLE against a stored revision. A dangling
-    // `supersedes` is the same writer obligation the acyclicity precondition already
-    // carries, so the append succeeds rather than inventing a referential constraint
-    // the append-only registry does not have.
+    // REFERENTIAL INTEGRITY is what makes every OTHER lineage rule order-independent.
+    // All three of them (no successor to a retired revision, a retirement may not
+    // rewrite content, at most one successor) are decided by READING the superseded
+    // row — so while a dangling `supersedes` was storable, a writer bypassed all of
+    // them for free by simply REVERSING the write order: append the successor first
+    // (nothing to check against) and its predecessor second (an ordinary first
+    // revision). The `agent.supersedes` FOREIGN KEY removes the shape those attacks
+    // are built from: a predecessor always exists BEFORE anything can name it, so
+    // every rule sees the row it needs no matter what order the writer chose.
     const retirement = yield* agent({
       id: "agt-3",
       supersedes: "agt-absent",
       retiredAt: "2026-07-20T12:00:00.000Z",
     });
-    expect(yield* store.agents.putAgent(retirement)).toBe("appended");
-    expect(yield* store.agents.listAgents).toStrictEqual([retirement]);
+    const error = yield* store.agents.putAgent(retirement).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    expect(error.detail.length).toBeGreaterThan(0);
+    // Nothing was written — a half-linked history never exists, not even briefly.
+    expect(yield* store.agents.listAgents).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("cannot RESURRECT a lineage by appending the successor before its predecessor", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.agents.putAgent(yield* agent({ id: "agt-1" }));
+
+    // THE REORDERED RESURRECTION. Forwards this is impossible: `agt-2` retires
+    // `agt-1`, and nothing may then supersede the retired `agt-2`. Backwards it used
+    // to work — append `agt-3` naming the not-yet-stored `agt-2` (dangling, so the
+    // retired-head rule had nothing to look at), then append `agt-2` retiring `agt-1`
+    // (an ordinary retirement of a live head). Two individually legal appends,
+    // producing byte-for-byte the history the forwards test proves is unstorable, with
+    // `agt-3` carrying no stamp so `isLineageRetired` walked past the retirement onto a
+    // live head and the whole lineage read as back IN SERVICE.
+    const error = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-3", supersedes: "agt-2", version: "2.0.0" }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+
+    // The retirement still lands, and the lineage reads retired from EVERY revision —
+    // the property that was FALSE on the reordered history.
+    yield* store.agents.putAgent(
+      yield* agent({ id: "agt-2", supersedes: "agt-1", retiredAt: "2026-07-20T12:00:00.000Z" }),
+    );
+    const after = yield* store.agents.listAgents;
+    expect(after.map((found) => found.id)).toStrictEqual(["agt-1", "agt-2"]);
+    expect(after.every((found) => isLineageRetired(found, after))).toBe(true);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("cannot REWRITE CONTENT while retiring by appending the retirement first", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+
+    // THE REORDERED CONTENT REWRITE. `agt-6` retires `agt-5` while changing both
+    // `model` and `tools` — the fused edit-and-retirement the lifecycle-only rule
+    // exists to reject. Appending it FIRST used to skip that rule entirely (nothing
+    // stored to compare against), and appending the real `agt-5` afterwards then
+    // completed a history in which the retirement had rewritten content — exactly what
+    // `docs/contract-mirror.md` promises the mirror never sees.
+    const error = yield* store.agents
+      .putAgent(
+        yield* agent({
+          id: "agt-6",
+          supersedes: "agt-5",
+          model: "gpt",
+          tools: [],
+          retiredAt: "2026-07-20T12:00:00.000Z",
+        }),
+      )
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    expect(yield* store.agents.listAgents).toStrictEqual([]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("cannot close a `supersedes` CYCLE — the backwards walk always terminates", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+
+    // A TWO-REVISION CYCLE: `agt-a` supersedes `agt-b` and `agt-b` supersedes `agt-a`.
+    // Neither append names itself, so the port's self-reference rule never fires, and
+    // while dangling links were storable the pair landed and made
+    // `isOriginalRevision`'s backwards walk non-terminating. A cycle can only ever be
+    // CLOSED by an edge naming a row that does not exist yet, so the foreign key
+    // rejects the first append and there is no order that recovers it — acyclicity
+    // stops being an unenforceable writer obligation.
+    const first = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-a", supersedes: "agt-b" }))
+      .pipe(Effect.flip);
+    expect(first).toBeInstanceOf(StateStoreError);
+
+    // And the mirror image, so this is not an artefact of which id went first.
+    const second = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-b", supersedes: "agt-a" }))
+      .pipe(Effect.flip);
+    expect(second).toBeInstanceOf(StateStoreError);
+    expect(yield* store.agents.listAgents).toStrictEqual([]);
   }).pipe(Effect.provide(layerMemory)),
 );
 
@@ -359,6 +450,9 @@ it.effect("refuses to rewrite a stored Agent revision with different content", (
 it.effect("cannot un-retire a retired Agent by re-appending its id", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
+    // The head first: a revision may only name a predecessor that is already stored
+    // (the `supersedes` foreign key), so a lineage is always built in order.
+    yield* store.agents.putAgent(yield* agent({ id: "agt-1" }));
     const retired = yield* agent({
       id: "agt-3",
       supersedes: "agt-1",

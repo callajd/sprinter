@@ -41,10 +41,19 @@
  * cursor to be INFERRED from offsets, which cannot work once a new generation's log
  * outgrows the stale mark (see `packages/contract/src/rpc.ts`).
  *
- * A bump only ever takes effect across a daemon RESTART: {@link applySchema} runs at
- * layer construction, so a live store keeps the generation it opened with and the
- * reset is observed by a client at its next reconnect. That bounds WHEN the hazard
- * can be met, not whether it must be handled.
+ * For a SINGLE process, a bump only ever takes effect across a daemon RESTART:
+ * {@link applySchema} runs at layer construction, so a live store keeps the
+ * generation it opened with and the reset is observed by a client at its next
+ * reconnect. That bounds WHEN the hazard can be met, not whether it must be handled.
+ *
+ * That bound is about the PROCESS, not the file, and nothing here extends it further:
+ * there is no lock and no version negotiation, so a SECOND process opening the same
+ * file-backed database at a different {@link SCHEMA_VERSION} — an older or newer
+ * binary, a CLI, a test harness — drops and recreates the tables underneath a running
+ * daemon, mid-connection, at a moment the daemon cannot observe. Concurrent
+ * multi-process access at differing schema versions is UNGUARDED. Stated plainly
+ * because the mitigation above reads like more than it is; single-process access is
+ * the deployment `DMR` assumes pre-release, and locking is not in scope here.
  *
  * **{@link SCHEMA_VERSION} is the guard.** Any change to the persisted shape —
  * a new table, a new column, a changed column — is landed by editing
@@ -296,15 +305,20 @@ const GENERATION_KEY = "generation";
  * ladder has `user_version = 0`, so it mismatches and is reset like any other
  * stale store. Version 2 adds `store_meta` and the generation identity minted into
  * it (see {@link createSchema}). Version 3 adds the `agent_supersedes` UNIQUE index,
- * making a FORKED lineage (one revision superseded twice) unstorable.
+ * making a FORKED lineage (one revision superseded twice) unstorable. Version 4 makes
+ * `agent.supersedes` a real FOREIGN KEY onto `agent (id)` (enforced per-connection by
+ * {@link configureConnection}), making a DANGLING `supersedes` unstorable — which is
+ * what makes every other lineage rule order-independent instead of bypassable by
+ * appending a successor before its predecessor.
  *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
  * a bump reaches a client at its next reconnect, never mid-connection. That bounds
  * WHEN the stale-cursor hazard can occur; it does not reduce it, which is why the
- * generation identity below is on the wire.
+ * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
+ * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -385,6 +399,27 @@ const createSchema = Effect.gen(function* () {
   // no repositoryId/workstreamId column and no per-repo join table ("agents used in
   // this repo" is a fold over that repo's executions, INV-DERIVED). `retiredAt` is a
   // nullable stamp, not a status column (INV-SUM). Nothing DELETEs from this table.
+  //
+  // `supersedes` is a REAL foreign key onto this same table, enforced by the engine
+  // (see {@link configureConnection}, which turns `PRAGMA foreign_keys` ON and
+  // verifies it). That is not tidiness — it is what makes every OTHER rule on this
+  // table hold. All three port-enforced `supersedes` rules (no successor to a
+  // retired revision, a retirement may not rewrite content, at most one successor)
+  // are decided by READING the superseded row, so while a DANGLING `supersedes` was
+  // storable a writer could bypass all of them simply by appending the successor
+  // FIRST and its predecessor second: the successor's check found nothing to check
+  // against, and the predecessor's append was an ordinary first revision. That made
+  // every rule order-dependent — a resurrection, a content-rewriting retirement and
+  // a `supersedes` CYCLE were all constructible out of appends each of which the
+  // port accepted. Referential integrity removes the shape those attacks are built
+  // from: a revision cannot name a predecessor that is not already stored, so the
+  // predecessor is ALWAYS there to be checked, and a cycle is unconstructible
+  // because closing one requires naming a row that does not exist yet.
+  //
+  // (Self-reference is the one edge a foreign key does NOT reject — SQLite checks
+  // the constraint against the table INCLUDING the row being inserted — so the
+  // port's explicit `supersedes !== id` rejection in `putAgent` stays, and together
+  // they make the whole relation acyclic by construction.)
   yield* sql`CREATE TABLE agent (
       id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
@@ -392,7 +427,8 @@ const createSchema = Effect.gen(function* () {
       version TEXT NOT NULL,
       tools TEXT NOT NULL,
       supersedes TEXT,
-      "retiredAt" TEXT
+      "retiredAt" TEXT,
+      FOREIGN KEY (supersedes) REFERENCES agent (id)
     )`;
   // A revision may be superseded AT MOST ONCE: the lineage is a CHAIN, and a
   // revision with two successors is a fork with no defined head. It is checkable
@@ -485,6 +521,45 @@ const createSchema = Effect.gen(function* () {
 /** The single row returned by `PRAGMA user_version`. */
 const UserVersionRow = Schema.Struct({ user_version: NonNegativeInt });
 
+/** The single row returned by `PRAGMA foreign_keys` — `1` when enforcement is on. */
+const ForeignKeysRow = Schema.Struct({ foreign_keys: NonNegativeInt });
+
+/**
+ * Turn FOREIGN KEY ENFORCEMENT ON for this connection, and PROVE it took.
+ *
+ * SQLite defaults `foreign_keys` OFF, and the setting is PER-CONNECTION, not a
+ * property of the file: a database whose DDL declares foreign keys silently
+ * enforces none of them unless every connection that writes to it has asked for
+ * enforcement. The `agent` table's self-referential `supersedes` key is load-bearing
+ * (see {@link createSchema}) — with it off, a dangling `supersedes` is storable again
+ * and every lineage rule reverts to being bypassable by write ordering — so this is
+ * not a nicety that may quietly fail to apply.
+ *
+ * Hence the read-back: the pragma is SET and then QUERIED, and a connection that
+ * still reports it off fails the store's CONSTRUCTION rather than serving writes
+ * under rules it is not enforcing. (SQLite answers a `PRAGMA foreign_keys = ON` it
+ * cannot honour — e.g. inside a transaction — by doing nothing at all, with no
+ * error, which is exactly the silent case a fire-and-forget statement would miss.)
+ * The adapter opens ONE connection per built layer ({@link SqliteClient.layer} holds
+ * a single `Database`), and this runs at layer construction ahead of every other
+ * statement, so "every connection the adapter opens" is covered by construction.
+ */
+const configureConnection = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // `PRAGMA` takes no bound parameters and this one has no user input in it.
+  yield* sql.unsafe(`PRAGMA foreign_keys = ON`);
+  const rows = yield* sql`PRAGMA foreign_keys`;
+  const decoded = yield* Schema.decodeUnknownEffect(Schema.NonEmptyArray(ForeignKeysRow))(rows);
+  if (decoded[0].foreign_keys !== 1) {
+    // Reported in the same `{ message }` shape every backing failure arrives in, so
+    // the caller's single `fail("applySchema")` mapping covers it too.
+    return yield* Effect.fail({
+      message:
+        "SQLite refused `PRAGMA foreign_keys = ON`; the agent registry's `supersedes` foreign key would not be enforced, leaving a dangling reference storable",
+    });
+  }
+});
+
 /**
  * Bring the database to {@link SCHEMA_VERSION}, the ONLY schema-evolution path
  * (INV-FRESH): read `PRAGMA user_version`, and if it does not already equal the
@@ -496,6 +571,25 @@ const UserVersionRow = Schema.Struct({ user_version: NonNegativeInt });
  * half-built schema stamped with the new version. `PRAGMA` statements take no
  * bound parameters, so the version is interpolated from our own numeric constant
  * (never user input).
+ *
+ * `PRAGMA defer_foreign_keys` holds the reset's own foreign keys to COMMIT time.
+ * {@link configureConnection} has already turned enforcement on, and `DROP TABLE`
+ * under enforcement performs an implicit `DELETE FROM` first — so dropping the
+ * self-referential `agent` table would trip its own key on the intermediate state.
+ * Deferring is correct rather than a loophole: at commit the table is gone, so
+ * there is nothing left to violate, and the setting resets itself at the end of the
+ * transaction (unlike `foreign_keys`, which is a no-op inside one).
+ *
+ * **The restart bound holds for a SINGLE PROCESS only.** A bump takes effect at
+ * layer construction, so a live store keeps the generation it opened with and a
+ * running daemon observes no reset mid-connection — but that is a statement about
+ * THIS process, not about the file. Nothing here takes a lock or negotiates a
+ * version, so a SECOND process opening the same file-backed database at a different
+ * {@link SCHEMA_VERSION} — an older or newer binary, a CLI, a test harness — will
+ * drop and recreate the tables underneath a running daemon, which keeps serving from
+ * a generation whose rows no longer exist. Concurrent multi-process access at
+ * differing schema versions is UNGUARDED; it is out of scope for the greenfield
+ * store and is stated here rather than implied away.
  */
 const applySchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -504,6 +598,7 @@ const applySchema = Effect.gen(function* () {
   if (decoded[0].user_version === SCHEMA_VERSION) return;
   yield* sql.withTransaction(
     Effect.gen(function* () {
+      yield* sql.unsafe(`PRAGMA defer_foreign_keys = ON`);
       yield* dropSchema;
       yield* createSchema;
       yield* sql.unsafe(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -591,10 +686,9 @@ const make = Effect.gen(function* () {
    *    promises cannot happen (see `store.ts`: "a lineage goes out of service once"),
    *    and gating this rule on the incoming revision's own `retiredAt` left that door
    *    open. It is checked on `supersedes` alone. (A revision naming a MID-lineage
-   *    revision that was later superseded is a different, un-checkable shape: the
-   *    store cannot see forward along the chain from one append — that stays the
-   *    writer's obligation, exactly as acyclicity does. The `agent_supersedes` UNIQUE
-   *    index is what makes the branch itself impossible.)
+   *    revision that was later superseded is a different shape, and it is not left to
+   *    the writer either: the `agent_supersedes` UNIQUE index makes that branch
+   *    unstorable outright.)
    * 2. A RETIRING revision (one carrying `retiredAt` as well) must additionally be
    *    LIFECYCLE-ONLY — it must repeat the superseded revision's non-lifecycle
    *    columns verbatim (retirement sets `retiredAt`, never content). Rule 1 cannot
@@ -607,11 +701,29 @@ const make = Effect.gen(function* () {
    * column stores it rather than by a looser re-decoded comparison — the same basis
    * {@link isSameAgentRow} uses for the idempotent re-append.
    *
-   * A superseded revision that is NOT stored is not a failure here: the rules are
-   * unverifiable without it, and a dangling `supersedes` is already the writer's
-   * obligation under `registry.ts`'s acyclicity precondition. The check runs inside
-   * the caller's transaction, so the row it reads is the one the insert commits
-   * against.
+   * ## Why these rules are ORDER-INDEPENDENT
+   *
+   * Every rule here is decided by READING the superseded row, so each one is only as
+   * strong as the guarantee that the row is there to be read. It is: `supersedes` is a
+   * FOREIGN KEY (see {@link createSchema}) and enforcement is on (see
+   * {@link configureConnection}), so an append naming an unstored predecessor is
+   * rejected by the ENGINE, on the INSERT, inside this same transaction.
+   *
+   * That is load-bearing, not belt-and-braces. While a dangling `supersedes` was
+   * storable, a writer bypassed all of these rules for free by reversing the write
+   * order — append the successor first (nothing to check against, accepted), then its
+   * predecessor (an ordinary first revision, accepted) — and landed a resurrection, a
+   * content-rewriting retirement, or a `supersedes` cycle out of two individually
+   * legal appends. With the key in place there is no ordering that reaches those
+   * shapes: a predecessor always exists BEFORE anything can name it.
+   *
+   * The `onNone` branch below is therefore not a permissive fallthrough but a
+   * transient: the SELECT can still miss, and the INSERT that follows is what rejects
+   * it, with the engine's referential-integrity error surfaced as a
+   * {@link StateStoreError}. Nothing is accepted on that path.
+   *
+   * The check runs inside the caller's transaction, so the row it reads is the one the
+   * insert commits against.
    */
   const assertSupersedesIsWellFormed = (
     supersedes: AgentId,
@@ -621,6 +733,8 @@ const make = Effect.gen(function* () {
       Effect.mapError(fail("putAgent")),
       Effect.flatMap((rows) =>
         Option.match(Arr.head(rows), {
+          // Not "allowed": UNCHECKABLE, and about to be rejected anyway — the INSERT
+          // that follows trips the `supersedes` FOREIGN KEY. See the docstring.
           onNone: () => Effect.void,
           onSome: (found) =>
             Schema.decodeUnknownEffect(AgentColumns)(found).pipe(
@@ -654,10 +768,13 @@ const make = Effect.gen(function* () {
       sql
         .withTransaction(
           Effect.gen(function* () {
-            // A revision that supersedes ITSELF is the one `supersedes` cycle a
-            // single append can create, and it would make a consumer's backwards
-            // walk of the chain non-terminating — so it is rejected at the port
-            // (`registry.ts` states the full acyclicity precondition).
+            // A revision that supersedes ITSELF is the one cycle the `supersedes`
+            // FOREIGN KEY does NOT reject — SQLite checks the constraint against the
+            // table INCLUDING the row being inserted, so a self-reference satisfies
+            // it. Every LONGER cycle needs an edge naming a row that does not exist
+            // yet, which the key rejects; closing that last gap here makes the whole
+            // relation acyclic by construction, so a consumer's backwards walk
+            // (`isOriginalRevision`) terminates on every history the store can hold.
             if (agent.supersedes === agent.id) {
               return yield* Effect.fail(
                 new StateStoreError({
@@ -1091,7 +1208,12 @@ export interface StateStoreConfig {
 export const layer = (config: StateStoreConfig): Layer.Layer<StateStore, StateStoreError> => {
   const disableWAL = config.disableWAL ?? config.filename === ":memory:";
   const clientLayer = SqliteClient.layer({ filename: config.filename, disableWAL });
-  const schemaLayer = Layer.effectDiscard(applySchema.pipe(Effect.mapError(fail("applySchema"))));
+  // Foreign-key enforcement is turned on (and verified) BEFORE any schema work runs,
+  // on the same connection: the pragma is per-connection, and `agent.supersedes` is
+  // only a real constraint while it is on.
+  const schemaLayer = Layer.effectDiscard(
+    configureConnection.pipe(Effect.andThen(applySchema), Effect.mapError(fail("applySchema"))),
+  );
   return Layer.effect(StateStore, make).pipe(
     Layer.provide(schemaLayer),
     Layer.provide(clientLayer),

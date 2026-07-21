@@ -117,6 +117,15 @@ public struct RpcBackend: Backend {
           // non-reconnecting subscription — so only the wire is made offset-aware here (the
           // optional `offset` is unwrapped away); resume via a ``ResumeContext`` layers on later,
           // exactly as ``WorkGraphResync`` did for the `events` feed.
+          //
+          // So this client is ORIGIN-ONLY on the session feed, and consequently the
+          // daemon's `sessionEvents` generation guard is LATENT: no `resume` is ever sent,
+          // ``InteractiveSession`` has no `ResyncRequired` handling, and there is no
+          // end-to-end path on which that error can be raised. The guard is defined and
+          // tested TS-side because the per-session offset really is a generation-scoped
+          // coordinate — retrofitting it onto a wire shape already in use is the expensive
+          // order — not because anything here exercises it. A resuming client is what makes
+          // it live, and that client is the one that must also handle ``ResyncRequired``.
           let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
           for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {
             continuation.yield(try fromJSONValue(OffsetSessionEvent.self, value).event)

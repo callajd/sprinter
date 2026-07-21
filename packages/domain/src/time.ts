@@ -53,6 +53,32 @@
  *   stays rejected: it is not a UTC instant string, and admitting one would mean
  *   re-deriving the UTC wall clock rather than restating it.
  *
+ * ## A LEAP SECOND is a hard decode failure — stated, not hidden
+ *
+ * `:60` in the seconds field (`2026-06-30T23:59:60Z`) is REJECTED. This is a real
+ * exclusion, not an oversight, and it is called out here because the paragraph above
+ * advertises this type as carrying EXTERNALLY-SOURCED instants: real upstreams —
+ * NTP-derived clocks, some observation APIs, anything restating a UTC broadcast — do
+ * emit leap seconds, so a boundary that takes third-party stamps WILL meet one.
+ *
+ * It falls out of the canonical round trip rather than being spelled as a rule:
+ * ECMAScript's time value has no leap second, so `Date.parse` rolls `:60` forward to
+ * the following `:00`, which then fails to re-serialise as the form it came from and
+ * {@link isRealInstant} refuses it.
+ *
+ * NORMALISING it — accepting `:60` and storing the rolled-forward `:00` — is
+ * deliberately NOT done, and would be worse than refusing. It is not a spelling of the
+ * same instant (unlike `+00:00` or a longer fraction): it SILENTLY CHANGES which
+ * second the stamp denotes, and two distinct instants would collapse onto one string,
+ * so the ordering property this type exists for would quietly stop being injective. A
+ * refusal is loud, at the boundary, and attributable to the upstream that sent it.
+ *
+ * The consequence is a real cost, owned here: DE1.2, which wires `observedAt` to
+ * externally-sourced timestamps, must plan for a leap-second stamp arriving as a
+ * DECODE FAILURE of the whole observation and decide what that boundary does with it
+ * (reject / clamp at the ADAPTER, where the choice is visible) — it must not assume
+ * every well-formed upstream instant decodes.
+ *
  * `Timestamp` is therefore a decode-side TRANSFORMATION, not a bare filter, and
  * encoding is the identity — the branded value is already canonical, so it goes to
  * the wire, the store, and the mirror byte-for-byte as decoded.
