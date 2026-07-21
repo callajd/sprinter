@@ -155,6 +155,39 @@ New branded ids: `RepositoryId`, `PullRequestId`, `SessionId` (re-pointed),
 `ExecutionId`, `WorkspaceId`, `AgentId`, `SpecId`, `SpecRevisionId`, `CommitSha`,
 `BranchName`.
 
+### Mutability follows the layer
+
+Point B gives each entity's **shape**. It does not say which of its fields are *facts about
+something that already happened* — and that omission cost DE2.2 (issue #104) four review
+rounds, each one a different column that turned out to be mutable when it should not have
+been, plus a write ordering the same key had forced.
+
+The answer does not need to be invented per entity: **the layer an entity sits in
+determines it.** `INV-OBSERVED` already splits entities into referenced-vs-owned for
+`observedAt`; mutability follows the same split.
+
+| Layer | On a re-put | Why |
+|---|---|---|
+| `── STATE ──` / `── TRANSITION ──` referenced (`Repository`, `Issue`, `PullRequest`) | **REPLACE wholesale**; `observedAt` advances | the row *is* the latest observation — replacing it is the point |
+| `── AGENTIC WORK ──` owned historical (`Execution`, `Session`) | **FREEZE** every field that records what happened; exactly one field carries the lifecycle | a record of a past run; re-pointing it rewrites history |
+| `── AGENTIC WORK ──` owned ephemeral (`Workspace`) | mutable throughout; released as one unit | diff/processes/ports change constantly by design |
+| `── REGISTRY ──` and `SpecRevision` | **APPEND-ONLY**; an edit mints a new revision | already stated; `Agent` enforced since DE1.1, `SpecRevision` at DE3.2 |
+
+**Every issue that lands an entity must state its column-by-column answer**, with a reason
+per column, and a NEW column's default is the layer's default. DE2.2 landed that table for
+`Execution` on `putExecution`; use it as the template.
+
+The two exceptions worth naming, because both are real and neither is obvious:
+
+- `Execution.agentId` and `Execution.mode` are **overwritten** despite `Execution` being an
+  owned historical record — because #77's merged-transcript model deliberately reuses one
+  execution id across re-dispatches. Freezing them would break retry-after-upgrade. The
+  docstrings therefore promise "the revision of the MOST RECENT run under this id", not
+  "the run".
+- A referenced entity's **identity** must still be stable across re-observation (DE1.2:
+  `RepositoryId` from the host's numeric id, not from `owner/name`), or "replace wholesale"
+  silently becomes "insert a duplicate".
+
 ### The work matrix
 
 `mode` is a **closed** axis; `target` is an **open** one. Every cell is valid; the
@@ -285,7 +318,7 @@ and no task may assert durability wider than that.
 | `INV-LIFECYCLE` | No entity stores a lifecycle its children already determine | review + typecheck |
 | `INV-OPAQUE` | No code in `packages/*` parses spec content. Structure exists only in the derived work graph | review |
 | `INV-MODE` | `mode` is per-execution. Nothing stores a session-level mode | review |
-| `INV-ENFORCE` | Every invariant above is enforced by a mechanism that makes violation **unconstructible** — a schema constraint (`UNIQUE`/`FOREIGN KEY`/`CHECK`) or a type — never by convention, and never by a runtime check a sibling code path can bypass. Two fields that must agree are **one value**. A surviving runtime guard states in its docstring why the state cannot instead be made unconstructible | review + the constraint itself |
+| `INV-ENFORCE` | Every invariant above is enforced by a mechanism that makes violation **unconstructible** — a schema constraint (`UNIQUE`/`FOREIGN KEY`/`CHECK`) or a type — never by convention, and never by a runtime check a sibling code path can bypass. Two fields that must agree are **one value**. A constraint must name **which tuple it ranges over** and **which operations may reach the state**: DE2.2 shipped a real `FOREIGN KEY (parent)` that still admitted a cross-job edge (wrong tuple — it needed `(parent, jobId)`) and still admitted a re-parent (wrong operation — it constrained INSERT but not UPDATE). A surviving runtime guard states in its docstring why the state cannot instead be made unconstructible | review + the constraint itself |
 
 ## Epics — set & sequencing
 
@@ -398,7 +431,8 @@ DE1 ──► DE2 ──► DE3 ──► DE4
     `jobId` migration: an ordinary re-put moved a leaf to another job, leaving the
     original owning nothing and `settle` sealing nothing). The rule that replaces the
     patching: **an `Execution` is a historical record of a run, so every column is FROZEN
-    unless there is a named reason it changes.** That yields `id` (key), `jobId`/`parent`
+    unless there is a named reason it changes** — generalised for every entity as
+    [Mutability follows the layer](#mutability-follows-the-layer). That yields `id` (key), `jobId`/`parent`
     (STRUCTURAL — frozen, refused inside the upsert statement), `agentId`/`mode` (PER-RUN
     FACTS — rewritten by a re-dispatch), `transcript` (the one field that legitimately
     changes, live → sealed). **A new column's default is FROZEN.** Stated on
@@ -492,6 +526,19 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   `transcriptRef` deleted from `packages/*` and `apple/*` (`SessionStatus`, i.e.
   DE2.1's `ExecutionStatus`, is already gone — DE2.2 replaced it with the transcript
   union); Swift mirror + golden.
+- **Hazard inherited from DE2.2:** this task re-points `Execution.jobId` at `sessionId`,
+  which is another foreign-key change — and an FK change **forces write reorderings**. In
+  DE2.2 the new `execution."jobId"` key forced *execution-after-job* at dispatch start
+  (correct and required), and the reversal leaked to the **terminal** write site where the
+  opposite order is load-bearing and neither order is forced: the job must go terminal
+  LAST, so a crash between the two statements leaves it `running` and the reconciler can
+  still find and seal it. Inverted, a crash left a permanently unrecoverable live orphan —
+  the exact class DE2.2 spent three rounds closing. **When an FK forces a reorder,
+  re-justify every other ordering on that path**, and comment each with the invariant it
+  protects.
+- **Mutability:** `Session` is an owned historical record, so its run-facts freeze; see
+  [Mutability follows the layer](#mutability-follows-the-layer). `SessionState` is derived
+  and never stored, so it is not a column at all.
 - **Depends on:** `DE2.2`, `DE2.3`
 
 ### DE2.5 — `Workspace` entity
@@ -500,6 +547,10 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   processes, ports and background tasks; the contract exposes a narrowed
   projection (`branch`, `base`, diff summary) — process ids and ports do not cross
   to the app; Swift mirror + golden for the projection.
+- **Mutability:** `Workspace` is the one owned entity that is *ephemeral*, not historical —
+  `diff`, `processes`, `ports` and `tasks` change constantly, so it is mutable throughout
+  and released as a single unit. Do not apply DE2.2's freeze rule here; see
+  [Mutability follows the layer](#mutability-follows-the-layer).
 - **Depends on:** `DE2.4`
 
 ---
@@ -645,6 +696,19 @@ The workstream is done when none of these can be constructed:
 20. A malformed value in a validated position — a `CommitSha` that is not 40 hex
     characters, a `BranchName` that is not a legal git ref, an instant that is not
     canonical. Branding a `NonEmptyString` does not satisfy this.
+21. An execution whose `parent` belongs to a **different job** — the tree is closed at the
+    job boundary by a composite key, not by writer discipline.
+22. A **terminal job with a live transcript**. Recovery walks only `running` jobs, so this
+    state is repaired by nothing; the terminal write order (execution sealed BEFORE the job
+    goes terminal) is what prevents it.
+23. A row that records a past event and can still be **re-pointed** — see
+    [Mutability follows the layer](#mutability-follows-the-layer).
+
+> **21-23 were learned in DE2.2 (#104), at a cost of four review rounds.** 21 and 23 were
+> each found only after the previous fix; 22 was introduced by the FOREIGN KEY the feature
+> itself added — which forced one write order at dispatch start and silently reversed the
+> opposite one at terminal — and was caught only on the fourth pass. They are stated here
+> so DE2.4, DE2.5 and DE3 inherit them.
 
 > **17-20 were learned, not designed.** They come from DE1.1's implementation
 > (issue #85 / PR #88), where each was initially a runtime check that some other path
@@ -653,7 +717,7 @@ The workstream is done when none of these can be constructed:
 
 ## Done (workstream)
 
-- All sixteen states above are unconstructible.
+- All twenty-three states above are unconstructible.
 - `Job`, `PullRequestRef`, `IssueStatus`, `JobStatus`, `SessionStatus`, `JobKind`
   appear nowhere in `packages/*` or `apple/*`. (`SessionStatus` — the process-level
   status enum, renamed `ExecutionStatus` by DE2.1 — was deleted early, at **DE2.2**:
