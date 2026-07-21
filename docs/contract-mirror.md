@@ -158,10 +158,22 @@ match:
 - **An omitted key ≠ a `null` key.** `NormalisedJSON` keeps a `null` as a value
   *present* in its object and an omitted key as simply *absent*, so the two are
   structurally distinct rather than distinct by a rule that could be relaxed.
-- **Scope.** Every committed golden, which covers every mirrored type with an
-  optional field. `GoldenCase.all` is required to be *exactly* the goldens in the test
-  bundle, so a golden added for a newly mirrored type is checked in the encode
-  direction or the gate fails.
+- **Scope.** Every committed golden. `GoldenCase.all` is required to be *exactly* the
+  goldens in the test bundle, so a golden added for a newly mirrored type is checked in
+  the encode direction or the gate fails. The *type* each case is paired with is pinned
+  from the decode side: `Golden.decode` checks the type its call site asks for against
+  that same table, so a case cannot be quietly retyped to something structural (say
+  `JSONValue`) that re-encodes to itself and passes vacuously while still counting as
+  covered.
+- **The absent forms are enforced, not enumerated** (`scripts/golden-coverage.ts`). The
+  check above is only decisive for a field some golden actually OMITS, and which goldens
+  exist used to be a matter of prose. After every fixture is written, the generator walks
+  the schema AST alongside the JSON it produced and requires — per FIELD, not per file —
+  that each `Schema.optionalKey` reachable from a golden has one golden that carries it
+  **and** one that omits it, and that each tagged-union case appears in some golden.
+  Adding an optional field or a union case without a fixture that pins it fails
+  `check:goldens` with the field named. The property is read off the contract's own
+  schemas, so there is no list to keep up to date.
 
 The guard is proved to fire by a committed **negative fixture**, kept in
 `Tests/SprinterContractTests/NegativeFixtures/` — a sibling of `Goldens/`, so the root
@@ -170,6 +182,31 @@ gate's `check:goldens` stage never tries to reconcile a file that must stay wron
 test asserts the harness **rejects** it. Normalising a missing key to `null` — the one
 change that would make this whole suite vacuous while every test still passed — fails
 there. See that directory's `README.md`.
+
+#### The other direction: the positive control (a procedure, not a fixture)
+
+The negative fixture proves the harness rejects a **golden** carrying a `null` the
+mirror omits. The opposite defect — the **mirror** emitting a key the golden omits, the
+actual `Optional`-encoding bug — cannot be a committed fixture, because the only way to
+produce that output is to ship a deliberately broken DTO. It is verified instead by
+mutating real product code and putting it back, which is stronger evidence anyway (it
+runs the true encode path, not a stand-in). Repeat it whenever the harness or
+`NormalisedJSON` is touched:
+
+```sh
+# 1. Break exactly one optional encode, in the mirror itself.
+#    Sources/SprinterContract/TranscriptEntry.swift:
+#      try container.encodeIfPresent(reasoning, forKey: .reasoning)
+#    → try container.encode(reasoning, forKey: .reasoning)
+cd apple/Sprinter && swift test --filter SprinterContractTests
+# 2. EXPECT a failure naming the golden, the JSON path and the direction:
+#    transcript-entries.json … $[2].reasoning: the Swift re-encode EMITS this key
+#    (null); the golden OMITS it
+# 3. Revert the mutation and re-run; the suite must be green again.
+```
+
+A run in which step 2 passes is the finding: the harness is not watching the encode
+direction and the mutation must be diagnosed before the change lands.
 
 `bun run check` (repo root) adds the **golden-freshness** stage
 (`check:goldens` → `apple/Sprinter/scripts/check-goldens.ts`): it re-runs the

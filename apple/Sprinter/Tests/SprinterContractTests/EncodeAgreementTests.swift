@@ -43,6 +43,12 @@ struct EncodeAgreementTests {
   /// `PullRequest`, `Spec`, `SpecRevision` and the transcript variants under the same
   /// invariant, so the table is required to be EXACTLY the bundle's goldens: add a golden
   /// without adding its case here and this fails.
+  ///
+  /// This pins the NAME set only. The TYPE each name is paired with is pinned from the
+  /// other side — every `Golden.decode` call site checks the type it asks for against the
+  /// table (``GoldenCase/requireDeclaredType(_:for:sourceLocation:)``) — because a case
+  /// retyped to something structural like `JSONValue` would re-encode to itself and pass
+  /// the encode test vacuously while still counting as covered here.
   @Test("every committed golden is covered in the encode direction — none is skipped")
   func everyGoldenIsCovered() throws {
     let covered = Set(GoldenCase.all.map(\.name))
@@ -83,8 +89,15 @@ struct EncodeAgreementTests {
       that conflates them defeats the whole suite while appearing to pass.
       """
     )
+    // The DIRECTION, in full. The bare word `OMITS` appears in BOTH of the divergence
+    // messages ("the Swift re-encode OMITS it" and "the golden OMITS it"), so matching on
+    // it alone would pass whichever side had dropped the key — i.e. it pins nothing. The
+    // phrase that distinguishes them is the assertion, and the opposite phrase is
+    // asserted ABSENT so a message carrying both could not satisfy this either.
     #expect(reported.contains("supersedes"))
-    #expect(reported.contains("OMITS"))
+    #expect(reported.contains("the golden CARRIES this key"))
+    #expect(reported.contains("the Swift re-encode OMITS it"))
+    #expect(!reported.contains("the golden OMITS it"))
 
     // And the fixture is wrong ONLY in that one way: the same bytes minus the null key
     // are a golden that agrees. So the rejection is attributable to the null, not to some

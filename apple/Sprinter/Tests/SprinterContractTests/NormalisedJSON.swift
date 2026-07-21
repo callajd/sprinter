@@ -27,6 +27,17 @@ import Foundation
 /// vs `12.0`): JSON has a single number type, so that is a serializer detail and not a
 /// contract difference. ``SprinterContract/JSONValue`` decodes every number as `Double`,
 /// which collapses the two.
+///
+/// **Known limit — integers beyond 2^53.** That same `Double` cannot represent every
+/// integer past 9_007_199_254_740_992, so both sides of the comparison round identically
+/// and a mirror that rounded such a field would agree with the golden here. The collapse
+/// is SYMMETRIC (the golden's bytes are parsed the same way as the re-encode's), so it
+/// can never produce a FALSE failure — it can only fail to catch that one bug. Every
+/// DECLARED numeric field is far below the limit (stream offsets, token counts, retry
+/// attempts, delays in ms, GitHub issue/PR numbers); the one place a larger integer could
+/// arrive is an arbitrary tool payload (`Schema.Unknown` — `input`/`output`/`partial`),
+/// where it is subject to the same symmetric collapse. Pinning those would need a
+/// comparison over the raw number TEXT rather than one through ``JSONValue``.
 enum NormalisedJSON {
   /// Parses JSON bytes into the normalised tree.
   ///

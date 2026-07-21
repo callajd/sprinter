@@ -39,8 +39,18 @@ enum Golden {
   }
 
   /// Decodes a golden into the mirror type it represents.
-  static func decode<T: Decodable>(_ type: T.Type, from name: String) throws -> T {
-    try JSONDecoder().decode(type, from: data(name))
+  ///
+  /// Every decode-side call site is also a CHECK on ``GoldenCase/all``: the type asked for
+  /// here must be the type that table pairs with `name`, so the pairing the ENCODE
+  /// direction relies on cannot be quietly retyped to something that passes vacuously
+  /// (see ``GoldenCase/requireDeclaredType(_:for:sourceLocation:)``).
+  static func decode<T: Decodable>(
+    _ type: T.Type,
+    from name: String,
+    sourceLocation: SourceLocation = #_sourceLocation
+  ) throws -> T {
+    GoldenCase.requireDeclaredType(type, for: name, sourceLocation: sourceLocation)
+    return try JSONDecoder().decode(type, from: data(name))
   }
 
   /// Encodes a value and decodes it back, proving the mirror's encode path agrees
