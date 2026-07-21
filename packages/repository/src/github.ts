@@ -38,10 +38,11 @@
  * The adapter is repo-scoped (D14): a {@link RepositoryConfig} binds ONE
  * `owner/repo`; cross-repo work provides many instances.
  */
-import { Effect, Layer, Option, Schema } from "effect";
+import { Clock, Effect, Layer, Option, Schema } from "effect";
 import {
   FetchHttpClient,
   HttpClient,
+  HttpClientError,
   HttpClientRequest,
   HttpClientResponse,
 } from "effect/unstable/http";
@@ -59,6 +60,7 @@ import {
 import {
   CodeHost,
   CodeHostError,
+  type CodeHostFailure,
   type CodeOps,
   type IssueOps,
   type PullRequestOps,
@@ -71,16 +73,64 @@ import {
 // ============================================================================
 
 /**
+ * The statuses that mean the host was REACHED and REFUSED us rather than failed:
+ * `401` (the token is absent, wrong or expired) and `403` (GitHub's answer for an
+ * exhausted rate limit as well as for a permission the token lacks). Neither is fixed
+ * by asking again with the same credentials, which is the whole reason
+ * {@link CodeHostFailure} separates `denied` from `unreachable`.
+ */
+const REFUSED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
+
+/**
+ * Classify a host failure into the closed {@link CodeHostFailure} a consumer branches
+ * on, by the ONE question that set answers: is asking again the remedy?
+ *
+ * The classification reads the transport's own typed failure reason rather than its
+ * message — `HttpClientError.isHttpClientError` is a type GUARD, so this is a check,
+ * never a cast (INV-NOCAST) — and the reason union is where the distinction actually
+ * lives: a `TransportError` never reached the host, a `StatusCodeError` carries the
+ * host's verdict, and everything else (a body that would not decode, a request this
+ * adapter could not form) means the exchange produced nothing usable. Anything that is
+ * NOT an `HttpClientError` reaching here is a `Schema.SchemaError` from decoding a
+ * response — `unusable` by the same argument.
+ */
+const failureKind = (error: unknown): CodeHostFailure => {
+  if (!HttpClientError.isHttpClientError(error)) return "unusable";
+  if (error.reason._tag === "TransportError") return "unreachable";
+  if (error.reason._tag === "StatusCodeError") {
+    return REFUSED_STATUSES.has(error.reason.response.status) ? "denied" : "unreachable";
+  }
+  return "unusable";
+};
+
+/**
  * Translate any host failure (an `HttpClientError` from the transport / status
  * filter, a `Schema.SchemaError` from decoding) into the owned
  * {@link CodeHostError}. Every such error carries a `message`; that is the only
- * surface this adapter leaks upward, so no consumer ever sees an HTTP or decode
- * type (INV-PORT).
+ * PROSE this adapter leaks upward, so no consumer ever sees an HTTP or decode type
+ * (INV-PORT). The `kind` is derived by {@link failureKind} from the error's own
+ * structure, so every call site gets the right classification without restating it —
+ * and a site that mixes transport and decode failures in one `mapError` (most of them
+ * do) still reports each one honestly.
  */
 const fail =
   (operation: string) =>
   (error: { readonly message: string }): CodeHostError =>
-    new CodeHostError({ operation, detail: error.message });
+    new CodeHostError({ operation, kind: failureKind(error), detail: error.message });
+
+/**
+ * The {@link CodeHostError} for a status this adapter did not expect at all — a
+ * `resolve` that answered neither 200 nor 404, a `branchExists` that answered neither
+ * 200 nor 404. It is classified by the SAME rule {@link failureKind} applies to a
+ * filtered status, so "GitHub said 401" reads as `denied` whether the status was
+ * rejected by `filterStatusOk` or by one of these explicit checks.
+ */
+const unexpectedStatus = (operation: string, status: number): CodeHostError =>
+  new CodeHostError({
+    operation,
+    kind: REFUSED_STATUSES.has(status) ? "denied" : "unreachable",
+    detail: `unexpected status ${status}`,
+  });
 
 // ============================================================================
 // The instant boundary — host spelling → the domain's canonical Timestamp
@@ -406,7 +456,20 @@ const DEFAULT_BASE_URL = "https://api.github.com";
  *
  * The encoding is INJECTIVE — a numeric id cannot contain the `:` separator, and `host`
  * is a closed literal — so two repositories can never receive one id and let the
- * id-keyed upsert silently overwrite a row.
+ * id-keyed upsert silently overwrite a row. `RepositoryId` now CHECKS that shape rather
+ * than assuming it (`repo:<host>:<host-id>`, host-id from the URL-unreserved set), so
+ * the injectivity argument is a schema constraint and not a comment (INV-ENFORCE).
+ *
+ * The decode therefore CANNOT fail for any input this function can be given, and it says
+ * so with `orDie` rather than declaring a `CodeHostError` nothing can produce. Both
+ * arguments are already constrained: `host` is `RepositoryHost`, a closed lowercase
+ * literal set, and `hostId` is `PositiveInt`, whose check is `Number.isSafeInteger` — so
+ * it is at most 2^53−1 and always stringifies as plain decimal digits, never in
+ * JavaScript's exponent form, and digits are inside the unreserved set. A failure here
+ * would mean one of those two schemas had stopped meaning what it says, which is a
+ * BROKEN INVARIANT and not a host outcome; reporting it as a `CodeHostError` would have
+ * put an unreachable branch in the error channel of every caller and invited them to
+ * phrase a user-facing reason for it.
  *
  * Nothing above this module may parse the result: it is opaque, and equality is its
  * only defined operation. In particular nothing may read a numeric GitHub id back out
@@ -415,14 +478,8 @@ const DEFAULT_BASE_URL = "https://api.github.com";
 export const repositoryIdFor = (
   host: RepositoryHost,
   hostId: PositiveInt,
-): Effect.Effect<RepositoryId, CodeHostError> =>
-  Schema.decodeUnknownEffect(RepositoryId)(`repo:${host}:${hostId}`).pipe(
-    Effect.mapError(() =>
-      fail("resolve")({
-        message: `cannot derive a repository id for ${host} repository ${hostId}`,
-      }),
-    ),
-  );
+): Effect.Effect<RepositoryId> =>
+  Schema.decodeUnknownEffect(RepositoryId)(`repo:${host}:${hostId}`).pipe(Effect.orDie);
 
 /** The months of an HTTP `Date` header, in the order RFC 7231's IMF-fixdate spells them. */
 const HTTP_DATE_MONTHS = [
@@ -467,32 +524,59 @@ const httpDateToIso = (header: string | undefined): string | undefined => {
 };
 
 /**
- * The instant an observation was made, as the CODE HOST reports it.
+ * The FALLBACK `observedAt`: this process's own clock, read through Effect's
+ * {@link Clock} rather than `new Date()`.
  *
- * The source is the response's HTTP `Date` header — the moment the host itself says it
- * produced this view, which is what `observedAt` means for a record read off that host
- * (INV-OBSERVED), and the reading DE4.4 renders staleness from. It arrives in the
- * host's own spelling and goes through {@link hostInstant}, so a leap second is
- * translated at this boundary (D5) rather than failing the whole observation.
+ * Going through the `Clock` service is what makes the fallback ASSERTABLE. `new Date()`
+ * is ambient and unmockable, so a test could only check the branch's shape, never the
+ * instant it produced — and this branch's whole claim is *which* clock the record ends
+ * up measuring. Under a `TestClock` it lands on a fixed instant like every other
+ * time-sensitive path in the codebase, so the claim is checked rather than asserted.
  *
- * A missing or non-conforming header falls back to THIS process's clock. That is a
- * deliberate degradation, not a silent one: the fallback is by construction canonical
- * (`toISOString` emits exactly the `Timestamp` form and can never produce a leap
- * second), so the observation still carries a real instant, one whose only cost is that
- * it measures our clock rather than the host's. Failing the observation instead would
- * make Sprinter unable to read a repository from a host that merely omits an optional
- * header.
+ * `toISOString` emits exactly the `Timestamp` form and can never produce a leap second,
+ * so the decode below cannot fail on this input; `orDie` says so rather than inventing
+ * an error channel nothing can occupy.
  */
-const observedAtFrom = (
-  header: string | undefined,
-  operation: string,
-): Effect.Effect<Timestamp, CodeHostError> => {
+const clockObservedAt: Effect.Effect<Timestamp> = Clock.currentTimeMillis.pipe(
+  Effect.flatMap((millis) => hostInstant(new Date(millis).toISOString(), "clock")),
+  Effect.orDie,
+);
+
+/**
+ * The instant an observation was made, as the CODE HOST reports it — or, failing that,
+ * as OUR clock reports it. Total: it cannot fail the observation.
+ *
+ * The preferred source is the response's HTTP `Date` header — the moment the host itself
+ * says it produced this view, which is what `observedAt` means for a record read off
+ * that host (INV-OBSERVED), and the reading DE4.4 renders staleness from. It arrives in
+ * the host's own spelling and goes through {@link hostInstant}, so a leap second is
+ * TRANSLATED at this boundary (D5) rather than failing the whole observation.
+ *
+ * Every OTHER way that header can be unusable degrades to {@link clockObservedAt}, and
+ * — this is the part that has to be uniform — that includes a header of the right SHAPE
+ * carrying an impossible VALUE. `Sat, 45 Jun 2026 12:00:00 GMT` matches
+ * {@link IMF_FIXDATE}, re-spells cleanly, and then fails `Timestamp`; treating that as a
+ * hard failure while an ABSENT header degraded gracefully would put a host with a buggy
+ * `Date` value in a strictly worse position than a host that omits the header entirely,
+ * which is backwards. The header is an OPTIONAL courtesy either way, so the policy is
+ * one sentence: an unusable `Date` header of ANY kind means we time the observation
+ * ourselves.
+ *
+ * That is adapter-boundary policy and nothing more — {@link Timestamp} stays strict, and
+ * this degradation is confined to the ONE field whose source is an optional header. An
+ * instant that arrives in a repository's BODY still fails the observation, because there
+ * we would be inventing data rather than timing our own read.
+ *
+ * The cost is stated rather than hidden: the record then measures OUR clock, not the
+ * host's, and a clock skewed against the host's makes DE4.4's rendered staleness wrong
+ * by the skew. Failing instead would make Sprinter unable to read a repository at all
+ * from a host that merely omits — or fumbles — an optional header.
+ */
+const observedAtFrom = (header: string | undefined): Effect.Effect<Timestamp> => {
   const iso = httpDateToIso(header);
   return iso === undefined
-    ? Effect.sync(() => new Date().toISOString()).pipe(
-        Effect.flatMap((now) => hostInstant(now, operation)),
-      )
-    : hostInstant(iso, operation);
+    ? clockObservedAt
+    : hostInstant(iso, "resolve").pipe(Effect.catch(() => clockObservedAt));
 };
 
 /**
@@ -514,6 +598,8 @@ const make = (config: RepositoryConfig) =>
       return yield* Effect.fail(
         new CodeHostError({
           operation: "make",
+          // `denied`: there is a credential problem and no retry fixes it.
+          kind: "denied",
           detail:
             "a GitHub token is required (set GITHUB_TOKEN); GitHub's GraphQL API rejects unauthenticated requests with 401",
         }),
@@ -556,12 +642,7 @@ const make = (config: RepositoryConfig) =>
           // rejection that writes nothing — never into an unobserved row.
           if (response.status === 404) return Option.none<Repository>();
           if (response.status !== 200) {
-            return yield* Effect.fail(
-              new CodeHostError({
-                operation: "resolve",
-                detail: `unexpected status ${response.status}`,
-              }),
-            );
+            return yield* Effect.fail(unexpectedStatus("resolve", response.status));
           }
           // The CANONICAL natural key — the host's spelling, not the caller's.
           //
@@ -593,15 +674,27 @@ const make = (config: RepositoryConfig) =>
             name: repo.name,
           }).pipe(Effect.mapError(fail("resolve")));
           const id = yield* repositoryIdFor(canonical.host, repo.id);
-          const observedAt = yield* observedAtFrom(response.headers["date"], "resolve");
+          const observedAt = yield* observedAtFrom(response.headers["date"]);
           // The refs are read in the SAME resolve, so the returned record describes ONE
           // moment (D7: a refresh replaces the record wholesale, never merges into it),
           // and from the CANONICAL path, so a renamed repository's refs are read from
           // where it lives now rather than through a second redirect.
-          // `per_page=100` is GitHub's maximum page; a repository with more branches is
-          // observed partially, which the model already admits — `refs` is what WAS
-          // observed, and an absent branch reads as "not observed", never as "does not
-          // exist" (see `tipOf`).
+          //
+          // KNOWN GAP — UNPAGINATED. `per_page=100` is GitHub's maximum PAGE, not its
+          // maximum repository: this reads ONE page and follows no `Link: rel="next"`, so
+          // a repository with more than 100 branches is observed PARTIALLY, and WHICH 100
+          // is GitHub's ordering (alphabetical), not a choice this adapter makes.
+          //
+          // The model already admits partial observation — `refs` is what WAS observed,
+          // and an absent branch reads as "not observed", never as "does not exist" (see
+          // `tipOf`) — so nothing here is corrupt. The CONSEQUENCE, stated because it is
+          // not obvious at the reading end: DE2.3 computes a pull request's staleness as
+          // `tipOf(pr.target) ≠ pr.base`, and on such a repository `tipOf` answers
+          // `undefined` for a REAL branch that simply fell off the page. DE2.3 must
+          // therefore treat "not observed" as UNKNOWN staleness rather than as stale, or
+          // pagination must land first. That constraint is recorded against DE2.3 in
+          // `docs/plan/domain-remodel.md`; paginating is deliberately not part of DE1.2,
+          // whose readers (the natural key, the id, `observedAt`) do not depend on refs.
           const canonicalPath = `/repos/${encodeURIComponent(canonical.owner)}/${encodeURIComponent(canonical.name)}`;
           const branchRows = yield* client
             .execute(HttpClientRequest.get(`${canonicalPath}/branches?per_page=100`))
@@ -659,12 +752,7 @@ const make = (config: RepositoryConfig) =>
                 200: () => Effect.succeed(true),
                 404: () => Effect.succeed(false),
                 orElse: (response) =>
-                  Effect.fail(
-                    new CodeHostError({
-                      operation: "branchExists",
-                      detail: `unexpected status ${response.status}`,
-                    }),
-                  ),
+                  Effect.fail(unexpectedStatus("branchExists", response.status)),
               }),
             ),
           ),

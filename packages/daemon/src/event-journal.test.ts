@@ -180,6 +180,72 @@ it.effect("journals an agent append ONCE — an idempotent re-append adds no sec
   ),
 );
 
+// N1 (round 3) — a repository RE-OBSERVATION that changed nothing must not journal.
+//
+// The row write is unconditional (D7 replaces wholesale, and `observedAt` has to move),
+// but the DELTA is a no-op: the two records agree about everything a client mirrors and
+// differ only in when we looked. `createWorkstreamFromPlan` resolves the repository
+// BEFORE it can derive the workstream id, so a client retry-looping on
+// `PlanRejected("a workstream already exists…")` re-puts on every attempt — and the
+// event log is append-only with no trim. Journaling unconditionally would grow it
+// without bound and re-broadcast an identical delta on every retry.
+it.effect("journals a repository put ONCE — a re-observation that changed nothing adds none", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    const subscription = yield* feed.subscribe;
+
+    yield* store.repositories.putRepository(repository);
+    // The SAME repository, re-observed a day later: a new `observedAt`, nothing else.
+    const reobserved = Schema.decodeUnknownSync(Repository)({
+      ...repository,
+      observedAt: "2026-07-21T12:00:00.000Z",
+    });
+    yield* store.repositories.putRepository(reobserved);
+
+    // ONE durable delta, not one per observation.
+    const entries = yield* store.events.read;
+    expect(entries.map((e) => e.kind)).toEqual(["RepositoryChanged"]);
+    // …and the ROW still advanced: the suppression is of the delta, never of the write.
+    expect(
+      Option.getOrThrow(yield* store.repositories.getRepository(repository.id)).observedAt,
+    ).toBe("2026-07-21T12:00:00.000Z");
+    // The LIVE fan-out is skipped too, proven the same way the agent test proves it: a
+    // DIFFERENT delta is driven through, and it is the second published item.
+    yield* store.workGraph.putWorkstream(workstream);
+    const published = [yield* PubSub.take(subscription), yield* PubSub.take(subscription)];
+    expect(published.map((e) => e.event._tag)).toEqual(["RepositoryChanged", "WorkstreamChanged"]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+// …and the other side of the same rule: an observation that DID change is journaled, so
+// the suppression cannot silently swallow a real delta. A ref moving is the commonest
+// real change, and the one DE2.3's staleness computation reads.
+it.effect("journals a repository put whose observation actually CHANGED", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.repositories.putRepository(repository);
+    const moved = Schema.decodeUnknownSync(Repository)({
+      ...repository,
+      refs: [{ name: "main", sha: "89abcdef0123456789abcdef0123456789abcdef" }],
+      observedAt: "2026-07-21T12:00:00.000Z",
+    });
+    yield* store.repositories.putRepository(moved);
+    const entries = yield* store.events.read;
+    expect(entries.map((e) => e.kind)).toEqual(["RepositoryChanged", "RepositoryChanged"]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
 it.effect(
   "journals the node write AND its delta ATOMICALLY: a failed transaction rolls back both (INV-RESTART)",
   () =>

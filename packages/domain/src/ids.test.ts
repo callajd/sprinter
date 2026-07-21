@@ -13,31 +13,81 @@ import {
   WorkstreamId,
 } from "./ids.ts";
 
+// Each brand paired with ONE well-formed sample. The sample is carried explicitly
+// rather than reusing the label as its own value because not every id is a bare
+// non-empty string: `RepositoryId` checks a SHAPE (`repo:<host>:<host-id>`), and a
+// table that fed each schema its own name would have quietly stopped covering it.
 const brands = [
-  ["WorkstreamId", WorkstreamId],
-  ["EpicId", EpicId],
-  ["IssueId", IssueId],
-  ["JobId", JobId],
-  ["SessionId", SessionId],
-  ["AgentId", AgentId],
-  ["RepositoryId", RepositoryId],
+  [WorkstreamId, "ws-alpha"],
+  [EpicId, "epic-alpha"],
+  [IssueId, "issue-alpha"],
+  [JobId, "job-alpha"],
+  [SessionId, "session-alpha"],
+  [AgentId, "agent-alpha"],
+  [RepositoryId, "repo:github:1296269"],
 ] as const;
 
-it.effect("decodes non-empty strings into each branded id and round-trips", () =>
-  Effect.forEach(brands, ([label, schema]) =>
+it.effect("decodes a well-formed value for each branded id and round-trips", () =>
+  Effect.forEach(brands, ([schema, sample]) =>
     Effect.gen(function* () {
-      const decoded = yield* Schema.decodeUnknownEffect(schema)(label);
+      const decoded = yield* Schema.decodeUnknownEffect(schema)(sample);
       const encoded = yield* Schema.encodeUnknownEffect(schema)(decoded);
-      expect(encoded).toBe(label);
+      expect(encoded).toBe(sample);
     }),
   ),
 );
 
 it.effect("rejects the empty string for every branded id", () =>
-  Effect.forEach(brands, ([, schema]) =>
+  Effect.forEach(brands, ([schema]) =>
     Effect.exit(Schema.decodeUnknownEffect(schema)("")).pipe(
       Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
     ),
+  ),
+);
+
+// ── RepositoryId — the SHAPE is in the schema, so a malformed id is unconstructible ──
+//
+// The value is opaque to READERS, but the encoding `repo:<host>:<host-id>` is what the
+// injectivity argument rests on (`packages/repository/src/github.ts`'s
+// `repositoryIdFor`), and these are the cases a branded `NonEmptyString` would have
+// waved through. `repo:github:callajd/sprinter` is the one that matters most: it is a
+// NATURAL-KEY-derived id, the exact shape that forks identity on a rename, and it is
+// now unconstructible rather than merely discouraged.
+it.effect("REJECTS a repository id that is not `repo:<host>:<host-id>`", () =>
+  Effect.forEach(
+    [
+      "",
+      "1296269",
+      "repo:github:",
+      "repo::1296269",
+      "repo:github:callajd/sprinter",
+      "repo:GitHub:1296269",
+      "repo:github:1e+21",
+      "repo:github:1296269 ",
+      "workstream:github:1296269",
+    ],
+    (raw) =>
+      Effect.exit(Schema.decodeUnknownEffect(RepositoryId)(raw)).pipe(
+        Effect.map((exit) => expect(Exit.isFailure(exit)).toBe(true)),
+      ),
+  ),
+);
+
+// The host-id segment is the URL-UNRESERVED set, which is what every identifier form a
+// code host actually issues fits inside — so the check constrains the shape without
+// committing the domain to GitHub's decimal ids.
+it.effect("ACCEPTS every host-id spelling a second code host could plausibly issue", () =>
+  Effect.forEach(
+    [
+      "repo:github:1296269",
+      "repo:gitlab:278964",
+      "repo:bitbucket:b4d0f6e2-0000-4000-8000-000000000001",
+      "repo:some-host:A_z0.9~-",
+    ],
+    (raw) =>
+      Schema.decodeUnknownEffect(RepositoryId)(raw).pipe(
+        Effect.map((decoded) => expect(decoded).toBe(raw)),
+      ),
   ),
 );
 

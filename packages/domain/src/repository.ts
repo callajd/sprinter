@@ -28,12 +28,23 @@
  *
  * Stated plainly rather than implied away. As of DE1.2 the ONLY production caller of
  * `putRepository` is new-plan materialisation (`createWorkstreamFromPlan`), so a
- * repository is observed when a workstream is first anchored to it and NEVER AGAIN:
- * `observedAt` and `refs` freeze at that first sighting. The mechanism a refresh needs
- * exists and is tested — `resolve` re-observes and `putRepository` replaces wholesale
- * (D7) — but nothing TRIGGERS it: no poll, no timer, no invalidation. `tipOf` and
- * `repositoryKey` are exported for the readers that will follow and have no production
- * caller yet.
+ * repository is observed when a workstream is first anchored to it and then only if
+ * someone happens to submit ANOTHER plan naming it — which is incidental, not a trigger.
+ * In the ordinary case `observedAt` and `refs` freeze at that first sighting. The
+ * mechanism a refresh needs exists and is tested — `resolve` re-observes and
+ * `putRepository` replaces wholesale (D7) — but nothing TRIGGERS it: no poll, no timer,
+ * no invalidation.
+ *
+ * The same gap explains which of this module's and the store's exports have no
+ * production READER yet, named here rather than left to be rediscovered:
+ * - `tipOf` — DE2.3's staleness computation is the reader it exists for.
+ * - `repositoryKey` — a refresh trigger's "which key does this record claim?".
+ * - the store's `findRepository` — the natural-key read a refresh trigger needs to ask
+ *   "is this key already ours?" before observing it.
+ * All three are covered by their own unit tests, not by a caller.
+ * `getRepository` and `observationsAgree` DO have production readers: the daemon's
+ * journaling decorator reads the record a put is about to replace and compares the two,
+ * so an unchanged re-observation is not journaled (`packages/daemon/src/event-journal.ts`).
  *
  * Two consequences are concrete, and both belong to DE4.4, which is where a trigger
  * would land. That constraint is recorded against DE4.4 in
@@ -120,6 +131,19 @@ export type RepositoryHost = (typeof RepositoryHost)["Type"];
  * as "no such repository". Narrowing per-host would trade a correct rejection the host
  * gives us for a rule the domain would then have to keep in sync with someone else's
  * product.
+ *
+ * ## COUPLING: the macOS client MIRRORS this allow-list
+ *
+ * `PlannerViewModel.segmentProblem`
+ * (`apple/Sprinter/Sources/SprinterSession/PlannerViewModel.swift`) re-states this same
+ * character set client-side, so the plan form can say WHY a key is unusable before it is
+ * submitted rather than surfacing a decode failure. That copy is a UX affordance and the
+ * daemon's decode stays the authority — but it IS a copy, and this rule is deliberately
+ * a SUPERSET meant to survive a second host adapter. So WIDENING this set (for a host
+ * whose grammar admits a character GitHub's does not) silently NARROWS the client: the
+ * daemon would accept the key while the Swift form refused to submit it, and the
+ * rejection would come from the copy rather than from the rule. Whoever adds that host
+ * must widen both. The Swift side carries the same note pointing back here.
  */
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
@@ -322,6 +346,47 @@ export const repositoryKey = (repository: Repository): RepositoryKey => ({
   owner: repository.owner,
   name: repository.name,
 });
+
+/**
+ * A canonical string standing for a whole observed ref set, used only to compare two of
+ * them for equality.
+ *
+ * A `\u0000` between a ref's name and its sha and a `\u0001` between refs cannot be
+ * AMBIGUOUS, which is the only property a signature owes: {@link BranchName} excludes
+ * every control character, and {@link CommitSha} is 40 hex characters, so neither
+ * separator can occur INSIDE a field and no two distinct ref lists can produce one
+ * string. {@link RepositoryRefs} is strictly ascending by name, so two equal ref sets
+ * always serialise in the same order — the comparison needs no sort of its own.
+ */
+const refsSignature = (refs: RepositoryRefs): string =>
+  refs.map((ref) => `${ref.name}\u0000${ref.sha}`).join("\u0001");
+
+/**
+ * Whether two observations of a repository AGREE — that is, whether they differ in
+ * nothing but WHEN they were taken.
+ *
+ * Every field is compared except `observedAt`, and the exclusion is the point.
+ * `observedAt` is not something the repository is; it is when we last looked
+ * (INV-OBSERVED). Two resolves a minute apart of an unchanged repository are two
+ * observations, and they always differ — so "did the record change?" and "is this a new
+ * observation?" are different questions, and a consumer that needs the FIRST (a delta
+ * feed: has anything a client mirrors actually moved?) cannot get it from value
+ * equality on the whole record.
+ *
+ * That consumer is the daemon's journaling decorator (`packages/daemon/src/event-journal.ts`),
+ * which uses this to keep a re-observation that changed NOTHING from appending another
+ * `RepositoryChanged` to the durable log and re-broadcasting it. The predicate lives
+ * HERE, with the entity, rather than there, because which fields constitute the
+ * repository's observed STATE is a property of the model — a field added to
+ * {@link Repository} has to be answered for in one place, next to the schema that
+ * introduced it.
+ */
+export const observationsAgree = (left: Repository, right: Repository): boolean =>
+  left.id === right.id &&
+  left.host === right.host &&
+  left.owner === right.owner &&
+  left.name === right.name &&
+  refsSignature(left.refs) === refsSignature(right.refs);
 
 /**
  * The commit a branch's tip pointed at when `repository` was observed, or `undefined`

@@ -294,10 +294,12 @@ export interface AgentStore {
  * a store that hid stale records would make "how old is this?" unanswerable by removing
  * the evidence.
  *
- * KNOWN GAP (DE1.2): nothing in production ever calls `putRepository` a SECOND time for
- * a given repository — new-plan materialisation is its only caller, so no record is ever
- * refreshed and `observedAt`/`refs` freeze at first sighting. The refresh MECHANISM here
- * is complete and tested; the TRIGGER does not exist and is out of scope for this task.
+ * KNOWN GAP (DE1.2): new-plan materialisation is `putRepository`'s only production
+ * caller, and nothing SCHEDULES a re-observation. A record is therefore refreshed only if
+ * a user happens to submit another plan naming the same repository — incidental, not a
+ * trigger — so in the ordinary case `observedAt`/`refs` freeze at first sighting. The
+ * refresh MECHANISM here is complete and tested; the TRIGGER does not exist and is out of
+ * scope for this task.
  * DE4.4's staleness rendering needs one. See the module docstring of
  * `packages/domain/src/repository.ts`.
  *

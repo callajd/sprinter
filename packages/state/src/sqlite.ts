@@ -1101,6 +1101,11 @@ const make = Effect.gen(function* () {
     // observations is the current one is exactly what only a refresh can answer), so the
     // behaviour is PINNED by a test in `store.test.ts` rather than changed, and the fix
     // is recorded against DE4.4 with the trigger it depends on.
+    //
+    // What the CALLER must not do with it is die. This failure is host-caused and
+    // permanent, not a broken store, so the one user-facing caller
+    // (`createWorkstreamFromPlan`) turns it into a `PlanRejected` naming the conflicting
+    // key instead of an unmodelled defect — see `packages/daemon/src/rpc-handlers.ts`.
     putRepository: (repository) =>
       sql
         .withTransaction(

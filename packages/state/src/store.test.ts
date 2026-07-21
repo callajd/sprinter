@@ -720,7 +720,7 @@ it.effect("REJECTS a second repository row for the same (host, owner, name)", ()
   Effect.gen(function* () {
     const store = yield* StateStore;
     yield* store.repositories.putRepository(yield* repository());
-    const duplicate = yield* repository({ id: "repo:github:1296269#2" });
+    const duplicate = yield* repository({ id: "repo:github:1296270" });
     // `flip` makes the REJECTION the success: a write that succeeded would flip into
     // the error channel and fail the test rather than pass it.
     const rejected = yield* store.repositories.putRepository(duplicate).pipe(Effect.flip);
@@ -739,6 +739,10 @@ it.effect("REJECTS a second repository row for the same (host, owner, name)", ()
 // which is doing exactly its job. The fix belongs to whoever lands the refresh trigger
 // (recorded against DE4.4) — evicting the stale row or resolving the conflict here would
 // invent policy DE1.2 has no basis to choose.
+//
+// What the CALLER does with it is settled, though, and pinned separately: it is
+// host-caused and permanent, not a broken store, so `createWorkstreamFromPlan` rejects
+// the plan rather than dying (`packages/daemon/src/rpc-handlers.test.ts`).
 it.effect("PINS: a stale row's natural key blocks another repository renamed into it", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

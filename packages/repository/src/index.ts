@@ -13,7 +13,13 @@
  * the port is the external system, the entity is the record read off it.
  */
 export type { CodeOps, IssueOps, PullRequestOps, RepositoryOps } from "./code-host.ts";
-export { CodeHost, CodeHostError, IssueState, RepositoryIssue } from "./code-host.ts";
+export {
+  CodeHost,
+  CodeHostError,
+  CodeHostFailure,
+  IssueState,
+  RepositoryIssue,
+} from "./code-host.ts";
 export type { RepositoryConfig } from "./github.ts";
 export { hostInstant, layer, layerFetch, repositoryIdFor } from "./github.ts";
 export type { ReconcileFailure, ReconcileOutcome } from "./reconcile.ts";

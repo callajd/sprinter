@@ -313,8 +313,10 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   `workstream.repositoryId` is a `FOREIGN KEY` (`INV-ENFORCE`).
 - **Out of scope, stated:** the refresh MECHANISM lands here; the refresh TRIGGER
   does not. One consequence is documented and pinned by a test rather than fixed: a
-  stale row's natural key blocks a different repository renamed into it. See the
-  constraint recorded against `DE4.4`.
+  stale row's natural key blocks a different repository renamed into it (it is
+  REJECTED at the RPC, not died on). Branch listing is unpaginated. And the plan-NAME
+  half of a workstream id is still a lossy slug — pre-existing, tracked as issue #95.
+  See the constraints recorded against `DE4.4` and `DE2.3`.
 - **Depends on:** —
 
 ### DE1.3 — Retire `SprinterCore/Workstream.swift`
@@ -357,6 +359,18 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   `PullRequestRef` and `merged: boolean` deleted; staleness computed as
   `tipOf(target) ≠ base`, never stored; a `Mergeability` whose `against` is behind
   `tipOf(target)` is reported unknown; Swift mirror + golden.
+- **Constraint (recorded by DE1.2, issue #86):** the observed `refs` a `tipOf` reads
+  are **UNPAGINATED**. The GitHub adapter lists branches at `per_page=100` — GitHub's
+  maximum page, not its maximum repository — and follows no `Link: rel="next"`, so on a
+  repository with more than 100 branches the observation is PARTIAL, and which 100 is
+  GitHub's alphabetical ordering rather than a choice the adapter makes. `Repository`
+  already admits partial observation (`refs` is what WAS observed, and an absent branch
+  means "not observed", never "does not exist"), so nothing is corrupt — but
+  `tipOf(pr.target)` then answers `undefined` for a REAL branch that simply fell off the
+  page. DE2.3 must therefore treat "not observed" as **unknown** staleness rather than
+  as stale (the same treatment it already gives an out-of-date `Mergeability`), **or**
+  land pagination in the adapter first. Paginating was out of scope for DE1.2, whose
+  own readers — the natural key, the id, `observedAt` — do not depend on `refs`.
 - **Depends on:** `DE1.2`
 
 ### DE2.4 — `Session` replaces `Job`
@@ -467,7 +481,19 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   on the `UNIQUE` natural key and fails with `StateStoreError` — permanently, though it
   is entirely valid on the host. DE1.2 pins that behaviour with a test rather than
   guessing which observation is current; the trigger is what makes the guess
-  unnecessary.
+  unnecessary. DE1.2 does, however, keep that collision off the DEFECT channel: at the
+  RPC it is delivered as a `PlanRejected` naming the conflicting key, because it is
+  host-caused and permanent, not a broken store.
+- **Constraint (recorded by DE1.2, issue #86):** a repository re-observation that
+  changed nothing is **not journaled**. The daemon's journaling decorator compares the
+  new observation against the stored row and emits `RepositoryChanged` only when they
+  differ in something other than `observedAt` — without which a client retry-looping on
+  a rejected plan would grow the untrimmed durable event log without bound and
+  re-broadcast an identical delta on every attempt. The cost lands on DE4.4: a client's
+  mirror keeps the `observedAt` it was last told about while the durable row moves
+  ahead, so a suppressed refresh renders as *staler than it is* until the next genuine
+  change. A trigger that wants the stamp fanned out regardless needs a delta carrying
+  the observation TIME as its own event, not a whole-record change.
 - **Depends on:** `DE2.3`, `DE3.3`
 
 ### DE4.5 — Execution tree in the session view

@@ -251,7 +251,103 @@ const unreachableCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
   CodeHost.of({
     repositories: {
       resolve: () =>
-        Effect.fail(new CodeHostError({ operation: "resolve", detail: "unexpected status 503" })),
+        Effect.fail(
+          new CodeHostError({
+            operation: "resolve",
+            kind: "unreachable",
+            detail: "unexpected status 503",
+          }),
+        ),
+    },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: { getIssue: () => Effect.die("never driven") },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () => Effect.die("never driven"),
+    },
+  }),
+);
+
+/**
+ * A {@link CodeHost} that REFUSED us — a 401/403, the `denied` {@link CodeHostFailure}.
+ * The host was reached and answered; what it answered is "no". Retrying with the same
+ * token reproduces it exactly, which is why it must not be phrased as the retryable one.
+ */
+const refusingCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      resolve: () =>
+        Effect.fail(
+          new CodeHostError({
+            operation: "resolve",
+            kind: "denied",
+            detail: "unexpected status 401",
+          }),
+        ),
+    },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: { getIssue: () => Effect.die("never driven") },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () => Effect.die("never driven"),
+    },
+  }),
+);
+
+/**
+ * A {@link CodeHost} whose ANSWER could not be read — the `unusable`
+ * {@link CodeHostFailure}, the shape a body that failed `GhRepo` takes at the port.
+ */
+const unreadableCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      resolve: () =>
+        Effect.fail(
+          new CodeHostError({
+            operation: "resolve",
+            kind: "unusable",
+            detail: "missing required field `id`",
+          }),
+        ),
+    },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: { getIssue: () => Effect.die("never driven") },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () => Effect.die("never driven"),
+    },
+  }),
+);
+
+/** The stale row's id, and the DIFFERENT repository the host renames into its key. */
+const STALE_ROW_ID = "repo:github:2";
+const RENAMED_INTO_KEY_ID = "repo:github:1";
+
+/**
+ * A {@link CodeHost} that resolves `callajd/x` to repository id {@link RENAMED_INTO_KEY_ID}
+ * — a DIFFERENT repository from the one a stale row records at that same natural key.
+ * This is the host half of the rename collision: entirely ordinary GitHub behaviour
+ * (rename `org/foo` away, create a new `org/foo`), and nothing about it is a fault.
+ */
+const renamingCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      resolve: (hostKey) =>
+        Effect.succeed(
+          Option.some(
+            Schema.decodeUnknownSync(Repository)({
+              id: RENAMED_INTO_KEY_ID,
+              host: hostKey.host,
+              owner: hostKey.owner,
+              name: hostKey.name,
+              refs: [],
+              observedAt: "2026-07-21T09:00:00.000Z",
+            }),
+          ),
+        ),
     },
     code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
     issues: { getIssue: () => Effect.die("never driven") },
@@ -562,6 +658,107 @@ it.effect("createWorkstreamFromPlan REJECTS (not dies) when the code host is unr
         expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
       }),
     unreachableCodeHost,
+  ),
+);
+
+// N2 (round 3) — "the host could not be asked" is THREE outcomes, and only ONE of them
+// is fixed by trying again. A single "could not be reached — retry" told a user with an
+// expired token to do the one thing that cannot possibly work, forever. The reason now
+// branches on the closed `CodeHostFailure` the port carries.
+it.effect("createWorkstreamFromPlan REJECTS a REFUSED host without inviting a retry", () =>
+  harness(
+    ({ client, store }) =>
+      Effect.gen(function* () {
+        const error = yield* client
+          .createWorkstreamFromPlan({
+            plan: { name: "Refused", repository: key("callajd", "sprinter"), spec: "real spec" },
+          })
+          .pipe(Effect.flip);
+        expect(error).toBeInstanceOf(PlanRejected);
+        // It says REFUSED, points at the credential, and says plainly that retrying now
+        // will not help — the opposite instruction from the reachability case.
+        expect(error.reason).toContain("refused");
+        expect(error.reason).toContain("credentials");
+        expect(error.reason).toContain("retrying now will not help");
+        expect(error.reason).not.toContain("could not be reached");
+        expect(yield* store.repositories.listRepositories).toStrictEqual([]);
+        expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      }),
+    refusingCodeHost,
+  ),
+);
+
+// …and the third: the host answered something Sprinter could not read. Also
+// deterministic, and it points at Sprinter or at a host contract change, not at the user.
+it.effect("createWorkstreamFromPlan REJECTS an UNREADABLE answer without inviting a retry", () =>
+  harness(
+    ({ client, store }) =>
+      Effect.gen(function* () {
+        const error = yield* client
+          .createWorkstreamFromPlan({
+            plan: { name: "Garbled", repository: key("callajd", "sprinter"), spec: "real spec" },
+          })
+          .pipe(Effect.flip);
+        expect(error).toBeInstanceOf(PlanRejected);
+        expect(error.reason).toContain("could not read");
+        expect(error.reason).toContain("retrying will not change the answer");
+        expect(error.reason).not.toContain("could not be reached");
+        expect(yield* store.repositories.listRepositories).toStrictEqual([]);
+        expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      }),
+    unreadableCodeHost,
+  ),
+);
+
+// B1 (round 3) — the stale-natural-key collision reaching the RPC BOUNDARY.
+//
+// `packages/state/src/store.test.ts` pins the store half: a stale row goes on occupying
+// a natural key the host has already freed, so a DIFFERENT repository renamed into that
+// key cannot be stored. This extends the pin UP THROUGH the RPC, because that is where
+// it matters: the failure is permanent, HOST-caused, and triggered by ordinary GitHub
+// behaviour, so delivering it as an unmodelled DEFECT would hand the client a
+// `Cause([Die(StateStoreError)])` it has no case for — `Commands.swift` models
+// `PlanRejected`.
+//
+// `Effect.flip` is the assertion, exactly as in the Q2 and N4 tests above: a defect does
+// not flip, it propagates, so an `orDie` regression here fails this test rather than
+// passing it.
+it.effect("createWorkstreamFromPlan REJECTS (not dies) a stale natural-key collision", () =>
+  harness(
+    ({ client, store }) =>
+      Effect.gen(function* () {
+        // The STALE row: repository B, observed once at `callajd/x` and never refreshed.
+        // Upstream it has since been renamed to `callajd/y`, which nothing tells us.
+        yield* store.repositories.putRepository(
+          Schema.decodeUnknownSync(Repository)({
+            id: STALE_ROW_ID,
+            host: "github",
+            owner: "callajd",
+            name: "x",
+            refs: [],
+            observedAt: "2026-07-20T12:00:00.000Z",
+          }),
+        );
+        // Repository A has now been renamed INTO `callajd/x` on the host. Storing the
+        // observation collides with the stale row on `UNIQUE (host, owner, name)`: the
+        // ids differ, so the id-keyed upsert does not fire.
+        const error = yield* client
+          .createWorkstreamFromPlan({
+            plan: { name: "Renamed", repository: key("callajd", "x"), spec: "real spec" },
+          })
+          .pipe(Effect.flip);
+        expect(error).toBeInstanceOf(PlanRejected);
+        // The reason NAMES the conflicting key and offers the actual explanation, so the
+        // user can see which repository is in the way rather than reading "internal error".
+        expect(error.reason).toContain("callajd/x");
+        expect(error.reason).toContain("renamed on the host");
+        // Nothing landed: the stale row is untouched and no workstream was written.
+        expect((yield* store.repositories.listRepositories).map((row) => row.id)).toStrictEqual([
+          STALE_ROW_ID,
+        ]);
+        expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      }),
+    renamingCodeHost,
   ),
 );
 

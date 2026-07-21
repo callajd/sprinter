@@ -93,8 +93,50 @@ export type StoreGenerationId = (typeof StoreGenerationId)["Type"];
  *
  * Both properties are properties of the minting ADAPTER, not something a consumer may
  * rely on by inspecting the value.
+ *
+ * ## The SHAPE is checked, because injectivity depends on it
+ *
+ * The value is opaque to READERS, but it is not shapeless. Every adapter mints
+ * `repo:<host>:<host-id>`, and the argument that the encoding is INJECTIVE — that two
+ * repositories can never receive one id and let the id-keyed upsert silently overwrite
+ * a row — is an argument about exactly that shape: the `<host>` segment contains no
+ * `:`, so the split is unambiguous, and the `<host-id>` segment is the host's own
+ * identifier for one repository. {@link REPOSITORY_ID} states that assumption as a
+ * SCHEMA constraint rather than leaving it to each adapter's good behaviour, so an id
+ * that could not have been minted injectively is UNCONSTRUCTIBLE (INV-ENFORCE) instead
+ * of merely unlikely.
+ *
+ * That is a rule about the ENCODING, not a licence to decode: nothing above a minting
+ * adapter may split this value, and in particular nothing may read a host id back out
+ * of it (INV-PORT). The check runs where the value is BUILT; the guarantee it buys is
+ * that the value nobody parses is nonetheless well-formed.
+ *
+ * Its reach is WIDER than the minting adapter, which is the point. The GitHub adapter is
+ * not the only source of a `RepositoryId`: one arrives on every wire payload the store
+ * and the RPC surface decode, and out of every fixture and test fake. Before this check,
+ * `repo:github:callajd/sprinter` — a NATURAL-KEY-derived id, the exact shape that forks
+ * identity on a rename and the whole reason this type is derived from the host's stable
+ * id instead — decoded happily anywhere. It no longer decodes at all.
  */
-export const RepositoryId = Schema.NonEmptyString.pipe(Schema.brand("RepositoryId"));
+const REPOSITORY_ID = /^repo:[a-z0-9-]+:[A-Za-z0-9._~-]+$/;
+
+/**
+ * A {@link Repository}'s identifier — `repo:<host>:<host-id>`, checked
+ * ({@link REPOSITORY_ID}).
+ *
+ * The `<host>` segment is lowercase alphanumeric (plus `-`) and so cannot contain the
+ * `:` separator; the `<host-id>` segment is one or more URL-UNRESERVED characters
+ * (`A-Za-z0-9._~-`, RFC 3986). Unreserved is the widest alphabet that is safe
+ * EVERYWHERE this id is embedded without escaping — inside a `WorkstreamId`, in a URL,
+ * on the wire — and every identifier form a code host actually issues fits inside it
+ * (decimal, hex, base64url, a UUID), so the check constrains the SHAPE without
+ * committing the domain to any one host's id format.
+ */
+export const RepositoryId = Schema.String.check(
+  Schema.makeFilter((value: string) => REPOSITORY_ID.test(value), {
+    expected: "a repository id of the form `repo:<host>:<host-id>`",
+  }),
+).pipe(Schema.brand("RepositoryId"));
 export type RepositoryId = (typeof RepositoryId)["Type"];
 
 /**

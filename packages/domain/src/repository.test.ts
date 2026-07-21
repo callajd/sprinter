@@ -4,6 +4,7 @@ import { expect } from "vitest";
 import { BranchName } from "./ids.ts";
 import {
   compareBranchNames,
+  observationsAgree,
   Repository,
   RepositoryKey,
   repositoryKey,
@@ -15,7 +16,7 @@ const shaMain = "0123456789abcdef0123456789abcdef01234567";
 const shaFeat = "89abcdef0123456789abcdef0123456789abcdef";
 
 const wire = {
-  id: "repo-github-callajd-sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -264,5 +265,76 @@ it.effect("extracts the natural key, and resolves a branch tip from the observed
     // Absent means "NOT OBSERVED" — never "the branch does not exist", which only the
     // code host can say.
     expect(tipOf(repository, absent)).toBeUndefined();
+  }),
+);
+
+// ── observationsAgree — the DELTA question, not the equality question ─────────────
+//
+// "Did the record change?" and "is this a new observation?" are different questions,
+// and `observedAt` is exactly what separates them: it is not something the repository
+// IS, it is when we last looked. A consumer that fans deltas out to clients needs the
+// first, and cannot get it from value equality on the whole record.
+
+it.effect("AGREES with a re-observation that differs only in observedAt", () =>
+  Effect.gen(function* () {
+    const first = yield* decode(wire);
+    const later = yield* decode({ ...wire, observedAt: "2026-07-21T09:30:00.000Z" });
+    expect(observationsAgree(first, later)).toBe(true);
+    // Reflexive, and symmetric on the pair above.
+    expect(observationsAgree(first, first)).toBe(true);
+    expect(observationsAgree(later, first)).toBe(true);
+  }),
+);
+
+// Every OTHER field is compared, one case each, so a field that stops being compared
+// fails a test rather than silently suppressing a real delta.
+it.effect("DISAGREES when any field other than observedAt differs", () =>
+  Effect.gen(function* () {
+    const first = yield* decode(wire);
+    const cases = [
+      { ...wire, id: "repo:github:1296270" },
+      { ...wire, owner: "someone-else" },
+      { ...wire, name: "sprint" },
+      // A ref MOVED — the commonest real change, and the one DE2.3 reads.
+      {
+        ...wire,
+        refs: [
+          { name: "feat/x-1", sha: shaFeat },
+          { name: "main", sha: shaFeat },
+        ],
+      },
+      // A ref REMOVED.
+      { ...wire, refs: [{ name: "main", sha: shaMain }] },
+      // Every ref removed — an empty observation is valid, and it is not this one.
+      { ...wire, refs: [] },
+    ];
+    yield* Effect.forEach(cases, (raw) =>
+      decode(raw).pipe(Effect.map((other) => expect(observationsAgree(first, other)).toBe(false))),
+    );
+  }),
+);
+
+// The ref signature cannot be made AMBIGUOUS by the content of a ref: a branch name
+// cannot hold a control character (`BranchName`) and a sha is 40 hex characters
+// (`CommitSha`), so no two distinct ref lists can serialise to one string. This drives
+// the closest thing the domain admits — a name whose characters bracket the separators.
+it.effect("compares ref sets without a separator a branch name could forge", () =>
+  Effect.gen(function* () {
+    const left = yield* decode({
+      ...wire,
+      refs: [
+        { name: "a-b", sha: shaMain },
+        { name: "a-c", sha: shaFeat },
+      ],
+    });
+    const right = yield* decode({
+      ...wire,
+      refs: [
+        { name: "a-b", sha: shaMain },
+        { name: "a-c", sha: shaMain },
+      ],
+    });
+    expect(observationsAgree(left, right)).toBe(false);
+    expect(observationsAgree(left, left)).toBe(true);
   }),
 );

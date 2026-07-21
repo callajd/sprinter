@@ -178,7 +178,11 @@ const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
         number === PR_NUMBER
           ? Effect.succeed(decode(PullRequestRef, openPr))
           : Effect.die(
-              new CodeHostError({ operation: "getPullRequest", detail: `unused #${number}` }),
+              new CodeHostError({
+                operation: "getPullRequest",
+                kind: "unreachable",
+                detail: `unused #${number}`,
+              }),
             ),
     },
   }),
@@ -375,7 +379,11 @@ const recordingRepository = (asked: Ref.Ref<ReadonlyArray<string>>): Layer.Layer
         closingPullRequest: () => Effect.succeed(Option.none()),
         getPullRequest: (number) =>
           Effect.die(
-            new CodeHostError({ operation: "getPullRequest", detail: `unused #${number}` }),
+            new CodeHostError({
+              operation: "getPullRequest",
+              kind: "unreachable",
+              detail: `unused #${number}`,
+            }),
           ),
       },
     }),

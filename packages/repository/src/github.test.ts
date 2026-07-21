@@ -14,6 +14,7 @@
  */
 import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Schema } from "effect";
+import { TestClock } from "effect/testing";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
 import { PositiveInt, RepositoryKey } from "@sprinter/domain";
@@ -677,16 +678,58 @@ it.effect("surfaces an unexpected resolve status as CodeHostError", () =>
 );
 
 // N2 — the `Date`-header fallback. A host that omits the optional header must not cost
-// us the observation: `observedAt` falls back to THIS process's clock, which is
-// canonical by construction (`toISOString`), so the record still carries a real instant.
-it.effect("falls back to this process's clock when the host sends no Date header", () =>
+// us the observation: `observedAt` falls back to OUR clock, which is canonical by
+// construction (`toISOString`), so the record still carries a real instant.
+//
+// The clock is read through Effect's `Clock`, not `new Date()`, which is what makes the
+// branch ASSERTABLE: under the `TestClock` these tests already run on, the fallback
+// lands on an instant this test CHOSE, so what is checked is which clock the record
+// ended up measuring — not merely that it got some string.
+const FALLBACK_INSTANT = "2026-03-01T08:15:00.000Z";
+
+it.effect("falls back to OUR clock — read through Clock — when the host sends no Date", () =>
   Effect.gen(function* () {
-    const before = new Date().toISOString();
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
     const host = yield* CodeHost;
     const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
-    const after = new Date().toISOString();
-    expect(resolved.observedAt >= before && resolved.observedAt <= after).toBe(true);
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
   }).pipe(Effect.provide(backend(repoRoutes()))),
+);
+
+// …and the same fallback for a header that is present but NOT an IMF-fixdate at all.
+it.effect("falls back to OUR clock for a Date header in no recognised form", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("yesterday afternoon")))),
+);
+
+// The DEGRADATION IS UNIFORM, which is the whole point. `Sat, 45 Jun 2026 …` is
+// IMF-fixdate SHAPED — it matches the regex and re-spells cleanly — and then fails
+// `Timestamp` on the impossible day. Failing the observation for THAT while degrading
+// gracefully for an ABSENT header would put a host with a buggy `Date` VALUE in a worse
+// position than a host that omits the header entirely, which is backwards. Both take the
+// clock.
+it.effect("falls back to OUR clock for an IMF-SHAPED Date carrying an impossible value", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 45 Jun 2026 12:00:00 GMT")))),
+);
+
+// …and one more shape that reaches the SAME re-speller and dies at `Timestamp`: a month
+// abbreviation the IMF regex admits (`[A-Za-z]{3}`) but RFC 7231 does not name.
+it.effect("falls back to OUR clock for a Date header naming no real month", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 12 Zzz 2026 12:00:00 GMT")))),
 );
 
 // `Option.none`, not a failure: "no such repository" is INFORMATION the host has,
@@ -798,18 +841,31 @@ it.effect("carries a host leap second all the way through resolve, as a real Tim
   }).pipe(Effect.provide(backend(repoRoutes("Sat, 30 Jun 2012 23:59:60 GMT")))),
 );
 
-// …and the same path with an IMPOSSIBLE date behind the leap second FAILS rather than
-// DIES. `httpDateToIso` deliberately does not validate the day (it re-spells only), so
-// `45 Jun` reaches `hostInstant` together with `:60` — the exact intersection that used
-// to format `new Date(NaN)` and throw. `Effect.flip` proves it is the declared failure:
-// a defect would propagate and fail this test instead of satisfying it.
-it.effect("a malformed host Date WITH a leap second FAILS the observation, never dies", () =>
+// …and the same path with an IMPOSSIBLE date BEHIND the leap second degrades rather
+// than DYING. `httpDateToIso` deliberately does not validate the day (it re-spells
+// only), so `45 Jun` reaches `hostInstant` together with `:60` — the exact intersection
+// that would otherwise format `new Date(NaN)` and throw. It resolves, on our clock: the
+// translation refuses to invent an instant, and an unusable `Date` header of ANY kind is
+// one policy. That a `resolve` SUCCEEDS here is what proves no defect escaped — a defect
+// would propagate out of `Option.getOrThrow`'s effect and fail this test.
+it.effect("degrades a malformed host Date WITH a leap second, never dies", () =>
   Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
     const host = yield* CodeHost;
-    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(CodeHostError);
-    expect(error.operation).toBe("resolve");
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
   }).pipe(Effect.provide(backend(repoRoutes("Sat, 45 Jun 2026 23:59:60 GMT")))),
+);
+
+// `hostInstant` ITSELF stays strict, and that is the boundary the degradation does NOT
+// cross: an instant arriving in a repository's BODY has no optional-header excuse, and
+// falling back there would be inventing data rather than timing our own read.
+it.effect("keeps hostInstant strict — the degradation is the HEADER's, not the domain's", () =>
+  Effect.gen(function* () {
+    const error = yield* hostInstant("2026-13-45T12:00:00Z", "resolve").pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.kind).toBe("unusable");
+  }),
 );
 
 // The id encoding must be INJECTIVE, or two different repositories would share one id
@@ -825,4 +881,106 @@ it.effect("mints DISTINCT ids for distinct repositories, and is deterministic", 
     // refresh land on the row it already has (D7).
     expect(yield* repositoryIdFor("github", num(1296269))).toBe(left);
   }),
+);
+
+// N8 (round 3) — `repositoryIdFor` has NO failure branch, and the reason is checkable
+// rather than asserted: `PositiveInt`'s own check is `Number.isSafeInteger`, so a host id
+// is at most 2^53−1 and always stringifies as plain decimal digits — never JavaScript's
+// exponent form — which the `RepositoryId` shape admits. This drives the EXTREMES of that
+// argument (the largest and smallest a `PositiveInt` can be) through the real schema; a
+// spelling the format refused would DIE here and fail this test, not flip.
+it.effect("mints a well-formed id at both extremes of PositiveInt, with no failure branch", () =>
+  Effect.gen(function* () {
+    expect(yield* repositoryIdFor("github", num(1))).toBe("repo:github:1");
+    expect(yield* repositoryIdFor("github", num(Number.MAX_SAFE_INTEGER))).toBe(
+      `repo:github:${Number.MAX_SAFE_INTEGER}`,
+    );
+    // And `PositiveInt` is what forbids the one spelling that would not be a token: an
+    // integer big enough to stringify as `1e+21` is not a safe integer, so it cannot be
+    // constructed and can never reach this function.
+    expect(Schema.decodeUnknownExit(PositiveInt)(1e21)._tag).toBe("Failure");
+  }),
+);
+
+// ============================================================================
+// CodeHostFailure — the classification a consumer branches on (INV-SUM)
+// ============================================================================
+//
+// `detail` is prose and must never be parsed, so the ONE question a consumer asks — is
+// trying again the remedy? — has to be answered by data. `createWorkstreamFromPlan`
+// phrases its rejection off exactly this field, and told users with an expired token to
+// retry forever before it existed. Each case below drives the classifier through the
+// REAL adapter rather than constructing the error directly.
+
+/** A route whose transport REJECTS — the shape a TCP black hole takes at `fetch`. */
+const unreachableRoutes: Record<string, Route> = {
+  "/repos/callajd/sprinter": () =>
+    new Response(null, { status: 302, headers: { location: "/repos/callajd/sprinter" } }),
+};
+
+it.effect("classifies a TRANSPORT failure as `unreachable` — a retry is the remedy", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unreachable");
+  }).pipe(Effect.provide(backend(unreachableRoutes))),
+);
+
+it.effect("classifies 401 and 403 as `denied` — the host was reached and refused", () =>
+  Effect.forEach([401, 403], (status) =>
+    Effect.gen(function* () {
+      const host = yield* CodeHost;
+      const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+      expect(error.kind).toBe("denied");
+      expect(error.detail).toContain(String(status));
+    }).pipe(
+      Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "no" }, status) })),
+    ),
+  ),
+);
+
+it.effect("classifies another 5xx as `unreachable`, not as a refusal", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unreachable");
+  }).pipe(
+    Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "boom" }, 500) })),
+  ),
+);
+
+// A 200 whose BODY is not JSON: the transport's own `DecodeError`, which is neither a
+// reachability problem nor a refusal — the exchange completed and produced nothing usable.
+it.effect("classifies a response body that will not parse as `unusable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unusable");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () =>
+          new Response("<html>not json</html>", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      }),
+    ),
+  ),
+);
+
+// …and a body that parses but fails the OWNED schema: a `Schema.SchemaError`, not an
+// `HttpClientError` at all, and `unusable` by the same argument.
+it.effect("classifies a response that fails the owned schema as `unusable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unusable");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () => json({ default_branch: "main", name: "sprinter" }),
+      }),
+    ),
+  ),
 );

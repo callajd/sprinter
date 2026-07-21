@@ -45,9 +45,37 @@ import {
 // ============================================================================
 
 /**
+ * WHY a {@link CodeHost} operation failed, as a CLOSED set — the one thing a consumer
+ * may branch on, expressed in terms of the only question a consumer actually asks:
+ * *is trying again the remedy?*
+ *
+ * `detail` is prose for a human and must never be parsed; without this field a caller
+ * that has to phrase an outcome for a user has nothing to decide from and is forced to
+ * describe every failure as the commonest one. That is exactly what
+ * `createWorkstreamFromPlan` did — it told the user to retry a rejected token — so the
+ * distinction is carried as DATA, on a closed union, rather than reconstructed from a
+ * string (INV-SUM).
+ *
+ * - `unreachable` — the host could not be ASKED, or answered in a way that says only
+ *   "ask again": a transport failure, a timeout, a 5xx. The condition is upstream and
+ *   transient, so a RETRY is the remedy.
+ * - `denied` — the host WAS reached and REFUSED: credentials rejected (401) or quota
+ *   exhausted (403). Nothing about the request will change on its own, so an immediate
+ *   retry reproduces it exactly; the remedy is a credential or a wait, and telling the
+ *   user to retry is a lie.
+ * - `unusable` — the exchange completed but its result cannot be used: a body that did
+ *   not decode, a value that failed an owned schema, a request this adapter could not
+ *   form. It is deterministic in the same way — a retry repeats it — and it points at
+ *   Sprinter or at a host contract change rather than at the user.
+ */
+export const CodeHostFailure = Schema.Literals(["unreachable", "denied", "unusable"]);
+export type CodeHostFailure = (typeof CodeHostFailure)["Type"];
+
+/**
  * The single owned failure raised by every {@link CodeHost} operation
  * (INV-NAMING, `*Error` via `Schema.TaggedErrorClass`). `operation` names the port
- * method that failed; `detail` carries a neutral, human-readable cause.
+ * method that failed; `kind` is the closed {@link CodeHostFailure} a consumer may
+ * branch on; `detail` carries a neutral, human-readable cause.
  *
  * This is the ONLY error the port exposes: an adapter translates its host-specific
  * failures (an `HttpClientError`, a `Schema.SchemaError`) into this type at the
@@ -57,7 +85,9 @@ import {
 export class CodeHostError extends Schema.TaggedErrorClass<CodeHostError>()("CodeHostError", {
   /** The port operation that failed, e.g. `"getIssue"` or `"resolveRepository"`. */
   operation: Schema.String,
-  /** A neutral, human-readable description of the cause. */
+  /** WHY it failed, as a closed set — the only field a consumer may branch on. */
+  kind: CodeHostFailure,
+  /** A neutral, human-readable description of the cause. Prose: never parsed. */
   detail: Schema.String,
 }) {}
 

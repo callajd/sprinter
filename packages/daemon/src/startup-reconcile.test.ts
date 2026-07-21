@@ -140,6 +140,25 @@ const host = (over: Partial<HostState> = {}): HostState => ({
 const repoIssue = (number: number, state: "open" | "closed"): RepositoryIssue =>
   decode(RepositoryIssue, { number, title: `Issue ${number}`, state });
 
+/**
+ * The stand-in for the NUMERIC identifier a code host assigns a repository — a pure
+ * FNV-1a hash of the natural key, so it is deterministic and independent of test order.
+ *
+ * It stands in for the host's OWN id rather than being the key in the id's clothing: a
+ * real adapter mints a `RepositoryId` from an identifier a RENAME does not change, and
+ * `RepositoryId` now CHECKS that shape (`repo:<host>:<host-id>`, host-id from the
+ * URL-unreserved set), so a key-shaped `repo:github:owner/name` no longer decodes at
+ * all. Spelling the fake's id like the real one keeps this harness from agreeing with a
+ * broken adapter.
+ */
+const fakeRepositoryId = (owner: string, name: string): string => {
+  let hash = 0x811c9dc5;
+  for (const character of `${owner}/${name}`) {
+    hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return `repo:github:${hash}`;
+};
+
 const fakeRepository = (state: HostState): Layer.Layer<CodeHost> =>
   Layer.succeed(
     CodeHost,
@@ -151,7 +170,7 @@ const fakeRepository = (state: HostState): Layer.Layer<CodeHost> =>
           Effect.succeed(
             Option.some(
               decode(DomainRepository, {
-                id: `repo:${key.host}:${key.owner}/${key.name}`,
+                id: fakeRepositoryId(key.owner, key.name),
                 host: key.host,
                 owner: key.owner,
                 name: key.name,
@@ -169,7 +188,11 @@ const fakeRepository = (state: HostState): Layer.Layer<CodeHost> =>
         getIssue: (number) =>
           state.failing.has(number)
             ? Effect.fail(
-                new CodeHostError({ operation: "getIssue", detail: `host 404 #${number}` }),
+                new CodeHostError({
+                  operation: "getIssue",
+                  kind: "unreachable",
+                  detail: `host 404 #${number}`,
+                }),
               )
             : Effect.succeed(repoIssue(number, state.issues.get(number) ?? "open")),
       },

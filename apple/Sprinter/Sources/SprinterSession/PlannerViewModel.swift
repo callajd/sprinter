@@ -95,6 +95,16 @@ public final class PlannerViewModel {
 
   /// The characters a repository owner or name may be spelled with — the same
   /// allow-list the contract's `RepositorySegment` enforces on the daemon side.
+  ///
+  /// COUPLING, stated because it is not enforced by anything: this is a hand-kept COPY
+  /// of `REPOSITORY_SEGMENT` in `packages/domain/src/repository.ts`, and that rule is
+  /// deliberately a SUPERSET of any one host's grammar so it survives a second code-host
+  /// adapter. The failure mode runs one way: if the daemon's set is ever WIDENED for a
+  /// host whose names admit a character GitHub's do not, this copy becomes a CLIENT-SIDE
+  /// rejection of a key the daemon would have accepted — ``canMaterialize`` would keep
+  /// the form disabled and the user would get a message about a rule that no longer
+  /// exists. Whoever adds that host must widen both sides. The daemon side carries the
+  /// same note pointing here.
   private static let repositorySegmentCharacters = CharacterSet(
     charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
