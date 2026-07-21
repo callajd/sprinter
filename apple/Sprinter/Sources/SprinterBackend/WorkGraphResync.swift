@@ -286,11 +286,14 @@ public actor WorkGraphResync {
     // `snapshot`. On a reconnect there is no snapshot: the daemon replays strictly after
     // `resume.offset`.
     // The resume sends the cursor WITH the generation it was minted in — the one carried
-    // on the retained baseline's ``Snapshot/generation``. They are one resume context: a
-    // cursor handed over without it (or with a stale one) is refused, which is exactly the
-    // behaviour this engine wants when the daemon's store was dropped underneath it.
+    // on the retained baseline's ``Snapshot/generation`` — as ONE
+    // ``SprinterContract/ResumeContext``. They cannot come apart, and there is no offset
+    // value that reads as "origin": the daemon distinguishes a first connect from a
+    // resume by the ABSENCE of this value, and compares the generation on every present
+    // one. A stale resume is refused, which is exactly what this engine wants when the
+    // daemon's store was dropped underneath it.
     let events = backend.events(
-      sinceOffset: resume?.offset, generation: resume?.state.generation)
+      resume: resume.map { ResumeContext(sinceOffset: $0.offset, generation: $0.state.generation) })
     do {
       try await withThrowingTaskGroup(of: Void.self) { group in
         // Reader: buffer live deltas (with their durable offsets) into the bounded queue.

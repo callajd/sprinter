@@ -192,13 +192,13 @@ struct WorkGraphResyncTests {
         requestId: eventsId, values: [try offsetDelta(2), try offsetDelta(3), try offsetDelta(4)]))
 
     // The overflow tears the attempt down; the engine reconnects and resumes INCREMENTALLY
-    // from the recorded contiguous cursor — a present `sinceOffset`, NOT a fresh snapshot.
+    // from the recorded contiguous cursor — a present `resume`, NOT a fresh snapshot.
     let second = try #require(await transports.next())
     var out2 = second.outbound.makeAsyncIterator()
     let resumeRequest = try await nextSent(&out2)
     #expect(resumeRequest.rpcTag == "events")
     let payload = try #require(resumeRequest.payload)
-    #expect(try fromJSONValue(EventsPayload.self, payload).sinceOffset != nil)
+    #expect(try fromJSONValue(EventsPayload.self, payload).resume != nil)
 
     await engine.stop()
     first.close()

@@ -17,7 +17,7 @@
 import { it } from "@effect/vitest";
 import { Array as Arr, Effect, Option, Schema } from "effect";
 import { expect } from "vitest";
-import { Agent, Epic, Issue, Job, Session, Workstream } from "@sprinter/domain";
+import { Agent, Epic, Issue, isLineageRetired, Job, Session, Workstream } from "@sprinter/domain";
 import {
   AppendEvent,
   layer,
@@ -237,6 +237,66 @@ it.effect("rejects a RETIRING revision that retires an ALREADY-RETIRED revision"
     // SAME retiring revision is the crash-retry case and is still a no-op, not a
     // second stamp. The rule rejects a NEW retirement, never a replayed one.
     expect(yield* store.agents.putAgent(retirement)).toBe("unchanged");
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("rejects ANY revision superseding a RETIRED one — a lineage is never resurrected", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.agents.putAgent(yield* agent({ id: "agt-1" }));
+    yield* store.agents.putAgent(
+      yield* agent({ id: "agt-2", supersedes: "agt-1", retiredAt: "2026-07-20T12:00:00.000Z" }),
+    );
+    const registry = yield* store.agents.listAgents;
+    const original = registry.find((found) => found.id === "agt-1");
+    if (original === undefined) throw new Error("expected agt-1");
+    expect(isLineageRetired(original, registry)).toBe(true);
+
+    // THE RESURRECTION. The retired-head rule used to be checked ONLY when the incoming
+    // revision was ITSELF retiring, so an ordinary EDIT superseding the retired head
+    // sailed through — and an edit carries no `retiredAt` of its own, so
+    // `isLineageRetired` then walked forward off the retired revision onto a live head
+    // and the whole lineage read as back IN SERVICE. Retirement is terminal: nothing may
+    // be appended after it, retiring or not.
+    const error = yield* store.agents
+      .putAgent(yield* agent({ id: "agt-3", supersedes: "agt-2", version: "2.0.0" }))
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+
+    // Nothing was written, and the lineage is still retired read from EVERY revision in
+    // it — the property `store.ts` promises ("neither ... un-retire a retired agent").
+    const after = yield* store.agents.listAgents;
+    expect(after.map((found) => found.id)).toStrictEqual(["agt-1", "agt-2"]);
+    expect(after.every((found) => isLineageRetired(found, after))).toBe(true);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("rejects a SECOND revision superseding the same one — a lineage is a chain", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.agents.putAgent(yield* agent({ id: "agt-1" }));
+    expect(yield* store.agents.putAgent(yield* agent({ id: "agt-2", supersedes: "agt-1" }))).toBe(
+      "appended",
+    );
+
+    // A FORK: two revisions claiming the same predecessor. There is no defined head,
+    // and the damage is not cosmetic — `isLineageRetired` builds the reverse index and
+    // keeps the FIRST successor it meets, so a forked history makes the SAME registry
+    // answer "retired" or "not retired" depending on `listAgents`' (presentational,
+    // id-ordered) order. The `agent_supersedes` UNIQUE index makes it unstorable, so the
+    // predicate is order-independent for every history the store can produce.
+    const error = yield* store.agents
+      .putAgent(
+        yield* agent({ id: "agt-3", supersedes: "agt-1", retiredAt: "2026-07-20T12:00:00.000Z" }),
+      )
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(StateStoreError);
+    expect(error.operation).toBe("putAgent");
+    expect((yield* store.agents.listAgents).map((found) => found.id)).toStrictEqual([
+      "agt-1",
+      "agt-2",
+    ]);
   }).pipe(Effect.provide(layerMemory)),
 );
 

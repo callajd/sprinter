@@ -46,10 +46,12 @@ enum Fixtures {
     generation: generation)
 
   /// The wire payload of a RESUME `events` request: the cursor PLUS the generation the
-  /// retained baseline was hydrated in. They are one resume context — the daemon refuses a
-  /// cursor sent without its generation — so the tests assert the pair, never a bare offset.
+  /// retained baseline was hydrated in, nested in the single `resume` object the contract
+  /// defines. A bare offset has no wire form at all, so the tests cannot accidentally
+  /// assert one.
   static func resumePayload(_ sinceOffset: Int) throws -> JSONValue {
-    try toJSONValue(EventsPayload(sinceOffset: sinceOffset, generation: generation))
+    try toJSONValue(
+      EventsPayload(resume: ResumeContext(sinceOffset: sinceOffset, generation: generation)))
   }
 
   /// The daemon's refusal AFTER a drop-and-recreate. Note the cursor is WITHIN the new

@@ -6,7 +6,7 @@ import Testing
 
 /// Cold-review hardening for the reconnect engine: the backoff must WIDEN against a
 /// flapping daemon (FIX2), and memory must stay BOUNDED through the production
-/// ``RpcBackend/events(sinceOffset:)`` path even though that adapter interposes an
+/// ``RpcBackend/events(resume:)`` path even though that adapter interposes an
 /// unbounded stream over the bounded gate (FIX1).
 @Suite("Reconnect hardening — flap backoff + bounded flow control")
 struct ReconnectHardeningTests {
@@ -178,7 +178,7 @@ struct ReconnectHardeningTests {
     for await _ in states {}
   }
 
-  /// FIX1 — memory stays bounded through the production ``RpcBackend/events(sinceOffset:)``
+  /// FIX1 — memory stays bounded through the production ``RpcBackend/events(resume:)``
   /// path even though it interposes an UNBOUNDED stream over the bounded gate. A fast daemon
   /// floods far past the bounded reconciler backlog while the reconciler is stalled; rather
   /// than buffering the whole flood the pipeline OVERFLOWS and resyncs — a 2nd `events`
@@ -230,7 +230,7 @@ struct ReconnectHardeningTests {
     let resume = try await nextSent(&out2)
     #expect(resume.rpcTag == "events")
     let payload = try #require(resume.payload)
-    #expect(try fromJSONValue(EventsPayload.self, payload).sinceOffset != nil)
+    #expect(try fromJSONValue(EventsPayload.self, payload).resume != nil)
 
     await engine.stop()
     first.close()

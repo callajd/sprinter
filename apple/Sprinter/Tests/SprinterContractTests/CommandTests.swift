@@ -5,6 +5,10 @@ import Testing
 
 @Suite("Commands and errors")
 struct CommandTests {
+  /// The store generation the resume-bearing goldens were frozen under.
+  private let generation = StoreGenerationId(
+    rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b")
+
   @Test("decodes the workstream plan")
   func decodesWorkstreamPlan() throws {
     let plan = try Golden.decode(WorkstreamPlan.self, from: "workstream-plan")
@@ -42,47 +46,46 @@ struct CommandTests {
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the events payload — the cursor and the generation it was minted in")
+  @Test("decodes the events payload — the resume context, cursor and generation as one")
   func decodesEventsPayload() throws {
     let payload = try Golden.decode(EventsPayload.self, from: "payload-events")
-    #expect(payload.sinceOffset == 12)
     // The cursor never travels alone: a durable offset is a coordinate in ONE store
-    // generation, so the resume carries the generation the client retained with its
-    // baseline. Without it the daemon refuses the resume outright.
-    #expect(
-      payload.generation == StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
+    // generation, so the wire nests the two INSIDE a single `resume` object rather than
+    // carrying two independent optional keys. There is no wire form for a cursor without
+    // its generation, which is what makes the daemon's guard un-bypassable.
+    #expect(payload.resume?.sinceOffset == 12)
+    #expect(payload.resume?.generation == generation)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the events payload with the cursor absent (origin replay)")
+  @Test("decodes the events payload with the resume context absent (origin replay)")
   func decodesEventsPayloadNoOffset() throws {
     let payload = try Golden.decode(EventsPayload.self, from: "payload-events-no-offset")
-    #expect(payload.sinceOffset == nil)
-    // An ORIGIN request names no coordinate, so it needs no generation either — BOTH
-    // keys are omitted from the wire (never `null`).
-    #expect(payload.generation == nil)
+    // An ORIGIN request names no coordinate, so the WHOLE `resume` key is omitted from
+    // the wire (never `null`). Its absence — not any offset value — is what makes this
+    // an origin request.
+    #expect(payload.resume == nil)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionEvents payload with a sinceOffset cursor")
+  @Test("decodes the sessionEvents payload with a resume context")
   func decodesSessionEventsPayload() throws {
     let payload = try Golden.decode(SessionEventsPayload.self, from: "payload-session-events")
     #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
-    #expect(payload.sinceOffset == 12)
     // The session channel's cursor is generation-scoped in exactly the same way (its
-    // per-session log is dropped by a schema bump too), so it carries the same pairing.
-    #expect(
-      payload.generation == StoreGenerationId(rawValue: "8f0d0a3e-4a7a-4a2e-9b5e-0f2c1d3e4a5b"))
+    // per-session log is dropped by a schema bump too), so it carries the SAME nested
+    // value — the guard is not weaker here, structurally or otherwise.
+    #expect(payload.resume?.sinceOffset == 12)
+    #expect(payload.resume?.generation == generation)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 
-  @Test("decodes the sessionEvents payload with the cursor absent (origin replay)")
+  @Test("decodes the sessionEvents payload with the resume context absent (origin replay)")
   func decodesSessionEventsPayloadNoOffset() throws {
     let payload = try Golden.decode(
       SessionEventsPayload.self, from: "payload-session-events-no-offset")
     #expect(payload.sessionId == SessionId(rawValue: "ses-1"))
-    #expect(payload.sinceOffset == nil)
-    #expect(payload.generation == nil)
+    #expect(payload.resume == nil)
     #expect(try Golden.roundTrip(payload) == payload)
   }
 

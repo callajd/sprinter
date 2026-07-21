@@ -176,10 +176,20 @@ export type AgentWrite = "appended" | "unchanged";
  *   operations indistinguishable in the history. Checkable only when the superseded
  *   revision is actually stored — a dangling `supersedes` is the writer's problem,
  *   as it already is for acyclicity.
- * - a RETIRING revision may not retire an ALREADY-RETIRED revision. A lineage goes
- *   out of service once; a second retiring append would leave two revisions each
- *   carrying a `retiredAt` and no way to say which instant the lineage stopped. This
- *   is NOT caught by the rule above, which ignores the lifecycle columns by design.
+ * - NOTHING may supersede an ALREADY-RETIRED revision — an edit no more than a
+ *   retirement. A lineage goes out of service ONCE, and `retiredAt` is its terminal
+ *   state. A second RETIRING append would leave two revisions each carrying a
+ *   `retiredAt` and no way to say which instant the lineage stopped; a NON-RETIRING
+ *   one is worse, because it carries no stamp at all, so `isLineageRetired` walks
+ *   forward off the retired revision onto a live head and the lineage reads as back
+ *   in service — un-retiring it, which this port's second paragraph promises cannot
+ *   happen. Neither is caught by the rule above, which ignores the lifecycle columns
+ *   by design, so it is enforced on `supersedes` alone.
+ * - a revision may be superseded AT MOST ONCE. A lineage is a CHAIN; two successors
+ *   are a fork with no defined head, and a fork makes `isLineageRetired`'s answer
+ *   depend on the order of the collection it is handed. Enforced by the adapter's
+ *   `agent_supersedes` UNIQUE index rather than by a read-then-insert check, so it
+ *   holds atomically against a concurrent racing append.
  *
  * DURABILITY SCOPE: "nothing is ever removed" holds for the life of a STORE
  * GENERATION. `SCHEMA_VERSION` ({@link ./sqlite.ts}) never migrates — bumping it
@@ -384,6 +394,15 @@ export interface SessionLogStore {
    * APPENDS), so it matches the transcript the Inspector renders.
    */
   readonly countEntries: (sessionId: SessionId) => Effect.Effect<number, StateStoreError>;
+  /**
+   * The highest offset this session's transcript currently holds (`0` when it has none)
+   * — the per-session mirror of {@link EventLogStore.maxOffset}, and for the same
+   * reason: the `sessionEvents` feed must validate a client's resume cursor BEFORE it
+   * does any work, and reading the whole transcript just to look at its last offset
+   * makes a request that is about to be REFUSED the most expensive one the channel
+   * serves. Answered from the backing's index, without materializing or decoding a row.
+   */
+  readonly maxOffset: (sessionId: SessionId) => Effect.Effect<NonNegativeInt, StateStoreError>;
 }
 
 // ============================================================================

@@ -45,7 +45,7 @@ public struct RpcBackend: Backend {
 
   public func events() -> AsyncThrowingStream<WorkGraphEvent, any Error> {
     // The port's bare feed is the origin-replay offset feed with the offset dropped.
-    let offsetEvents = events(sinceOffset: nil, generation: nil)
+    let offsetEvents = events(resume: nil)
     return AsyncThrowingStream { continuation in
       let task = Task {
         do {
@@ -61,7 +61,7 @@ public struct RpcBackend: Backend {
     }
   }
 
-  public func events(sinceOffset: Int?, generation: StoreGenerationId?) -> OffsetEventStream {
+  public func events(resume: ResumeContext?) -> OffsetEventStream {
     // FLOW CONTROL NOTE: this interposes an UNBOUNDED ``AsyncThrowingStream`` over the
     // bounded ``AckGatedStream`` and drains it as fast as it can, so the gate's deferred
     // ack fires on arrival — it is NOT a live demand signal that throttles the daemon on
@@ -78,17 +78,16 @@ public struct RpcBackend: Backend {
           // to resume STRICTLY AFTER the last-applied offset on reconnect. An unknown
           // inner `_tag` still surfaces as a decode failure, never a silent drop.
           //
-          // Send a PRESENT ``EventsPayload`` (the `sinceOffset` and `generation` KEYS are
-          // omitted when `nil` → origin replay; present → incremental resume) so the
-          // request encodes a payload object, matching the canonical Effect client
-          // (INV-CONTRACT). The payload schema is a `Struct`, so an OMITTED payload key
-          // would decode to `undefined` and fail — a present object decodes correctly.
+          // Send a PRESENT ``EventsPayload`` (the `resume` KEY is omitted when `nil` →
+          // origin replay; present → incremental resume) so the request encodes a payload
+          // object, matching the canonical Effect client (INV-CONTRACT). The payload
+          // schema is a `Struct`, so an OMITTED payload key would decode to `undefined`
+          // and fail — a present object decodes correctly.
           //
-          // The cursor and the generation are sent as a PAIR: the daemon refuses a cursor
-          // without its generation, because a bare offset cannot be told apart from a
-          // stale one once the new log outgrows it.
-          let payload = try toJSONValue(
-            EventsPayload(sinceOffset: sinceOffset, generation: generation))
+          // The cursor and the generation cannot come apart here, because they are not
+          // two arguments: a bare offset cannot be told apart from a stale one once the
+          // new log outgrows it, so the contract gives it no wire form to travel in.
+          let payload = try toJSONValue(EventsPayload(resume: resume))
           for try await value in await connection.stream(tag: "events", payload: payload) {
             continuation.yield(try fromJSONValue(OffsetEvent.self, value))
           }
@@ -110,13 +109,13 @@ public struct RpcBackend: Backend {
           // The wire carries the ``OffsetSessionEvent`` envelope — ONE channel
           // serving BOTH modalities: DURABLE transcript-grade events carry a per-session
           // `offset`, EPHEMERAL live deltas ride offset-less. Send a PRESENT
-          // ``SessionEventsPayload`` with NO `sinceOffset` key (→ origin replay of the durable
+          // ``SessionEventsPayload`` with NO `resume` key (→ origin replay of the durable
           // transcript, then live tail), then UNWRAP `.event` and yield EVERY event — durable
           // and ephemeral alike — to the existing ``SessionEvent`` fold (unchanged), which folds
           // durable entries into the transcript and applies ephemeral deltas live. Tracking the
           // offset for a reconnect resume is deferred — ``InteractiveSession`` is a single,
           // non-reconnecting subscription — so only the wire is made offset-aware here (the
-          // optional `offset` is unwrapped away); resume via `sinceOffset` layers on later,
+          // optional `offset` is unwrapped away); resume via a ``ResumeContext`` layers on later,
           // exactly as ``WorkGraphResync`` did for the `events` feed.
           let payload = try toJSONValue(SessionEventsPayload(sessionId: sessionId))
           for try await value in await connection.stream(tag: "sessionEvents", payload: payload) {

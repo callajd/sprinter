@@ -79,7 +79,7 @@ struct StoreGenerationResyncTests {
     let third = try #require(await transports.next())
     var out3 = third.outbound.makeAsyncIterator()
     let byTag3 = try await requestsByTag(&out3)
-    // The cursor is gone: `events` goes out with NO `sinceOffset` (origin), exactly as on
+    // The cursor is gone: `events` goes out with NO `resume` (origin), exactly as on
     // a first connect — and a `snapshot` request accompanies it, which a resume never issues.
     #expect(byTag3["events"]?.payload == (try toJSONValue(EventsPayload())))
     let rehydrate = try #require(byTag3["snapshot"])
@@ -96,5 +96,69 @@ struct StoreGenerationResyncTests {
     await engine.stop()
     third.close()
     for await _ in states {}
+  }
+  /// The ZERO-OFFSET resume point is not a resume at all — the client's belt-and-braces
+  /// half of round 4's B1.
+  ///
+  /// ``ResumePoint`` records ``ContiguousOffsetTracker/contiguous``, which is `0` until a
+  /// delta lands on the contiguous prefix. An attempt whose FIRST applied delta arrives
+  /// out of order (concurrent daemon writers publish non-monotonically) therefore records
+  /// a baseline while the cursor is still `0`, and the next attempt would otherwise send
+  /// `events(resume: { sinceOffset: 0, generation: <possibly dead> })` — a request that
+  /// takes the RESUME path (no fresh `snapshot()`) while naming no coordinate.
+  ///
+  /// The daemon now refuses that shape when the generation is stale, so this is not the
+  /// guard; it simply means the canonical client never constructs the shape. A `0` cursor
+  /// asks for the whole log, which is precisely what a first connect asks for — so the
+  /// client takes the subscribe-around-`snapshot()` path and gets a FRESH baseline
+  /// instead of folding onto a retained one.
+  @Test("a resume point whose cursor never left 0 is not resumable — it is a first connect")
+  func zeroCursorIsNotResumable() {
+    var point = ResumePoint()
+    // A baseline with no delta applied at all: not resumable (the pre-existing rule).
+    point.record(state: Fixtures.snapshot, contiguous: nil)
+    #expect(point.resumable == nil)
+
+    // A baseline WITH a recorded cursor that is still 0 — the reachable state above.
+    point.record(state: Fixtures.snapshot, contiguous: 0)
+    #expect(point.resumable == nil)
+
+    // The first genuinely-advanced cursor makes it resumable, and carries the baseline
+    // the deltas fold onto.
+    point.record(state: Fixtures.snapshot, contiguous: 1)
+    let resumable = point.resumable
+    #expect(resumable?.offset == 1)
+    #expect(resumable?.state == Fixtures.snapshot)
+
+    // And `discard()` still drops BOTH halves.
+    point.discard()
+    #expect(point.resumable == nil)
+  }
+
+  /// The wire shape the structural fix buys: a resume request carries its cursor and its
+  /// generation as ONE nested value, so there is no `events` payload that names an offset
+  /// without naming the generation it belongs to.
+  @Test("a resume request encodes the cursor and generation as one nested resume context")
+  func resumeContextTravelsAsOneValue() throws {
+    let payload = EventsPayload(
+      resume: ResumeContext(sinceOffset: 4, generation: Fixtures.generation))
+    guard case .object(let fields) = try toJSONValue(payload) else {
+      Issue.record("expected an object payload")
+      return
+    }
+    // ONE key, not two: `sinceOffset` and `generation` are not siblings on the payload.
+    #expect(fields.keys.sorted() == ["resume"])
+    guard case .object(let resume)? = fields["resume"] else {
+      Issue.record("expected a nested resume object")
+      return
+    }
+    #expect(resume.keys.sorted() == ["generation", "sinceOffset"])
+
+    // An ORIGIN request omits the whole key (never `null`) — absence is what makes it one.
+    guard case .object(let originFields) = try toJSONValue(EventsPayload()) else {
+      Issue.record("expected an object payload")
+      return
+    }
+    #expect(originFields.isEmpty)
   }
 }

@@ -295,7 +295,8 @@ const GENERATION_KEY = "generation";
  * migration ladder (`1_initial` / `2_session_event_log`). A database left by that
  * ladder has `user_version = 0`, so it mismatches and is reset like any other
  * stale store. Version 2 adds `store_meta` and the generation identity minted into
- * it (see {@link createSchema}).
+ * it (see {@link createSchema}). Version 3 adds the `agent_supersedes` UNIQUE index,
+ * making a FORKED lineage (one revision superseded twice) unstorable.
  *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and
@@ -303,7 +304,7 @@ const GENERATION_KEY = "generation";
  * WHEN the stale-cursor hazard can occur; it does not reduce it, which is why the
  * generation identity below is on the wire.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -393,6 +394,25 @@ const createSchema = Effect.gen(function* () {
       supersedes TEXT,
       "retiredAt" TEXT
     )`;
+  // A revision may be superseded AT MOST ONCE: the lineage is a CHAIN, and a
+  // revision with two successors is a fork with no defined head. It is checkable
+  // from a single append (exactly like the self-reference and retirement rules the
+  // port already enforces), so it is enforced rather than documented — and it is
+  // enforced HERE, by the backing, because a UNIQUE index is atomic against a
+  // concurrent racing append in a way a read-then-insert check is not.
+  //
+  // Without it a fork is not merely untidy, it makes a DERIVED ANSWER ambiguous:
+  // `isLineageRetired` builds the reverse `supersedes` index and keeps the FIRST
+  // successor it encounters, so on a forked lineage the same registry returns
+  // "retired" or "not retired" depending on `listAgents`' (presentational, id-ordered)
+  // order. With this index that history cannot be stored, so the predicate is
+  // order-independent for every input the store can produce.
+  //
+  // PARTIAL (`WHERE supersedes IS NOT NULL`) because NULL means "supersedes nothing":
+  // every lineage's FIRST revision carries it, and those must not collide with each
+  // other. (SQLite treats NULLs as distinct in a UNIQUE index anyway; the predicate
+  // says so explicitly and keeps the index off the rows that never need it.)
+  yield* sql`CREATE UNIQUE INDEX agent_supersedes ON agent (supersedes) WHERE supersedes IS NOT NULL`;
   yield* sql`CREATE TABLE workstream (
       id TEXT PRIMARY KEY NOT NULL,
       name TEXT NOT NULL,
@@ -556,34 +576,44 @@ const make = Effect.gen(function* () {
     );
 
   /**
-   * Enforce the two rules a RETIRING revision (one carrying both `supersedes` and
-   * `retiredAt`) must satisfy against the revision it retires:
+   * Enforce the rules an append carrying `supersedes` must satisfy against the
+   * revision it names — for EVERY such append, edit and retirement alike:
    *
-   * 1. LIFECYCLE-ONLY — it must repeat the superseded revision's non-lifecycle
-   *    columns verbatim (retirement sets `retiredAt`, never content).
-   * 2. NOT ALREADY RETIRED — the revision it supersedes must not itself carry a
-   *    `retiredAt`. Retiring a retired head is not idempotence: it appends a SECOND
-   *    stamp, under a new id, at a different instant, to a lineage that already went
-   *    out of service — leaving two revisions each claiming to be the retirement and
-   *    no way to say which instant the lineage actually stopped. Rule 1 cannot catch
-   *    it, because it deliberately ignores the lifecycle columns, so it is checked
-   *    here alongside it. (A retiring revision naming a MID-lineage revision that was
-   *    later superseded is a different, un-checkable shape: the store cannot see
-   *    forward along the chain from one append — that stays the writer's obligation,
-   *    exactly as acyclicity does.)
+   * 1. THE SUPERSEDED REVISION MUST NOT BE RETIRED. A `retiredAt` stamp is the
+   *    lineage's terminal state, so nothing may be appended after it. This is scoped
+   *    to the WHOLE `supersedes` relation, not to retiring appends only, because both
+   *    ways of extending a dead lineage are wrong and only one of them looks like it:
+   *    a RETIRING successor would leave two revisions each claiming to be the
+   *    retirement, with no way to say which instant the lineage stopped; a
+   *    NON-RETIRING one silently RESURRECTS it — the successor carries no stamp, so
+   *    `isLineageRetired` walks forward off the retired revision onto a live head and
+   *    the lineage reads as back in service. Un-retiring is precisely what the port
+   *    promises cannot happen (see `store.ts`: "a lineage goes out of service once"),
+   *    and gating this rule on the incoming revision's own `retiredAt` left that door
+   *    open. It is checked on `supersedes` alone. (A revision naming a MID-lineage
+   *    revision that was later superseded is a different, un-checkable shape: the
+   *    store cannot see forward along the chain from one append — that stays the
+   *    writer's obligation, exactly as acyclicity does. The `agent_supersedes` UNIQUE
+   *    index is what makes the branch itself impossible.)
+   * 2. A RETIRING revision (one carrying `retiredAt` as well) must additionally be
+   *    LIFECYCLE-ONLY — it must repeat the superseded revision's non-lifecycle
+   *    columns verbatim (retirement sets `retiredAt`, never content). Rule 1 cannot
+   *    catch a fused edit, because it looks only at the lifecycle columns; rule 2
+   *    cannot catch a resurrection, because it deliberately ignores them. Both are
+   *    needed, and they apply to overlapping — not identical — sets of appends.
    *
    * Compared on the STORED BYTES (`tools` stays the encoded JSON string, as
    * {@link AgentColumns} models it), so "same content" is decided exactly as the
    * column stores it rather than by a looser re-decoded comparison — the same basis
    * {@link isSameAgentRow} uses for the idempotent re-append.
    *
-   * A superseded revision that is NOT stored is not a failure here: the rule is
+   * A superseded revision that is NOT stored is not a failure here: the rules are
    * unverifiable without it, and a dangling `supersedes` is already the writer's
    * obligation under `registry.ts`'s acyclicity precondition. The check runs inside
    * the caller's transaction, so the row it reads is the one the insert commits
    * against.
    */
-  const assertRetirementIsWellFormed = (
+  const assertSupersedesIsWellFormed = (
     supersedes: AgentId,
     row: AgentColumns,
   ): Effect.Effect<void, StateStoreError> =>
@@ -600,18 +630,19 @@ const make = Effect.gen(function* () {
                   return Effect.fail(
                     new StateStoreError({
                       operation: "putAgent",
-                      detail: `agent "${row.id}" retires "${supersedes}", which is ALREADY retired (at ${head.retiredAt}); a lineage goes out of service once, so there is nothing left to retire`,
+                      detail: `agent "${row.id}" supersedes "${supersedes}", which is RETIRED (at ${head.retiredAt}); a lineage goes out of service ONCE and nothing may be appended after its retirement — a further revision would either double-stamp it or silently un-retire it`,
                     }),
                   );
                 }
-                return isSameAgentContent(head, row)
-                  ? Effect.void
-                  : Effect.fail(
-                      new StateStoreError({
-                        operation: "putAgent",
-                        detail: `agent "${row.id}" retires "${supersedes}" but changes its content; a retirement sets retiredAt ONLY — append the edit as its own revision first, then retire that revision`,
-                      }),
-                    );
+                if (row.retiredAt !== null && !isSameAgentContent(head, row)) {
+                  return Effect.fail(
+                    new StateStoreError({
+                      operation: "putAgent",
+                      detail: `agent "${row.id}" retires "${supersedes}" but changes its content; a retirement sets retiredAt ONLY — append the edit as its own revision first, then retire that revision`,
+                    }),
+                  );
+                }
+                return Effect.void;
               }),
             ),
         }),
@@ -675,21 +706,22 @@ const make = Effect.gen(function* () {
                 }),
               );
             }
-            // A RETIREMENT is LIFECYCLE-ONLY: it may set `retiredAt` and nothing
-            // else. Fusing a content edit into it would collapse two distinct
-            // operations into one indistinguishable append — a reader walking back
-            // from the retiring revision could no longer tell whether the lineage
-            // was edited, retired, or both, and the retired head's content would
-            // appear to have changed at the moment it went out of service. So a
-            // revision carrying BOTH `supersedes` and `retiredAt` must match the
-            // revision it supersedes on every non-lifecycle column — AND that
-            // revision must not already be retired, since a lineage goes out of
-            // service once and a second stamp would leave two revisions each
-            // claiming to be the retirement. Checkable only when the superseded
-            // revision is actually stored; a dangling `supersedes` is the same
-            // writer obligation the acyclicity precondition already carries.
-            if (agent.retiredAt !== undefined && agent.supersedes !== undefined) {
-              yield* assertRetirementIsWellFormed(agent.supersedes, row);
+            // EVERY append that names a `supersedes` is checked against the revision
+            // it names — not just a retiring one. Two rules live there, on
+            // overlapping but different sets of appends: a RETIRED revision may not
+            // be superseded AT ALL (a successor either double-stamps the retirement
+            // or, carrying no stamp of its own, silently un-retires the lineage —
+            // which the port promises cannot happen), and a RETIRING revision must
+            // additionally be lifecycle-only, repeating the superseded revision's
+            // content verbatim so an edit and a retirement never fuse into one
+            // indistinguishable append. Gating the first on the incoming revision's
+            // own `retiredAt` — as this once did — enforced it for the append that
+            // could not do the damage and skipped the one that could. Checkable only
+            // when the superseded revision is actually stored; a dangling
+            // `supersedes` is the same writer obligation the acyclicity precondition
+            // already carries.
+            if (agent.supersedes !== undefined) {
+              yield* assertSupersedesIsWellFormed(agent.supersedes, row);
             }
             yield* sql`INSERT INTO agent ${sql.insert(row)}`.pipe(
               Effect.mapError(fail("putAgent")),
@@ -985,6 +1017,17 @@ const make = Effect.gen(function* () {
         Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
         Effect.map((rows) => rows[0].n),
         Effect.mapError(fail("sessionLog.countEntries")),
+      ),
+    // The per-session extent, answered by the backing over the `session_event_log_session`
+    // index — no row is materialized or JSON-decoded, which is the whole point: the
+    // `sessionEvents` cursor guard runs BEFORE the transcript read, so a request that is
+    // about to be refused never pays for one. `COALESCE` turns the SQL `NULL` an
+    // entry-less session yields into `0`, below every durable offset (strictly `> 0`).
+    maxOffset: (sessionId) =>
+      sql`SELECT COALESCE(MAX("offset"), 0) AS n FROM session_event_log WHERE "sessionId" = ${sessionId}`.pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(Schema.NonEmptyArray(CountRow))),
+        Effect.map((rows) => rows[0].n),
+        Effect.mapError(fail("sessionLog.maxOffset")),
       ),
   };
 

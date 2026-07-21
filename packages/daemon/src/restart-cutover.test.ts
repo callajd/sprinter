@@ -292,7 +292,9 @@ it.effect(
           // is genuinely live and the daemon must resume it incrementally — the guard
           // must refuse dead cursors WITHOUT refusing this one.
           const resumed = yield* client
-            .events({ sinceOffset: resumePoint.offset, generation: resumePoint.generation })
+            .events({
+              resume: { sinceOffset: resumePoint.offset, generation: resumePoint.generation },
+            })
             .pipe(
               Stream.takeUntil(
                 (offsetEvent) =>

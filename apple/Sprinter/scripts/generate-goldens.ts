@@ -397,24 +397,24 @@ writeFileSync(
 
 // ── Command payloads (the wire the daemon receives) ──────────────────────────
 
-// The `events` request cursor is OPTIONAL (CE2.0): both wire forms
-// are captured — present (`sinceOffset` key set) and absent (key omitted, the
-// backward-compatible origin replay) — so the Swift mirror decodes each.
-// A cursor never travels alone: the generation it was minted in rides with it.
-write("payload-events", events.payloadSchema, { sinceOffset: 12, generation });
+// The `events` request RESUME CONTEXT is OPTIONAL (CE2.0): both wire forms are
+// captured — present (a `resume` object carrying BOTH coordinates) and absent (key
+// omitted, the origin replay) — so the Swift mirror decodes each. The cursor and its
+// generation are ONE nested value, so "a cursor without its generation" has no wire
+// form to freeze: absence of `resume` is the only origin request there is.
+write("payload-events", events.payloadSchema, { resume: { sinceOffset: 12, generation } });
 write("payload-events-no-offset", events.payloadSchema, {});
 write("payload-create-workstream-from-plan", createWorkstreamFromPlan.payloadSchema, {
   plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" },
 });
 write("payload-control", control.payloadSchema, { workstreamId: "ws-1", action: "pause" });
 write("payload-retry-issue", retryIssue.payloadSchema, { issueId: "iss-1" });
-// The `sessionEvents` request cursor is OPTIONAL, exactly like `events`:
-// both wire forms are captured — present (`sinceOffset` key set) and absent (key omitted,
-// the origin-replay case) — so the Swift mirror decodes each.
+// The `sessionEvents` request resume context is OPTIONAL, and is the SAME nested
+// value `events` carries: both wire forms are captured — present and absent (the
+// origin-replay case) — so the Swift mirror decodes each.
 write("payload-session-events", sessionEvents.payloadSchema, {
   sessionId: "ses-1",
-  sinceOffset: 12,
-  generation,
+  resume: { sinceOffset: 12, generation },
 });
 write("payload-session-events-no-offset", sessionEvents.payloadSchema, { sessionId: "ses-1" });
 write("payload-session-send", sessionSend.payloadSchema, {

@@ -61,10 +61,21 @@ const withStore = <A>(
  *
  * When the schema changes: bump {@link SCHEMA_VERSION} and ADD a row. Do not edit an
  * existing row.
+ *
+ * **HISTORICAL ROWS ARE DOCUMENTATION, NOT VERIFIED GUARDS.** Only the row for the
+ * CURRENT {@link SCHEMA_VERSION} is re-derived and compared below; every earlier row
+ * pins DDL that no longer exists anywhere in the tree, so its digest can never be
+ * recomputed from source and nothing here can detect a typo'd, corrupted, or invented
+ * historical value. What the older rows genuinely enforce is DISTINCTNESS — a version
+ * may not silently re-claim a shipped digest — which is what makes the pin
+ * un-defeatable going forward. Read them as a changelog of shapes that once shipped,
+ * not as a checked assertion about them. (Nothing stronger is available: INV-FRESH
+ * never migrates, so no past schema survives to be reconstructed and re-hashed.)
  */
 const SCHEMA_LEDGER: Readonly<Record<number, string>> = {
   1: "12cfac61b40228489b1fbd68c13b9660799e48089d12ee0b30043e7668d604f0",
   2: "4fe63e6cce2cfabc2382c99d73347aec6a08fdbf58e42791be6cfeb93f960eac",
+  3: "e005c3b880ba0bb3f0cb1645504d09d31ed3dd91ab9174b7ea1e03764fa84f7b",
 };
 
 /** The DDL of every object in the database, canonically ordered — the pinned text. */

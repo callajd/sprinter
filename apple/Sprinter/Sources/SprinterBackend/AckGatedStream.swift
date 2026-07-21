@@ -12,7 +12,7 @@ import SprinterContract
 /// this stream AT ITS OWN PACE (a direct/bounded consumer), the deferred ack is genuine
 /// end-to-end demand-gating: the daemon's chunk→ack→chunk flow control stalls until the
 /// consumer asks for more. It is NOT a live throttle on the production
-/// ``RpcBackend/events(sinceOffset:)`` path, however: that adapter drains this gate into
+/// ``RpcBackend/events(resume:)`` path, however: that adapter drains this gate into
 /// an UNBOUNDED ``AsyncThrowingStream`` (so the inner drain task acks every batch
 /// instantly), so the ack there fires on arrival, not on downstream demand. The operative
 /// production flow control on that path is not the ack but the **bounded backlog below**

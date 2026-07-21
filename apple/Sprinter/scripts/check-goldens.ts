@@ -40,40 +40,48 @@ const readGoldens = (dir: string): Map<string, string> =>
   );
 
 const scratch = mkdtempSync(join(tmpdir(), "sprinter-goldens-"));
+// The verdict is CARRIED OUT of the try, never thrown from inside it: `process.exit`
+// terminates the process immediately and does NOT unwind through `finally`, so exiting
+// in place would skip the cleanup below and leak a `sprinter-goldens-*` directory into
+// the system temp dir on every failing run — i.e. exactly on the runs a developer
+// repeats. The gate promises to leave the machine as it found it, so the exit happens
+// after the scratch directory is gone.
+let exitCode = 0;
 try {
   const generated = Bun.spawnSync(["bun", "run", generator, scratch], { stdout: "pipe" });
   if (generated.exitCode !== 0) {
     process.stderr.write(new TextDecoder().decode(generated.stderr));
     process.stderr.write("FAIL: the golden generator did not run.\n");
-    process.exit(1);
-  }
+    exitCode = 1;
+  } else {
+    const committed = readGoldens(committedDir);
+    const fresh = readGoldens(scratch);
 
-  const committed = readGoldens(committedDir);
-  const fresh = readGoldens(scratch);
+    const stale = [...fresh.keys()].filter((name) => committed.get(name) !== fresh.get(name));
+    const orphaned = [...committed.keys()].filter((name) => !fresh.has(name));
 
-  const stale = [...fresh.keys()].filter((name) => committed.get(name) !== fresh.get(name));
-  const orphaned = [...committed.keys()].filter((name) => !fresh.has(name));
-
-  if (stale.length > 0 || orphaned.length > 0) {
-    for (const name of stale) {
+    if (stale.length > 0 || orphaned.length > 0) {
+      for (const name of stale) {
+        process.stderr.write(
+          committed.has(name)
+            ? `  stale (contract output changed): ${name}\n`
+            : `  missing (the generator writes it, the repo does not have it): ${name}\n`,
+        );
+      }
+      for (const name of orphaned) {
+        process.stderr.write(`  orphaned (the generator no longer writes it): ${name}\n`);
+      }
       process.stderr.write(
-        committed.has(name)
-          ? `  stale (contract output changed): ${name}\n`
-          : `  missing (the generator writes it, the repo does not have it): ${name}\n`,
+        "FAIL: the committed goldens are not what the contract emits (INV-MIRROR).\n" +
+          "THE FIX IS: bun run apple/Sprinter/scripts/generate-goldens.ts — then re-run the\n" +
+          "Swift gate, because a wire-shape change needs its Swift mirror in the SAME change.\n",
       );
+      exitCode = 1;
+    } else {
+      process.stdout.write(`goldens: ${fresh.size} fixtures match the contract's output\n`);
     }
-    for (const name of orphaned) {
-      process.stderr.write(`  orphaned (the generator no longer writes it): ${name}\n`);
-    }
-    process.stderr.write(
-      "FAIL: the committed goldens are not what the contract emits (INV-MIRROR).\n" +
-        "THE FIX IS: bun run apple/Sprinter/scripts/generate-goldens.ts — then re-run the\n" +
-        "Swift gate, because a wire-shape change needs its Swift mirror in the SAME change.\n",
-    );
-    process.exit(1);
   }
-
-  process.stdout.write(`goldens: ${fresh.size} fixtures match the contract's output\n`);
 } finally {
   rmSync(scratch, { recursive: true, force: true });
 }
+process.exit(exitCode);

@@ -41,6 +41,17 @@ public struct Agent: Codable, Equatable, Sendable {
   /// The PREVIOUS revision this record replaces; `nil` on the first revision.
   public let supersedes: AgentId?
   /// The ISO-8601 UTC instant the agent was retired; `nil` while it is in service.
+  ///
+  /// - Note: the TypeScript side models this as a `Timestamp` — a CANONICAL form
+  ///   (`YYYY-MM-DDTHH:MM:SS.sssZ`, always UTC, always millisecond precision) chosen so
+  ///   that lexicographic order IS chronological order across the wire, SQLite `TEXT`,
+  ///   and this mirror. This property is NOT enforced here: the mirror is a bare
+  ///   `String?`, so a non-canonical instant would decode without complaint and compare
+  ///   wrongly. It is inert today because Swift is DECODE-ONLY on this field — every
+  ///   value it sees was canonicalised by the daemon, which is the only writer — and it
+  ///   becomes real the moment the client mints or edits an ``Agent`` — the SAME
+  ///   decode-only reprieve, and the same expiry, as the unasserted encode-side mirror
+  ///   fidelity tracked by issue #89 (a client-authored payload is what ends both).
   public let retiredAt: String?
 
   /// True when THIS RECORD carries a ``retiredAt`` stamp. The only expression of a
@@ -93,11 +104,10 @@ public struct Agent: Codable, Equatable, Sendable {
 /// hands over — and walks FORWARD from `agent` until it reaches a stamped revision or
 /// the head of the lineage. Revisions belonging to other lineages are ignored.
 ///
-/// On a WELL-FORMED history the answer does not depend on `all`'s order: each revision
-/// has at most one successor, so there is exactly one forward path. On a MALFORMED one
-/// (a revision superseded by two revisions, which the writer's precondition excludes)
-/// it does: the index keeps the first successor it encounters and the walk follows that
-/// branch only.
+/// The answer does not depend on `all`'s order: each revision has at most one successor,
+/// so there is exactly one forward path. The daemon's store makes a forked lineage (one
+/// revision superseded twice) UNSTORABLE — a UNIQUE index on `supersedes` — so the
+/// history that would let the walk pick a branch never reaches a client.
 ///
 /// - Complexity: O(n) in `all` per call — the reverse index is rebuilt each time, so
 ///   folding this over a whole registry is O(n²). Fine for a lookup; if a view ever

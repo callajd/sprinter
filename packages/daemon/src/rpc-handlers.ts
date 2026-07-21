@@ -70,6 +70,7 @@ import {
   IssueNotFound,
   type OffsetSessionEvent,
   PlanRejected,
+  type ResumeContext,
   ResyncRequired,
   SessionNotFound,
   type Snapshot,
@@ -85,7 +86,6 @@ import {
   type Session,
   type SessionId,
   type SessionInput,
-  type StoreGenerationId,
   type UiResponse,
   type WorkStatus,
   type Workstream,
@@ -490,47 +490,54 @@ const resyncSessionEvents = (
   sessionFeed: SessionFeed,
   registry: Registry,
   sessionId: SessionId,
-  sinceOffset?: number,
-  generation?: StoreGenerationId,
+  resume?: ResumeContext,
 ): Stream.Stream<OffsetSessionEvent, SessionEventsError> =>
   Stream.unwrap(
     Effect.gen(function* () {
       // Subscribe BEFORE the durable read (subscribe-before-replay), so a durable entry
       // committed during the read still reaches the live tail on the LIVE path.
       const subscription = yield* sessionFeed.subscribe;
-      const live = yield* resolveLive(store, registry, sessionId).pipe(
-        Effect.asSome,
-        Effect.catchTag("SessionNotFound", () => Effect.succeedNone),
-      );
-      const session = yield* store.jobs.getSession(sessionId).pipe(Effect.orDie);
-      // ONE durable snapshot serves BOTH the replay AND the live-tail overlap boundary (no
-      // double read). Replay = entries strictly after the client's `sinceOffset`;
-      // `maxReplayedOffset` is the EXACT high-water the live tail must exclude, taken from the
-      // SAME snapshot the replay is built from so the two agree (no split-read race).
-      const fromOffset = sinceOffset ?? 0;
-      const durable = yield* store.sessionLog.read(sessionId).pipe(Effect.orDie);
       // GENERATION GATE — the same guard the work-graph `events` feed applies, for the
       // same reason: `session_event_log` is `AUTOINCREMENT` too, and a schema-version
       // bump DROPS it, restarting per-session offsets at `1`. A cursor is therefore a
       // coordinate in ONE generation's space, and an extent check alone cannot say so
       // (once a new generation's transcript outgrows the stale mark, `sinceOffset <=
-      // max` holds and the resume looks perfectly valid). So a cursor-bearing request
-      // must carry the generation it was minted under, and a MISMATCHED or ABSENT one
-      // is refused — with the extent as a cheap secondary. This runs BEFORE the
-      // existence verdict: a dropped store's session is a resync, not a "never existed".
-      // An ORIGIN request (no cursor) names no coordinate and is valid in any generation.
-      if (fromOffset > 0) {
-        const maxOffset = durable.at(-1)?.offset ?? 0;
-        if (generation !== store.generation || fromOffset > maxOffset) {
+      // max` holds and the resume looks perfectly valid). So the cursor and its
+      // generation arrive as one inseparable `ResumeContext`, and a PRESENT one whose
+      // generation is not the current one is refused at EVERY offset — with the extent
+      // as a cheap secondary. An ABSENT `resume` is the origin request: it names no
+      // coordinate and is valid in any generation. That absence is the only exemption;
+      // there is no numeric one, so a dead generation paired with `sinceOffset: 0`
+      // is refused exactly like any other stale resume.
+      //
+      // It runs BEFORE the existence verdict (a dropped store's session is a resync,
+      // not a "never existed") AND before the transcript read: the extent comes from
+      // the store's indexed `sessionLog.maxOffset`, so a request that is about to be
+      // REFUSED never decodes a whole durable transcript first — the mirror of what
+      // `EventLogStore.maxOffset` does for the work-graph feed.
+      if (resume !== undefined) {
+        const maxOffset = yield* store.sessionLog.maxOffset(sessionId).pipe(Effect.orDie);
+        if (resume.generation !== store.generation || resume.sinceOffset > maxOffset) {
           return Stream.fail<SessionEventsError>(
             new ResyncRequired({
-              sinceOffset: fromOffset,
+              sinceOffset: resume.sinceOffset,
               maxOffset,
               generation: store.generation,
             }),
           );
         }
       }
+      const live = yield* resolveLive(store, registry, sessionId).pipe(
+        Effect.asSome,
+        Effect.catchTag("SessionNotFound", () => Effect.succeedNone),
+      );
+      const session = yield* store.jobs.getSession(sessionId).pipe(Effect.orDie);
+      // ONE durable snapshot serves BOTH the replay AND the live-tail overlap boundary (no
+      // double read). Replay = entries strictly after the client's cursor;
+      // `maxReplayedOffset` is the EXACT high-water the live tail must exclude, taken from the
+      // SAME snapshot the replay is built from so the two agree (no split-read race).
+      const fromOffset = resume?.sinceOffset ?? 0;
+      const durable = yield* store.sessionLog.read(sessionId).pipe(Effect.orDie);
       // Existence: a session is viewable if it is LIVE, has a durable transcript, OR has a
       // SETTLED (terminal) Session row — the last lets a settled session that emitted ZERO
       // durable events replay an EMPTY transcript and COMPLETE (not error). A NON-terminal row
@@ -653,15 +660,17 @@ export const handlers = SprinterRpc.toLayer(
       // the boundary overlap. Each streamed item is an `OffsetEvent` carrying its
       // durable offset (CE2.0), and replay + live offsets share one
       // coordinate space, so the client can feed a streamed item's offset back as
-      // `sinceOffset`. The cursor is OPTIONAL: a request with NO `sinceOffset` (a
-      // present but empty `{}` payload) replays from origin, present resumes strictly
-      // after that offset, over the same `resyncFrom` primitive. The strict
-      // `> sinceOffset` ordering is scoped to that resume; within one stream the
+      // `resume.sinceOffset`. The resume context is OPTIONAL: a request with NO
+      // `resume` (a present but empty `{}` payload) replays from origin, present
+      // resumes strictly after that offset, over the same `resyncFrom` primitive. The
+      // strict `> sinceOffset` ordering is scoped to that resume; within one stream the
       // subscribe-before-replay boundary can overlap (harmless under upsert).
-      // The cursor is refused unless it carries the CURRENT store generation
-      // (`Snapshot.generation`), so a cursor minted before a drop-and-recreate can
-      // never be resumed incrementally against the new log — `ResyncRequired`.
-      events: ({ sinceOffset, generation }) => resyncEvents(store, feed, sinceOffset, generation),
+      // A PRESENT `resume` always carries the generation its cursor was minted under —
+      // they are one value, not two optional keys — and it is refused unless that
+      // generation is the CURRENT one, at EVERY offset, so a cursor minted before a
+      // drop-and-recreate can never be resumed incrementally against the new log
+      // (`ResyncRequired`).
+      events: ({ resume }) => resyncEvents(store, feed, resume),
       createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
@@ -677,11 +686,11 @@ export const handlers = SprinterRpc.toLayer(
       // COMPLETES (viewable transcript, no `SessionNotFound`), an absent one is
       // `SessionNotFound`. Each item is an `OffsetSessionEvent` carrying its durable offset
       // (INV-REACTIVE — no poll loop).
-      // Its `sinceOffset` is guarded by the SAME generation check as `events` — the
-      // per-session log is dropped by a schema bump too — so the error channel is
-      // `SessionNotFound | ResyncRequired`.
-      sessionEvents: ({ sessionId, sinceOffset, generation }) =>
-        resyncSessionEvents(store, sessionFeed, sessions, sessionId, sinceOffset, generation),
+      // Its `resume` is the SAME `ResumeContext` as `events`', guarded by the same
+      // unconditional generation check — the per-session log is dropped by a schema bump
+      // too — so the error channel is `SessionNotFound | ResyncRequired`.
+      sessionEvents: ({ sessionId, resume }) =>
+        resyncSessionEvents(store, sessionFeed, sessions, sessionId, resume),
       sessionSend: ({ sessionId, input }) => driveInput(store, sessions, sessionId, input),
       interrupt: ({ sessionId }) => abortTurn(store, sessions, sessionId),
       answerUiRequest: ({ sessionId, response }) => answerUi(store, sessions, sessionId, response),

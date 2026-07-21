@@ -363,11 +363,10 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
 
     // Attach with a cursor PAST the first entry (offset 1): the resync must replay
     // only the second durable delta (strictly-after semantics), not re-send offset 1.
-    const collecting = yield* resyncEvents(store, feed, 1, store.generation).pipe(
-      Stream.take(1),
-      Stream.runCollect,
-      Effect.forkChild,
-    );
+    const collecting = yield* resyncEvents(store, feed, {
+      sinceOffset: 1,
+      generation: store.generation,
+    }).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
 
     const received = yield* Fiber.join(collecting);
     const only: OffsetEvent | undefined = received[0];
@@ -398,7 +397,10 @@ it.live("resyncEvents fails a cursor BEYOND the log's extent with ResyncRequired
     // back leaves its contiguous cursor stale so it discards everything — so the
     // generation is made EXPLICIT and the request FAILS.
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 999, store.generation).pipe(Stream.take(2), Stream.runCollect),
+      resyncEvents(store, feed, { sinceOffset: 999, generation: store.generation }).pipe(
+        Stream.take(2),
+        Stream.runCollect,
+      ),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
     // Self-describing: the rejected cursor and the extent it exceeded.
@@ -424,7 +426,10 @@ it.live("resyncEvents fails a non-zero cursor against an EMPTY log — the post-
     // client reconnects holding a cursor from the destroyed generation. `maxOffset` is
     // `0` (the empty-log sentinel), which every non-zero cursor exceeds.
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 7, store.generation).pipe(Stream.take(1), Stream.runCollect),
+      resyncEvents(store, feed, { sinceOffset: 7, generation: store.generation }).pipe(
+        Stream.take(1),
+        Stream.runCollect,
+      ),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
     expect(failure.maxOffset).toBe(0);
@@ -436,15 +441,16 @@ it.live("resyncEvents fails a non-zero cursor against an EMPTY log — the post-
   ),
 );
 
-it.live("resyncEvents accepts the ORIGIN cursor against an empty log — it is never stale", () =>
+it.live("resyncEvents accepts the ORIGIN request against an empty log — it is never stale", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
 
-    // `sinceOffset: 0` (and an absent cursor) asks for the whole log, which is a valid
-    // request against EVERY generation including an empty one — a first connect must
-    // never be told to resync. It replays nothing and streams the live tail.
-    const collecting = yield* resyncEvents(store, feed, 0).pipe(
+    // An ABSENT resume context asks for the whole log, which is a valid request against
+    // EVERY generation including an empty one — a first connect must never be told to
+    // resync. It replays nothing and streams the live tail. Absence is the ONLY thing
+    // that means "origin": there is no offset value that carries the same exemption.
+    const collecting = yield* resyncEvents(store, feed).pipe(
       Stream.take(1),
       Stream.runCollect,
       Effect.forkChild,
@@ -472,11 +478,10 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
     // The boundary the stale-epoch rule must NOT swallow: a fully caught-up client
     // (cursor == max offset) is not stale, so it replays nothing and only streams
     // the live tail — it is never re-sent history it already acknowledged.
-    const collecting = yield* resyncEvents(store, feed, 2, store.generation).pipe(
-      Stream.take(1),
-      Stream.runCollect,
-      Effect.forkChild,
-    );
+    const collecting = yield* resyncEvents(store, feed, {
+      sinceOffset: 2,
+      generation: store.generation,
+    }).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
     yield* Effect.sleep("20 millis");
     yield* store.workGraph.putIssue(issue);
 
@@ -515,7 +520,10 @@ it.live("resyncEvents REFUSES a cursor WITHIN the log's extent but from a PRIOR 
     expect(maxOffset).toBe(3);
 
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 2, deadGeneration).pipe(Stream.take(1), Stream.runCollect),
+      resyncEvents(store, feed, { sinceOffset: 2, generation: deadGeneration }).pipe(
+        Stream.take(1),
+        Stream.runCollect,
+      ),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
     // The cursor is WITHIN the extent — this refusal is the identity check, not the
@@ -537,22 +545,61 @@ it.live("resyncEvents REFUSES a cursor WITHIN the log's extent but from a PRIOR 
   ),
 );
 
-it.live("resyncEvents REFUSES a cursor carrying NO generation at all", () =>
+it.live("resyncEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
-    // A cursor with no generation has no context to be valid IN, so it is exactly as
-    // un-resumable as one from the wrong context. Accepting it would make the guard
-    // trivially bypassable — a client (or an older build) that simply omits the key
-    // would be resumed against a log its cursor may never have belonged to.
+    // THE ZERO-OFFSET DOOR. `sinceOffset === 0` used to be read as "the origin" and skip
+    // the generation comparison outright, so a request carrying a DEAD generation with a
+    // zero cursor was accepted as a first connect: the daemon replayed the NEW
+    // generation's log onto the client's RETAINED baseline (a resume takes no fresh
+    // `snapshot()`), leaving every entity the reset destroyed in place forever — deltas
+    // are upsert-only, so nothing streamed can ever remove them.
+    //
+    // It is reachable, not theoretical: the client's cursor is its CONTIGUOUS prefix,
+    // which stays at `0` for an attempt whose first applied delta arrived out of order
+    // (concurrent writers can publish non-monotonically, and a skipped foreign-`kind`
+    // entry does the same). That attempt still records a resume point — offset `0`.
+    //
+    // Now the presence of the resume context, not the value of its offset, is what says
+    // "this is a resume", so the generation is compared here like anywhere else.
     const failure = yield* Effect.flip(
-      resyncEvents(store, feed, 1).pipe(Stream.take(1), Stream.runCollect),
+      resyncEvents(store, feed, { sinceOffset: 0, generation: deadGeneration }).pipe(
+        Stream.take(1),
+        Stream.runCollect,
+      ),
     );
     expect(failure).toBeInstanceOf(ResyncRequired);
+    expect(failure.sinceOffset).toBe(0);
     expect(failure.generation).toBe(store.generation);
+    expect(failure.generation).not.toBe(deadGeneration);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+it.live("resyncEvents ACCEPTS sinceOffset 0 under the CURRENT generation — a real resume", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    yield* store.workGraph.putWorkstream(workstream);
+
+    // The other side of the same branch: a zero cursor is not poison, it is a resume
+    // that has applied nothing yet. Under the CURRENT generation it is honoured and
+    // replays the whole log — so closing the door above costs a legitimate client
+    // nothing.
+    const received = yield* resyncEvents(store, feed, {
+      sinceOffset: 0,
+      generation: store.generation,
+    }).pipe(Stream.take(1), Stream.runCollect);
+    expect(received[0]?.event._tag).toBe("WorkstreamChanged");
+    expect(received[0]?.offset).toBe(1);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),

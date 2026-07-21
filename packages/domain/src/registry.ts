@@ -163,16 +163,12 @@ export const isOriginalRevision = (agent: Agent): boolean => agent.supersedes ==
  * `Snapshot.agents` hand over — and walks FORWARD from `agent` along it until it
  * reaches a stamped revision or the head of the lineage.
  *
- * Revisions in `all` that belong to other lineages are ignored. On a WELL-FORMED
- * history the answer does not depend on `all`'s order: each revision has at most one
- * successor, so there is exactly one forward path. On a MALFORMED one — a revision
- * superseded by TWO revisions, which the writer's precondition already excludes — it
- * DOES: the reverse index keeps the first successor it encounters and the walk follows
- * that branch only, so a differently-ordered `all` can reach a different revision and
- * return a different answer. That is stated rather than smoothed over, because the
- * input this reads (`listAgents` / `Snapshot.agents`) is ordered by id, which is
- * presentational: the answer is deterministic for a given input, well-defined for a
- * well-formed history, and order-dependent only for a history that is already invalid.
+ * Revisions in `all` that belong to other lineages are ignored. The answer does NOT
+ * depend on `all`'s order: each revision has at most one successor, so there is exactly
+ * one forward path. That is not a convention this helper hopes its callers honour — a
+ * revision superseded TWICE is unstorable (the adapter's `agent_supersedes` UNIQUE
+ * index), so the forked history that would make the walk pick a branch, and the answer
+ * follow the collection's order, cannot reach here from the store at all.
  *
  * COST: this rebuilds the reverse index on EVERY call — O(n) in `all` per agent, and
  * therefore O(n²) for a fold over the whole registry (e.g. a UI listing live agents by

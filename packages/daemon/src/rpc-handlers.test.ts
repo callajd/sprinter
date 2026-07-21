@@ -460,7 +460,7 @@ it.effect("events streams a work-graph delta produced by a command", () =>
       // not a replayed one: `events` replays `event_log.tail(sinceOffset)` first.
       const seeded = yield* store.events.read;
       const collector = yield* client
-        .events({ sinceOffset: seeded.length, generation: store.generation })
+        .events({ resume: { sinceOffset: seeded.length, generation: store.generation } })
         .pipe(Stream.take(1), Stream.runHead, Effect.forkChild);
       // Drive a REPEATABLE command until the (lazily-subscribing) events stream
       // attaches: `control start` re-publishes a `WorkstreamChanged` delta on every
@@ -492,7 +492,7 @@ it.effect("events resumes durable replay after a client-supplied sinceOffset cur
       // endpoint threads it into `resyncFrom`, so the replay starts STRICTLY AFTER
       // offset 2 — the issue/job/session deltas — never re-sending the earlier ones.
       const replay = yield* client
-        .events({ sinceOffset: 2, generation: store.generation })
+        .events({ resume: { sinceOffset: 2, generation: store.generation } })
         .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild)
         .pipe(Effect.flatMap(Fiber.join));
 
@@ -588,7 +588,7 @@ it.effect("sessionEvents replays a SETTLED session's durable transcript and comp
       // Resume from a mid-transcript cursor: only offsets STRICTLY AFTER it (no re-delivery).
       const cursor = offsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor, generation: store.generation })
+        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
         .pipe(Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([noticeEvent, entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);
@@ -614,7 +614,7 @@ it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
         "00000000-dead-4000-8000-000000000000",
       );
       const failure = yield* client
-        .sessionEvents({ sessionId, sinceOffset: 1, generation: deadGeneration })
+        .sessionEvents({ sessionId, resume: { sinceOffset: 1, generation: deadGeneration } })
         .pipe(Stream.runCollect, Effect.flip);
       expect(failure).toBeInstanceOf(ResyncRequired);
       if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
@@ -626,19 +626,35 @@ it.effect("sessionEvents REFUSES a cursor from a PRIOR store generation", () =>
   ),
 );
 
-it.effect("sessionEvents REFUSES a cursor carrying NO generation, and admits the ORIGIN", () =>
+it.effect("sessionEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)", () =>
   harness(({ client, store }) =>
     Effect.gen(function* () {
       yield* store.jobs.putSession(session);
       yield* store.jobs.putJob(orphanedJob);
       yield* store.sessionLog.append(sessionId, entryAppended);
 
-      // A cursor with no generation has no context to be valid in — refused, exactly as a
-      // wrong one is, so the guard cannot be bypassed by omitting the key.
+      // The session channel's half of the zero-offset door. A zero cursor used to skip the
+      // generation comparison outright — it reads as "the origin" numerically — so a
+      // request from a DEAD generation was served a resume against a transcript its
+      // coordinates never indexed. It is now an ordinary resume: the PRESENCE of the
+      // context, never the value of the offset, is what marks it as one.
+      const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
+        "00000000-dead-4000-8000-000000000000",
+      );
       const failure = yield* client
-        .sessionEvents({ sessionId, sinceOffset: 1 })
+        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: deadGeneration } })
         .pipe(Stream.runCollect, Effect.flip);
       expect(failure).toBeInstanceOf(ResyncRequired);
+      if (!(failure instanceof ResyncRequired)) throw new Error("expected ResyncRequired");
+      expect(failure.sinceOffset).toBe(0);
+      expect(failure.generation).toBe(store.generation);
+
+      // A zero cursor under the CURRENT generation is a REAL resume and is honoured —
+      // closing the door costs a legitimate client nothing.
+      const fromZero = yield* client
+        .sessionEvents({ sessionId, resume: { sinceOffset: 0, generation: store.generation } })
+        .pipe(Stream.runCollect);
+      expect(fromZero.map((i) => i.event)).toEqual([entryAppended]);
 
       // The ORIGIN request names no coordinate, so it is valid in EVERY generation and is
       // never refused — a first connect (and today's client, which sends no cursor) is
@@ -744,7 +760,7 @@ it.live("sessionEvents forwards a LIVE session's ephemeral deltas AND durable en
       // live, so bound the durable replay with `take(1)` (the one entry past the cursor).
       const cursor = durableOffsets[0] ?? 0;
       const resumed = yield* client
-        .sessionEvents({ sessionId, sinceOffset: cursor, generation: store.generation })
+        .sessionEvents({ sessionId, resume: { sinceOffset: cursor, generation: store.generation } })
         .pipe(Stream.take(1), Stream.runCollect);
       expect(resumed.map((i) => i.event)).toEqual([entryAppended2]);
       expect(resumed.every((i) => i.offset !== undefined && i.offset > cursor)).toBe(true);

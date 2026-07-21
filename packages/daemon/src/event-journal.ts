@@ -30,9 +30,10 @@
  *   boundary is harmless. A reconnecting client thus catches up on the whole durable
  *   history deterministically, not just the deltas that happen after it attaches.
  *
- * The wire `events` procedure carries an OPTIONAL `sinceOffset` REQUEST cursor and an
+ * The wire `events` procedure carries an OPTIONAL {@link ResumeContext} REQUEST value
+ * (cursor AND generation, inseparably) and an
  * {@link OffsetEvent} RESPONSE envelope (CE2.0, INV-CONTRACT): a request
- * with NO `sinceOffset` (a present but empty `{}` payload) replays from the log ORIGIN
+ * with NO `resume` (a present but empty `{}` payload) replays from the log ORIGIN
  * (`tail(0)`), present resumes STRICTLY AFTER that offset, and each streamed item
  * exposes the durable offset the client feeds back as its next cursor. {@link resyncFrom} is the
  * offset-parameterized primitive both cases drive (CE2.2 layers reconnect/
@@ -52,16 +53,11 @@ import { Array as Arr, Context, Effect, Layer, Option, Schema, Stream } from "ef
 import {
   type OffsetEvent,
   type OffsetSessionEvent,
+  type ResumeContext,
   ResyncRequired,
   WorkGraphEvent,
 } from "@sprinter/contract";
-import type {
-  Agent,
-  NonNegativeInt,
-  SessionEvent,
-  SessionId,
-  StoreGenerationId,
-} from "@sprinter/domain";
+import type { Agent, NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
 import {
   type AgentWrite,
   type PersistedEvent,
@@ -260,8 +256,9 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       publishEphemeral: publishEphemeralLive(sessionFeed),
       read: base.sessionLog.read,
       tail: base.sessionLog.tail,
-      // A pure read — no live fan-out — so it delegates straight to the base store.
+      // Pure reads — no live fan-out — so they delegate straight to the base store.
       countEntries: base.sessionLog.countEntries,
+      maxOffset: base.sessionLog.maxOffset,
     },
     // The generation is a property of the DURABLE store, not of journaling: this
     // decorator adds a live fan-out over the same tables, so it reports the base
@@ -356,37 +353,47 @@ const decodedReplay = (
  * NECESSARY: the moment a new generation's log grows past the stale mark, the stale
  * cursor is `<= maxOffset` and an extent check sees nothing at all — the daemon would
  * resume the client incrementally against a coordinate space its cursor never belonged
- * to, silently and undetectably from either side. So a cursor-bearing request must
- * carry the {@link StoreGenerationId} it was minted under (read off
- * `Snapshot.generation`), and this refuses:
+ * to, silently and undetectably from either side.
  *
- * - a cursor whose generation DIFFERS from `store.generation` — the store was dropped
- *   and recreated under the client;
- * - a cursor with NO generation at all — a cursor with no context is exactly as
- *   un-resumable as one from the wrong context, and accepting it would leave a
- *   trivially bypassable guard;
- * - a cursor beyond {@link EventLogStore.maxOffset} — kept as a cheap SECONDARY check,
+ * So the cursor and its generation arrive as ONE inseparable {@link ResumeContext},
+ * and this refuses:
+ *
+ * - a resume whose generation DIFFERS from `store.generation` — the store was dropped
+ *   and recreated under the client. Checked UNCONDITIONALLY, at every offset;
+ * - a resume beyond {@link EventLogStore.maxOffset} — kept as a cheap SECONDARY check,
  *   since a cursor ahead of the log is impossible even within one generation (a client
  *   that mangled its own cursor, or a replayed request against a truncated log).
  *
- * `sinceOffset === 0` (or absent) is the ORIGIN request: it names no coordinate, so it
- * is valid against every generation — including an empty log — and never trips this,
- * with or without a `generation`.
+ * An ABSENT `resume` is the ORIGIN request: it names no coordinate, so it is valid
+ * against every generation — including an empty log — and never trips this. That
+ * ABSENCE is the ONLY exemption, and it is the one the type system already states.
+ *
+ * There is deliberately no numeric exemption. `sinceOffset === 0` used to be treated
+ * as "the origin" and skip the generation comparison entirely, which made the guard
+ * bypassable by a request carrying a DEAD generation with a zero cursor — a shape a
+ * real client reaches whenever its contiguous prefix never advanced past `0` during an
+ * attempt (an out-of-order first delta is enough). Now `resume: { sinceOffset: 0, … }`
+ * is a RESUME like any other and its generation is compared like any other; only the
+ * absence of the whole value means origin. A cursor with no generation is not rejected
+ * here because it cannot be built (INV-SUM).
  */
 const requireLiveCursor = (
   store: Store,
-  sinceOffset: number,
-  generation: StoreGenerationId | undefined,
+  resume: ResumeContext | undefined,
 ): Effect.Effect<void, ResyncRequired> =>
-  sinceOffset === 0
+  resume === undefined
     ? Effect.void
     : store.events.maxOffset.pipe(
         Effect.orDie,
         Effect.flatMap((maxOffset) =>
-          generation === store.generation && sinceOffset <= maxOffset
+          resume.generation === store.generation && resume.sinceOffset <= maxOffset
             ? Effect.void
             : Effect.fail(
-                new ResyncRequired({ sinceOffset, maxOffset, generation: store.generation }),
+                new ResyncRequired({
+                  sinceOffset: resume.sinceOffset,
+                  maxOffset,
+                  generation: store.generation,
+                }),
               ),
         ),
       );
@@ -418,14 +425,16 @@ const requireLiveCursor = (
 export const resyncEvents = (
   store: Store,
   feed: Feed,
-  sinceOffset?: number,
-  generation?: StoreGenerationId,
+  resume?: ResumeContext,
 ): Stream.Stream<OffsetEvent, ResyncRequired> =>
   Stream.unwrap(
-    requireLiveCursor(store, sinceOffset ?? 0, generation).pipe(
+    requireLiveCursor(store, resume).pipe(
       Effect.andThen(feed.subscribe),
       Effect.map((subscription) =>
-        Stream.concat(resyncFrom(store, sinceOffset ?? 0), Stream.fromSubscription(subscription)),
+        Stream.concat(
+          resyncFrom(store, resume?.sinceOffset ?? 0),
+          Stream.fromSubscription(subscription),
+        ),
       ),
     ),
   );

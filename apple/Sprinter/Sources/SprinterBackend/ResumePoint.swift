@@ -34,8 +34,21 @@ struct ResumePoint: Sendable, Equatable {
   private var offset: Int?
 
   /// The incremental-resume point, or `nil` when there is nothing to resume from.
+  ///
+  /// A recorded offset of `0` is deliberately NOT resumable. It is a real state — the
+  /// cursor is the CONTIGUOUS prefix, so an attempt whose first applied delta arrived
+  /// out of order records a baseline while the prefix is still `0` — but it is a resume
+  /// that would ask the daemon for "everything strictly after nothing", i.e. exactly the
+  /// origin, while carrying a retained baseline the daemon would then NOT refresh. There
+  /// is nothing to gain from it and a whole class of confusion to lose, so this client
+  /// takes the subscribe-around-`snapshot()` path instead.
+  ///
+  /// This is belt-and-braces, not the guard. The daemon compares the generation on EVERY
+  /// present ``SprinterContract/ResumeContext``, offset `0` included, so a stale
+  /// zero-cursor resume is refused there even if some future call site builds one; this
+  /// simply means the canonical client never sends the shape at all.
   var resumable: (state: Snapshot, offset: Int)? {
-    guard let state, let offset else { return nil }
+    guard let state, let offset, offset > 0 else { return nil }
     return (state, offset)
   }
 
