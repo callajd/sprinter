@@ -22,6 +22,13 @@ actor BoundedDeltaQueue<Element: Sendable> {
   private var items: [Element] = []
   private var finished = false
   private var waiter: CheckedContinuation<Element?, Never>?
+  /// Identity of the CURRENTLY installed waiter, and the source it is minted from. A
+  /// cancellation release names the generation it was armed for, so it can only ever resume
+  /// the waiter that its own ``next()`` installed — never a later consumer's (see
+  /// ``releaseWaiter(generation:)``). Its getter is `internal` (not `private`) so the
+  /// regression test can drive a STALE release deterministically instead of racing for it.
+  private(set) var waiterGeneration = 0
+  private var mintedGenerations = 0
 
   init(limit: Int) {
     self.limit = limit
@@ -46,8 +53,23 @@ actor BoundedDeltaQueue<Element: Sendable> {
     waiter = nil
   }
 
-  /// Pops the next delta, suspending until one arrives or the feed finishes
-  /// (`nil`). One outstanding consumer at a time.
+  /// Pops the next delta, suspending until one arrives, the feed finishes (`nil`), or the
+  /// consumer is CANCELLED (`nil`).
+  ///
+  /// **PRECONDITION — one outstanding consumer at a time**, and it is now ENFORCED rather
+  /// than merely documented. A second concurrent `next()` would overwrite ``waiter``, and the
+  /// displaced continuation is resumed by NO path — `enqueue`, `finish` and
+  /// ``releaseWaiter(generation:)`` each touch only the currently installed one. That is an
+  /// unbounded wait, the exact class #94 exists to close, so it traps here at the violation
+  /// instead of hanging somewhere else later. Resuming the displaced waiter with `nil`
+  /// instead would keep the process alive but hand that consumer a spurious end-of-feed,
+  /// which `fold` reads as "the feed finished" — a silent stream truncation in place of a
+  /// loud, local failure.
+  ///
+  /// The wait is cancellation-aware on purpose: the consumer is a child of an attempt's
+  /// task group, and the group's teardown cancels it. A bare `withCheckedContinuation`
+  /// here would be an unbounded wait on a producer that may already be gone — the shape
+  /// that turns an attempt's teardown into a hang instead of a return (#94).
   func next() async -> Element? {
     if !items.isEmpty {
       return items.removeFirst()
@@ -55,8 +77,38 @@ actor BoundedDeltaQueue<Element: Sendable> {
     if finished {
       return nil
     }
-    return await withCheckedContinuation { continuation in
-      waiter = continuation
+    precondition(
+      waiter == nil,
+      "BoundedDeltaQueue supports one outstanding consumer; a second next() would strand the "
+        + "installed waiter in an unbounded wait")
+    mintedGenerations &+= 1
+    let generation = mintedGenerations
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Element?, Never>) in
+        waiter = continuation
+        waiterGeneration = generation
+      }
+    } onCancel: {
+      // Hops back onto the actor, so it can only run AFTER this `next()` has installed its
+      // waiter (the install is synchronous with the suspension) — but it can run arbitrarily
+      // LATE, well after `enqueue` already resumed this wait normally and a SUBSEQUENT
+      // `next()` installed a fresh waiter. Naming the generation is what stops it resuming
+      // that unrelated consumer with a spurious `nil`, which `fold` would read as "the feed
+      // finished" and truncate the stream on.
+      Task { await self.releaseWaiter(generation: generation) }
     }
+  }
+
+  /// Wakes the waiter installed by generation `generation` with `nil`, because THAT
+  /// consumer was cancelled. A no-op once that waiter has been resumed by any other path
+  /// (an `enqueue`, a `finish`), so a late release can never steal a later consumer's
+  /// wakeup. The feed itself is untouched — this only ends one consumer's wait.
+  ///
+  /// `internal` rather than `private` so the regression test can inject a stale release
+  /// deterministically; production's only caller is ``next()``'s cancellation handler.
+  func releaseWaiter(generation: Int) {
+    guard waiterGeneration == generation, let waiter else { return }
+    self.waiter = nil
+    waiter.resume(returning: nil)
   }
 }

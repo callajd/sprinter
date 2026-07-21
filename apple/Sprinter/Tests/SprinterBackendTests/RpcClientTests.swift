@@ -44,6 +44,103 @@ struct RpcClientTests {
     await #expect(throws: BackendError.connectionClosed) { try await backend.snapshot() }
   }
 
+  @Test("a cancelled request resumes rather than waiting for an Exit that never comes")
+  func cancelledRequestResumes() async throws {
+    // #94's general bar — no unbounded waits. A request's suspension is otherwise released
+    // ONLY by its correlated `Exit` or by the connection's teardown, so a cancelled caller
+    // whose daemon never answers (and whose connection nobody closes) would wait forever.
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let inflight = Task { try await connection.request(tag: "snapshot", payload: nil) }
+    // Awaiting the sent Request guarantees the entry is registered as pending, so this
+    // exercises cancelling an ALREADY-suspended request, not an early-exit check.
+    let request = try await nextSent(&outbound)
+    #expect(request.envelopeTag == "Request")
+
+    inflight.cancel()
+    await #expect(throws: CancellationError.self) { try await inflight.value }
+    // And the daemon is told to stop working on it, exactly as an abandoned stream is.
+    let interrupt = try await nextSent(&outbound)
+    #expect(interrupt.envelopeTag == "Interrupt")
+    #expect(interrupt.requestId == request.id)
+    transport.close()
+  }
+
+  @Test("cancelling a MUTATING request releases the caller without interrupting the daemon")
+  func cancelledMutatingRequestIsNotInterrupted() async throws {
+    // The daemon interrupts the handler's FIBER on an `Interrupt`, and
+    // `createWorkstreamFromPlan` commits `putRepository` and `putWorkstream` as two
+    // independent transactions. Interrupting it can therefore leave a persisted repository
+    // with no workstream. So the cancellation bounds the CLIENT's wait (a `CancellationError`)
+    // without changing the wire semantics for a mutation: no `Interrupt` goes out, and the
+    // daemon runs the write to completion exactly as it did before #94.
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let inflight = Task {
+      try await connection.request(tag: "createWorkstreamFromPlan", payload: nil)
+    }
+    let request = try await nextSent(&outbound)
+    #expect(request.rpcTag == "createWorkstreamFromPlan")
+
+    inflight.cancel()
+    // The wait is still bounded — this is #94's actual bar, and it is unchanged.
+    await #expect(throws: CancellationError.self) { try await inflight.value }
+
+    // ...but nothing was sent for it. A following `Ping` is the probe: the retirement path
+    // transmits on the actor without suspending, so an `Interrupt` — had one been emitted —
+    // would be recorded strictly BEFORE this ping, and would be the frame read here.
+    await connection.ping()
+    let next = try await nextSent(&outbound)
+    #expect(
+      next.envelopeTag == "Ping",
+      Comment(
+        rawValue: """
+          expected no frame for the cancelled mutation, but the next frame on the wire was \
+          \(next.envelopeTag) — a cancelled mutation is interrupting daemon-side work.
+          """))
+    transport.close()
+  }
+
+  @Test("a cancelled request's Interrupt never overtakes its own Request on the wire")
+  func cancelledRequestInterruptFollowsItsRequest() async throws {
+    // The transmit and the cancellation are two UNSTRUCTURED tasks hopping onto the same
+    // actor; their relative order is not a language guarantee (priority escalation can
+    // reorder them). If the `Interrupt` won, the daemon would drop it as an unknown id and
+    // then run the `Request` to completion with no client-side consumer left — its `Exit` is
+    // discarded by `handleExit`'s missing-entry guard — leaking server work on every
+    // cancelled request. So the ordering is enforced by state, and asserted here.
+    //
+    // Cancelled WITHOUT first awaiting the sent `Request`, which is what makes both
+    // interleavings reachable; repeated so a scheduling-dependent regression cannot pass by
+    // happening to win the race once.
+    for iteration in 0..<64 {
+      let transport = FakeTransport()
+      let connection = RpcConnection(transport: transport)
+      var outbound = transport.outbound.makeAsyncIterator()
+
+      let inflight = Task { try await connection.request(tag: "snapshot", payload: nil) }
+      inflight.cancel()
+      await #expect(throws: CancellationError.self) { try await inflight.value }
+
+      let first = try await nextSent(&outbound)
+      #expect(
+        first.envelopeTag == "Request",
+        Comment(
+          rawValue: """
+            iteration \(iteration): the first frame on the wire was \(first.envelopeTag) — \
+            an Interrupt overtook its own Request.
+            """))
+      let second = try await nextSent(&outbound)
+      #expect(second.envelopeTag == "Interrupt")
+      #expect(second.requestId == first.id)
+      transport.close()
+    }
+  }
+
   @Test("createWorkstreamFromPlan sends the plan payload and returns the id")
   func createWorkstreamQuery() async throws {
     let transport = FakeTransport()

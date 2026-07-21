@@ -110,6 +110,74 @@ private final class EventFeeds: @unchecked Sendable {
   }
 }
 
+/// A connect seam a test can HOLD OPEN: the dial reports that it started, then parks until
+/// the test releases it. That makes the "dial resolves after `stop()`" window — which is
+/// otherwise a race — deterministic.
+///
+/// It is a COUNTING gate, exactly like the `DispatchSemaphore` it replaces: ``AppModel/start()``
+/// drives TWO consumers of the same connect seam (the board's ``WorkGraphResync`` feed and the
+/// connect loop), so both park here, and one ``release()`` must let exactly ONE through. A
+/// sticky "released" flag would let the board's dial resolve too, close the fake behind the
+/// connect loop's back, and make the late-dial regression test pass vacuously.
+///
+/// The park is a SUSPENSION, not a `DispatchSemaphore.wait` hopped onto a global queue: the
+/// latter occupies a libdispatch worker for as long as the dial is held — and the dial that is
+/// never released holds one for the rest of the process. That is the block-a-worker
+/// antipattern this PR removes from the transport, and it should not live inside the gate.
+/// ``releaseAll()`` drains the rest at the end of a test so no continuation is left dangling.
+final class HeldDial: @unchecked Sendable {
+  private let lock = NSLock()
+  private var started = false
+  private var resumed = false
+  private var permits = 0
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  var didStart: Bool { lock.withLock { started } }
+  /// `true` once a parked ``park()`` has actually RESUMED — the point after which the connect
+  /// seam's own outcome (a live connection, or a throw) has reached the connect loop.
+  var didResume: Bool { lock.withLock { resumed } }
+
+  /// Called from inside the connect seam: mark the dial in flight, then park.
+  func park() async {
+    lock.withLock { started = true }
+    defer { lock.withLock { resumed = true } }
+    await withCheckedContinuation { (resume: CheckedContinuation<Void, Never>) in
+      let granted: Bool = lock.withLock {
+        guard permits > 0 else {
+          waiters.append(resume)
+          return false
+        }
+        permits -= 1
+        return true
+      }
+      if granted { resume.resume() }
+    }
+  }
+
+  /// Lets exactly ONE parked dial resolve (or banks a permit for the next one).
+  func release() {
+    let next: CheckedContinuation<Void, Never>? = lock.withLock {
+      guard !waiters.isEmpty else {
+        permits += 1
+        return nil
+      }
+      return waiters.removeFirst()
+    }
+    next?.resume()
+  }
+
+  /// Drains every remaining parked dial — test cleanup, so nothing is left suspended on a
+  /// continuation that will never be resumed.
+  func releaseAll() {
+    let parked: [CheckedContinuation<Void, Never>] = lock.withLock {
+      let pending = waiters
+      waiters.removeAll()
+      return pending
+    }
+    for waiter in parked { waiter.resume() }
+  }
+}
+
 /// A lock-guarded counter of connect-seam calls, so a test can fail the first N dials and
 /// succeed afterward — exercising the ``AppModel`` reconnect loop's retry-with-backoff.
 final class DialCounter: @unchecked Sendable {

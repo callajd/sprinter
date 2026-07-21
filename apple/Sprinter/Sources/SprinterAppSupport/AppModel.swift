@@ -85,19 +85,36 @@ public final class AppModel {
     while !Task.isCancelled {
       do {
         let connected = try await daemon.connect()
+        // A dial that completes AFTER `stop()` cancelled this loop still yields a LIVE
+        // connection — the dial's continuation is not cancellation-aware — and `stop()` has
+        // already inspected `backend`, so nothing else would ever close this one. Close it
+        // here: an abandoned `UnixSocketTransport` keeps its read thread parked in `read(2)`
+        // and its fd open for the life of the process. `close()` is idempotent, so racing
+        // `stop()`'s own close is harmless.
+        guard !Task.isCancelled else {
+          await connected.close()
+          break
+        }
         backend = connected
         connectionState = .connected
         // Watch the connection's liveness: `events` ends/throws when the daemon goes away
         // (a restart). Returns whether it delivered a read — a healthy connection resets
         // the backoff (so a healthy drop re-dials promptly); an accept-then-flap does not.
         let wasHealthy = await awaitDrop(connected)
-        if Task.isCancelled { break }
-        // The connection dropped: retire the dead backend and fall through to re-dial.
+        // The connection dropped (or this loop was cancelled): retire the dead backend and
+        // close it HERE, on EVERY exit, rather than leaving the cancelled path to `stop()`.
         backend = nil
         connectionState = .connecting
         await connected.close()
+        if Task.isCancelled { break }
         if wasHealthy { backoff.reset() }
       } catch {
+        // The mirror of the success case above: a dial that FAILS after `stop()` cancelled
+        // this loop must not publish that failure. `stop()` has already reset the model to
+        // `.connecting`, and there is no retry coming, so writing `.failed` here would leave
+        // a STOPPED model reporting a connection error forever. Check before the write, not
+        // after it.
+        guard !Task.isCancelled else { break }
         // The dial itself failed (daemon not up yet): surface the reason and retry.
         connectionState = .failed(reason: String(describing: error))
       }
