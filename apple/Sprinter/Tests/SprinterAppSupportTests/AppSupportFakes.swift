@@ -182,7 +182,7 @@ enum AppSupportFixtures {
   /// The repository the workstream REFERENCES — a snapshot must carry it, or the
   /// board could not resolve the reference into a name.
   static let repository = Repository(
-    id: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    id: RepositoryId(rawValue: "repo:github:1296269"),
     host: .github,
     owner: "callajd",
     name: "sprinter",
@@ -199,7 +199,7 @@ enum AppSupportFixtures {
       Workstream(
         id: WorkstreamId(rawValue: "ws-1"),
         name: "Convergence",
-        repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+        repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
         status: .active,
         epics: [EpicId(rawValue: "ep-1")])
     ],

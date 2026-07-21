@@ -50,9 +50,10 @@ import {
   PositiveInt,
   type PullRequestRef,
   type Repository,
+  type RepositoryHost,
   RepositoryId,
   RepositoryKey,
-  RepositoryRef,
+  RepositoryRefs,
   Timestamp,
 } from "@sprinter/domain";
 import {
@@ -179,20 +180,30 @@ export const hostInstant = (
 // ============================================================================
 
 /**
- * The `GET /repos/{owner}/{repo}` fields we read: the default branch, and the
- * repository's CANONICAL identity as the host itself spells it.
+ * The `GET /repos/{owner}/{repo}` fields we read: the default branch, the repository's
+ * CANONICAL natural key as the host itself spells it, and the host's own STABLE
+ * identifier for it.
  *
  * `owner.login` + `name` rather than `full_name`: the two carry the same information,
  * but the split form is already the natural key's shape, so it needs no parser and no
  * decision about what a `full_name` with more than one `/` in it would mean.
  *
- * The identity is read because GitHub's repository lookup is NOT
+ * The natural key is read because GitHub's repository lookup is NOT
  * spelling-preserving — it matches case-insensitively, and it 301-redirects a renamed
  * repository to its current path (a redirect `fetch` follows transparently). So a 200
  * confirms "a repository is here", never "it is spelled the way you asked", and the
  * only spelling that can be stored is the one in the body.
+ *
+ * `id` is GitHub's numeric repository id, and it is read for a stronger reason: it is
+ * the only field in this body that a RENAME or a TRANSFER does not change. It is what
+ * {@link repositoryIdFor} mints the domain's `RepositoryId` from, so identity survives
+ * the very event the mutable natural key does not (see {@link repositoryIdFor}). It is
+ * decoded as {@link PositiveInt} rather than a bare number: GitHub's ids are positive
+ * integers, and `0`, a negative, or a float would each mean the body is not the body we
+ * think it is, which should fail the observation rather than mint an id from it.
  */
 const GhRepo = Schema.Struct({
+  id: PositiveInt,
   default_branch: Schema.NonEmptyString,
   name: Schema.String,
   owner: Schema.Struct({ login: Schema.String }),
@@ -362,33 +373,54 @@ const DEFAULT_BASE_URL = "https://api.github.com";
 // ============================================================================
 
 /**
- * Mint the opaque {@link RepositoryId} for a repository's NATURAL key.
+ * Mint the opaque {@link RepositoryId} for a repository from the HOST's OWN STABLE
+ * IDENTIFIER — GitHub's numeric repository id (`GET /repos/…` → `id`) — scoped by the
+ * host it belongs to: `repo:github:<numeric id>`.
  *
- * It is a pure FUNCTION of the key, and it has to be: the store upserts a refresh on
- * the id while holding `(host, owner, name)` UNIQUE, so an id that varied per
- * observation would make the second observation of one repository collide with the
- * first instead of replacing it (D7).
+ * It is a deterministic function of ONE repository, and it has to be: the store upserts
+ * a refresh on the id, so an id that varied per observation would make the second
+ * observation of a repository insert a new row instead of replacing the first (D7).
  *
- * The encoding is INJECTIVE, which is the property that actually matters here and the
- * one a naive `repo-${host}-${owner}-${name}` would NOT have: `owner: "a-b", name: "c"`
- * and `owner: "a", name: "b-c"` are two different repositories that would receive one
- * id, and the store's id-keyed upsert would then let either silently overwrite the
- * other's row. The separators are chosen so no segment can contain them — `host` is a
- * closed literal, and an owner/name segment may not contain `/` (the domain rejects it)
- * and cannot contain `:` on any host Sprinter reads — so the three parts can never
- * re-split into a different triple.
+ * It is NOT a function of the natural key, and that is the whole point. The natural key
+ * `(host, owner, name)` is MUTABLE — a repository can be renamed or transferred while
+ * remaining the same repository — so an id derived from it FORKS on exactly that event:
  *
- * The key it is handed must be the HOST's canonical spelling, not a caller's: the id is
- * a function of the key, so two spellings of one repository would otherwise mint two
- * ids. `resolve` reads that spelling off the `GET /repos/…` body before calling here.
+ *   T0  `callajd/sprinter` is observed → `repo:github:callajd/sprinter`, and a
+ *       workstream's `repositoryId` points at that row.
+ *   T1  the repository is renamed to `callajd/sprint`.
+ *   T2  any new plan — under EITHER name, since GitHub's 301 lands on the canonical
+ *       one — mints `repo:github:callajd/sprint` and inserts a SECOND row.
+ *
+ * Two rows for one repository, with `UNIQUE (host, owner, name)` blind to it because
+ * the triples genuinely differ, and the original workstream left rendering a stale
+ * name. That is verbatim the failure the `Repository` entity exists to eliminate. Only
+ * the LOOKUP falls out of following the 301; identity continuity does not, and has to
+ * be bought with a rename-invariant id.
+ *
+ * The CONSEQUENCE, which the store must honour: on a rename the id is UNCHANGED while
+ * the natural key CHANGES, so `putRepository`'s id-keyed upsert must UPDATE the existing
+ * row's `host`/`owner`/`name` rather than insert a new one. It does (`ON CONFLICT (id)
+ * DO UPDATE SET` covers the key columns), and the `UNIQUE (host, owner, name)` index is
+ * satisfied because the old triple leaves the table in the same statement that adds the
+ * new one. `packages/state/src/store.test.ts` pins that.
+ *
+ * The encoding is INJECTIVE — a numeric id cannot contain the `:` separator, and `host`
+ * is a closed literal — so two repositories can never receive one id and let the
+ * id-keyed upsert silently overwrite a row.
  *
  * Nothing above this module may parse the result: it is opaque, and equality is its
- * only defined operation.
+ * only defined operation. In particular nothing may read a numeric GitHub id back out
+ * of it — that this is GitHub's id is an ADAPTER fact (INV-PORT).
  */
-export const repositoryIdFor = (key: RepositoryKey): Effect.Effect<RepositoryId, CodeHostError> =>
-  Schema.decodeUnknownEffect(RepositoryId)(`repo:${key.host}:${key.owner}/${key.name}`).pipe(
+export const repositoryIdFor = (
+  host: RepositoryHost,
+  hostId: PositiveInt,
+): Effect.Effect<RepositoryId, CodeHostError> =>
+  Schema.decodeUnknownEffect(RepositoryId)(`repo:${host}:${hostId}`).pipe(
     Effect.mapError(() =>
-      fail("resolve")({ message: `cannot derive a repository id for ${key.owner}/${key.name}` }),
+      fail("resolve")({
+        message: `cannot derive a repository id for ${host} repository ${hostId}`,
+      }),
     ),
   );
 
@@ -534,17 +566,23 @@ const make = (config: RepositoryConfig) =>
           // The CANONICAL natural key — the host's spelling, not the caller's.
           //
           // GitHub resolves `/repos/{owner}/{name}` case-INSENSITIVELY and 301-redirects
-          // a renamed repository, so `CallaJD/Sprinter`, `callajd/sprinter` and a former
-          // name all answer 200 for ONE repository. Building the record from `key` would
-          // mint one `RepositoryId` and one row PER SPELLING — two anchors for one
-          // repository, invisible to the store's `UNIQUE (host, owner, name)` because the
-          // triples genuinely differ. That is verbatim the failure the `Repository` entity
-          // exists to eliminate, so the caller's spelling is used to ASK and the host's
-          // to ANSWER, and the rename case falls out for free.
+          // a renamed repository (a redirect the HTTP client follows; pinned by a test
+          // that answers a real 301 + `Location`, since if it did NOT follow, the branch
+          // above would reject the 301 as an unexpected status). So `CallaJD/Sprinter`,
+          // `callajd/sprinter` and a former name all answer 200 for ONE repository.
+          // Building the record from `key` would store one row PER SPELLING — two anchors
+          // for one repository, invisible to the store's `UNIQUE (host, owner, name)`
+          // because the triples genuinely differ. So the caller's spelling is used to ASK
+          // and the host's to ANSWER.
           //
-          // It is re-DECODED through the owned `RepositoryKey`, not trusted: the host's
-          // strings are externally sourced like any other, and this is the boundary they
-          // cross (INV-ENFORCE).
+          // The key is re-DECODED through the owned `RepositoryKey`, not trusted: the
+          // host's strings are externally sourced like any other, and this is the
+          // boundary they cross (INV-ENFORCE).
+          //
+          // The ID, though, is minted from `repo.id` — the host's own numeric identifier
+          // — NOT from this key. Following the 301 makes the LOOKUP survive a rename; it
+          // does not make IDENTITY survive one, because the canonical key it lands on is
+          // the NEW name and a key-derived id would fork there. See `repositoryIdFor`.
           const repo = yield* response.json.pipe(
             Effect.flatMap(Schema.decodeUnknownEffect(GhRepo)),
             Effect.mapError(fail("resolve")),
@@ -554,7 +592,7 @@ const make = (config: RepositoryConfig) =>
             owner: repo.owner.login,
             name: repo.name,
           }).pipe(Effect.mapError(fail("resolve")));
-          const id = yield* repositoryIdFor(canonical);
+          const id = yield* repositoryIdFor(canonical.host, repo.id);
           const observedAt = yield* observedAtFrom(response.headers["date"], "resolve");
           // The refs are read in the SAME resolve, so the returned record describes ONE
           // moment (D7: a refresh replaces the record wholesale, never merges into it),
@@ -573,23 +611,30 @@ const make = (config: RepositoryConfig) =>
               Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(GhBranch))),
               Effect.mapError(fail("resolve")),
             );
-          // Decoded through the OWNED `RepositoryRef`, so the host's flat strings are
-          // CHECKED here: a malformed branch name or a non-canonical sha fails the
-          // observation at the boundary instead of entering the domain (INV-ENFORCE).
-          const refs = yield* Schema.decodeUnknownEffect(Schema.Array(RepositoryRef))(
-            branchRows.map((branch) => ({ name: branch.name, sha: branch.commit.sha })),
+          // Sorted, then decoded through the OWNED `RepositoryRefs`, so BOTH host-supplied
+          // rules are checked here rather than asserted: a malformed branch name or a
+          // non-canonical sha fails the observation at the boundary instead of entering
+          // the domain, and so does a ref list this adapter failed to order correctly
+          // (INV-ENFORCE). `RepositoryRefs` is branded, so there is no way to skip it —
+          // the sorted array cannot simply be assigned to `Repository.refs`.
+          //
+          // The order is the domain's `compareBranchNames` (Unicode code point), which is
+          // also the order the store reads them back in, so a round-trip cannot reorder
+          // them; JS `<` here would be UTF-16 code-unit order and would disagree with the
+          // store for a non-BMP branch name. Sorting also collapses nothing: a host that
+          // returned one branch name TWICE now fails the strict-ascending check instead
+          // of producing a record the store's composite PK would reject later.
+          const refs = yield* Schema.decodeUnknownEffect(RepositoryRefs)(
+            branchRows
+              .map((branch) => ({ name: branch.name, sha: branch.commit.sha }))
+              .sort((left, right) => compareBranchNames(left.name, right.name)),
           ).pipe(Effect.mapError(fail("resolve")));
           const repository: Repository = {
             id,
             host: canonical.host,
             owner: canonical.owner,
             name: canonical.name,
-            // Ordered by name so one observation has ONE spelling, whatever order the
-            // host paginated them in — in the domain's `compareBranchNames` (Unicode code
-            // point) order, which is also the order the store reads them back in, so a
-            // round-trip cannot reorder them. JS `<` here would be UTF-16 code-unit order
-            // and would disagree with the store for a non-BMP branch name.
-            refs: [...refs].sort((left, right) => compareBranchNames(left.name, right.name)),
+            refs,
             observedAt,
           };
           return Option.some(repository);

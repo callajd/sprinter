@@ -277,21 +277,36 @@ export interface AgentStore {
  * It upserts on the {@link Repository.id}, while the store also holds the NATURAL key
  * `(host, owner, name)` UNIQUE. Both are load-bearing and they are not redundant: the
  * id is what other rows reference (so it must be stable across refreshes), and the
- * triple is what actually identifies a repository (so two records disagreeing about
- * one repository must be unconstructible — INV-ENFORCE). The consequence for a
- * code-host adapter is stated on {@link RepositoryId}: the id it mints is a FUNCTION of
- * the natural key, or its own refresh would collide with the row it is refreshing.
+ * triple is what actually identifies a repository BY NAME (so two records disagreeing
+ * about one repository must be unconstructible — INV-ENFORCE).
+ *
+ * The two can DISAGREE, and handling that is part of this contract: the natural key is
+ * MUTABLE (a rename, a transfer) while the id an adapter mints is derived from the
+ * host's own stable identifier and is not (see {@link RepositoryId}). So a refresh
+ * after a rename arrives with the SAME id and a DIFFERENT triple, and the id-keyed
+ * upsert must UPDATE the existing row's `host`/`owner`/`name` in place rather than
+ * insert a second one. The `UNIQUE (host, owner, name)` index does not stand in the way:
+ * the old triple leaves the table in the same statement that writes the new one. A
+ * rename therefore keeps ONE row and every reference to it valid.
  *
  * Reads NEVER gate on staleness (D7). Nothing here refuses to return a repository
  * because its `observedAt` is old — staleness is RENDERED from that stamp (DE4.4), and
  * a store that hid stale records would make "how old is this?" unanswerable by removing
  * the evidence.
+ *
+ * KNOWN GAP (DE1.2): nothing in production ever calls `putRepository` a SECOND time for
+ * a given repository — new-plan materialisation is its only caller, so no record is ever
+ * refreshed and `observedAt`/`refs` freeze at first sighting. The refresh MECHANISM here
+ * is complete and tested; the TRIGGER does not exist and is out of scope for this task.
+ * DE4.4's staleness rendering needs one. See the module docstring of
+ * `packages/domain/src/repository.ts`.
  */
 export interface RepositoryStore {
   /**
-   * Upsert a {@link Repository} observation by id, REPLACING its scalar columns and
-   * its ENTIRE observed ref set (D7). Fails with {@link StateStoreError} when the
-   * record's natural key `(host, owner, name)` is already held by a DIFFERENT id —
+   * Upsert a {@link Repository} observation by id, REPLACING its scalar columns —
+   * INCLUDING the natural key, so a RENAME moves the existing row rather than adding
+   * one — and its ENTIRE observed ref set (D7). Fails with {@link StateStoreError} when
+   * the record's natural key `(host, owner, name)` is already held by a DIFFERENT id —
    * the backing's UNIQUE constraint, not a read-then-check.
    */
   readonly putRepository: (repository: Repository) => Effect.Effect<void, StateStoreError>;

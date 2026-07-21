@@ -117,7 +117,7 @@ struct BoardProjectionTests {
         Workstream(
           id: WorkstreamId(rawValue: "ws"),
           name: "W",
-          repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+          repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
           status: .active,
           epics: [EpicId(rawValue: "ep"), EpicId(rawValue: "ep-missing")])
       ],

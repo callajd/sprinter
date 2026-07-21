@@ -39,7 +39,7 @@ const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
 const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
 
 const repository = Schema.decodeUnknownEffect(Repository)({
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -83,7 +83,7 @@ it.effect("REJECTS two refs with the same (repositoryId, name) — the composite
     const rejected = probe(filename, (database) => {
       try {
         database.run(`INSERT INTO repository_ref ("repositoryId", name, sha) VALUES (?, ?, ?)`, [
-          "repo:github:callajd/sprinter",
+          "repo:github:1296269",
           "main",
           SHA_FEAT,
         ]);
@@ -103,7 +103,7 @@ it.effect("REJECTS a ref naming a repository that is not stored — the FOREIGN 
     const rejected = probe(filename, (database) => {
       try {
         database.run(`INSERT INTO repository_ref ("repositoryId", name, sha) VALUES (?, ?, ?)`, [
-          "repo:github:callajd/never-observed",
+          "repo:github:9000001",
           "main",
           SHA_MAIN,
         ]);
@@ -122,7 +122,7 @@ it.effect("CASCADES — deleting a repository removes its observed refs", () =>
     yield* seed(filename);
     const remaining = probe(filename, (database) => {
       const before = database.query(`SELECT COUNT(*) AS n FROM repository_ref`).get();
-      database.run(`DELETE FROM repository WHERE id = ?`, ["repo:github:callajd/sprinter"]);
+      database.run(`DELETE FROM repository WHERE id = ?`, ["repo:github:1296269"]);
       const after = database.query(`SELECT COUNT(*) AS n FROM repository_ref`).get();
       return { before, after };
     });
@@ -145,7 +145,7 @@ it.effect("REJECTS a workstream row naming an absent repository, at the BACKING"
       try {
         database.run(
           `INSERT INTO workstream (id, name, "repositoryId", status, epics) VALUES (?, ?, ?, ?, ?)`,
-          ["ws-orphan", "Orphan", "repo:github:callajd/never-observed", "pending", "[]"],
+          ["ws-orphan", "Orphan", "repo:github:9000001", "pending", "[]"],
         );
         return undefined;
       } catch (error) {

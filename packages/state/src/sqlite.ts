@@ -101,7 +101,8 @@ import {
   type Repository,
   RepositoryHost,
   RepositoryId,
-  RepositoryRef,
+  type RepositoryRef,
+  RepositoryRefs,
   RepositorySegment,
   Session,
   SessionEvent,
@@ -160,8 +161,17 @@ const RepositoryScalarRow = Schema.Struct({
   observedAt: Timestamp,
 });
 
-/** A single `repository_ref` row: one observed branch tip. */
-const RepositoryRefRow = RepositoryRef;
+/**
+ * The `repository_ref` rows of ONE repository, read `ORDER BY name`.
+ *
+ * It is the domain's branded {@link RepositoryRefs}, not a bare `Schema.Array` of rows,
+ * so the read is CHECKED against the same order rule a producer is: SQLite's default
+ * BINARY collation is a `memcmp` over UTF-8, which is exactly the domain's
+ * `compareBranchNames` (Unicode code point), and decoding through the brand is what
+ * makes "the store reads them back in the required order" a verified property of every
+ * read rather than a claim in a comment.
+ */
+const RepositoryRefRows = RepositoryRefs;
 
 /**
  * One row of the LEFT-JOINED repository read: a repository's scalar columns plus at
@@ -192,10 +202,16 @@ const RepositoryJoinedRow = Schema.Struct({
  * its refs arrive already in the branch-name order `Repository.refs` requires — the
  * fold appends, it never sorts. A row whose `refName` is `null` is the LEFT-join's
  * "this repository has no refs" marker and contributes nothing to the list.
+ *
+ * The accumulated list is DECODED through the branded {@link RepositoryRefs} rather
+ * than assigned: the ordering claim above rests on `ORDER BY name` matching the
+ * domain's `compareBranchNames`, and decoding is what turns that from an assertion in a
+ * comment into a check the read cannot skip. A backing whose collation ever disagreed
+ * would fail the read loudly instead of handing a mis-ordered record to every client.
  */
 const groupRepositories = (
   rows: ReadonlyArray<(typeof RepositoryJoinedRow)["Type"]>,
-): ReadonlyArray<Repository> => {
+): Effect.Effect<ReadonlyArray<Repository>, Schema.SchemaError> => {
   const refsById = new Map<string, Array<RepositoryRef>>();
   const firstRowPerRepository: Array<(typeof RepositoryJoinedRow)["Type"]> = [];
   for (const row of rows) {
@@ -209,15 +225,19 @@ const groupRepositories = (
       refs.push({ name: row.refName, sha: row.refSha });
     }
   }
-  return firstRowPerRepository.map(
-    (row): Repository => ({
-      id: row.id,
-      host: row.host,
-      owner: row.owner,
-      name: row.name,
-      refs: refsById.get(row.id) ?? [],
-      observedAt: row.observedAt,
-    }),
+  return Effect.forEach(firstRowPerRepository, (row) =>
+    Schema.decodeUnknownEffect(RepositoryRefs)(refsById.get(row.id) ?? []).pipe(
+      Effect.map(
+        (refs): Repository => ({
+          id: row.id,
+          host: row.host,
+          owner: row.owner,
+          name: row.name,
+          refs,
+          observedAt: row.observedAt,
+        }),
+      ),
+    ),
   );
 };
 
@@ -1026,7 +1046,7 @@ const make = Effect.gen(function* () {
       const base = yield* Schema.decodeUnknownEffect(RepositoryScalarRow)(row);
       const refRows =
         yield* sql`SELECT name, sha FROM repository_ref WHERE "repositoryId" = ${base.id} ORDER BY name`;
-      const refs = yield* Schema.decodeUnknownEffect(Schema.Array(RepositoryRefRow))(refRows);
+      const refs = yield* Schema.decodeUnknownEffect(RepositoryRefRows)(refRows);
       const repository: Repository = {
         id: base.id,
         host: base.host,
@@ -1049,6 +1069,15 @@ const make = Effect.gen(function* () {
     // id": the `repository_natural_key` UNIQUE index answers it atomically, on the
     // INSERT, where a concurrent racing write cannot slip between the look and the
     // leap (INV-ENFORCE). A violation surfaces as an ordinary `StateStoreError`.
+    //
+    // `DO UPDATE SET` covers the NATURAL KEY columns too, and that is deliberate rather
+    // than incidental: the id an adapter mints comes from the host's own stable
+    // identifier, so a RENAMED repository refreshes under the SAME id with a DIFFERENT
+    // `(host, owner, name)`. The conflict is on `id`, so this MOVES the existing row to
+    // the new name — one row, every reference to it still valid — and the UNIQUE index
+    // is satisfied because the old triple leaves the table in the same statement.
+    // Deriving the id from the natural key instead would make that case an INSERT, and
+    // the store would end up with two rows for one repository.
     putRepository: (repository) =>
       sql
         .withTransaction(
@@ -1108,6 +1137,16 @@ const make = Effect.gen(function* () {
     // BINARY collation (a `memcmp` over UTF-8), which is exactly the domain's
     // `compareBranchNames` (Unicode code point); the two are the same order by
     // construction, so a record's refs cannot be reordered by a store round-trip.
+    //
+    // That equivalence holds because the column is UTF-8 `TEXT` and every `BranchName`
+    // is UTF-8-encodable: `BranchName` rejects an UNPAIRED SURROGATE, which is the one
+    // JavaScript string a UTF-8 column cannot hold intact (it would be substituted or
+    // refused, taking the round-trip claim with it). The rule lives in the domain, at
+    // the boundary such a name would enter through, rather than here.
+    //
+    // The fold decodes through the branded `RepositoryRefs`, so if a backing's collation
+    // ever DID disagree, the read would fail loudly rather than hand a mis-ordered record
+    // to every client.
     listRepositories: sql`
       SELECT r.id, r.host, r.owner, r.name, r."observedAt",
              f.name AS "refName", f.sha AS "refSha"
@@ -1116,7 +1155,7 @@ const make = Effect.gen(function* () {
       ORDER BY r.id, f.name
     `.pipe(
       Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(RepositoryJoinedRow))),
-      Effect.map(groupRepositories),
+      Effect.flatMap(groupRepositories),
       Effect.mapError(fail("listRepositories")),
     ),
   };

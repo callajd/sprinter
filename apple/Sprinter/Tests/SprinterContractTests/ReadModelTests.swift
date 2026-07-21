@@ -34,7 +34,7 @@ struct ReadModelTests {
   func decodesWorkstream() throws {
     let workstream = try Golden.decode(Workstream.self, from: "workstream")
     #expect(workstream.id == WorkstreamId(rawValue: "ws-1"))
-    #expect(workstream.repositoryId == RepositoryId(rawValue: "repo:github:callajd/sprinter"))
+    #expect(workstream.repositoryId == RepositoryId(rawValue: "repo:github:1296269"))
     #expect(workstream.status == .active)
     #expect(workstream.epics == [EpicId(rawValue: "ep-1")])
     #expect(try Golden.roundTrip(workstream) == workstream)
@@ -43,7 +43,7 @@ struct ReadModelTests {
   @Test("maps repository fields, its observed refs, and its observedAt")
   func decodesRepository() throws {
     let repository = try Golden.decode(Repository.self, from: "repository")
-    #expect(repository.id == RepositoryId(rawValue: "repo:github:callajd/sprinter"))
+    #expect(repository.id == RepositoryId(rawValue: "repo:github:1296269"))
     #expect(repository.host == .github)
     #expect(repository.owner == "callajd")
     #expect(repository.name == "sprinter")

@@ -55,7 +55,7 @@ const posInt = (n: number): PositiveInt => decode(PositiveInt, n);
  * real FOREIGN KEY, so it has to be stored before anything references it.
  */
 const repository = decode(DomainRepository, {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -67,7 +67,7 @@ const workstream = (over: Partial<(typeof Workstream)["Encoded"]> = {}) =>
   decode(Workstream, {
     id: "ws-a",
     name: "Track A",
-    repositoryId: "repo:github:callajd/sprinter",
+    repositoryId: "repo:github:1296269",
     status: "active",
     epics: ["epic-1"],
     ...over,

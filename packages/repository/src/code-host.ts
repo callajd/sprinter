@@ -112,9 +112,11 @@ export type RepositoryIssue = (typeof RepositoryIssue)["Type"];
  * variant, and no staleness parameter — this port never decides that an observation is
  * too old to return.
  *
- * The returned entity's `id` is minted BY the adapter as a function of the key, so
- * re-observing one repository yields the same id (see `RepositoryId`); nothing above
- * the port may parse it.
+ * The returned entity's `id` is minted BY the adapter, as a deterministic function of
+ * the repository the host resolved the key TO — an identifier the HOST owns, never the
+ * key itself, which is mutable. So re-observing one repository yields the same id even
+ * across a RENAME, while the natural key on the returned record follows the rename (see
+ * `RepositoryId`). Nothing above the port may parse it.
  */
 export interface RepositoryOps {
   /**

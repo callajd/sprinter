@@ -42,8 +42,15 @@ public enum BoardProjection {
       }
       // The workstream carries a REFERENCE; the board shows a name. Resolve it out
       // of the snapshot's own state layer, and fall back to the raw id when the
-      // referenced record is absent — a baseline-consistent snapshot always carries
-      // it, but the projection stays total rather than dropping the workstream.
+      // referenced record is absent.
+      //
+      // The fallback is a TOTALITY guarantee, not a prediction that it never fires.
+      // The daemon builds a snapshot by reading workstreams first and repositories
+      // last, precisely so a concurrently-materialised plan cannot leave a workstream
+      // here whose repository is missing (`buildSnapshot`, `rpc-handlers.ts`) — but
+      // that is the daemon's ordering discipline, not something this projection can
+      // check, and a raw id on screen is strictly better than a dropped workstream or
+      // a force-unwrap (INV-NOFORCE).
       let repository = repositoriesById[workstream.repositoryId]
       return BoardWorkstream(
         id: workstream.id,

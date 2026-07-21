@@ -16,7 +16,7 @@ import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
-import { PositiveInt } from "@sprinter/domain";
+import { PositiveInt, RepositoryKey } from "@sprinter/domain";
 import { CLOSING_PR_QUERY } from "./github.ts";
 import {
   CodeHost,
@@ -36,15 +36,43 @@ type Route = () => Response;
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/**
+ * The fake transport FOLLOWS a redirect, exactly as a conforming `fetch` does when the
+ * caller leaves `RequestInit.redirect` at its default (`"follow"`).
+ *
+ * This is not decoration: GitHub answers a RENAMED repository's old path with a 301, and
+ * the adapter's `resolve` depends on that redirect being followed — it treats any status
+ * other than 200/404 as a host failure, so an unfollowed 301 would reject the
+ * observation outright. A route table that only ever returned the 200 a followed
+ * redirect *lands on* would assume the very thing under test. Honouring `redirect` here
+ * makes the assumption checkable: if `FetchHttpClient` (or the adapter) ever asked for
+ * `"manual"`, the 301 would reach `resolve` and the rename tests would fail rather than
+ * silently pass.
+ *
+ * The follow chain is bounded at five hops — the browser limit — so a route table with a
+ * redirect cycle fails the test rather than hanging it.
+ */
+const MAX_REDIRECTS = 5;
+
 const makeFetch = (routes: Record<string, Route>): typeof globalThis.fetch =>
   Object.assign(
-    (input: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+    (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const href = input instanceof URL ? input.href : input instanceof Request ? input.url : input;
-      const path = new URL(href).pathname;
-      const route = routes[path];
-      return Promise.resolve(
-        route === undefined ? new Response("not found", { status: 404 }) : route(),
-      );
+      let url = new URL(href);
+      for (let hop = 0; ; hop += 1) {
+        const route = routes[url.pathname];
+        if (route === undefined) return Promise.resolve(new Response("not found", { status: 404 }));
+        const response = route();
+        const location = response.headers.get("location");
+        const follows = init?.redirect === undefined || init.redirect === "follow";
+        if (!follows || response.status < 300 || response.status >= 400 || location === null) {
+          return Promise.resolve(response);
+        }
+        if (hop >= MAX_REDIRECTS) {
+          return Promise.reject(new Error("too many redirects"));
+        }
+        url = new URL(location, url);
+      }
     },
     { preconnect: globalThis.fetch.preconnect },
   );
@@ -104,7 +132,12 @@ it.effect("reads the default branch and detects branch existence (present / abse
     Effect.provide(
       backend({
         "/repos/callajd/sprinter": () =>
-          json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+          json({
+            id: 1296269,
+            default_branch: "main",
+            name: "sprinter",
+            owner: { login: "callajd" },
+          }),
         "/repos/callajd/sprinter/branches/main": () => json({ name: "main" }),
       }),
     ),
@@ -461,36 +494,50 @@ it.effect("the transport seam is satisfiable by a fake HttpClient", () =>
 // RepositoryOps — observing the owned `Repository` entity (DE1.2)
 // ============================================================================
 
-const KEY = { host: "github", owner: "callajd", name: "sprinter" } as const;
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain string literal is
+ * not one and the tests have to obtain a key the same way production does.
+ */
+const key = (owner: string, name: string): RepositoryKey =>
+  Schema.decodeUnknownSync(RepositoryKey)({ host: "github", owner, name });
+
+const KEY = key("callajd", "sprinter");
 const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
 const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
+
+/** GitHub's own numeric id for the fixture repository — what the adapter mints from. */
+const GH_ID = num(1296269);
 
 /**
  * A canned repository route pair (the repo itself + its branches), optionally under a
  * host `Date` response header — the instant the adapter reads `observedAt` from.
  *
  * The repo body carries the CANONICAL identity (`owner.login` + `name`) because that is
- * what the adapter builds the record from — GitHub's lookup is case-insensitive and
- * follows renames, so the caller's spelling is only ever the question.
+ * what the adapter builds the record's natural key from — GitHub's lookup is
+ * case-insensitive and follows renames, so the caller's spelling is only ever the
+ * question — and the numeric `id`, which is what the adapter mints `RepositoryId` from.
  */
-const repoRoutes = (date?: string): Record<string, Route> => ({
-  "/repos/callajd/sprinter": () =>
-    new Response(
-      JSON.stringify({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
-      {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          ...(date === undefined ? {} : { date }),
+const repoRoutes = (date?: string, options?: { readonly name?: string }): Record<string, Route> => {
+  const name = options?.name ?? "sprinter";
+  return {
+    [`/repos/callajd/${name}`]: () =>
+      new Response(
+        JSON.stringify({ id: GH_ID, default_branch: "main", name, owner: { login: "callajd" } }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            ...(date === undefined ? {} : { date }),
+          },
         },
-      },
-    ),
-  "/repos/callajd/sprinter/branches": () =>
-    json([
-      { name: "main", commit: { sha: SHA_MAIN } },
-      { name: "feat/x-1", commit: { sha: SHA_FEAT } },
-    ]),
-});
+      ),
+    [`/repos/callajd/${name}/branches`]: () =>
+      json([
+        { name: "main", commit: { sha: SHA_MAIN } },
+        { name: "feat/x-1", commit: { sha: SHA_FEAT } },
+      ]),
+  };
+};
 
 it.effect("resolves a repository into the owned entity, refs and all", () =>
   Effect.gen(function* () {
@@ -505,9 +552,9 @@ it.effect("resolves a repository into the owned entity, refs and all", () =>
       { name: "feat/x-1", sha: SHA_FEAT },
       { name: "main", sha: SHA_MAIN },
     ]);
-    // The id is a FUNCTION of the natural key — a refresh must land on the same row,
-    // not collide with it (the store holds the triple UNIQUE).
-    expect(resolved.id).toBe(yield* repositoryIdFor(KEY));
+    // The id is a deterministic function of the HOST's own stable identifier for the
+    // repository — a refresh must land on the same row, not insert a second one.
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
     expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
   }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT")))),
 );
@@ -520,22 +567,27 @@ it.effect("resolves a repository into the owned entity, refs and all", () =>
 // the failure the entity exists to eliminate.
 it.effect("canonicalises the natural key — two spellings converge on ONE id and ONE record", () =>
   Effect.gen(function* () {
-    const resolve = (key: { host: "github"; owner: string; name: string }) =>
+    const resolve = (asked: RepositoryKey) =>
       Effect.gen(function* () {
         const host = yield* CodeHost;
-        return Option.getOrThrow(yield* host.repositories.resolve(key));
+        return Option.getOrThrow(yield* host.repositories.resolve(asked));
       }).pipe(
         Effect.provide(
           backend({
             // The host answers the MIS-CASED path too, with its own spelling in the body.
             "/repos/CallaJD/Sprinter": () =>
-              json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+              json({
+                id: GH_ID,
+                default_branch: "main",
+                name: "sprinter",
+                owner: { login: "callajd" },
+              }),
             ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
           }),
         ),
       );
 
-    const asked = yield* resolve({ host: "github", owner: "CallaJD", name: "Sprinter" });
+    const asked = yield* resolve(key("CallaJD", "Sprinter"));
     const canonical = yield* resolve(KEY);
     // ONE id, and ONE natural key — so ONE row, and the UNIQUE constraint can see it.
     expect(asked.id).toBe(canonical.id);
@@ -545,30 +597,69 @@ it.effect("canonicalises the natural key — two spellings converge on ONE id an
   }),
 );
 
-// The same mechanism handles a RENAME for free: GitHub 301-redirects an old path to the
-// repository's current one and `fetch` follows it, so the 200 that comes back describes
-// a repository with a DIFFERENT name than the one asked for. Only the body can say so.
-it.effect("follows a RENAME to the canonical name (the redirect target's spelling)", () =>
+// N7 — a REAL 301, not a stand-in for one. GitHub answers a renamed repository's old
+// path with `301 Moved Permanently` + `Location`, and `resolve` treats every status
+// other than 200/404 as a host failure — so "the HTTP client follows the redirect" is a
+// load-bearing assumption of the rename path, and this is where it is verified. If the
+// transport ever stopped following (a `redirect: "manual"` anywhere in the stack), the
+// 301 would reach `resolve`'s unexpected-status branch and this test would fail.
+it.effect("follows a real 301 to the canonical name (the redirect target's spelling)", () =>
   Effect.gen(function* () {
     const host = yield* CodeHost;
     const resolved = Option.getOrThrow(
-      yield* host.repositories.resolve({ host: "github", owner: "callajd", name: "old-name" }),
+      yield* host.repositories.resolve(key("callajd", "old-name")),
     );
     expect(resolved.name).toBe("sprinter");
-    expect(resolved.id).toBe(yield* repositoryIdFor(KEY));
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
     // The refs were read from the CANONICAL path, so they are the renamed repository's.
     expect(resolved.refs.map((ref) => ref.name)).toStrictEqual(["feat/x-1", "main"]);
   }).pipe(
     Effect.provide(
       backend({
-        // What a followed 301 looks like to the client: a 200 whose body names the
-        // repository's CURRENT path.
         "/repos/callajd/old-name": () =>
-          json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+          new Response(null, {
+            status: 301,
+            headers: { location: "https://api.github.com/repos/callajd/sprinter" },
+          }),
         ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
       }),
     ),
   ),
+);
+
+// B1 (round 2) — identity must survive a RENAME, and following the 301 is NOT what buys
+// that. The redirect makes the LOOKUP survive; it lands on the repository's NEW natural
+// key, so an id derived from that key would change with it: the repository would acquire
+// a SECOND row under the new name while every existing `Workstream.repositoryId` still
+// pointed at the old one, with `UNIQUE (host, owner, name)` blind to it because the
+// triples genuinely differ. Deriving the id from the host's own numeric id — the one
+// field a rename does not touch — is what makes the two observations ONE repository.
+it.effect("a RENAME keeps the SAME id while the natural key changes", () =>
+  Effect.gen(function* () {
+    const observe = (askedName: string, routes: Record<string, Route>) =>
+      Effect.gen(function* () {
+        const host = yield* CodeHost;
+        return Option.getOrThrow(yield* host.repositories.resolve(key("callajd", askedName)));
+      }).pipe(Effect.provide(backend(routes)));
+
+    // T0 — observed under its original name.
+    const before = yield* observe("sprinter", repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"));
+    // T1/T2 — renamed upstream; the old path now 301s to the new one, and the same
+    // numeric id comes back under the new name.
+    const after = yield* observe("sprinter", {
+      "/repos/callajd/sprinter": () =>
+        new Response(null, {
+          status: 301,
+          headers: { location: "https://api.github.com/repos/callajd/sprint" },
+        }),
+      ...repoRoutes("Tue, 21 Jul 2026 09:30:00 GMT", { name: "sprint" }),
+    });
+
+    expect(before.name).toBe("sprinter");
+    expect(after.name).toBe("sprint");
+    // The natural key moved; the identity did NOT.
+    expect(after.id).toBe(before.id);
+  }),
 );
 
 // N2 — `resolve`'s non-200/non-404 branch. 404 is INFORMATION (below); every other
@@ -723,11 +814,15 @@ it.effect("a malformed host Date WITH a leap second FAILS the observation, never
 
 // The id encoding must be INJECTIVE, or two different repositories would share one id
 // and the store's id-keyed upsert would let either silently overwrite the other's row.
-// `a-b/c` and `a/b-c` are the pair a `-`-joined encoding would collapse.
-it.effect("mints DISTINCT ids for repositories a naive encoding would collide", () =>
+// Two different repositories on one host have two different numeric ids, and a numeric
+// id cannot contain the `:` separator, so the encoding cannot re-split.
+it.effect("mints DISTINCT ids for distinct repositories, and is deterministic", () =>
   Effect.gen(function* () {
-    const left = yield* repositoryIdFor({ host: "github", owner: "a-b", name: "c" });
-    const right = yield* repositoryIdFor({ host: "github", owner: "a", name: "b-c" });
+    const left = yield* repositoryIdFor("github", num(1296269));
+    const right = yield* repositoryIdFor("github", num(1296270));
     expect(left).not.toBe(right);
+    // Deterministic: the same repository always mints the same id, which is what lets a
+    // refresh land on the row it already has (D7).
+    expect(yield* repositoryIdFor("github", num(1296269))).toBe(left);
   }),
 );

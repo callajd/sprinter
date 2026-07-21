@@ -24,20 +24,44 @@
  * refresh REPLACES the record wholesale under a new `observedAt` (D7) rather than
  * merging fields into it, so a record always describes one coherent moment.
  *
- * ## The natural key is `(host, owner, name)`
+ * ## KNOWN GAP: nothing REFRESHES a record after it is first created
  *
- * {@link RepositoryId} is opaque; {@link RepositoryKey} is what actually identifies a
- * repository, and the store holds that triple UNIQUE. Two records disagreeing about
- * the same repository is therefore unconstructible rather than merely unlikely, which
- * is what makes a code host's resolve deterministic by construction instead of by
- * convention (INV-ENFORCE).
+ * Stated plainly rather than implied away. As of DE1.2 the ONLY production caller of
+ * `putRepository` is new-plan materialisation (`createWorkstreamFromPlan`), so a
+ * repository is observed when a workstream is first anchored to it and NEVER AGAIN:
+ * `observedAt` and `refs` freeze at that first sighting. The mechanism a refresh needs
+ * exists and is tested — `resolve` re-observes and `putRepository` replaces wholesale
+ * (D7) — but nothing TRIGGERS it: no poll, no timer, no invalidation. `tipOf` and
+ * `repositoryKey` are exported for the readers that will follow and have no production
+ * caller yet.
+ *
+ * The consequence is concrete and belongs to DE4.4, which renders staleness from
+ * `observedAt`: with no refresh trigger every record renders as monotonically ageing,
+ * so DE4.4 cannot land honestly until a trigger exists. That constraint is recorded
+ * against DE4.4 in `docs/plan/domain-remodel.md`. Building the trigger is deliberately
+ * NOT part of this task.
+ *
+ * ## The natural key is `(host, owner, name)`; the ID is the HOST's own
+ *
+ * {@link RepositoryKey} is what a human or a client NAMES a repository by, and the
+ * store holds that triple UNIQUE, so two records disagreeing about one repository is
+ * unconstructible rather than merely unlikely (INV-ENFORCE).
+ *
+ * But the triple is MUTABLE — a repository can be renamed or transferred — so it
+ * cannot be what an id is derived from. {@link RepositoryId} is derived instead from
+ * the STABLE identifier the host itself assigns (GitHub's numeric repository id),
+ * which a rename does not change. That is what makes identity survive a rename: the
+ * row keeps its id and its `host`/`owner`/`name` columns are UPDATED in place, rather
+ * than a second row appearing under the new name while every existing
+ * `Workstream.repositoryId` still points at the old one. Minting the id from the
+ * natural key would fork identity on exactly the event the natural key exists to
+ * survive.
  *
  * The UNIQUE constraint can only see a collision between IDENTICAL triples, so the
- * triple that reaches it must be the HOST's canonical spelling, never the caller's:
- * `CallaJD/Sprinter` and `callajd/sprinter` name one repository on GitHub, and storing
- * each caller's spelling verbatim would produce two triples that genuinely differ and
- * two anchors for one repository — precisely the failure this entity exists to
- * eliminate. Canonicalisation is therefore the ADAPTER's obligation (INV-PORT): a
+ * triple that reaches it must still be the HOST's canonical spelling, never the
+ * caller's: `CallaJD/Sprinter` and `callajd/sprinter` name one repository on GitHub,
+ * and storing each caller's spelling verbatim would produce two triples that genuinely
+ * differ. Canonicalisation is therefore the ADAPTER's obligation (INV-PORT): a
  * `CodeHost` builds the record, and mints its id, from the identity the host reports
  * for the key it was asked about.
  *
@@ -68,12 +92,23 @@ export type RepositoryHost = (typeof RepositoryHost)["Type"];
  * digits, `.`, `_` and `-`, one or more of them.
  *
  * This is an ALLOW-list, and deliberately a SUPERSET of what any code host actually
- * permits (GitHub allows exactly this set for a repository name and a strict subset of
- * it for an owner). An allow-list is the only form that closes this hole once: a
- * deny-list of "the characters that were dangerous last time" is a list somebody has to
- * keep complete, and the segment is CLIENT-SUPPLIED — it arrives on `WorkstreamPlan`
- * off the RPC surface and is interpolated into an AUTHENTICATED request path by the
- * code-host adapter.
+ * permits (GitHub allows exactly this set for a repository NAME and a strict subset of
+ * it for an OWNER — no `.`, no leading/trailing `-`). An allow-list is the only form
+ * that closes this hole once: a deny-list of "the characters that were dangerous last
+ * time" is a list somebody has to keep complete, and the segment is CLIENT-SUPPLIED —
+ * it arrives on `WorkstreamPlan` off the RPC surface and is interpolated into an
+ * AUTHENTICATED request path by the code-host adapter.
+ *
+ * The superset is INTENDED, not a gap to be tightened later. This module is a pure
+ * description of shape and knows nothing about GitHub (INV-PORT), so encoding GitHub's
+ * exact owner grammar here would put a host's rules in the one place that must survive
+ * a SECOND host adapter — and the next host's grammar will differ. What this rule owes
+ * is that a segment cannot mean anything to the transports it is interpolated into and
+ * cannot make the natural key ambiguous; deciding whether `--x` is a legal owner is the
+ * HOST's job, and the host answers it with a 404 that {@link Repository} already models
+ * as "no such repository". Narrowing per-host would trade a correct rejection the host
+ * gives us for a rule the domain would then have to keep in sync with someone else's
+ * product.
  */
 const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
@@ -102,8 +137,17 @@ const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
  *
  * Both rules are SCHEMA constraints, so a segment that violates either cannot be
  * CONSTRUCTED — the rejection happens on DECODE, at the RPC boundary, before any
- * adapter sees the value. Checking it in the adapter instead would leave the guarantee
- * to whichever call site remembered to look.
+ * adapter sees the value (asserted end-to-end in `packages/daemon/src/acceptance.test.ts`,
+ * which drives `owner: ".."` over the REAL serialized socket and asserts the `CodeHost`
+ * was never asked). Checking it in the adapter instead would leave the guarantee to
+ * whichever call site remembered to look.
+ *
+ * It is BRANDED for the same reason {@link CommitSha} and {@link BranchName} are: the
+ * check is only load-bearing if a plain `string` cannot stand in for a checked one.
+ * Without the brand `RepositoryKey["Type"].owner` is `string`, and
+ * `resolve({ host: "github", owner: "..", name: "user" })` typechecks anywhere in the
+ * tree — the rule above would then be enforced only on the paths that happen to decode.
+ * With it, the ONLY way to obtain a segment is to decode one.
  */
 export const RepositorySegment = Schema.NonEmptyString.check(
   Schema.makeFilter(
@@ -113,7 +157,7 @@ export const RepositorySegment = Schema.NonEmptyString.check(
         "a repository owner/name segment: one or more of [A-Za-z0-9._-], and neither '.' nor '..'",
     },
   ),
-);
+).pipe(Schema.brand("RepositorySegment"));
 export type RepositorySegment = (typeof RepositorySegment)["Type"];
 
 /**
@@ -180,14 +224,17 @@ export const compareBranchNames = (left: string, right: string): number => {
   return leftPoints.length - rightPoints.length;
 };
 
-/** True when no two refs in `refs` share a branch name. */
-const hasDistinctNames = (refs: ReadonlyArray<RepositoryRef>): boolean =>
-  new Set(refs.map((ref) => ref.name)).size === refs.length;
-
 /**
- * True when `refs` is in {@link compareBranchNames} order. Strict (`< 0`, not `<= 0`),
- * so it also rejects the adjacent-duplicate case rather than leaning on
- * {@link hasDistinctNames} to catch it.
+ * True when `refs` is in STRICTLY ascending {@link compareBranchNames} order.
+ *
+ * This is ONE rule, not two. Strictness (`< 0`, not `<= 0`) means it SUBSUMES
+ * distinctness: in a sorted list equal names are adjacent, so a repeated name is
+ * exactly an adjacent pair comparing `=== 0`, which this already rejects. A separate
+ * "no duplicates" filter beside it would be redundant and, worse, would present as an
+ * independent guarantee a reader might rely on if the order rule were ever relaxed.
+ * Uniqueness is ALSO unconstructible in the store, by `repository_ref`'s composite
+ * PRIMARY KEY — that one is genuinely independent, because it holds against a writer
+ * that never went through this schema.
  */
 const isSortedByName = (refs: ReadonlyArray<RepositoryRef>): boolean =>
   refs.every(
@@ -195,11 +242,35 @@ const isSortedByName = (refs: ReadonlyArray<RepositoryRef>): boolean =>
   );
 
 /**
+ * The observed ref LIST of a {@link Repository}: strictly ascending in
+ * {@link compareBranchNames} order, hence also free of repeated names.
+ *
+ * It is BRANDED, and the brand is what makes the check load-bearing rather than
+ * decorative. The filter is a runtime rule, and every producer in the tree — the GitHub
+ * adapter, both store readers — assembles a `Repository` as a typed OBJECT LITERAL, at
+ * which no schema runs. Unbranded, `refs` would be a plain `ReadonlyArray<RepositoryRef>`
+ * and a mis-sorted literal would typecheck and construct fine, only failing later on
+ * ENCODE — inside a `Snapshot` response, i.e. breaking every connected client rather
+ * than the producer. Branded, the only way to obtain the field's type is to DECODE, so a
+ * mis-sorted list fails where it is built.
+ */
+export const RepositoryRefs = Schema.Array(RepositoryRef)
+  .check(
+    Schema.makeFilter((refs: ReadonlyArray<RepositoryRef>) => isSortedByName(refs), {
+      expected:
+        "a ref list strictly ascending by branch name (Unicode code point order), hence with no repeated name",
+    }),
+  )
+  .pipe(Schema.brand("RepositoryRefs"));
+export type RepositoryRefs = (typeof RepositoryRefs)["Type"];
+
+/**
  * A repository as observed on a code host — `{ id, host, owner, name, refs,
  * observedAt }`.
  *
- * - `id` — the opaque {@link RepositoryId}. Nothing parses it; the natural key
- *   identifies the repository (see the module docstring).
+ * - `id` — the opaque {@link RepositoryId}, minted by the adapter from the host's own
+ *   STABLE identifier so a rename does not fork it. Nothing parses it; a human names a
+ *   repository by the natural key (see the module docstring).
  * - `host` / `owner` / `name` — the natural key, inline. It is spelled out here rather
  *   than nested as a {@link RepositoryKey} because these are the entity's own columns
  *   and the `UNIQUE` constraint is over exactly them.
@@ -208,14 +279,15 @@ const isSortedByName = (refs: ReadonlyArray<RepositoryRef>): boolean =>
  *   deliberate: a record schema SELECTS the keys its key-schema matches, so a
  *   malformed branch name would be silently DROPPED on decode instead of rejecting the
  *   observation — the opposite of what {@link BranchName} exists for. As a list, every
- *   entry is decoded and a bad one fails loudly. Its names are DISTINCT, and it is
- *   ORDERED by {@link compareBranchNames} (Unicode code point, the order the store's
- *   `ORDER BY name` yields) — both CHECKED here rather than merely documented, so a
- *   producer that sorts differently fails to construct the record instead of shipping
- *   an order the next round-trip through the store would silently change. Uniqueness is
- *   additionally unconstructible in the store, by the `repository_ref` composite PRIMARY
- *   KEY (INV-ENFORCE). An EMPTY list is VALID: it means nothing has been observed yet,
- *   not that the repository has no branches.
+ *   entry is decoded and a bad one fails loudly. It is STRICTLY ORDERED by
+ *   {@link compareBranchNames} (Unicode code point, the order the store's `ORDER BY name`
+ *   yields), which also makes its names distinct — one rule, CHECKED here rather than
+ *   merely documented, and {@link RepositoryRefs}' brand is what forces a producer
+ *   through that check instead of past it, so a producer that sorts differently fails to
+ *   BUILD the record rather than shipping an order the next round-trip through the store
+ *   would silently change. Uniqueness is additionally unconstructible in the store, by
+ *   the `repository_ref` composite PRIMARY KEY (INV-ENFORCE). An EMPTY list is VALID: it
+ *   means nothing has been observed yet, not that the repository has no branches.
  * - `observedAt` — when this snapshot was taken (INV-OBSERVED). See the module
  *   docstring: rendered as staleness, never enforced.
  *
@@ -228,14 +300,7 @@ export const Repository = Schema.Struct({
   host: RepositoryHost,
   owner: RepositorySegment,
   name: RepositorySegment,
-  refs: Schema.Array(RepositoryRef).check(
-    Schema.makeFilter((refs: ReadonlyArray<RepositoryRef>) => hasDistinctNames(refs), {
-      expected: "a ref list with no repeated branch name",
-    }),
-    Schema.makeFilter((refs: ReadonlyArray<RepositoryRef>) => isSortedByName(refs), {
-      expected: "a ref list ordered by branch name (Unicode code point order)",
-    }),
-  ),
+  refs: RepositoryRefs,
   observedAt: Timestamp,
 });
 export type Repository = (typeof Repository)["Type"];
@@ -251,11 +316,14 @@ export const repositoryKey = (repository: Repository): RepositoryKey => ({
  * The commit a branch's tip pointed at when `repository` was observed, or `undefined`
  * when that branch was not among the observed refs.
  *
- * This is the ONE reader of `refs`, and it is why `refs` is a map in spirit even
- * though it is a list on the wire: "what is the tip of `main`?" is the question every
- * downstream staleness computation asks (DE2.3's `tipOf(pr.target) ≠ pr.base`).
- * Absence is `undefined` and means exactly "not observed" — never "the branch does not
- * exist", which only the code host can say.
+ * This is the one place `refs` is LOOKED UP by name (as opposed to built or persisted
+ * whole), and it is why `refs` is a map in spirit even though it is a list on the wire:
+ * "what is the tip of `main`?" is the question every downstream staleness computation
+ * asks (DE2.3's `tipOf(pr.target) ≠ pr.base`). Absence is `undefined` and means exactly
+ * "not observed" — never "the branch does not exist", which only the code host can say.
+ *
+ * It has NO production caller as of DE1.2 — DE2.3's staleness computation is the reader
+ * it exists for (see the module docstring's KNOWN GAP).
  */
 export const tipOf = (repository: Repository, branch: BranchName): CommitSha | undefined =>
   repository.refs.find((ref) => ref.name === branch)?.sha;

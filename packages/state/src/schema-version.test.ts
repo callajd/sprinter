@@ -28,7 +28,7 @@ const dbFile = Effect.acquireRelease(
 ).pipe(Effect.map((dir) => join(dir, "state.db")));
 
 const repository = Schema.decodeUnknownEffect(Repository)({
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -40,7 +40,7 @@ const repository = Schema.decodeUnknownEffect(Repository)({
 const anchoredWorkstream = Schema.decodeUnknownEffect(Workstream)({
   id: "ws-a",
   name: "Track A",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: [],
 }).pipe(Effect.orDie);

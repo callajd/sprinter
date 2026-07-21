@@ -7,6 +7,7 @@ import {
   Repository,
   RepositoryKey,
   repositoryKey,
+  RepositoryRefs,
   tipOf,
 } from "./repository.ts";
 
@@ -157,11 +158,12 @@ it.effect("rejects an observation whose refs carry a malformed name or sha", () 
   ),
 );
 
-// A branch appears AT MOST ONCE in one repository's observed refs. The store makes
-// this unconstructible with a composite PRIMARY KEY; the schema states it too, so a
-// value that never reaches the store (a wire payload, a fixture) cannot carry it
-// either.
-it.effect("rejects a ref list repeating a branch name", () =>
+// A branch appears AT MOST ONCE in one repository's observed refs — and that falls out
+// of the ORDER rule rather than being a second, independent filter: the order is
+// STRICTLY ascending, so a repeated name is an adjacent pair comparing equal, which
+// strictness already rejects. (The store makes it unconstructible independently, with a
+// composite PRIMARY KEY that holds against a writer which never saw this schema.)
+it.effect("rejects a ref list repeating a branch name (subsumed by the strict order)", () =>
   Effect.gen(function* () {
     const exit = yield* Effect.exit(
       decode({
@@ -181,18 +183,29 @@ it.effect("rejects a ref list repeating a branch name", () =>
 // adapter, and the store's `ORDER BY name`) can drift apart and nothing notices. The
 // order is `compareBranchNames` — Unicode code point, which is what SQLite's default
 // BINARY collation yields over UTF-8, so a record cannot be reordered by a round-trip.
+//
+// The check runs on DECODE, and `RepositoryRefs` is BRANDED so decode is the only way
+// to obtain the field's type — which is what makes "a mis-sorted producer fails to
+// BUILD the record" true rather than "fails to encode it, inside somebody else's
+// `Snapshot` response". The type-level half of that is enforced by the gate's
+// `check:types`; this is its runtime half, asserted on `RepositoryRefs` directly as well
+// as through `Repository`, since the brand is what a producer must go through.
 it.effect("rejects a ref list that is not ordered by branch name", () =>
   Effect.gen(function* () {
-    const exit = yield* Effect.exit(
-      decode({
-        ...wire,
-        refs: [
-          { name: "main", sha: shaMain },
-          { name: "feat/x-1", sha: shaFeat },
-        ],
-      }),
-    );
-    expect(Exit.isFailure(exit)).toBe(true);
+    const misSorted = [
+      { name: "main", sha: shaMain },
+      { name: "feat/x-1", sha: shaFeat },
+    ];
+    expect(Exit.isFailure(yield* Effect.exit(decode({ ...wire, refs: misSorted })))).toBe(true);
+    expect(
+      Exit.isFailure(yield* Effect.exit(Schema.decodeUnknownEffect(RepositoryRefs)(misSorted))),
+    ).toBe(true);
+    // …and the positive control: the same pair, sorted, decodes.
+    expect(
+      (yield* Schema.decodeUnknownEffect(RepositoryRefs)([...misSorted].reverse())).map(
+        (ref) => ref.name,
+      ),
+    ).toStrictEqual(["feat/x-1", "main"]);
   }),
 );
 

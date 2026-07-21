@@ -25,6 +25,7 @@ import {
   Job,
   Repository,
   RepositoryId,
+  RepositoryKey,
   Session,
   Workstream,
 } from "@sprinter/domain";
@@ -44,12 +45,19 @@ import {
 const decode = <S extends Schema.Top>(schema: S, raw: S["Encoded"]) =>
   Schema.decodeUnknownEffect(schema)(raw).pipe(Effect.orDie);
 
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain object literal is
+ * not a `RepositoryKey`.
+ */
+const repositoryKey = (owner: string, name: string): RepositoryKey =>
+  Schema.decodeUnknownSync(RepositoryKey)({ host: "github", owner, name });
+
 const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
 const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
 
 const repository = (over: Partial<(typeof Repository)["Encoded"]> = {}) =>
   decode(Repository, {
-    id: "repo:github:callajd/sprinter",
+    id: "repo:github:1296269",
     host: "github",
     owner: "callajd",
     name: "sprinter",
@@ -73,7 +81,7 @@ const workstream = (over: Partial<(typeof Workstream)["Encoded"]> = {}) =>
   decode(Workstream, {
     id: "ws-a",
     name: "Track A",
-    repositoryId: "repo:github:callajd/sprinter",
+    repositoryId: "repo:github:1296269",
     status: "active",
     epics: ["epic-1"],
     ...over,
@@ -595,11 +603,7 @@ it.effect("round-trips a repository observation, refs and all", () =>
     // path a caller holding a plan (and no id) takes.
     expect(
       Option.getOrThrow(
-        yield* store.repositories.findRepository({
-          host: "github",
-          owner: "callajd",
-          name: "sprinter",
-        }),
+        yield* store.repositories.findRepository(repositoryKey("callajd", "sprinter")),
       ),
     ).toStrictEqual(repo);
     expect(yield* store.repositories.listRepositories).toStrictEqual([repo]);
@@ -612,14 +616,10 @@ it.effect("round-trips a repository observation, refs and all", () =>
 it.effect("answers Option.none for a repository that was never observed", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
-    const id = yield* Schema.decodeUnknownEffect(RepositoryId)("repo:github:nobody/nothing");
+    const id = yield* Schema.decodeUnknownEffect(RepositoryId)("repo:github:9000002");
     expect(yield* store.repositories.getRepository(id)).toStrictEqual(Option.none());
     expect(
-      yield* store.repositories.findRepository({
-        host: "github",
-        owner: "nobody",
-        name: "nothing",
-      }),
+      yield* store.repositories.findRepository(repositoryKey("nobody", "nothing")),
     ).toStrictEqual(Option.none());
   }).pipe(Effect.provide(layerMemory)),
 );
@@ -664,6 +664,55 @@ it.effect("a refresh REPLACES the record wholesale and advances observedAt", () 
   }).pipe(Effect.provide(layerMemory)),
 );
 
+// B1 (round 2) — a RENAME. The `RepositoryId` a code-host adapter mints comes from the
+// host's own STABLE identifier, so a renamed repository keeps its id while its natural
+// key changes. That combination is the one the store has to get right: the id-keyed
+// upsert must UPDATE the existing row's `host`/`owner`/`name` in place, not insert a
+// second row — and the `UNIQUE (host, owner, name)` index must not stand in its way,
+// since the old triple leaves the table in the same statement that writes the new one.
+//
+// If the id were derived from the natural key instead, T1 would mint a DIFFERENT id and
+// this would be two rows, with the workstream below still bound to the first.
+it.effect("a RENAME updates the SAME row in place and keeps the workstream resolvable", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const before = yield* repository();
+    yield* store.repositories.putRepository(before);
+    // A workstream anchored to it — the reference that must survive the rename.
+    const anchored = yield* workstream({ repositoryId: before.id });
+    yield* store.workGraph.putWorkstream(anchored);
+
+    // The repository is renamed upstream; the next observation carries the SAME id and
+    // the NEW name.
+    const after = yield* repository({
+      name: "sprint",
+      observedAt: "2026-07-21T09:30:00.000Z",
+    });
+    expect(after.id).toBe(before.id);
+    yield* store.repositories.putRepository(after);
+
+    // ONE row, under the NEW name.
+    const stored = yield* store.repositories.listRepositories;
+    expect(stored).toStrictEqual([after]);
+    expect(stored[0]?.name).toBe("sprint");
+    // The old natural key no longer resolves; the new one does, to the same record.
+    expect(yield* store.repositories.findRepository(repositoryKey("callajd", "sprinter"))).toEqual(
+      Option.none(),
+    );
+    expect(
+      Option.getOrThrow(
+        yield* store.repositories.findRepository(repositoryKey("callajd", "sprint")),
+      ).id,
+    ).toBe(before.id);
+    // And the workstream's reference still resolves — it was never invalidated.
+    const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(anchored.id));
+    expect(persisted.repositoryId).toBe(before.id);
+    expect(
+      Option.getOrThrow(yield* store.repositories.getRepository(persisted.repositoryId)).name,
+    ).toBe("sprint");
+  }).pipe(Effect.provide(layerMemory)),
+);
+
 // D3 — the NATURAL KEY is UNIQUE, and it is the BACKING that says so. Two rows for
 // one repository is "two records disagreeing about the same thing"; a resolve-time
 // read-then-check would let a concurrent or reordered write straight past it.
@@ -671,7 +720,7 @@ it.effect("REJECTS a second repository row for the same (host, owner, name)", ()
   Effect.gen(function* () {
     const store = yield* StateStore;
     yield* store.repositories.putRepository(yield* repository());
-    const duplicate = yield* repository({ id: "repo:github:callajd/sprinter#2" });
+    const duplicate = yield* repository({ id: "repo:github:1296269#2" });
     // `flip` makes the REJECTION the success: a write that succeeded would flip into
     // the error channel and fail the test rather than pass it.
     const rejected = yield* store.repositories.putRepository(duplicate).pipe(Effect.flip);
@@ -690,7 +739,7 @@ it.effect("REJECTS a ref list repeating a branch name before it can reach the st
   Effect.gen(function* () {
     const exit = yield* Effect.exit(
       Schema.decodeUnknownEffect(Repository)({
-        id: "repo:github:callajd/sprinter",
+        id: "repo:github:1296269",
         host: "github",
         owner: "callajd",
         name: "sprinter",
@@ -712,7 +761,7 @@ it.effect("REJECTS a ref list repeating a branch name before it can reach the st
 it.effect("REJECTS a workstream whose repositoryId names no stored repository", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;
-    const orphan = yield* workstream({ repositoryId: "repo:github:callajd/never-observed" });
+    const orphan = yield* workstream({ repositoryId: "repo:github:9000001" });
     const rejected = yield* store.workGraph.putWorkstream(orphan).pipe(Effect.flip);
     expect(rejected).toBeInstanceOf(StateStoreError);
     expect(rejected.operation).toBe("putWorkstream");

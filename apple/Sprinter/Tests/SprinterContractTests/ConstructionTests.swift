@@ -22,7 +22,7 @@ struct ConstructionTests {
     let built = Workstream(
       id: WorkstreamId(rawValue: "ws-1"),
       name: "Foundation",
-      repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+      repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
       status: .active,
       epics: [EpicId(rawValue: "ep-1")])
     #expect(built == (try Golden.decode(Workstream.self, from: "workstream")))
@@ -31,7 +31,7 @@ struct ConstructionTests {
   @Test("builds a repository equal to the golden")
   func buildsRepository() throws {
     let built = Repository(
-      id: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+      id: RepositoryId(rawValue: "repo:github:1296269"),
       host: .github,
       owner: "callajd",
       name: "sprinter",

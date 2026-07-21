@@ -182,7 +182,7 @@ const entryAppended = (id: string, text: string) => ({
  * FOREIGN KEY, so it has to be written before the workstream that references it.
  */
 const seedRepository = decode(DomainRepository, {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -193,7 +193,7 @@ const seedRepository = decode(DomainRepository, {
 const seedWorkstream = decode(Workstream, {
   id: "ws-seed",
   name: "Restart Seed",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["epic-seed"],
 });

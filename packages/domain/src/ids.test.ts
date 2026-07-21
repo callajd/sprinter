@@ -94,7 +94,18 @@ it.effect("rejects every non-sha a branded NonEmptyString would have accepted", 
 
 it.effect("accepts ordinary git branch names", () =>
   Effect.forEach(
-    ["main", "feat/x-1", "release/2.0", "fix/86-repository-entity", "a", "user/feat/deep/name"],
+    [
+      "main",
+      "feat/x-1",
+      "release/2.0",
+      "fix/86-repository-entity",
+      "a",
+      "user/feat/deep/name",
+      // A PAIRED surrogate is a real code point and stays accepted — the rule rejects
+      // lone surrogates, not non-BMP names (the store holds this one fine, and
+      // `compareBranchNames` exists precisely to order it correctly).
+      "feat/\u{1F680}",
+    ],
     (value) =>
       Effect.gen(function* () {
         const decoded = yield* Schema.decodeUnknownEffect(BranchName)(value);
@@ -125,6 +136,13 @@ it.effect("rejects one example of every branch-name rule it enforces", () =>
       "main.lock",
       // is not the reserved bare `@`
       "@",
+      // no UNPAIRED SURROGATE: a lone `U+D800…U+DFFF` code unit is a well-formed JS
+      // string but is NOT encodable as UTF-8, so it cannot survive the `TEXT` column
+      // the store keeps ref names in — a name the store round-trip would silently
+      // mangle to `U+FFFD` must not enter the domain in the first place.
+      "\uD83D",
+      "feat/\uDE80",
+      "\uDC00trailing",
     ],
     (value) =>
       Effect.exit(Schema.decodeUnknownEffect(BranchName)(value)).pipe(

@@ -170,7 +170,7 @@ const epic = {
 // Its `refs` are the OBSERVED ref map, ordered by branch name; an EMPTY one is valid
 // ("nothing observed yet"), and `repository-no-refs` pins that shape too.
 const repository = {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -186,7 +186,7 @@ const workstream = {
   name: "Foundation",
   // A REFERENCE to the repository above, not a bare string: the two cannot disagree
   // about which repository this workstream is bound to.
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["ep-1"],
 };

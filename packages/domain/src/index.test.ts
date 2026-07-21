@@ -8,7 +8,7 @@ it.effect("re-exports the read model and session schemas from the barrel", () =>
     const ws = yield* Schema.decodeUnknownEffect(Workstream)({
       id: "ws-fdn",
       name: "Foundation",
-      repositoryId: "repo:github:callajd/sprinter",
+      repositoryId: "repo:github:1296269",
       status: "done",
       epics: [],
     });

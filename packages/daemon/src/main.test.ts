@@ -26,7 +26,7 @@ import { RpcTest } from "effect/unstable/rpc";
 import { BunFileSystem, BunPath } from "@effect/platform-bun";
 import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
-import { Repository as DomainRepository } from "@sprinter/domain";
+import { Repository as DomainRepository, RepositoryKey } from "@sprinter/domain";
 import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
 import { StateStore } from "@sprinter/state";
 import {
@@ -47,6 +47,13 @@ import { StartupReconcile } from "./startup-reconcile.ts";
 /** Decode a fixture through its owned schema (no casts, INV-NOCAST). */
 const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
   Schema.decodeUnknownSync(schema)(raw);
+
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain object literal is
+ * not a `RepositoryKey`.
+ */
+const repositoryKey = (owner: string, name: string): RepositoryKey =>
+  decode(RepositoryKey, { host: "github", owner, name });
 
 /** A fake `CodeHost`: canned, no HTTP. Never driven here (reconcile is not run). */
 const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
@@ -188,7 +195,7 @@ it.effect("the graph serves snapshot + commands end-to-end over the frozen contr
       const id = yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Convergence",
-          repository: { host: "github", owner: "callajd", name: "sprinter" },
+          repository: repositoryKey("callajd", "sprinter"),
           spec: "wire the daemon",
         },
       });
@@ -211,7 +218,7 @@ it.effect("the events feed does DURABLE offset-based resync for a late-attaching
       yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Convergence",
-          repository: { host: "github", owner: "callajd", name: "sprinter" },
+          repository: repositoryKey("callajd", "sprinter"),
           spec: "wire the daemon",
         },
       });
@@ -243,7 +250,7 @@ it.effect("state is FILE-backed: a rebuild on the same database file sees prior 
       return yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Convergence",
-          repository: { host: "github", owner: "callajd", name: "sprinter" },
+          repository: repositoryKey("callajd", "sprinter"),
           spec: "wire the daemon",
         },
       });

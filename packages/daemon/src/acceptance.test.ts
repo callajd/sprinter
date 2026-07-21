@@ -57,7 +57,19 @@
  *      RUNBOOK's real-cutover job, deliberately out of this deterministic test's scope.
  */
 import { it } from "@effect/vitest";
-import { Cause, Deferred, Effect, Layer, Option, Queue, Schema, Sink, Stream } from "effect";
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Layer,
+  Option,
+  Queue,
+  Ref,
+  Schema,
+  Sink,
+  Stream,
+} from "effect";
 import { FileSystem } from "effect/FileSystem";
 import { Ndjson } from "effect/unstable/encoding";
 import { ChildProcessSpawner } from "effect/unstable/process";
@@ -71,6 +83,7 @@ import {
   Job,
   PositiveInt,
   PullRequestRef,
+  RepositoryKey,
   SessionId,
   Workstream,
 } from "@sprinter/domain";
@@ -86,6 +99,13 @@ const HARD_TIMEOUT = "15 seconds";
 const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
   Schema.decodeUnknownSync(schema)(raw);
 
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain object literal is
+ * not a `RepositoryKey`.
+ */
+const repositoryKey = (owner: string, name: string): RepositoryKey =>
+  decode(RepositoryKey, { host: "github", owner, name });
+
 // ── the sandboxed GitHub truth: one deterministic OPEN pull request ───────────
 //
 // The seeded work graph AND the fake `CodeHost` both reflect THIS single fact —
@@ -96,6 +116,23 @@ const openPr: (typeof PullRequestRef)["Encoded"] = {
   number: PR_NUMBER,
   url: `https://github.com/callajd/sprinter/pull/${PR_NUMBER}`,
   merged: false,
+};
+
+/**
+ * The sandbox's stand-in for the NUMERIC identifier a code host assigns a repository —
+ * a pure hash of the natural key, so it is deterministic and order-independent.
+ *
+ * It stands in for the host's own id rather than being derived from the key in the
+ * shape the id takes: a real adapter mints `RepositoryId` from an identifier a RENAME
+ * does not change, never from the mutable `(host, owner, name)` triple. Spelling the
+ * fake's id like the real one keeps this harness from agreeing with a broken adapter.
+ */
+const sandboxRepositoryId = (owner: string, name: string): string => {
+  let hash = 0x811c9dc5;
+  for (const character of `${owner}/${name}`) {
+    hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return `repo:github:${hash}`;
 };
 
 /**
@@ -114,7 +151,7 @@ const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
         Effect.succeed(
           Option.some(
             decode(DomainRepository, {
-              id: `repo:${key.host}:${key.owner}/${key.name}`,
+              id: sandboxRepositoryId(key.owner, key.name),
               host: key.host,
               owner: key.owner,
               name: key.name,
@@ -247,8 +284,10 @@ const entryAppended = (id: string, text: string) => ({
  * The repository the seeded workstream is anchored to — `repositoryId` is a real
  * FOREIGN KEY, so it has to be written before the workstream that references it.
  */
+const SEED_REPOSITORY_ID = sandboxRepositoryId("callajd", "sprinter");
+
 const seedRepository = decode(DomainRepository, {
-  id: "repo:github:callajd/sprinter",
+  id: SEED_REPOSITORY_ID,
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -259,7 +298,7 @@ const seedRepository = decode(DomainRepository, {
 const seedWorkstream = decode(Workstream, {
   id: "ws-seed",
   name: "Convergence Seed",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: SEED_REPOSITORY_ID,
   status: "active",
   epics: ["epic-seed"],
 });
@@ -287,14 +326,75 @@ const seedJob = decode(Job, {
 });
 const SESSION_ID = decode(SessionId, "session-job-seed");
 
+/**
+ * A repository segment carrying the domain's BRAND but NONE of its checks.
+ *
+ * This is not a way around `RepositorySegment` — it is the THREAT MODEL, made
+ * constructible. The segment is client-supplied, so the guard's whole job is to hold
+ * against a client that never ran our schema; a test that could only build well-formed
+ * segments could not put a malformed one on the wire and so could not test the guard at
+ * all. It is a real decode of a real schema (no cast, INV-NOCAST) — just a deliberately
+ * permissive one, confined to this file.
+ */
+const AttackerSegment = Schema.String.pipe(Schema.brand("RepositorySegment"));
+
+/**
+ * A `CodeHost` that RECORDS every natural key its `resolve` is handed, then answers as
+ * the sandbox does. The recording is the assertion surface for "no adapter ever sees a
+ * rejected value".
+ */
+const recordingRepository = (asked: Ref.Ref<ReadonlyArray<string>>): Layer.Layer<CodeHost> =>
+  Layer.succeed(
+    CodeHost,
+    CodeHost.of({
+      repositories: {
+        resolve: (key) =>
+          Ref.update(asked, (seen) => [...seen, `${key.owner}/${key.name}`]).pipe(
+            Effect.andThen(
+              Effect.succeed(
+                Option.some(
+                  decode(DomainRepository, {
+                    id: sandboxRepositoryId(key.owner, key.name),
+                    host: key.host,
+                    owner: key.owner,
+                    name: key.name,
+                    refs: [{ name: "main", sha: "a".repeat(40) }],
+                    observedAt: "2026-07-20T12:00:00.000Z",
+                  }),
+                ),
+              ),
+            ),
+          ),
+      },
+      code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(true) },
+      issues: {
+        getIssue: (number) =>
+          Effect.succeed(decode(RepositoryIssue, { number, title: "unused", state: "open" })),
+      },
+      pullRequests: {
+        closingPullRequest: () => Effect.succeed(Option.none()),
+        getPullRequest: (number) =>
+          Effect.die(
+            new CodeHostError({ operation: "getPullRequest", detail: `unused #${number}` }),
+          ),
+      },
+    }),
+  );
+
 // ── the harness daemon graph: the REAL main.ts graph, fake leaves substituted ──
-const harnessDaemon = (config: DaemonConfig, pi: ScriptedPi) =>
+const harnessDaemon = (
+  config: DaemonConfig,
+  pi: ScriptedPi,
+  // The CodeHost is a PARAMETER so a test can observe what the port was asked, without
+  // a second copy of the whole graph.
+  codeHost: Layer.Layer<CodeHost> = fakeRepository,
+) =>
   Layer.mergeAll(RpcServer.layer(SprinterRpc), bootLayer).pipe(
     Layer.provide(appLayer(config)),
     Layer.provide(socketProtocolLayer(config)),
     // Fake leaves win (provided nearest): the sandboxed CodeHost + the scripted pi
     // spawner. Real Bun services satisfy the rest (FileSystem/Path/socket platform).
-    Layer.provide(Layer.mergeAll(fakeRepository, pi.layer)),
+    Layer.provide(Layer.mergeAll(codeHost, pi.layer)),
     Layer.provide(BunServices.layer),
   );
 
@@ -367,7 +467,7 @@ it.effect(
           const newId = yield* client.createWorkstreamFromPlan({
             plan: {
               name: "CE4 New Plan",
-              repository: { host: "github", owner: "callajd", name: "sprinter" },
+              repository: repositoryKey("callajd", "sprinter"),
               spec: "drive the loop",
             },
           });
@@ -447,6 +547,69 @@ it.effect(
           expect(pairedIssue?.pr?.merged).toBe(false);
         }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
       }).pipe(Effect.provide(harnessDaemon(config, pi)), Effect.scoped);
+    }).pipe(Effect.provide(BunFileSystem.layer)),
+  { timeout: 60_000 },
+);
+
+// ── B1 (round 2, N1) — the traversal guard is enforced at the RPC DECODE ───────
+//
+// `RepositorySegment` rejects `.` and `..` in the SCHEMA, and the load-bearing half of
+// that claim is WHERE the rejection happens: on DECODE, at the RPC boundary, before any
+// adapter is handed the value. Asserting it against the domain schema alone proves only
+// that a decode rejects it — not that the daemon actually decodes what a client sent.
+//
+// So this drives a poisoned key over the REAL socket with REAL NDJSON serialization
+// (the only harness in the suite where the server genuinely decodes the payload — the
+// in-memory `RpcTest` client is a NO-SERIALIZATION transport and would prove nothing
+// here), and asserts the `CodeHost` was NEVER ASKED. A guard that merely returned an
+// error after the adapter had already issued the authenticated request would fail this.
+it.effect(
+  "a traversal segment is refused at the RPC decode — the CodeHost is never asked",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem;
+      const dir = yield* fs.makeTempDirectoryScoped({ prefix: "sprinter-b1-" });
+      const config = testConfig(dir);
+      const pi = yield* makeScriptedPi;
+      // Every `resolve` the daemon performs lands here. It must stay empty.
+      const asked = yield* Ref.make<ReadonlyArray<string>>([]);
+
+      yield* Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          const client = yield* RpcClient.make(SprinterRpc);
+          // A client that did NOT run the domain's schema — which is the entire threat
+          // model, since the segment is client-supplied. `AttackerSegment` carries the
+          // brand WITHOUT the checks, so the poisoned key can be built here (no cast,
+          // INV-NOCAST) exactly as a hostile client would put it on the wire.
+          const poisoned: RepositoryKey = {
+            host: "github",
+            owner: decode(AttackerSegment, ".."),
+            name: decode(AttackerSegment, "user"),
+          };
+          const outcome = yield* client
+            .createWorkstreamFromPlan({
+              plan: { name: "Traversal", repository: poisoned, spec: "real spec" },
+            })
+            .pipe(Effect.exit);
+          // The call did not succeed…
+          expect(Exit.isFailure(outcome)).toBe(true);
+          // …and, the point of the test: no adapter was ever handed the value, so no
+          // authenticated request was steered anywhere.
+          expect(yield* Ref.get(asked)).toStrictEqual([]);
+
+          // POSITIVE CONTROL, in the same test: a WELL-FORMED key over the same wire
+          // does reach the host — so the assertion above is the guard working, not the
+          // recorder being wired to nothing.
+          yield* client.createWorkstreamFromPlan({
+            plan: {
+              name: "Legitimate",
+              repository: repositoryKey("callajd", "sprinter"),
+              spec: "real spec",
+            },
+          });
+          expect(yield* Ref.get(asked)).toStrictEqual(["callajd/sprinter"]);
+        }).pipe(Effect.provide(clientLayer(config.socketPath)), Effect.scoped);
+      }).pipe(Effect.provide(harnessDaemon(config, pi, recordingRepository(asked))), Effect.scoped);
     }).pipe(Effect.provide(BunFileSystem.layer)),
   { timeout: 60_000 },
 );

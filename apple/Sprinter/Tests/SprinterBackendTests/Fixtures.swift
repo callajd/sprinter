@@ -8,7 +8,7 @@ enum Fixtures {
   /// The repository the workstream fixtures REFERENCE. Every Snapshot carries it,
   /// because Workstream.repositoryId is a reference a client must be able to resolve.
   static let repository = Repository(
-    id: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    id: RepositoryId(rawValue: "repo:github:1296269"),
     host: .github,
     owner: "callajd",
     name: "sprinter",
@@ -22,7 +22,7 @@ enum Fixtures {
   static let workstream = Workstream(
     id: WorkstreamId(rawValue: "ws-1"),
     name: "Foundation",
-    repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
     status: .active,
     epics: [EpicId(rawValue: "ep-1")])
 
@@ -111,7 +111,7 @@ enum Fixtures {
       Workstream(
         id: WorkstreamId(rawValue: "ws-1"),
         name: "Foundation",
-        repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+        repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
         status: .done,
         epics: [EpicId(rawValue: "ep-1")])
     ],

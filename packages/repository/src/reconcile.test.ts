@@ -39,7 +39,7 @@ const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
  * FOREIGN KEY, so this has to be stored before any workstream references it.
  */
 const repository = decode(DomainRepository, {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -50,7 +50,7 @@ const repository = decode(DomainRepository, {
 const workstream = decode(Workstream, {
   id: "ws-a",
   name: "Track A",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["epic-1"],
 });
@@ -340,7 +340,7 @@ it.effect(
       const ws = decode(Workstream, {
         id: "ws-x",
         name: "X",
-        repositoryId: "repo:github:callajd/sprinter",
+        repositoryId: "repo:github:1296269",
         status: "active",
         epics: [],
       });
@@ -391,7 +391,7 @@ it.effect("is a no-op for a missing workstream", () =>
     const missing = decode(Workstream, {
       id: "ws-missing",
       name: "Nope",
-      repositoryId: "repo:github:callajd/sprinter",
+      repositoryId: "repo:github:1296269",
       status: "active",
       epics: [],
     });

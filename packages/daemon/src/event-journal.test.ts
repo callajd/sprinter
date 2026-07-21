@@ -46,7 +46,7 @@ const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
  * delta, which is why the offset expectations below start with one.
  */
 const repository = Schema.decodeUnknownSync(Repository)({
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -57,7 +57,7 @@ const repository = Schema.decodeUnknownSync(Repository)({
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
   name: "Convergence",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["ep-1"],
 });

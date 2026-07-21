@@ -38,7 +38,7 @@ const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
  * FOREIGN KEY, so it has to be stored before anything references it.
  */
 const repository = decode(Repository, {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -48,7 +48,7 @@ const repository = decode(Repository, {
 const workstream = decode(Workstream, {
   id: "ws-a",
   name: "Track A",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["epic-1"],
 });

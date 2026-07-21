@@ -75,14 +75,24 @@ export type StoreGenerationId = (typeof StoreGenerationId)["Type"];
  * It is OPAQUE: nothing may parse it, order it, or read an owner/name back out of
  * it — equality is the only defined operation. The NATURAL key of a repository is
  * `(host, owner, name)`, and that triple is what the store holds `UNIQUE`, so
- * "which repository is this?" is answered by the key, never by decomposing the id.
+ * "which repository is this NAMED?" is answered by the key, never by decomposing the id.
  *
- * Because the natural key is what identifies a repository, the id a code-host adapter
- * mints for one is a FUNCTION of that key: re-observing the same repository must
- * produce the same id, or a refresh (DE1.2 D7 — replace the record wholesale) would
- * try to insert a SECOND row for a triple the store holds unique and fail. That is a
- * property of the minting adapter, not something a consumer may rely on by inspecting
- * the value.
+ * The id a code-host adapter mints is a deterministic FUNCTION of ONE repository, so
+ * re-observing that repository produces the same id and a refresh (DE1.2 D7 — replace
+ * the record wholesale) lands on the row it already has instead of trying to insert a
+ * second one.
+ *
+ * That function is of the host's OWN STABLE IDENTIFIER for the repository (GitHub's
+ * numeric repository id), NOT of the natural key. The natural key is MUTABLE: a rename
+ * or a transfer changes it while the repository stays the same repository. An id
+ * derived from it would therefore FORK on a rename — a second row would appear under
+ * the new name while every existing `Workstream.repositoryId` still referenced the old
+ * one, which is exactly the "two anchors for one repository" failure the entity exists
+ * to eliminate. Derived from the host's stable id, a rename instead UPDATES the
+ * existing row's `host`/`owner`/`name` in place.
+ *
+ * Both properties are properties of the minting ADAPTER, not something a consumer may
+ * rely on by inspecting the value.
  */
 export const RepositoryId = Schema.NonEmptyString.pipe(Schema.brand("RepositoryId"));
 export type RepositoryId = (typeof RepositoryId)["Type"];
@@ -141,6 +151,15 @@ export type CommitSha = (typeof CommitSha)["Type"];
  * - Does not end in `.lock`. Git uses `<ref>.lock` files for its own locking, so such
  *   a name can never be created as a ref.
  * - Is not exactly `@`. Git reserves the bare `@` as shorthand for `HEAD`.
+ * - No UNPAIRED SURROGATE. A lone `U+D800…U+DFFF` code unit is a well-formed
+ *   JavaScript string but is NOT encodable as UTF-8, so it cannot survive the store: the
+ *   `repository_ref.name` column is SQLite `TEXT` (UTF-8), and writing one either fails
+ *   or substitutes `U+FFFD`, in both cases breaking the round-trip that
+ *   `packages/state/src/sqlite.ts` claims (a stored record reads back identical, and its
+ *   refs read back in the same order). Rejecting it here keeps that claim true at the
+ *   one boundary rather than leaving a name in the domain the store cannot hold. No code
+ *   host can produce one either — a lone surrogate is not valid in JSON's own UTF-8
+ *   encoding — so nothing real is excluded.
  *
  * Rules git also has that are NOT enforced here (a leading/trailing `.` in a component,
  * `@{`, a trailing `.`, `~^:?*[`, a backslash) are omitted deliberately: they would
@@ -150,6 +169,11 @@ export type CommitSha = (typeof CommitSha)["Type"];
  */
 const isValidBranchName = (value: string): boolean => {
   if (value.length === 0) return false;
+  // A string is "well-formed" exactly when it contains no LONE surrogate — i.e. exactly
+  // when it is encodable as UTF-8, which is what the store's `TEXT` column holds. The
+  // platform's own predicate says it in one word rather than re-deriving the surrogate
+  // ranges here.
+  if (!value.isWellFormed()) return false;
   // ASCII whitespace and CONTROL characters, tested by CODE POINT rather than by a
   // regex character class: the class would have to hold literal control bytes (or
   // escapes a linter flags), while the numeric form STATES the range — C0 (< 0x20),

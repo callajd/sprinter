@@ -53,7 +53,7 @@ const ALL_TAGS = [
 
 // Representative, domain-valid fixtures.
 const repository = {
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -63,7 +63,7 @@ const repository = {
 const workstream = {
   id: "ws-1",
   name: "Foundation",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["ep-1"],
 };
@@ -118,7 +118,7 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   // The STATE layer rides the snapshot too: `Workstream.repositoryId` is a REFERENCE,
   // so a client receiving workstreams without their repositories could resolve none of
   // them. Each record carries its own `observedAt` — what DE4.4 renders staleness from.
-  expect(decoded.repositories[0]?.id).toBe("repo:github:callajd/sprinter");
+  expect(decoded.repositories[0]?.id).toBe("repo:github:1296269");
   expect(decoded.repositories[0]?.observedAt).toBe("2026-07-20T12:00:00.000Z");
   expect(decoded.issues[0]?.number).toBe(10);
   // The REGISTRY layer rides the snapshot whole — every revision, no per-repo slice

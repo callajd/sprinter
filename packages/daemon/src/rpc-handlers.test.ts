@@ -45,6 +45,7 @@ import {
   Job,
   type JobResult,
   Repository,
+  RepositoryKey,
   Session,
   type SessionEvent,
   type SessionId,
@@ -59,7 +60,7 @@ import { CodeHost, CodeHostError } from "@sprinter/repository";
 import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
-import { handlers } from "./rpc-handlers.ts";
+import { handlers, RESOLVE_TIMEOUT } from "./rpc-handlers.ts";
 import { layer as layerSessionEvents, SessionEvents } from "./session-events.ts";
 import {
   layer as layerSessionRegistry,
@@ -73,7 +74,7 @@ import { layer as layerWorkGraphEvents, WorkGraphEvents } from "./work-graph-eve
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
   name: "Foundation",
-  repositoryId: "repo:github:callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "pending",
   epics: ["ep-1"],
 });
@@ -152,7 +153,7 @@ const succeededResult: JobResult = { status: "succeeded" };
  * `workstream.repositoryId` is a real FOREIGN KEY, so it must be stored first.
  */
 const repository = Schema.decodeUnknownSync(Repository)({
-  id: "repo:github:callajd/sprinter",
+  id: "repo:github:1296269",
   host: "github",
   owner: "callajd",
   name: "sprinter",
@@ -165,6 +166,40 @@ const repository = Schema.decodeUnknownSync(Repository)({
  * unknown branch of D6, which must be a `PlanRejected` that writes nothing.
  */
 const UNKNOWN_REPOSITORY_NAME = "does-not-exist";
+
+/**
+ * A natural key, DECODED. `RepositorySegment` is branded, so a plain object literal is
+ * not a `RepositoryKey` — a test has to obtain one exactly the way a decoding RPC
+ * boundary does.
+ */
+const key = (owner: string, name: string): RepositoryKey =>
+  Schema.decodeUnknownSync(RepositoryKey)({ host: "github", owner, name });
+
+/**
+ * The fake host's STABLE identifier for a natural key — its stand-in for GitHub's
+ * numeric repository id.
+ *
+ * A real adapter mints `RepositoryId` from an identifier the HOST owns and a rename
+ * does not change, never from the mutable natural key; the fake models that by assigning
+ * each key an OPAQUE NUMBER. Deriving the id from the key here would quietly
+ * re-introduce the very coupling the adapter avoids, and would make these tests agree
+ * with a broken adapter.
+ *
+ * The number is a pure FNV-1a hash rather than a counter so it does not depend on test
+ * ORDER: a counter would make the id a repository receives a function of which tests ran
+ * before it, which is exactly the kind of hidden coupling a suite should not have.
+ */
+const hostIdFor = (owner: string, name: string): number => {
+  let hash = 0x811c9dc5;
+  for (const character of `${owner}/${name}`) {
+    hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return hash;
+};
+
+/** The `RepositoryId` {@link fakeCodeHost} mints for a natural key. */
+const fakeRepositoryId = (owner: string, name: string): string =>
+  `repo:github:${hostIdFor(owner, name)}`;
 
 /**
  * A fake {@link CodeHost} whose repository resolution knows every key EXCEPT
@@ -183,7 +218,7 @@ const fakeCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
             ? Option.none()
             : Option.some(
                 Schema.decodeUnknownSync(Repository)({
-                  id: `repo:${key.host}:${key.owner}/${key.name}`,
+                  id: fakeRepositoryId(key.owner, key.name),
                   host: key.host,
                   owner: key.owner,
                   name: key.name,
@@ -218,6 +253,24 @@ const unreachableCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
       resolve: () =>
         Effect.fail(new CodeHostError({ operation: "resolve", detail: "unexpected status 503" })),
     },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: { getIssue: () => Effect.die("never driven") },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () => Effect.die("never driven"),
+    },
+  }),
+);
+
+/**
+ * A {@link CodeHost} that never ANSWERS — the shape a hung TCP connection takes at the
+ * port. Distinct from {@link unreachableCodeHost}, which FAILS: a failure returns, and a
+ * hang does not, which is why a bound is the only thing that can end it.
+ */
+const hangingCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: { resolve: () => Effect.never },
     code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
     issues: { getIssue: () => Effect.die("never driven") },
     pullRequests: {
@@ -330,6 +383,74 @@ it.effect("snapshot of an empty daemon is empty", () =>
   ),
 );
 
+// N3 (round 2) — a snapshot must never carry a workstream whose repository is absent.
+// The reads are not one transaction, so a concurrent `createWorkstreamFromPlan` can
+// interleave between them; it always writes the repository BEFORE the workstream (the
+// FK forces it), so reading WORKSTREAMS FIRST and REPOSITORIES LAST makes the dangling
+// window unreachable — anything the workstream read saw was written earlier, so its
+// repository is in the later read.
+//
+// The interleave is made deterministic by a store whose `listWorkstreams` performs the
+// concurrent write itself, right where the race would land. Under the old order (repos
+// first) this snapshot dangles; under the new one it cannot.
+it.effect("snapshot never carries a workstream whose repository is missing", () =>
+  Effect.gen(function* () {
+    const interleaving = Layer.effect(
+      StateStore,
+      Effect.gen(function* () {
+        const base = yield* StateStore;
+        return StateStore.of({
+          ...base,
+          workGraph: {
+            ...base.workGraph,
+            // The "concurrent" materialisation: anchor first, then the workstream that
+            // references it — the only order the FOREIGN KEY permits.
+            listWorkstreams: Effect.gen(function* () {
+              yield* base.repositories.putRepository(repository);
+              yield* base.workGraph.putWorkstream(workstream);
+              return yield* base.workGraph.listWorkstreams;
+            }),
+          },
+        });
+      }),
+    );
+
+    const snapshot = yield* Effect.gen(function* () {
+      const client = yield* clientEffect();
+      return yield* client.snapshot();
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        handlers.pipe(
+          Layer.provideMerge(
+            Layer.mergeAll(
+              interleaving.pipe(Layer.provide(layerJournaling(layerMemory))),
+              Layer.succeed(
+                JobRunner,
+                JobRunner.of({ dispatch: () => Effect.succeed(succeededResult) }),
+              ),
+              layerSessionRegistry,
+              fakeCodeHost,
+            ).pipe(
+              Layer.provideMerge(layerWorkGraphEvents),
+              Layer.provideMerge(layerSessionEvents),
+            ),
+          ),
+        ),
+      ),
+      Effect.orDie,
+    );
+
+    expect(snapshot.workstreams).not.toStrictEqual([]);
+    const known = new Set(snapshot.repositories.map((repository) => repository.id));
+    for (const carried of snapshot.workstreams) {
+      expect(known.has(carried.repositoryId), `${carried.id} references a missing repository`).toBe(
+        true,
+      );
+    }
+  }),
+);
+
 // ── createWorkstreamFromPlan ──────────────────────────────────────────────────
 
 it.effect("createWorkstreamFromPlan materializes and persists a new workstream", () =>
@@ -339,7 +460,7 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
       const id = yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Payments Revamp",
-          repository: { host: "github", owner: "callajd", name: "sprinter" },
+          repository: key("callajd", "sprinter"),
           spec: "ship it",
         },
       });
@@ -348,24 +469,25 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
       // INJECTIVE encoding of a repository — percent-encoded so the composed id stays
       // url-safe. A slug of the natural key would map two different repositories onto
       // one workstream id (see the injectivity test below).
-      expect(id).toBe("ws-payments-revamp-repo%3Agithub%3Acallajd%2Fsprinter");
+      const anchorId = fakeRepositoryId("callajd", "sprinter");
+      expect(id).toBe(`ws-payments-revamp-${encodeURIComponent(anchorId)}`);
+      // Url-safe: the separators inside a `RepositoryId` do not survive into the
+      // composed id, whatever a host's identifier is spelled with.
+      expect(id).not.toContain(":");
+      expect(id).not.toContain("/");
 
       const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(id));
       expect(persisted.name).toBe("Payments Revamp");
       expect(persisted.status).toBe("pending");
       expect(persisted.epics).toEqual([]);
       // The plan named a natural key; the workstream references the RESOLVED record.
-      expect(persisted.repositoryId).toBe("repo:github:callajd/sprinter");
+      expect(persisted.repositoryId).toBe(anchorId);
 
       // The plan's repository was RESOLVED through the `CodeHost` port and STORED
       // (D6): the workstream's `repositoryId` is a FOREIGN KEY, so the anchor is not
       // optional bookkeeping — the workstream write could not have succeeded without it.
       const anchor = Option.getOrThrow(
-        yield* store.repositories.findRepository({
-          host: "github",
-          owner: "callajd",
-          name: "sprinter",
-        }),
+        yield* store.repositories.findRepository(key("callajd", "sprinter")),
       );
       expect(anchor.id).toBe(persisted.repositoryId);
 
@@ -394,7 +516,7 @@ it.effect("createWorkstreamFromPlan rejects an UNKNOWN repository and writes not
         .createWorkstreamFromPlan({
           plan: {
             name: "Ghost",
-            repository: { host: "github", owner: "callajd", name: UNKNOWN_REPOSITORY_NAME },
+            repository: key("callajd", UNKNOWN_REPOSITORY_NAME),
             spec: "real spec",
           },
         })
@@ -425,7 +547,7 @@ it.effect("createWorkstreamFromPlan REJECTS (not dies) when the code host is unr
           .createWorkstreamFromPlan({
             plan: {
               name: "Transient",
-              repository: { host: "github", owner: "callajd", name: "sprinter" },
+              repository: key("callajd", "sprinter"),
               spec: "real spec",
             },
           })
@@ -443,6 +565,47 @@ it.effect("createWorkstreamFromPlan REJECTS (not dies) when the code host is unr
   ),
 );
 
+// N4 (round 2) — the code host resolve is BOUNDED. `createWorkstreamFromPlan` was
+// store-only before DE1.2; it now makes a NETWORK call on a user-facing RPC, and the
+// GitHub adapter carries no timeout of its own. A hung connection does not fail — it
+// simply never answers — so without a bound this RPC would hang forever, and the user
+// would get no outcome of any kind. The bound turns that into the same retryable
+// rejection an unreachable host gets, which is what it is.
+//
+// The hanging host is `Effect.never`, so a MISSING timeout makes this test hang rather
+// than fail — which the suite-level timeout surfaces. Advancing the TestClock past the
+// bound is what fires it.
+it.effect("createWorkstreamFromPlan REJECTS rather than hanging when the host never answers", () =>
+  harness(
+    ({ client, store }) =>
+      Effect.gen(function* () {
+        const fiber = yield* Effect.forkChild(
+          client
+            .createWorkstreamFromPlan({
+              plan: {
+                name: "Hung",
+                repository: key("callajd", "sprinter"),
+                spec: "real spec",
+              },
+            })
+            .pipe(Effect.flip),
+          { startImmediately: true },
+        );
+        yield* TestClock.adjust(RESOLVE_TIMEOUT);
+        const error = yield* Fiber.join(fiber);
+        expect(error).toBeInstanceOf(PlanRejected);
+        // The SAME reason an unreachable host gets: from the plan's point of view a host
+        // that never answered and a host that answered 503 are one outcome.
+        expect(error.reason).toContain("could not be reached");
+        expect(error.reason).toContain("no response within");
+        // And nothing was written on the way out.
+        expect(yield* store.repositories.listRepositories).toStrictEqual([]);
+        expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      }),
+    hangingCodeHost,
+  ),
+);
+
 // N1 — the workstream id must be INJECTIVE in the repository. A slug of
 // `${host}-${owner}-${name}` maps `(github, a-b, c)` and `(github, a, b-c)` — two
 // different repositories, which `repositoryIdFor` deliberately keeps distinct — onto
@@ -453,7 +616,7 @@ it.effect("derives DISTINCT workstream ids for repositories a slug would collide
     Effect.gen(function* () {
       const materialize = (owner: string, name: string) =>
         client.createWorkstreamFromPlan({
-          plan: { name: "Same Name", repository: { host: "github", owner, name }, spec: "spec" },
+          plan: { name: "Same Name", repository: key(owner, name), spec: "spec" },
         });
       const left = yield* materialize("a-b", "c");
       // Would have been the same id — and so a rejection — before the fix.
@@ -470,7 +633,7 @@ it.effect("createWorkstreamFromPlan rejects a blank spec with PlanRejected", () 
         .createWorkstreamFromPlan({
           plan: {
             name: "Empty",
-            repository: { host: "github", owner: "callajd", name: "sprinter" },
+            repository: key("callajd", "sprinter"),
             spec: "   ",
           },
         })
@@ -488,7 +651,7 @@ it.effect("createWorkstreamFromPlan rejects a name with no derivable id", () =>
         .createWorkstreamFromPlan({
           plan: {
             name: "!@#$",
-            repository: { host: "github", owner: "callajd", name: "sprinter" },
+            repository: key("callajd", "sprinter"),
             spec: "real spec",
           },
         })
@@ -504,7 +667,7 @@ it.effect("createWorkstreamFromPlan rejects a colliding create rather than clobb
     Effect.gen(function* () {
       const plan = {
         name: "Payments Revamp",
-        repository: { host: "github", owner: "callajd", name: "sprinter" },
+        repository: key("callajd", "sprinter"),
         spec: "v1",
       } as const;
       const id = yield* client.createWorkstreamFromPlan({ plan });
@@ -530,14 +693,14 @@ it.effect("createWorkstreamFromPlan does not collide the same name across differ
       const a = yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Revamp",
-          repository: { host: "github", owner: "callajd", name: "one" },
+          repository: key("callajd", "one"),
           spec: "s",
         },
       });
       const b = yield* client.createWorkstreamFromPlan({
         plan: {
           name: "Revamp",
-          repository: { host: "github", owner: "callajd", name: "two" },
+          repository: key("callajd", "two"),
           spec: "s",
         },
       });

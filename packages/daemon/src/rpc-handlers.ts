@@ -63,7 +63,7 @@
  * these handlers drive the `JobRunner` PORT, which a runtime backs with either the
  * real adapter or a fake — this task keeps it fakeable and does not wire LocalPi.
  */
-import { Context, Effect, Option, Schema, Stream } from "effect";
+import { Context, Duration, Effect, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type ControlAction,
@@ -130,6 +130,18 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
  * from each record's `observedAt` (DE4.4), and withholding a stale record would delete
  * the very evidence that rendering needs (D7: reads never gate on staleness).
  *
+ * READ ORDER IS LOAD-BEARING: workstreams FIRST, repositories LAST. These reads are not
+ * one transaction, so a concurrent `createWorkstreamFromPlan` can interleave between
+ * them — and it always writes the repository BEFORE the workstream that references it
+ * (`Workstream.repositoryId` is a FOREIGN KEY, so it cannot do otherwise). Reading
+ * repositories first would therefore admit `read repos → write R → write W → read
+ * workstreams`, yielding a snapshot carrying a workstream whose repository is absent —
+ * a dangling reference the Swift projection has to render around. Reading them last
+ * makes that window unreachable: any workstream in the list was written before the read
+ * that found it, so the repository it references was written earlier still and is in the
+ * later read. (The converse skew — a repository with no workstream yet referencing it —
+ * is harmless; the state layer is not required to be reachable from the work graph.)
+ *
  * GROWTH CURVE, stated so it is a known cost rather than a surprise: this ships EVERY
  * repository with EVERY observed ref (up to the adapter's 100-branch page) on every
  * `snapshot()` and on every `ResyncRequired` recovery, so the payload grows as
@@ -154,7 +166,9 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
 const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   Effect.gen(function* () {
     const agents = yield* store.agents.listAgents;
-    const repositories = yield* store.repositories.listRepositories;
+    // Workstreams FIRST and repositories LAST — see the docstring: a repository always
+    // predates the workstream referencing it, so this order makes a dangling
+    // `repositoryId` in a snapshot unreachable rather than merely unlikely.
     const workstreams = yield* store.workGraph.listWorkstreams;
     const epics: Array<Epic> = [];
     const issues: Array<Issue> = [];
@@ -176,6 +190,7 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
         }
       }
     }
+    const repositories = yield* store.repositories.listRepositories;
     return {
       repositories,
       workstreams,
@@ -189,6 +204,17 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   }).pipe(Effect.orDie);
 
 // ── createWorkstreamFromPlan ──────────────────────────────────────────────────
+
+/**
+ * How long `createWorkstreamFromPlan` will wait for the code host to answer before
+ * rejecting the plan as unreachable.
+ *
+ * Ten seconds is chosen against the INTERACTION, not against GitHub: a human is
+ * watching a form, and a wait longer than this reads as a hang rather than as work in
+ * progress. It is far above GitHub's normal repository-lookup latency (tens of
+ * milliseconds), so it fires on a genuinely stuck connection and not on a slow one.
+ */
+export const RESOLVE_TIMEOUT = Duration.seconds(10);
 
 /** Derive a stable, url-safe workstream-id slug from the plan name. */
 const slugify = (name: string): string =>
@@ -228,6 +254,27 @@ const slugify = (name: string): string =>
  * user can act on or a plan can be corrected for — it means Sprinter's own store is
  * broken — and folding it into a rejection would advertise a user-facing reason for an
  * internal fault.
+ *
+ * ## The resolve is BOUNDED (`RESOLVE_TIMEOUT`)
+ *
+ * This is the first NETWORK call on a user-facing command — `createWorkstreamFromPlan`
+ * was store-only before DE1.2 — and the adapter carries no timeout and no retry of its
+ * own (`packages/repository/src/github.ts`). A hung connection (a TCP black hole, a
+ * proxy that accepts and never answers) does not fail: it simply never returns, so
+ * without a bound the RPC would hang FOREVER, holding the caller's request open with no
+ * outcome of any kind for the user to act on.
+ *
+ * So the resolve is bounded, and a timeout is mapped to the SAME "could not be
+ * reached — retry" rejection an unreachable host gets, because that is exactly what it
+ * is: from the plan's point of view a host that never answered and a host that answered
+ * 500 are one outcome — the plan was not materialised, nothing was written, and a retry
+ * is the remedy. Inventing a third reason would only ask the user to distinguish two
+ * situations they act on identically.
+ *
+ * The bound belongs HERE rather than in the adapter: it is a property of the
+ * INTERACTION — a human is waiting on a synchronous RPC — not of GitHub. A background
+ * reconciler calling the same port would want a different bound, and the adapter has no
+ * way to know which caller it is serving (INV-PORT).
  */
 const resolveRepository = (
   store: Store,
@@ -235,13 +282,17 @@ const resolveRepository = (
   plan: WorkstreamPlan,
 ): Effect.Effect<Repository, PlanRejected> =>
   Effect.gen(function* () {
+    const unreachable = (detail: string) =>
+      new PlanRejected({
+        reason: `the code host could not be reached to resolve ${plan.repository.owner}/${plan.repository.name} (${detail}); the plan was not materialized — retry`,
+      });
     const observed = yield* host.repositories.resolve(plan.repository).pipe(
-      Effect.mapError(
-        (error) =>
-          new PlanRejected({
-            reason: `the code host could not be reached to resolve ${plan.repository.owner}/${plan.repository.name} (${error.detail}); the plan was not materialized — retry`,
-          }),
-      ),
+      Effect.mapError((error) => unreachable(error.detail)),
+      Effect.timeoutOrElse({
+        duration: RESOLVE_TIMEOUT,
+        orElse: () =>
+          Effect.fail(unreachable(`no response within ${Duration.format(RESOLVE_TIMEOUT)}`)),
+      }),
     );
     if (Option.isNone(observed)) {
       return yield* Effect.fail(

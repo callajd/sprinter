@@ -24,7 +24,7 @@ enum BoardFixtures {
   /// The two repositories the workstreams REFERENCE. The board resolves each into
   /// its `owner/name` display string, so a snapshot missing one would render the raw id.
   static let repositoryA = Repository(
-    id: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    id: RepositoryId(rawValue: "repo:github:1296269"),
     host: .github,
     owner: "callajd",
     name: "sprinter",
@@ -35,7 +35,7 @@ enum BoardFixtures {
     ],
     observedAt: "2026-07-20T12:00:00.000Z")
   static let repositoryB = Repository(
-    id: RepositoryId(rawValue: "repo:github:callajd/sprinter-daemon"),
+    id: RepositoryId(rawValue: "repo:github:1296270"),
     host: .github,
     owner: "callajd",
     name: "sprinter-daemon",
@@ -49,7 +49,7 @@ enum BoardFixtures {
   static let workstreamA = Workstream(
     id: WorkstreamId(rawValue: "ws-a"),
     name: "SwiftUI app",
-    repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+    repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
     status: .active,
     epics: [EpicId(rawValue: "ep-a")])
 
@@ -90,7 +90,7 @@ enum BoardFixtures {
   static let workstreamB = Workstream(
     id: WorkstreamId(rawValue: "ws-b"),
     name: "Daemon",
-    repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter-daemon"),
+    repositoryId: RepositoryId(rawValue: "repo:github:1296270"),
     status: .done,
     epics: [EpicId(rawValue: "ep-b")])
 
@@ -155,7 +155,7 @@ enum BoardFixtures {
         Workstream(
           id: WorkstreamId(rawValue: "ws"),
           name: "W",
-          repositoryId: RepositoryId(rawValue: "repo:github:callajd/sprinter"),
+          repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
           status: .active,
           epics: [EpicId(rawValue: "ep")])
       ],
