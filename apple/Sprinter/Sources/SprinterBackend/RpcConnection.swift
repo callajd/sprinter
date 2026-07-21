@@ -66,12 +66,44 @@ actor RpcConnection {
   /// consumer left to receive its `Exit`.
   private struct QueryEntry {
     let continuation: CheckedContinuation<JSONValue?, any Error>
+    /// `true` when a caller's cancellation may also INTERRUPT the daemon-side work — i.e.
+    /// this request's tag is in ``daemonInterruptibleTags``. `false` for every mutating
+    /// procedure: the caller is released, the daemon runs the mutation to completion.
+    let interruptsDaemon: Bool
     /// `true` once this request's `Request` frame has been handed to the transport.
     var transmitted = false
     /// `true` when the caller cancelled BEFORE the `Request` went out; the transmit path
     /// retires the entry itself, immediately after sending it.
     var cancelDeferred = false
   }
+
+  /// The request/response tags whose daemon-side handler is READ-ONLY, and whose in-flight
+  /// work may therefore be aborted by an `Interrupt` when the caller cancels.
+  ///
+  /// This is an ALLOWLIST, deliberately: `effect/unstable/rpc`'s server interrupts the
+  /// handler's fiber the instant it sees an `Interrupt` (`RpcServer`'s `Interrupt` case calls
+  /// `fiber.interruptUnsafe`), and the daemon marks no handler `Rpc.uninterruptible`. So an
+  /// `Interrupt` for a MUTATING procedure aborts a partially-applied write sequence.
+  /// `createWorkstreamFromPlan` is the concrete case: it commits `putRepository` and
+  /// `putWorkstream` as two INDEPENDENT SQLite transactions with a host call and a duplicate
+  /// check in between, and no `withTransaction` wraps the pair — an interrupt landing between
+  /// them leaves a persisted repository row (and its journalled `RepositoryChanged` delta)
+  /// with no workstream, and the client cannot tell whether the create landed. `control` is
+  /// worse: it writes the workstream, then dispatches jobs on the LAYER scope, so an interrupt
+  /// can leave a workstream marked active whose jobs were never dispatched.
+  ///
+  /// The client-side wait is still bounded for those tags — the caller is resumed with a
+  /// `CancellationError` either way, which is #94's actual bar. What is withheld is only the
+  /// wire-level `Interrupt`, restoring the pre-#94 daemon semantics: the mutation runs to
+  /// completion and its `Exit` is discarded by ``handleExit(_:_:)``'s missing-entry guard.
+  /// Bounding a client wait must not silently change what a cancelled mutation does to the
+  /// daemon's store.
+  ///
+  /// Default-DENY: a tag not named here is treated as mutating, so a new procedure is safe
+  /// until someone establishes it is read-only. Only `snapshot` qualifies today; the two
+  /// streaming tags (`events`, `sessionEvents`) are read-only too, but their abandonment path
+  /// is ``interruptIfPending(_:)``, not this one.
+  private static let daemonInterruptibleTags: Set<String> = ["snapshot"]
 
   // MARK: - Issuing requests
 
@@ -81,18 +113,23 @@ actor RpcConnection {
   /// CANCELLATION-AWARE (#94's general bar: no wait may be unbounded). Without a handler
   /// this suspension is released ONLY by a correlated `Exit` or by ``failAll(with:)`` — so a
   /// cancelled caller whose daemon never answers, and whose connection is never closed, waits
-  /// forever. On cancellation the pending entry is resolved with a `CancellationError` and the
-  /// daemon is told to stop working on it (`Interrupt`), exactly as an abandoned stream
-  /// consumer is. Registration happens synchronously on the actor before this method can
-  /// suspend, so the handler's hop can never run ahead of the entry it retires — and
-  /// ``QueryEntry/transmitted`` keeps the `Interrupt` behind its own `Request` on the wire.
+  /// forever. On cancellation the pending entry is ALWAYS resolved with a `CancellationError`,
+  /// whatever the tag — that is what bounds the wait. Whether the daemon is ALSO told to stop
+  /// working on it (`Interrupt`) depends on the tag: only ``daemonInterruptibleTags`` — the
+  /// read-only procedures — are interrupted, because the daemon interrupts the handler fiber
+  /// outright and a mutating handler is not atomic. Registration happens synchronously on the
+  /// actor before this method can suspend, so the handler's hop can never run ahead of the
+  /// entry it retires — and ``QueryEntry/transmitted`` keeps the `Interrupt` behind its own
+  /// `Request` on the wire.
   func request(tag: String, payload: JSONValue?) async throws -> JSONValue? {
     guard !closed else { throw BackendError.connectionClosed }
     startReceiving()
     let id = allocateId()
+    let interruptsDaemon = Self.daemonInterruptibleTags.contains(tag)
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
-        pending[id] = .query(QueryEntry(continuation: continuation))
+        pending[id] = .query(
+          QueryEntry(continuation: continuation, interruptsDaemon: interruptsDaemon))
         Task { await self.transmitRequest(id: id, tag: tag, payload: payload) }
       }
     } onCancel: {
@@ -130,11 +167,18 @@ actor RpcConnection {
   }
 
   /// Retires a cancelled request/response entry whose `Request` is already on the wire:
-  /// resumes its continuation with a `CancellationError` and interrupts the daemon-side work.
+  /// resumes its continuation with a `CancellationError` and — for a READ-ONLY tag only —
+  /// interrupts the daemon-side work.
+  ///
+  /// The continuation is resumed unconditionally: that is the bounded wait #94 asks for. The
+  /// `Interrupt` is withheld for every mutating tag (see ``daemonInterruptibleTags``), so a
+  /// cancelled submit can never abort a half-applied write sequence daemon-side; that
+  /// request's later `Exit` lands on no entry and is dropped by ``handleExit(_:_:)``.
   private func retireCancelledRequest(_ id: RequestId) async {
     guard case .query(let entry)? = pending[id] else { return }
     pending.removeValue(forKey: id)
     entry.continuation.resume(throwing: CancellationError())
+    guard entry.interruptsDaemon else { return }
     await transmit(.interrupt(requestId: id))
   }
 

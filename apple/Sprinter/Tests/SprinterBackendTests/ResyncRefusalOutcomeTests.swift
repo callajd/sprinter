@@ -24,12 +24,15 @@ struct ResyncRefusalOutcomeTests {
   /// The count is calibrated against a MEASURED loss rate, not an assumed one: with the
   /// `runAttempt` drain reverted, this harness swallowed the refusal in **80 of 750 attempts
   /// across 5 runs — 10.7%** (per-run: 18, 21, 14, 13, 14 out of 150) on the machine this
-  /// branch was verified on. At that rate a regression survives this many iterations with
-  /// probability ~2e-5; even at HALF the measured rate it stays under 1%. (An earlier
-  /// revision of this comment cited "~5%", which no measurement here supports — the observed
-  /// density is about twice that, so the loop is trimmed rather than the claim restated.)
-  /// The whole loop runs in ~0.12s against the in-memory harness.
-  private static let attempts = 96
+  /// branch was verified on. (An earlier revision of this comment cited "~5%", which no
+  /// measurement supports — the observed density is about twice that.)
+  ///
+  /// The count is deliberately NOT fitted to that measurement. A briefly-trimmed 96 was the
+  /// tight fit — enough at 10.7%, and still enough at half of it — but the density is a
+  /// property of THIS machine's scheduler, and the gate that matters (`make check`, with
+  /// coverage instrumentation) schedules differently. The whole loop runs in well under a
+  /// tenth of a second, so the headroom costs nothing: take the margin, not the fit.
+  private static let attempts = 150
 
   /// Attempt 1 — a first connect that leaves the engine holding a retained baseline and a
   /// cursor at offset 1 (the state a resume is minted from).

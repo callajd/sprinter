@@ -68,6 +68,43 @@ struct RpcClientTests {
     transport.close()
   }
 
+  @Test("cancelling a MUTATING request releases the caller without interrupting the daemon")
+  func cancelledMutatingRequestIsNotInterrupted() async throws {
+    // The daemon interrupts the handler's FIBER on an `Interrupt`, and
+    // `createWorkstreamFromPlan` commits `putRepository` and `putWorkstream` as two
+    // independent transactions. Interrupting it can therefore leave a persisted repository
+    // with no workstream. So the cancellation bounds the CLIENT's wait (a `CancellationError`)
+    // without changing the wire semantics for a mutation: no `Interrupt` goes out, and the
+    // daemon runs the write to completion exactly as it did before #94.
+    let transport = FakeTransport()
+    let connection = RpcConnection(transport: transport)
+    var outbound = transport.outbound.makeAsyncIterator()
+
+    let inflight = Task {
+      try await connection.request(tag: "createWorkstreamFromPlan", payload: nil)
+    }
+    let request = try await nextSent(&outbound)
+    #expect(request.rpcTag == "createWorkstreamFromPlan")
+
+    inflight.cancel()
+    // The wait is still bounded — this is #94's actual bar, and it is unchanged.
+    await #expect(throws: CancellationError.self) { try await inflight.value }
+
+    // ...but nothing was sent for it. A following `Ping` is the probe: the retirement path
+    // transmits on the actor without suspending, so an `Interrupt` — had one been emitted —
+    // would be recorded strictly BEFORE this ping, and would be the frame read here.
+    await connection.ping()
+    let next = try await nextSent(&outbound)
+    #expect(
+      next.envelopeTag == "Ping",
+      Comment(
+        rawValue: """
+          expected no frame for the cancelled mutation, but the next frame on the wire was \
+          \(next.envelopeTag) — a cancelled mutation is interrupting daemon-side work.
+          """))
+    transport.close()
+  }
+
   @Test("a cancelled request's Interrupt never overtakes its own Request on the wire")
   func cancelledRequestInterruptFollowsItsRequest() async throws {
     // The transmit and the cancellation are two UNSTRUCTURED tasks hopping onto the same

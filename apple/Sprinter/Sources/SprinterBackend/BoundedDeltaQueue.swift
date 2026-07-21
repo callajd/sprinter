@@ -54,7 +54,17 @@ actor BoundedDeltaQueue<Element: Sendable> {
   }
 
   /// Pops the next delta, suspending until one arrives, the feed finishes (`nil`), or the
-  /// consumer is CANCELLED (`nil`). One outstanding consumer at a time.
+  /// consumer is CANCELLED (`nil`).
+  ///
+  /// **PRECONDITION — one outstanding consumer at a time**, and it is now ENFORCED rather
+  /// than merely documented. A second concurrent `next()` would overwrite ``waiter``, and the
+  /// displaced continuation is resumed by NO path — `enqueue`, `finish` and
+  /// ``releaseWaiter(generation:)`` each touch only the currently installed one. That is an
+  /// unbounded wait, the exact class #94 exists to close, so it traps here at the violation
+  /// instead of hanging somewhere else later. Resuming the displaced waiter with `nil`
+  /// instead would keep the process alive but hand that consumer a spurious end-of-feed,
+  /// which `fold` reads as "the feed finished" — a silent stream truncation in place of a
+  /// loud, local failure.
   ///
   /// The wait is cancellation-aware on purpose: the consumer is a child of an attempt's
   /// task group, and the group's teardown cancels it. A bare `withCheckedContinuation`
@@ -67,6 +77,10 @@ actor BoundedDeltaQueue<Element: Sendable> {
     if finished {
       return nil
     }
+    precondition(
+      waiter == nil,
+      "BoundedDeltaQueue supports one outstanding consumer; a second next() would strand the "
+        + "installed waiter in an unbounded wait")
     mintedGenerations &+= 1
     let generation = mintedGenerations
     return await withTaskCancellationHandler {
