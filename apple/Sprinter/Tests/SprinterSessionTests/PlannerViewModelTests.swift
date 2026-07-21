@@ -13,8 +13,9 @@ import Testing
 @MainActor
 struct PlannerViewModelTests {
   private static let session = SessionId(rawValue: "plan-session")
+  private static let repositoryKey = RepositoryKey(host: .github, owner: "acme", name: "pipe")
   private static let plan = WorkstreamPlan(
-    name: "Postgres sink", repo: "acme/pipe", spec: "batch writes to Postgres")
+    name: "Postgres sink", repository: repositoryKey, spec: "batch writes to Postgres")
 
   /// Planning IS a normal interactive session: the reused `SessionViewModel`'s
   /// transcript builds live off the scripted planning feed, driven by the fake.
@@ -145,16 +146,17 @@ struct PlannerViewModelTests {
         knownSession: Self.session, materializeResult: .success(created)),
       planningSessionId: Self.session)
     let corrected = WorkstreamPlan(
-      name: Self.plan.name, repo: Self.plan.repo, spec: "corrected spec")
+      name: Self.plan.name, repository: Self.plan.repository, spec: "corrected spec")
     try await accepting.materialize(corrected)
     #expect(accepting.outcome == .created(created))
     #expect(accepting.createdWorkstreamId == created)
   }
 
   /// The plan-construction FORM (CE3.2): `canMaterialize` gates on a non-empty name
-  /// AND repo (spec optional), and whitespace-only fields don't count — the plan is
-  /// built explicitly from the fields, never extracted from the transcript.
-  @Test("the form gates materialize on a non-empty name and repo")
+  /// AND a COMPLETE repository key — both halves, since the contract's key is a triple
+  /// and a half-filled one names nothing. Whitespace-only fields don't count, and the
+  /// plan is built explicitly from the fields, never extracted from the transcript.
+  @Test("the form gates materialize on a non-empty name and a complete repository key")
   func formValidationGatesMaterialize() {
     let backend = PlannerFakeBackend(
       knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
@@ -163,17 +165,89 @@ struct PlannerViewModelTests {
     // Empty form → cannot materialize.
     #expect(!planner.canMaterialize)
 
-    // Name only is not enough; a repo is required too.
+    // Name only is not enough; a repository key is required too.
     planner.name = "Postgres sink"
     #expect(!planner.canMaterialize)
 
-    // Whitespace-only repo still doesn't count.
-    planner.repo = "   "
+    // Whitespace-only fields still don't count.
+    planner.owner = "   "
+    planner.repositoryName = "   "
     #expect(!planner.canMaterialize)
 
-    // Name + repo (spec may stay empty) → ready.
-    planner.repo = "acme/pipe"
+    // HALF the key is still not a key: an owner with no repository name names nothing.
+    planner.owner = "acme"
+    planner.repositoryName = ""
+    #expect(!planner.canMaterialize)
+
+    // Name + the COMPLETE key (spec may stay empty) → ready.
+    planner.repositoryName = "pipe"
     #expect(planner.canMaterialize)
+  }
+
+  /// A repository key the daemon's schema would REFUSE is caught in the form, with a
+  /// message a person can act on. The wire rejection for the same input is an opaque
+  /// contract DECODE failure carrying no field and no remedy — and the commonest input
+  /// by far is a pasted `owner/name` slug in the OWNER field, which this names in those
+  /// words rather than silently splitting on `/` (a second parser of the key syntax is
+  /// exactly what the two-field form exists to avoid).
+  @Test("the form rejects a repository key the contract would refuse, with a real message")
+  func formRejectsInvalidRepositoryKey() {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    planner.name = "Postgres sink"
+
+    // The regression this PR introduced by splitting one field into two.
+    planner.owner = "callajd/sprinter"
+    planner.repositoryName = "sprinter"
+    #expect(!planner.canMaterialize)
+    #expect(planner.repositoryProblem?.contains("\"/\"") == true)
+
+    // A relative PATH segment — the vector that escaped the request URL entirely.
+    planner.owner = ".."
+    planner.repositoryName = "user"
+    #expect(!planner.canMaterialize)
+    #expect(planner.repositoryProblem != nil)
+
+    // Anything outside the allow-list, refused with the allowed set spelled out.
+    planner.owner = "acme"
+    planner.repositoryName = "pipe?x"
+    #expect(!planner.canMaterialize)
+    #expect(planner.repositoryProblem?.contains("letters, digits") == true)
+
+    // Over the LENGTH bound the contract's `RepositorySegment` enforces. The allow-list
+    // says which characters, not how many, so without this the form would happily submit
+    // a megabyte of `a` and the user would get an opaque decode failure back.
+    planner.owner = String(repeating: "a", count: 256)
+    planner.repositoryName = "pipe"
+    #expect(!planner.canMaterialize)
+    #expect(planner.repositoryProblem?.contains("too long") == true)
+
+    // The boundary itself is fine — 255 is accepted on both sides.
+    planner.owner = String(repeating: "a", count: 255)
+    #expect(planner.canMaterialize)
+    #expect(planner.repositoryProblem == nil)
+
+    // A valid key clears it.
+    planner.owner = "acme"
+    planner.repositoryName = "pipe"
+    #expect(planner.canMaterialize)
+    #expect(planner.repositoryProblem == nil)
+  }
+
+  /// An UNTOUCHED form is incomplete, not wrong: `repositoryProblem` stays `nil` until
+  /// something is typed, so nothing shouts at a user who has not started.
+  @Test("an untouched repository form reports no problem")
+  func untouchedRepositoryFormIsSilent() {
+    let backend = PlannerFakeBackend(
+      knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
+    let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
+    #expect(planner.repositoryProblem == nil)
+    #expect(!planner.canMaterialize)
+
+    // Half-filled IS reportable — the missing half is a real, actionable gap.
+    planner.owner = "acme"
+    #expect(planner.repositoryProblem?.contains("name") == true)
   }
 
   /// `draftPlan` constructs the plan from the explicit fields, trimming surrounding
@@ -184,12 +258,14 @@ struct PlannerViewModelTests {
       knownSession: Self.session, materializeResult: .success(WorkstreamId(rawValue: "ws-1")))
     let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
     planner.name = "  Postgres sink\n"
-    planner.repo = " acme/pipe "
+    planner.owner = " acme "
+    planner.repositoryName = " pipe "
     planner.spec = "  batch writes  "
 
     #expect(
       planner.draftPlan
-        == WorkstreamPlan(name: "Postgres sink", repo: "acme/pipe", spec: "batch writes"))
+        == WorkstreamPlan(
+          name: "Postgres sink", repository: Self.repositoryKey, spec: "batch writes"))
   }
 
   /// `materializeDraft` submits the plan the form describes through the port and
@@ -202,7 +278,8 @@ struct PlannerViewModelTests {
     let planner = PlannerViewModel(backend: backend, planningSessionId: Self.session)
     var observed = backend.submittedPlans.makeAsyncIterator()
     planner.name = "Postgres sink"
-    planner.repo = "acme/pipe"
+    planner.owner = "acme"
+    planner.repositoryName = "pipe"
     planner.spec = "batch writes to Postgres"
 
     try await planner.materializeDraft()

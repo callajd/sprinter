@@ -112,11 +112,12 @@ struct BoardProjectionTests {
   @Test("skips a dangling child reference")
   func skipsDanglingReference() {
     let snapshot = Snapshot(
+      repositories: [BoardFixtures.repositoryA],
       workstreams: [
         Workstream(
           id: WorkstreamId(rawValue: "ws"),
           name: "W",
-          repo: "callajd/sprinter",
+          repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
           status: .active,
           epics: [EpicId(rawValue: "ep"), EpicId(rawValue: "ep-missing")])
       ],

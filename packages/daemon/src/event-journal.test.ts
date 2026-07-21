@@ -16,6 +16,7 @@ import {
   Epic,
   Issue,
   Job,
+  Repository,
   type SessionEvent,
   SessionId,
   Session,
@@ -38,10 +39,25 @@ const deadGeneration = Schema.decodeUnknownSync(StoreGenerationId)(
   "00000000-dead-4000-8000-000000000000",
 );
 
+/**
+ * The repository {@link workstream} is anchored to. `workstream.repositoryId` is a
+ * FOREIGN KEY, so this has to be stored before anything references it — and because
+ * this store is the JOURNALING one, storing it also emits a `RepositoryChanged`
+ * delta, which is why the offset expectations below start with one.
+ */
+const repository = Schema.decodeUnknownSync(Repository)({
+  id: "repo:github:1296269",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
   name: "Convergence",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["ep-1"],
 });
@@ -95,6 +111,7 @@ const issueWithDeps = Schema.decodeUnknownSync(Issue)({
 
 const seedGraph = (store: Context.Service.Shape<typeof StateStore>) =>
   Effect.gen(function* () {
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
     yield* store.workGraph.putIssue(issue);
@@ -112,6 +129,7 @@ it.effect("journals every persisted mutation to the durable offset log, in order
 
     const entries = yield* store.events.tail(0);
     expect(entries.map((e) => e.kind)).toEqual([
+      "RepositoryChanged",
       "WorkstreamChanged",
       "EpicChanged",
       "IssueChanged",
@@ -150,9 +168,76 @@ it.effect("journals an agent append ONCE — an idempotent re-append adds no sec
     // And the LIVE fan-out is skipped on the no-op too, not merely the durable append:
     // the only published item is the first one (the second `take` would block, so a
     // second publish is proven absent by driving a DIFFERENT delta through after it).
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     const published = [yield* PubSub.take(subscription), yield* PubSub.take(subscription)];
-    expect(published.map((e) => e.event._tag)).toEqual(["AgentChanged", "WorkstreamChanged"]);
+    expect(published.map((e) => e.event._tag)).toEqual(["AgentChanged", "RepositoryChanged"]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+// N1 (round 3) — a repository RE-OBSERVATION that changed nothing must not journal.
+//
+// The row write is unconditional (D7 replaces wholesale, and `observedAt` has to move),
+// but the DELTA is a no-op: the two records agree about everything a client mirrors and
+// differ only in when we looked. `createWorkstreamFromPlan` resolves the repository
+// BEFORE it can derive the workstream id, so a client retry-looping on
+// `PlanRejected("a workstream already exists…")` re-puts on every attempt — and the
+// event log is append-only with no trim. Journaling unconditionally would grow it
+// without bound and re-broadcast an identical delta on every retry.
+it.effect("journals a repository put ONCE — a re-observation that changed nothing adds none", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const feed = yield* WorkGraphEvents;
+    const subscription = yield* feed.subscribe;
+
+    yield* store.repositories.putRepository(repository);
+    // The SAME repository, re-observed a day later: a new `observedAt`, nothing else.
+    const reobserved = Schema.decodeUnknownSync(Repository)({
+      ...repository,
+      observedAt: "2026-07-21T12:00:00.000Z",
+    });
+    yield* store.repositories.putRepository(reobserved);
+
+    // ONE durable delta, not one per observation.
+    const entries = yield* store.events.read;
+    expect(entries.map((e) => e.kind)).toEqual(["RepositoryChanged"]);
+    // …and the ROW still advanced: the suppression is of the delta, never of the write.
+    expect(
+      Option.getOrThrow(yield* store.repositories.getRepository(repository.id)).observedAt,
+    ).toBe("2026-07-21T12:00:00.000Z");
+    // The LIVE fan-out is skipped too, proven the same way the agent test proves it: a
+    // DIFFERENT delta is driven through, and it is the second published item.
+    yield* store.workGraph.putWorkstream(workstream);
+    const published = [yield* PubSub.take(subscription), yield* PubSub.take(subscription)];
+    expect(published.map((e) => e.event._tag)).toEqual(["RepositoryChanged", "WorkstreamChanged"]);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerJournaling(layerMemory)),
+    Effect.provide(layerWorkGraphEvents),
+    Effect.provide(layerSessionEvents),
+  ),
+);
+
+// …and the other side of the same rule: an observation that DID change is journaled, so
+// the suppression cannot silently swallow a real delta. A ref moving is the commonest
+// real change, and the one DE2.3's staleness computation reads.
+it.effect("journals a repository put whose observation actually CHANGED", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* store.repositories.putRepository(repository);
+    const moved = Schema.decodeUnknownSync(Repository)({
+      ...repository,
+      refs: [{ name: "main", sha: "89abcdef0123456789abcdef0123456789abcdef" }],
+      observedAt: "2026-07-21T12:00:00.000Z",
+    });
+    yield* store.repositories.putRepository(moved);
+    const entries = yield* store.events.read;
+    expect(entries.map((e) => e.kind)).toEqual(["RepositoryChanged", "RepositoryChanged"]);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
@@ -172,6 +257,10 @@ it.effect(
       // failure BOTH roll back — never the node-persisted-but-delta-missing split a
       // crash between two separate commits would leave (the offset feed's history
       // would then be incomplete).
+      // The FK anchor is stored FIRST, outside the transaction under test: without it
+      // the rolled-back `putWorkstream` would fail on the foreign key rather than on
+      // `boom`, and the test would pass for the wrong reason.
+      yield* store.repositories.putRepository(repository);
       const boom = new StateStoreError({ operation: "test", detail: "boom" });
       const failure = yield* store.workGraph
         .putWorkstream(workstream)
@@ -182,7 +271,8 @@ it.effect(
       const persisted = yield* store.workGraph.getWorkstream(workstream.id);
       expect(persisted._tag).toBe("None");
       const entries = yield* store.events.tail(0);
-      expect(entries).toEqual([]);
+      // Only the anchor's own delta — the rolled-back workstream journaled nothing.
+      expect(entries.map((e) => e.kind)).toEqual(["RepositoryChanged"]);
 
       // And a NORMAL put commits both together — the node is readable and its delta
       // is journaled (the two halves the transaction binds).
@@ -190,7 +280,7 @@ it.effect(
       const committed = yield* store.workGraph.getWorkstream(workstream.id);
       expect(committed._tag).toBe("Some");
       const journaled = yield* store.events.tail(0);
-      expect(journaled.map((e) => e.kind)).toEqual(["WorkstreamChanged"]);
+      expect(journaled.map((e) => e.kind)).toEqual(["RepositoryChanged", "WorkstreamChanged"]);
     }).pipe(
       Effect.scoped,
       Effect.provide(layerJournaling(layerMemory)),
@@ -248,6 +338,8 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
     const replay = yield* resyncFrom(store, 0).pipe(Stream.runCollect);
     // Each item pairs the owned delta with its durable offset (CE2.0).
     expect(replay.map((e) => e.event)).toEqual([
+      // The STATE layer's delta rides the same durable log as the work graph.
+      { _tag: "RepositoryChanged", repository },
       { _tag: "WorkstreamChanged", workstream },
       { _tag: "EpicChanged", epic },
       { _tag: "IssueChanged", issue },
@@ -267,6 +359,7 @@ it.effect("resyncFrom decodes the durable log into offset-stamped owned deltas",
     const cursor = offsets[1] ?? 0;
     const fromThird = yield* resyncFrom(store, cursor).pipe(Stream.runCollect);
     expect(fromThird.map((e) => e.event._tag)).toEqual([
+      "EpicChanged",
       "IssueChanged",
       "JobChanged",
       "SessionChanged",
@@ -291,13 +384,14 @@ it.effect("the live feed stamps every fanned-out delta with its durable offset (
     yield* seedGraph(store);
 
     const received: Array<OffsetEvent> = [];
-    for (let i = 0; i < 6; i++) received.push(yield* PubSub.take(subscription));
+    for (let i = 0; i < 7; i++) received.push(yield* PubSub.take(subscription));
 
     // The live tail carries the SAME coordinate space as the durable replay: the
     // published offsets match the journaled `event_log` offsets exactly.
     const journaled = yield* store.events.tail(0);
     expect(received.map((e) => e.offset)).toEqual(journaled.map((j) => j.offset));
     expect(received.map((e) => e.event._tag)).toEqual([
+      "RepositoryChanged",
       "WorkstreamChanged",
       "EpicChanged",
       "IssueChanged",
@@ -323,11 +417,13 @@ it.live("resyncEvents replays durable history, then streams the live tail", () =
     const feed = yield* WorkGraphEvents;
 
     // A mutation BEFORE any client attaches — only a durable resync can catch it up.
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
 
     // Attach: eager-subscribe live, replay the durable log, then the live tail.
     const collecting = yield* resyncEvents(store, feed).pipe(
-      Stream.take(2),
+      // Three: the anchor repository's delta, the workstream's, then the live epic.
+      Stream.take(3),
       Stream.runCollect,
       Effect.forkChild,
     );
@@ -338,8 +434,9 @@ it.live("resyncEvents replays durable history, then streams the live tail", () =
     yield* store.workGraph.putEpic(epic);
 
     const received = yield* Fiber.join(collecting);
-    const first = received[0];
-    const second = received[1];
+    expect(received[0]?.event._tag).toBe("RepositoryChanged");
+    const first = received[1];
+    const second = received[2];
     expect(first?.event._tag).toBe("WorkstreamChanged");
     expect(second?.event._tag).toBe("EpicChanged");
     // Replay (durable) then live-tail offsets are one strictly-increasing coordinate.
@@ -357,22 +454,24 @@ it.live("resyncEvents resumes durable replay from a sinceOffset cursor (CE2.0)",
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
 
-    // Two mutations BEFORE any client attaches — journaled at offsets 1 and 2.
+    // Three mutations BEFORE any client attaches — journaled at offsets 1, 2 and 3
+    // (the first is the repository the workstream is anchored to).
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
-    // Attach with a cursor PAST the first entry (offset 1): the resync must replay
-    // only the second durable delta (strictly-after semantics), not re-send offset 1.
+    // Attach with a cursor PAST the first two entries (offset 2): the resync must
+    // replay only the third durable delta (strictly-after semantics).
     const collecting = yield* resyncEvents(store, feed, {
-      sinceOffset: 1,
+      sinceOffset: 2,
       generation: store.generation,
     }).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
 
     const received = yield* Fiber.join(collecting);
     const only: OffsetEvent | undefined = received[0];
     expect(only?.event._tag).toBe("EpicChanged");
-    // Strictly-after semantics: the replayed offset is greater than the cursor (1).
-    expect((only?.offset ?? 0) > 1).toBe(true);
+    // Strictly-after semantics: the replayed offset is greater than the cursor (2).
+    expect((only?.offset ?? 0) > 2).toBe(true);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
@@ -386,7 +485,8 @@ it.live("resyncEvents fails a cursor BEYOND the log's extent with ResyncRequired
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
 
-    // Two mutations, journaled at offsets 1 and 2 — the WHOLE log of this generation.
+    // Three mutations, journaled at offsets 1..3 — the WHOLE log of this generation.
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
@@ -406,7 +506,7 @@ it.live("resyncEvents fails a cursor BEYOND the log's extent with ResyncRequired
     // Self-describing: the rejected cursor and the extent it exceeded.
     expect({ sinceOffset: failure.sinceOffset, maxOffset: failure.maxOffset }).toStrictEqual({
       sinceOffset: 999,
-      maxOffset: 2,
+      maxOffset: 3,
     });
   }).pipe(
     Effect.scoped,
@@ -456,10 +556,11 @@ it.live("resyncEvents accepts the ORIGIN request against an empty log — it is 
       Effect.forkChild,
     );
     yield* Effect.sleep("20 millis");
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
 
     const received = yield* Fiber.join(collecting);
-    expect(received[0]?.event._tag).toBe("WorkstreamChanged");
+    expect(received[0]?.event._tag).toBe("RepositoryChanged");
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
@@ -472,6 +573,7 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
@@ -479,7 +581,7 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
     // (cursor == max offset) is not stale, so it replays nothing and only streams
     // the live tail — it is never re-sent history it already acknowledged.
     const collecting = yield* resyncEvents(store, feed, {
-      sinceOffset: 2,
+      sinceOffset: 3,
       generation: store.generation,
     }).pipe(Stream.take(1), Stream.runCollect, Effect.forkChild);
     yield* Effect.sleep("20 millis");
@@ -488,7 +590,7 @@ it.live("resyncEvents replays nothing for a caught-up cursor AT the log's max of
     const received = yield* Fiber.join(collecting);
     const only: OffsetEvent | undefined = received[0];
     expect(only?.event._tag).toBe("IssueChanged");
-    expect((only?.offset ?? 0) > 2).toBe(true);
+    expect((only?.offset ?? 0) > 3).toBe(true);
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),
@@ -506,18 +608,19 @@ it.live("resyncEvents REFUSES a cursor WITHIN the log's extent but from a PRIOR 
     // identity rather than an inference. After a schema-version bump the database is
     // dropped and recreated, `event_log` restarts at offset 1, and `StartupReconcile`
     // journals boot deltas — so the NEW log quickly grows PAST a client's stale cursor.
-    // Here the log reaches offset 3 while the client reconnects with cursor 2: the
+    // Here the log reaches offset 4 while the client reconnects with cursor 2: the
     // extent test (`sinceOffset <= maxOffset`) is satisfied, and a daemon relying on it
     // would resume the client incrementally against a coordinate space its cursor never
     // belonged to — never re-sending the new generation's offsets 1..2, and leaving the
     // client's retained baseline holding every entity the reset destroyed, forever
     // (deltas are upsert-only, so nothing streamed can remove them). Undetectable from
     // either side. The generation identity is what makes it detectable — and refused.
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
     yield* store.workGraph.putIssue(issue);
     const maxOffset = yield* store.events.maxOffset;
-    expect(maxOffset).toBe(3);
+    expect(maxOffset).toBe(4);
 
     const failure = yield* Effect.flip(
       resyncEvents(store, feed, { sinceOffset: 2, generation: deadGeneration }).pipe(
@@ -531,7 +634,7 @@ it.live("resyncEvents REFUSES a cursor WITHIN the log's extent but from a PRIOR 
     expect(failure.sinceOffset <= failure.maxOffset).toBe(true);
     expect({ sinceOffset: failure.sinceOffset, maxOffset: failure.maxOffset }).toStrictEqual({
       sinceOffset: 2,
-      maxOffset: 3,
+      maxOffset: 4,
     });
     // And it names the daemon's CURRENT generation, so the failure says which context
     // the client is now expected to hydrate into rather than merely "no".
@@ -549,6 +652,7 @@ it.live("resyncEvents REFUSES a STALE generation paired with sinceOffset 0 (B1)"
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
     yield* store.workGraph.putEpic(epic);
 
@@ -588,6 +692,7 @@ it.live("resyncEvents ACCEPTS sinceOffset 0 under the CURRENT generation — a r
   Effect.gen(function* () {
     const store = yield* StateStore;
     const feed = yield* WorkGraphEvents;
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
 
     // The other side of the same branch: a zero cursor is not poison, it is a resume
@@ -598,7 +703,7 @@ it.live("resyncEvents ACCEPTS sinceOffset 0 under the CURRENT generation — a r
       sinceOffset: 0,
       generation: store.generation,
     }).pipe(Stream.take(1), Stream.runCollect);
-    expect(received[0]?.event._tag).toBe("WorkstreamChanged");
+    expect(received[0]?.event._tag).toBe("RepositoryChanged");
     expect(received[0]?.offset).toBe(1);
   }).pipe(
     Effect.scoped,
@@ -635,11 +740,12 @@ it.live("resyncEvents on a fresh daemon replays nothing, then streams live", () 
       Effect.forkChild,
     );
     yield* Effect.sleep("20 millis");
+    yield* store.repositories.putRepository(repository);
     yield* store.workGraph.putWorkstream(workstream);
 
     const received = yield* Fiber.join(collecting);
     const only: OffsetEvent | undefined = received[0];
-    expect(only?.event._tag).toBe("WorkstreamChanged");
+    expect(only?.event._tag).toBe("RepositoryChanged");
   }).pipe(
     Effect.scoped,
     Effect.provide(layerJournaling(layerMemory)),

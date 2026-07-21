@@ -179,12 +179,27 @@ private final class NullTransport: RpcTransport {
 /// A one-node baseline snapshot: an active workstream ⊃ epic ⊃ in-progress issue, so the
 /// board projects a non-empty tree the ``AppModel`` test can wait on.
 enum AppSupportFixtures {
+  /// The repository the workstream REFERENCES — a snapshot must carry it, or the
+  /// board could not resolve the reference into a name.
+  static let repository = Repository(
+    id: RepositoryId(rawValue: "repo:github:1296269"),
+    host: .github,
+    owner: "callajd",
+    name: "sprinter",
+    refs: [
+      RepositoryRef(
+        name: BranchName(rawValue: "main"),
+        sha: CommitSha(rawValue: "0123456789abcdef0123456789abcdef01234567"))
+    ],
+    observedAt: "2026-07-20T12:00:00.000Z")
+
   static let snapshot = Snapshot(
+    repositories: [repository],
     workstreams: [
       Workstream(
         id: WorkstreamId(rawValue: "ws-1"),
         name: "Convergence",
-        repo: "callajd/sprinter",
+        repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
         status: .active,
         epics: [EpicId(rawValue: "ep-1")])
     ],

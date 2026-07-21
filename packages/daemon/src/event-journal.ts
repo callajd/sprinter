@@ -57,7 +57,14 @@ import {
   ResyncRequired,
   WorkGraphEvent,
 } from "@sprinter/contract";
-import type { Agent, NonNegativeInt, SessionEvent, SessionId } from "@sprinter/domain";
+import {
+  type Agent,
+  type NonNegativeInt,
+  observationsAgree,
+  type Repository,
+  type SessionEvent,
+  type SessionId,
+} from "@sprinter/domain";
 import {
   type AgentWrite,
   type PersistedEvent,
@@ -166,6 +173,96 @@ const putAgentAndJournal = (
     );
 
 /**
+ * The {@link putAndJournal} variant for the OBSERVED `── STATE ──` layer: journal and
+ * fan out only when the observation actually CHANGED something.
+ *
+ * The row write is unconditional — a refresh REPLACES the record wholesale under a new
+ * `observedAt` (D7), and that stamp is what DE4.4 renders staleness from, so it must
+ * land every time. What is suppressed is the DELTA, and the two are not the same
+ * question: `observedAt` is not something the repository IS, it is when we last looked,
+ * so two resolves of an unchanged repository produce records that always differ by it
+ * and agree about everything a client mirrors ({@link observationsAgree}).
+ *
+ * Journaling unconditionally would therefore make every RE-OBSERVATION a durable log
+ * entry and a broadcast to every client, for a repository that did not move. That is
+ * reachable on the ordinary rejection path, not just in theory:
+ * `createWorkstreamFromPlan` RESOLVES the repository before it can derive the
+ * workstream id (the id is a function of `repository.id`), so a client retry-looping on
+ * a `PlanRejected("a workstream already exists…")` re-observes and re-puts on EVERY
+ * attempt. The event log is append-only with no trim or compaction, so that loop grows
+ * it without bound and re-broadcasts an identical `RepositoryChanged` each time —
+ * exactly the amplification {@link putAgentAndJournal} exists to suppress for the
+ * registry.
+ *
+ * The prior read, the write and the journal append all happen INSIDE one transaction,
+ * exactly as {@link putAgentAndJournal} decides from the store's own answer inside one:
+ * the comparison is made against the row this write is about to replace, and the row
+ * write and its delta still commit together or not at all (INV-RESTART). The live
+ * publish still happens after the commit, and is skipped entirely on the agreeing path.
+ *
+ * ## What this closes, and what it does NOT
+ *
+ * Be precise about the scope, because the retry loop above has TWO halves and this
+ * closes ONE. The DURABLE half is closed: the append-only event log stops growing and
+ * the identical `RepositoryChanged` stops being broadcast to every client.
+ *
+ * The CODE-HOST half is untouched. Each rejected attempt still RESOLVES the repository
+ * before it can derive the workstream id, and a resolve is two live GitHub requests (the
+ * repository, then its branches). The adapter carries no retry budget, no backoff and no
+ * cache (`packages/repository/src/github.ts`), and the daemon adds none — so a client
+ * looping on `PlanRejected("a workstream already exists…")` issues two requests per
+ * attempt against GitHub's 5,000 requests/hour authenticated REST quota, exhausting it in
+ * roughly 2,500 attempts — about 42 minutes at one attempt per second, less for a tighter
+ * loop. After that EVERY code-host operation the daemon makes is refused (403), so a
+ * single misbehaving client's retry loop denies the whole daemon its code host until the
+ * limit resets. Nothing here defends against that; issue **#98** is where a retry budget,
+ * backoff and a short-lived resolve cache belong.
+ *
+ * The COST, stated because it is real: on a suppressed refresh a client's mirror keeps
+ * the `observedAt` it was last told about while the durable row moves ahead, so a
+ * mirror can render a repository as staler than it is until the next genuine change
+ * republishes the whole record. That is the right side to err on — an unbounded log and
+ * a broadcast storm are worse than a conservative staleness reading, and the reading is
+ * conservative in the safe direction (too old, never too fresh). A refresh trigger
+ * (DE4.4) that wants the stamp fanned out regardless will need a delta that carries the
+ * observation time as its own event rather than a whole-record change; that is recorded
+ * against DE4.4 in `docs/plan/domain-remodel.md`.
+ */
+const putRepositoryAndJournal = (
+  base: Store,
+  feed: Feed,
+  repository: Repository,
+): Effect.Effect<void, StateStoreError> => {
+  const event: WorkGraphEvent = { _tag: "RepositoryChanged", repository };
+  return base
+    .withTransaction(
+      base.repositories
+        .getRepository(repository.id)
+        .pipe(
+          Effect.flatMap((stored) =>
+            base.repositories
+              .putRepository(repository)
+              .pipe(
+                Effect.andThen(() =>
+                  Option.isSome(stored) && observationsAgree(stored.value, repository)
+                    ? Effect.succeedNone
+                    : journalDelta(base, event).pipe(Effect.map((offset) => Option.some(offset))),
+                ),
+              ),
+          ),
+        ),
+    )
+    .pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () => Effect.void,
+          onSome: (offset) => feed.publish({ offset, event }),
+        }),
+      ),
+    );
+};
+
+/**
  * Persist one durable, transcript-grade {@link SessionEvent} to the session's durable
  * transcript log (minting its per-session offset), THEN fan it out live on the
  * {@link SessionEvents} feed stamped with that same offset. The session log's `append` is a
@@ -219,6 +316,21 @@ const journaling = (base: Store, feed: Feed, sessionFeed: SessionFeed): Store =>
       putAgent: (agent) => putAgentAndJournal(base, feed, agent),
       getAgent: base.agents.getAgent,
       listAgents: base.agents.listAgents,
+    },
+    // The STATE layer journals through the SAME seam as the work graph: a repository
+    // observation is durable-plus-live in one transaction, fanned out as
+    // `RepositoryChanged`, and there is no delete anywhere to journal. It takes its own
+    // helper for the same reason the append-only registry does: a put here always
+    // WRITES (a refresh REPLACES the record wholesale under a new `observedAt`, D7),
+    // but a re-observation that changed nothing is still a NO-OP DELTA — the two
+    // records agree about everything except when we looked — and journaling it would
+    // grow the append-only log and re-broadcast on every retry. See
+    // `putRepositoryAndJournal`.
+    repositories: {
+      putRepository: (repository) => putRepositoryAndJournal(base, feed, repository),
+      getRepository: base.repositories.getRepository,
+      findRepository: base.repositories.findRepository,
+      listRepositories: base.repositories.listRepositories,
     },
     workGraph: {
       putWorkstream: (workstream) =>

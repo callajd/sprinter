@@ -14,7 +14,7 @@ import { layer, WorkGraphEvents } from "./work-graph-events.ts";
 const workstream = Schema.decodeUnknownSync(Workstream)({
   id: "ws-1",
   name: "Foundation",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "pending",
   epics: [],
 });

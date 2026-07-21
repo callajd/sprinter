@@ -22,10 +22,29 @@ struct ConstructionTests {
     let built = Workstream(
       id: WorkstreamId(rawValue: "ws-1"),
       name: "Foundation",
-      repo: "callajd/sprinter",
+      repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
       status: .active,
       epics: [EpicId(rawValue: "ep-1")])
     #expect(built == (try Golden.decode(Workstream.self, from: "workstream")))
+  }
+
+  @Test("builds a repository equal to the golden")
+  func buildsRepository() throws {
+    let built = Repository(
+      id: RepositoryId(rawValue: "repo:github:1296269"),
+      host: .github,
+      owner: "callajd",
+      name: "sprinter",
+      refs: [
+        RepositoryRef(
+          name: BranchName(rawValue: "feat/x-1"),
+          sha: CommitSha(rawValue: "89abcdef0123456789abcdef0123456789abcdef")),
+        RepositoryRef(
+          name: BranchName(rawValue: "main"),
+          sha: CommitSha(rawValue: "0123456789abcdef0123456789abcdef01234567"))
+      ],
+      observedAt: "2026-07-20T12:00:00.000Z")
+    #expect(built == (try Golden.decode(Repository.self, from: "repository")))
   }
 
   @Test("builds an epic equal to the golden")
@@ -104,6 +123,7 @@ struct ConstructionTests {
   func buildsSnapshot() throws {
     let decoded = try Golden.decode(Snapshot.self, from: "snapshot")
     let built = Snapshot(
+      repositories: decoded.repositories,
       workstreams: decoded.workstreams,
       epics: decoded.epics,
       issues: decoded.issues,
@@ -116,6 +136,8 @@ struct ConstructionTests {
     // always carries the key, so there is no default to let a construction site
     // quietly omit it. What the golden carries is a NON-empty registry.
     #expect(!decoded.agents.isEmpty)
+    // Same for the STATE layer, and for the same reason.
+    #expect(!decoded.repositories.isEmpty)
   }
 
   @Test("builds Usage equal to the golden")
@@ -144,7 +166,7 @@ struct ConstructionTests {
   func buildsWorkstreamPlan() throws {
     let built = WorkstreamPlan(
       name: "Foundation",
-      repo: "callajd/sprinter",
+      repository: RepositoryKey(host: .github, owner: "callajd", name: "sprinter"),
       spec: "Build the daemon↔client contract and its mirrors.")
     #expect(built == (try Golden.decode(WorkstreamPlan.self, from: "workstream-plan")))
   }
@@ -152,7 +174,10 @@ struct ConstructionTests {
   @Test("builds every command payload equal to its golden")
   func buildsCommandPayloads() throws {
     let create = CreateWorkstreamFromPlanPayload(
-      plan: WorkstreamPlan(name: "Foundation", repo: "callajd/sprinter", spec: "build it"))
+      plan: WorkstreamPlan(
+        name: "Foundation",
+        repository: RepositoryKey(host: .github, owner: "callajd", name: "sprinter"),
+        spec: "build it"))
     #expect(
       create
         == (try Golden.decode(

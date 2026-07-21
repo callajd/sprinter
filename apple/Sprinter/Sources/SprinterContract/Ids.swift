@@ -70,6 +70,43 @@ public struct AgentId: StringIdentifier {
   public init(rawValue: String) { self.rawValue = rawValue }
 }
 
+/// Identifies a ``Repository`` — a repository as OBSERVED on a code host, and the
+/// anchor the state layer hangs from (``Workstream/repositoryId``).
+///
+/// It is OPAQUE. Equality is the only defined operation — nothing may parse it, order
+/// it, or read an owner/name back out of it. The NATURAL key of a repository is its
+/// `(host, owner, name)` triple, which the daemon holds unique.
+public struct RepositoryId: StringIdentifier {
+  public let rawValue: String
+  public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+/// A full git commit object name — 40 lowercase hex characters on the contract.
+///
+/// **The mirror is DECODE-ONLY and does NOT re-validate**, exactly as ``Timestamp``'s
+/// mirror does not (same posture, cross-referencing #89). The daemon's schema is the
+/// single point of truth for what a commit sha is: it decodes every externally-sourced
+/// sha at the boundary and refuses a malformed one there, so anything reaching this
+/// type has already been checked. Re-checking here would put a SECOND definition of
+/// "valid" in the tree — one that can drift from the daemon's — and a client that
+/// rejected a value the daemon accepted would simply be unable to render state the
+/// daemon considers real. So this wrapper carries the string as-is and exists for TYPE
+/// SAFETY: it keeps a sha from being passed where a branch name belongs.
+public struct CommitSha: StringIdentifier {
+  public let rawValue: String
+  public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+/// A git branch name.
+///
+/// Decode-only and NOT re-validated, for the same reason as ``CommitSha`` above (and
+/// ``Timestamp``, #89): the daemon's schema decides what a branch name is, at the one
+/// boundary every externally-sourced name crosses.
+public struct BranchName: StringIdentifier {
+  public let rawValue: String
+  public init(rawValue: String) { self.rawValue = rawValue }
+}
+
 /// Identifies one STORE GENERATION — the lifetime of a single durable daemon store,
 /// from the moment its schema is created to the moment it is dropped and recreated.
 ///

@@ -3,11 +3,11 @@
  * FROM the code host INTO its own durable planning state.
  *
  * Reconciliation is one-directional and Issue/PR-level (D13): it READS which
- * Issues have closed and which PRs have merged from the {@link Repository} port,
+ * Issues have closed and which PRs have merged from the {@link CodeHost} port,
  * then ROLLS that up into Epic/Workstream `WorkStatus` persisted via the
  * `@sprinter/state` {@link StateStore}. It NEVER writes planning state back to the
  * host — Workstreams and Epics live entirely in Sprinter (D13). Both ports are
- * fakeable seams, so this is exercised offline against a fake `Repository` + the
+ * fakeable seams, so this is exercised offline against a fake `CodeHost` + the
  * in-memory `StateStore` ({@link ./reconcile.test.ts}).
  *
  * An Issue is LANDED when the host reports it closed AND its closing PR merged
@@ -18,7 +18,7 @@
  *
  * **Per-issue error isolation (AE3.2 / #27 F4, resolved AE5.1 / #32; hardened
  * CE1.3 / #53).** The Issue loop is catch-and-continue on a host failure: a single
- * Issue's `RepositoryError` (a 404 for a deleted Issue, a 403/429 rate-limit) is
+ * Issue's `CodeHostError` (a 404 for a deleted Issue, a 403/429 rate-limit) is
  * caught, logged, AND COLLECTED, and the roll-up proceeds with the remaining Issues
  * — one flaky host read never aborts the whole Workstream roll-up. A
  * {@link StateStoreError} is NOT isolated: our own durable store failing is a real
@@ -54,18 +54,18 @@ import {
   type WorkstreamId,
 } from "@sprinter/domain";
 import { StateStore, type StateStoreError } from "@sprinter/state";
-import { Repository, type RepositoryError } from "./repository.ts";
+import { CodeHost, type CodeHostError } from "./code-host.ts";
 
 /**
  * One Issue that a roll-up could NOT read from the host — a per-issue
- * `RepositoryError` (a 404/403/429) that was isolated so the rest of the roll-up
+ * `CodeHostError` (a 404/403/429) that was isolated so the rest of the roll-up
  * proceeded. Surfaced in the {@link ReconcileOutcome} so a partially-failed run is
  * observable, not silent.
  */
 export interface ReconcileFailure {
   /** The host Issue number whose read failed. */
   readonly issueNumber: number;
-  /** The neutral, human-readable cause carried by the isolated `RepositoryError`. */
+  /** The neutral, human-readable cause carried by the isolated `CodeHostError`. */
   readonly detail: string;
 }
 
@@ -102,18 +102,18 @@ const withChild = <A>(list: ReadonlyArray<A>, id: A): ReadonlyArray<A> =>
 const reconcileIssue = (
   epic: Epic,
   issue: Issue,
-): Effect.Effect<void, RepositoryError | StateStoreError, Repository | StateStore> =>
+): Effect.Effect<void, CodeHostError | StateStoreError, CodeHost | StateStore> =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const host = yield* CodeHost;
     const store = yield* StateStore;
 
-    const hostIssue = yield* repo.issues.getIssue(issue.number);
+    const hostIssue = yield* host.issues.getIssue(issue.number);
     if (hostIssue.state !== "closed") return;
 
-    const closingPr = yield* repo.pullRequests.closingPullRequest(issue.number);
+    const closingPr = yield* host.pullRequests.closingPullRequest(issue.number);
     if (Option.isNone(closingPr)) return;
 
-    const pr = yield* repo.pullRequests.getPullRequest(closingPr.value);
+    const pr = yield* host.pullRequests.getPullRequest(closingPr.value);
     if (!pr.merged) return;
 
     const landed: Issue = { ...issue, status: "done", pr };
@@ -149,19 +149,19 @@ const ensureIssueInEpic = (
  */
 const reconcileEpic = (
   epic: Epic,
-): Effect.Effect<EpicOutcome, StateStoreError, Repository | StateStore> =>
+): Effect.Effect<EpicOutcome, StateStoreError, CodeHost | StateStore> =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const issues = yield* store.workGraph.listIssues(epic.id);
     // Per-issue error isolation (F4): a host failure on one Issue is caught, logged,
     // AND collected so the roll-up continues; a StateStoreError is NOT caught (our
     // own store failing is a real abort). `catchTag` narrows the loop's error to the
-    // owned StateStoreError, leaving `Repository` in the requirement. Each Issue
+    // owned StateStoreError, leaving `CodeHost` in the requirement. Each Issue
     // yields the failures it produced (none on success), flattened for the Epic.
     const perIssue = yield* Effect.forEach(issues, (issue) =>
       reconcileIssue(epic, issue).pipe(
         Effect.as<ReadonlyArray<ReconcileFailure>>([]),
-        Effect.catchTag("RepositoryError", (error) =>
+        Effect.catchTag("CodeHostError", (error) =>
           Effect.logWarning(
             `reconcile: skipping issue #${issue.number} after host error: ${error.detail}`,
           ).pipe(Effect.as([{ issueNumber: issue.number, detail: error.detail }])),
@@ -205,7 +205,7 @@ const reconcileEpic = (
  */
 export const reconcileWorkstream = (
   workstreamId: WorkstreamId,
-): Effect.Effect<ReconcileOutcome, StateStoreError, Repository | StateStore> =>
+): Effect.Effect<ReconcileOutcome, StateStoreError, CodeHost | StateStore> =>
   Effect.gen(function* () {
     const store = yield* StateStore;
     const found = yield* store.workGraph.getWorkstream(workstreamId);

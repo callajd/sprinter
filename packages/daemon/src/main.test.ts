@@ -10,7 +10,7 @@
  *   - `ExecutionRunner` — the REAL `LocalPi` adapter over the REAL worktree router,
  *     with only the `ChildProcessSpawner` faked (never driven here — dispatch is
  *     covered by `local-pi-runner.test.ts` / `job-runner.test.ts`);
- *   - `Repository` — a canned fake (no HTTP);
+ *   - `CodeHost` — a canned fake (no HTTP);
  *   - `FileSystem`/`Path` — real Bun services.
  *
  * The suite proves the CE1.2 Done criteria on the SERVED surface: the graph builds,
@@ -26,7 +26,8 @@ import { RpcTest } from "effect/unstable/rpc";
 import { BunFileSystem, BunPath } from "@effect/platform-bun";
 import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
-import { Repository, RepositoryError, RepositoryIssue } from "@sprinter/repository";
+import { Repository as DomainRepository, RepositoryKey } from "@sprinter/domain";
+import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
 import { StateStore } from "@sprinter/state";
 import {
   appLayer,
@@ -43,10 +44,57 @@ import { StartupReconcile } from "./startup-reconcile.ts";
 
 // ── substitutable leaves (fakes) ──────────────────────────────────────────────
 
-/** A fake `Repository`: canned, no HTTP. Never driven here (reconcile is not run). */
-const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
-  Repository,
-  Repository.of({
+/** Decode a fixture through its owned schema (no casts, INV-NOCAST). */
+const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
+  Schema.decodeUnknownSync(schema)(raw);
+
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain object literal is
+ * not a `RepositoryKey`.
+ */
+const repositoryKey = (owner: string, name: string): RepositoryKey =>
+  decode(RepositoryKey, { host: "github", owner, name });
+
+/**
+ * The stand-in for the NUMERIC identifier a code host assigns a repository — a pure
+ * FNV-1a hash of the natural key, so it is deterministic and independent of test order.
+ *
+ * It stands in for the host's OWN id rather than being the key in the id's clothing: a
+ * real adapter mints a `RepositoryId` from an identifier a RENAME does not change, and
+ * `RepositoryId` now CHECKS that shape (`repo:<host>:<host-id>`, host-id from the
+ * URL-unreserved set), so a key-shaped `repo:github:owner/name` no longer decodes at
+ * all. Spelling the fake's id like the real one keeps this harness from agreeing with a
+ * broken adapter.
+ */
+const fakeRepositoryId = (owner: string, name: string): string => {
+  let hash = 0x811c9dc5;
+  for (const character of `${owner}/${name}`) {
+    hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return `repo:github:${hash}`;
+};
+
+/** A fake `CodeHost`: canned, no HTTP. Never driven here (reconcile is not run). */
+const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      // Resolves ANY key to a canned observation: these suites exercise Issue/PR
+      // reconciliation, not repository resolution (which is tested on its own).
+      resolve: (key) =>
+        Effect.succeed(
+          Option.some(
+            decode(DomainRepository, {
+              id: fakeRepositoryId(key.owner, key.name),
+              host: key.host,
+              owner: key.owner,
+              name: key.name,
+              refs: [{ name: "main", sha: "a".repeat(40) }],
+              observedAt: "2026-07-20T12:00:00.000Z",
+            }),
+          ),
+        ),
+    },
     code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
     issues: {
       getIssue: (number) =>
@@ -58,7 +106,11 @@ const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
       closingPullRequest: () => Effect.succeed(Option.none()),
       getPullRequest: (number) =>
         Effect.die(
-          new RepositoryError({ operation: "getPullRequest", detail: `unused #${number}` }),
+          new CodeHostError({
+            operation: "getPullRequest",
+            kind: "unreachable",
+            detail: `unused #${number}`,
+          }),
         ),
     },
   }),
@@ -166,7 +218,11 @@ it.effect("the graph serves snapshot + commands end-to-end over the frozen contr
 
       // A command materializes + persists a workstream through the real file-backed store.
       const id = yield* client.createWorkstreamFromPlan({
-        plan: { name: "Convergence", repo: "callajd/sprinter", spec: "wire the daemon" },
+        plan: {
+          name: "Convergence",
+          repository: repositoryKey("callajd", "sprinter"),
+          spec: "wire the daemon",
+        },
       });
       const hydrated = yield* client.snapshot();
       expect(hydrated.workstreams.map((w) => w.id)).toEqual([id]);
@@ -185,16 +241,24 @@ it.effect("the events feed does DURABLE offset-based resync for a late-attaching
       // A mutation BEFORE the client subscribes to `events` — snapshot-on-connect
       // alone would miss it; only the durable resync catches it up.
       yield* client.createWorkstreamFromPlan({
-        plan: { name: "Convergence", repo: "callajd/sprinter", spec: "wire the daemon" },
+        plan: {
+          name: "Convergence",
+          repository: repositoryKey("callajd", "sprinter"),
+          spec: "wire the daemon",
+        },
       });
 
       // Attaching now REPLAYS the journaled history: the pre-subscribe delta arrives,
       // stamped with its durable offset (CE2.0).
-      const first = Option.getOrThrow(
-        yield* client.events({}).pipe(Stream.take(1), Stream.runHead),
-      );
-      expect(first.event._tag).toBe("WorkstreamChanged");
-      expect(first.offset).toBeGreaterThan(0);
+      // Two deltas were journaled: the plan RESOLVED its repository through the
+      // CodeHost port and stored it (the workstream references it by FOREIGN KEY), so
+      // the anchor is journaled first and the workstream second.
+      const replayed = yield* client.events({}).pipe(Stream.take(2), Stream.runCollect);
+      expect(replayed.map((item) => item.event._tag)).toEqual([
+        "RepositoryChanged",
+        "WorkstreamChanged",
+      ]);
+      expect(replayed.every((item) => item.offset > 0)).toBe(true);
     }).pipe(Effect.scoped, Effect.provide(served(testConfig(dir))));
   }).pipe(Effect.provide(BunFileSystem.layer)),
 );
@@ -209,7 +273,11 @@ it.effect("state is FILE-backed: a rebuild on the same database file sees prior 
     const id = yield* Effect.gen(function* () {
       const client = yield* RpcTest.makeClient(SprinterRpc);
       return yield* client.createWorkstreamFromPlan({
-        plan: { name: "Convergence", repo: "callajd/sprinter", spec: "wire the daemon" },
+        plan: {
+          name: "Convergence",
+          repository: repositoryKey("callajd", "sprinter"),
+          spec: "wire the daemon",
+        },
       });
     }).pipe(Effect.scoped, Effect.provide(served(config)));
 
@@ -249,7 +317,7 @@ it.effect("bootLayer runs StartupReconcile once at startup (restart resync + re-
 it("mainLayer assembles the full served graph (transport + boot) without error", () => {
   // Constructing the layer is pure (no socket bound until it is BUILT), so this
   // proves the production graph — RpcServer over the socket transport, the real
-  // Repository, boot reconcile, Bun services — type-checks and assembles as ONE
+  // CodeHost, boot reconcile, Bun services — type-checks and assembles as ONE
   // Effect layer graph (INV-EFFECT-DI). The BUILD is exercised below.
   const layer = mainLayer(
     configFromEnv({ SPRINTER_SOCKET: "/tmp/sprinter-test.sock", GITHUB_TOKEN: "ghp_secret" }),
@@ -266,7 +334,7 @@ it.effect("mainLayer BUILDS the full served graph (real transport bind + boot) i
     // a REAL Unix-domain socket on a temp path (via the un-widened `mainLayer`, whose
     // now-visible error/requirement channels a build error would surface), runs the
     // boot reconcile (a fresh/empty graph → offline, no host calls), and wires
-    // RpcServer over the socket transport, the real Repository, and Bun services. A
+    // RpcServer over the socket transport, the real CodeHost, and Bun services. A
     // wiring/build failure (or a failed bind) fails the test — the assurance the
     // construct-only assertion above cannot give. Building on a temp path also
     // exercises the stale-socket unlink-before-bind (a prior bind on the same path is

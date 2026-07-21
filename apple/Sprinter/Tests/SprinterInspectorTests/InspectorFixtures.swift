@@ -41,6 +41,7 @@ enum InspectorFixtures {
   /// A snapshot where the job itself carries the PR.
   static func snapshotWithJobPullRequest(_ pullRequest: PullRequestRef?) -> Snapshot {
     Snapshot(
+      repositories: [],
       workstreams: [],
       epics: [],
       issues: [issue],
@@ -54,6 +55,7 @@ enum InspectorFixtures {
   /// `job.issueId → issue.pullRequest` path.
   static func snapshotWithIssuePullRequest(_ pullRequest: PullRequestRef?) -> Snapshot {
     Snapshot(
+      repositories: [],
       workstreams: [],
       epics: [],
       issues: [

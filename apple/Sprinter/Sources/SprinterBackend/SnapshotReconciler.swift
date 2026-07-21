@@ -16,6 +16,13 @@ public struct SnapshotReconciler: Sendable {
   /// Folds one delta onto `snapshot`, returning the updated baseline.
   public func reconcile(_ snapshot: Snapshot, applying event: WorkGraphEvent) -> Snapshot {
     switch event {
+    // The STATE layer folds under the same upsert rule. A repository record is
+    // REPLACED WHOLESALE on every refresh (a new observation under a new
+    // `observedAt`), so the carried value is always complete and replacing the one
+    // in the baseline is exactly right — there is nothing to merge.
+    case .repositoryChanged(let repository):
+      return snapshot.replacing(
+        repositories: Self.upsert(repository, into: snapshot.repositories, by: \.id))
     case .workstreamChanged(let workstream):
       return snapshot.replacing(
         workstreams: Self.upsert(workstream, into: snapshot.workstreams, by: \.id))
@@ -64,6 +71,7 @@ extension Snapshot {
   /// a different one. A delta from another generation cannot reach here at all — the
   /// daemon refuses the resume that would have carried it.
   fileprivate func replacing(
+    repositories: [Repository]? = nil,
     workstreams: [Workstream]? = nil,
     epics: [Epic]? = nil,
     issues: [Issue]? = nil,
@@ -72,6 +80,7 @@ extension Snapshot {
     agents: [Agent]? = nil
   ) -> Snapshot {
     Snapshot(
+      repositories: repositories ?? self.repositories,
       workstreams: workstreams ?? self.workstreams,
       epics: epics ?? self.epics,
       issues: issues ?? self.issues,

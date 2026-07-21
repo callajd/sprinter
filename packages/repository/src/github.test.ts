@@ -1,5 +1,5 @@
 /**
- * GitHub adapter coverage (AE3.2) — the {@link Repository} port exercised THROUGH
+ * GitHub adapter coverage (AE3.2) — the {@link CodeHost} port exercised THROUGH
  * the GitHub adapter against a FAKE HTTP backend (a fake `Fetch` under
  * {@link FetchHttpClient}). Deterministic and OFFLINE — no live GitHub call in the
  * gate (INV-GATE): every request is answered by a canned in-memory route table.
@@ -8,17 +8,25 @@
  * closing-PR query (`closedByPullRequestsReferences`), decodes each wire response
  * through `Schema` into the OWNED port types (never a cast, INV-NOCAST), and
  * translates every host failure — an HTTP error, a decode error, a GraphQL
- * `errors[]` — into the owned {@link RepositoryError} (INV-PORT). The tests depend
+ * `errors[]` — into the owned {@link CodeHostError} (INV-PORT). The tests depend
  * ONLY on the package's public surface plus the standard `FetchHttpClient` transport
  * seam — never a concrete GitHub client.
  */
 import { it } from "@effect/vitest";
 import { Effect, Layer, Option, Schema } from "effect";
+import { TestClock } from "effect/testing";
 import { FetchHttpClient, HttpClient } from "effect/unstable/http";
 import { expect } from "vitest";
-import { PositiveInt } from "@sprinter/domain";
+import { PositiveInt, RepositoryKey } from "@sprinter/domain";
 import { CLOSING_PR_QUERY } from "./github.ts";
-import { layer, layerFetch, Repository, RepositoryError } from "./index.ts";
+import {
+  CodeHost,
+  CodeHostError,
+  hostInstant,
+  layer,
+  layerFetch,
+  repositoryIdFor,
+} from "./index.ts";
 
 // ============================================================================
 // Fake HTTP backend — a canned route table over a fake `Fetch`
@@ -29,22 +37,50 @@ type Route = () => Response;
 const json = (body: unknown, status = 200): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+/**
+ * The fake transport FOLLOWS a redirect, exactly as a conforming `fetch` does when the
+ * caller leaves `RequestInit.redirect` at its default (`"follow"`).
+ *
+ * This is not decoration: GitHub answers a RENAMED repository's old path with a 301, and
+ * the adapter's `resolve` depends on that redirect being followed — it treats any status
+ * other than 200/404 as a host failure, so an unfollowed 301 would reject the
+ * observation outright. A route table that only ever returned the 200 a followed
+ * redirect *lands on* would assume the very thing under test. Honouring `redirect` here
+ * makes the assumption checkable: if `FetchHttpClient` (or the adapter) ever asked for
+ * `"manual"`, the 301 would reach `resolve` and the rename tests would fail rather than
+ * silently pass.
+ *
+ * The follow chain is bounded at five hops — the browser limit — so a route table with a
+ * redirect cycle fails the test rather than hanging it.
+ */
+const MAX_REDIRECTS = 5;
+
 const makeFetch = (routes: Record<string, Route>): typeof globalThis.fetch =>
   Object.assign(
-    (input: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+    (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
       const href = input instanceof URL ? input.href : input instanceof Request ? input.url : input;
-      const path = new URL(href).pathname;
-      const route = routes[path];
-      return Promise.resolve(
-        route === undefined ? new Response("not found", { status: 404 }) : route(),
-      );
+      let url = new URL(href);
+      for (let hop = 0; ; hop += 1) {
+        const route = routes[url.pathname];
+        if (route === undefined) return Promise.resolve(new Response("not found", { status: 404 }));
+        const response = route();
+        const location = response.headers.get("location");
+        const follows = init?.redirect === undefined || init.redirect === "follow";
+        if (!follows || response.status < 300 || response.status >= 400 || location === null) {
+          return Promise.resolve(response);
+        }
+        if (hop >= MAX_REDIRECTS) {
+          return Promise.reject(new Error("too many redirects"));
+        }
+        url = new URL(location, url);
+      }
     },
     { preconnect: globalThis.fetch.preconnect },
   );
 
 const config = { owner: "callajd", repo: "sprinter", token: "test-token" };
 
-const backend = (routes: Record<string, Route>): Layer.Layer<Repository, RepositoryError> =>
+const backend = (routes: Record<string, Route>): Layer.Layer<CodeHost, CodeHostError> =>
   layer(config).pipe(
     Layer.provide(
       FetchHttpClient.layer.pipe(
@@ -61,11 +97,11 @@ const num = (n: number): PositiveInt => Schema.decodeUnknownSync(PositiveInt)(n)
 
 it.effect("reads an Issue's host state (open / closed)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const issue = yield* repo.issues.getIssue(num(25));
     expect(issue).toStrictEqual({
       number: 25,
-      title: "AE3.2 — Repository port + GitHub adapter",
+      title: "AE3.2 — CodeHost port + GitHub adapter",
       state: "closed",
     });
   }).pipe(
@@ -74,7 +110,7 @@ it.effect("reads an Issue's host state (open / closed)", () =>
         "/repos/callajd/sprinter/issues/25": () =>
           json({
             number: 25,
-            title: "AE3.2 — Repository port + GitHub adapter",
+            title: "AE3.2 — CodeHost port + GitHub adapter",
             state: "closed",
             body: "ignored excess field",
           }),
@@ -89,25 +125,31 @@ it.effect("reads an Issue's host state (open / closed)", () =>
 
 it.effect("reads the default branch and detects branch existence (present / absent)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     expect(yield* repo.code.defaultBranch).toBe("main");
     expect(yield* repo.code.branchExists("main")).toBe(true);
     expect(yield* repo.code.branchExists("feat/does-not-exist")).toBe(false);
   }).pipe(
     Effect.provide(
       backend({
-        "/repos/callajd/sprinter": () => json({ default_branch: "main" }),
+        "/repos/callajd/sprinter": () =>
+          json({
+            id: 1296269,
+            default_branch: "main",
+            name: "sprinter",
+            owner: { login: "callajd" },
+          }),
         "/repos/callajd/sprinter/branches/main": () => json({ name: "main" }),
       }),
     ),
   ),
 );
 
-it.effect("surfaces an unexpected branch status as RepositoryError", () =>
+it.effect("surfaces an unexpected branch status as CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.code.branchExists("main").pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("branchExists");
   }).pipe(
     Effect.provide(
@@ -124,7 +166,7 @@ it.effect("surfaces an unexpected branch status as RepositoryError", () =>
 
 it.effect("reads a PR and reports whether it merged", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const pr = yield* repo.pullRequests.getPullRequest(num(42));
     expect(pr).toStrictEqual({
       number: 42,
@@ -170,7 +212,7 @@ const gqlClosing =
 
 it.effect("detects the PR that CLOSED an Issue via GraphQL closedByPullRequestsReferences", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
   }).pipe(Effect.provide(backend({ "/graphql": gqlClosing(42) }))),
@@ -231,7 +273,7 @@ it.effect(
         },
         { preconnect: globalThis.fetch.preconnect },
       );
-      const repo = yield* Repository.pipe(
+      const repo = yield* CodeHost.pipe(
         Effect.provide(
           layer(config).pipe(
             Layer.provide(
@@ -261,7 +303,7 @@ it.effect(
     // it — where the retired timeline `cross-referenced` heuristic false-positived,
     // GraphQL returns an empty node set, so the reconciler never mis-lands (D18/CE1.3).
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const found = yield* repo.pullRequests.closingPullRequest(num(25));
       expect(found).toStrictEqual(Option.none());
     }).pipe(Effect.provide(backend({ "/graphql": gqlClosing() }))),
@@ -269,7 +311,7 @@ it.effect(
 
 it.effect("reports no closing PR when the host has no record of the Issue (null issue)", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.none());
   }).pipe(
@@ -277,11 +319,11 @@ it.effect("reports no closing PR when the host has no record of the Issue (null 
   ),
 );
 
-it.effect("surfaces a GraphQL errors[] response as RepositoryError", () =>
+it.effect("surfaces a GraphQL errors[] response as CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("closingPullRequest");
     expect(error.detail).toContain("rate limited");
   }).pipe(
@@ -293,7 +335,7 @@ it.effect("addresses the GraphQL endpoint for a GitHub Enterprise base URL", () 
   // GHE exposes REST at `/api/v3` and GraphQL at `/api/graphql`; the adapter must
   // POST the closing-PR query to the latter, not `baseUrl + /graphql`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(7));
   }).pipe(
@@ -319,7 +361,7 @@ it.effect(
     // `nodes[0]` + a merged-gate would wrongly report not-landed; the adapter must
     // select the merged reference among the page.
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const found = yield* repo.pullRequests.closingPullRequest(num(25));
       expect(found).toStrictEqual(Option.some(99));
     }).pipe(
@@ -334,7 +376,7 @@ it.effect(
 it.effect("reports no closing PR when every closing reference is unmerged (NB2)", () =>
   // Only closed-but-unmerged references exist — nothing landed, so `Option.none`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.none());
   }).pipe(Effect.provide(backend({ "/graphql": gqlNodes({ number: 41, merged: false }) }))),
@@ -343,7 +385,7 @@ it.effect("reports no closing PR when every closing reference is unmerged (NB2)"
 it.effect("normalizes a trailing slash on the base URL so the endpoint is /graphql (NB3)", () =>
   // A base URL ending in `/` must yield `.../graphql`, never `...//graphql`.
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const found = yield* repo.pullRequests.closingPullRequest(num(25));
     expect(found).toStrictEqual(Option.some(42));
   }).pipe(
@@ -362,14 +404,14 @@ it.effect("normalizes a trailing slash on the base URL so the endpoint is /graph
 );
 
 it.effect(
-  "surfaces a 401 from the GraphQL endpoint as a loud RepositoryError, not Option.none (B1)",
+  "surfaces a 401 from the GraphQL endpoint as a loud CodeHostError, not Option.none (B1)",
   () =>
     // GitHub 401s an unauthenticated/invalid-token GraphQL request. That must be a
     // DISTINCT, loud failure the reconciler can see — never masked as "no closing PR".
     Effect.gen(function* () {
-      const repo = yield* Repository;
+      const repo = yield* CodeHost;
       const error = yield* repo.pullRequests.closingPullRequest(num(25)).pipe(Effect.flip);
-      expect(error).toBeInstanceOf(RepositoryError);
+      expect(error).toBeInstanceOf(CodeHostError);
       expect(error.operation).toBe("closingPullRequest");
     }).pipe(
       Effect.provide(
@@ -386,7 +428,7 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
   // adapter refuses to build at all — one construction-time fail-fast covering every
   // op — rather than a per-op guard, and never silently reports "no closing PR".
   Effect.gen(function* () {
-    const error = yield* Repository.pipe(
+    const error = yield* CodeHost.pipe(
       Effect.provide(
         layer({ ...config, token: "" }).pipe(
           Layer.provide(
@@ -398,7 +440,7 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
       ),
       Effect.flip,
     );
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.detail).toContain("token is required");
   }),
 );
@@ -407,11 +449,11 @@ it.effect("refuses to construct a token-less adapter with a distinct, loud error
 // Error translation (INV-PORT) & production wiring
 // ============================================================================
 
-it.effect("translates a non-2xx host response into RepositoryError", () =>
+it.effect("translates a non-2xx host response into CodeHostError", () =>
   Effect.gen(function* () {
-    const repo = yield* Repository;
+    const repo = yield* CodeHost;
     const error = yield* repo.issues.getIssue(num(25)).pipe(Effect.flip);
-    expect(error).toBeInstanceOf(RepositoryError);
+    expect(error).toBeInstanceOf(CodeHostError);
     expect(error.operation).toBe("getIssue");
     expect(error.detail.length).toBeGreaterThan(0);
   }).pipe(
@@ -429,7 +471,7 @@ it.effect("layerFetch builds a self-contained adapter (Bun-native fetch transpor
     // HttpClient (the transport is sealed inside), which we assert by type: the
     // layer is provided with nothing else and yields the port.
     const authed = layerFetch({ ...config, token: "t0ken", baseUrl: "https://ghe.example/api/v3" });
-    const repo = yield* Repository.pipe(Effect.provide(authed));
+    const repo = yield* CodeHost.pipe(Effect.provide(authed));
     expect(typeof repo.issues.getIssue).toBe("function");
   }),
 );
@@ -445,6 +487,615 @@ it.effect("the transport seam is satisfiable by a fake HttpClient", () =>
       FetchHttpClient.layer.pipe(
         Layer.provide(Layer.succeed(FetchHttpClient.Fetch, makeFetch({}))),
       ),
+    ),
+  ),
+);
+
+// ============================================================================
+// RepositoryOps — observing the owned `Repository` entity (DE1.2)
+// ============================================================================
+
+/**
+ * A natural key, DECODED — `RepositorySegment` is branded, so a plain string literal is
+ * not one and the tests have to obtain a key the same way production does.
+ */
+const key = (owner: string, name: string): RepositoryKey =>
+  Schema.decodeUnknownSync(RepositoryKey)({ host: "github", owner, name });
+
+const KEY = key("callajd", "sprinter");
+const SHA_MAIN = "0123456789abcdef0123456789abcdef01234567";
+const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
+
+/** GitHub's own numeric id for the fixture repository — what the adapter mints from. */
+const GH_ID = num(1296269);
+
+/**
+ * A canned repository route pair (the repo itself + its branches), optionally under a
+ * host `Date` response header — the instant the adapter reads `observedAt` from.
+ *
+ * The repo body carries the CANONICAL identity (`owner.login` + `name`) because that is
+ * what the adapter builds the record's natural key from — GitHub's lookup is
+ * case-insensitive and follows renames, so the caller's spelling is only ever the
+ * question — and the numeric `id`, which is what the adapter mints `RepositoryId` from.
+ */
+const repoRoutes = (date?: string, options?: { readonly name?: string }): Record<string, Route> => {
+  const name = options?.name ?? "sprinter";
+  return {
+    [`/repos/callajd/${name}`]: () =>
+      new Response(
+        JSON.stringify({ id: GH_ID, default_branch: "main", name, owner: { login: "callajd" } }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            ...(date === undefined ? {} : { date }),
+          },
+        },
+      ),
+    [`/repos/callajd/${name}/branches`]: () =>
+      json([
+        { name: "main", commit: { sha: SHA_MAIN } },
+        { name: "feat/x-1", commit: { sha: SHA_FEAT } },
+      ]),
+  };
+};
+
+it.effect("resolves a repository into the owned entity, refs and all", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.host).toBe("github");
+    expect(resolved.owner).toBe("callajd");
+    expect(resolved.name).toBe("sprinter");
+    // The observed refs are ORDERED BY NAME, whatever order the host paginated them
+    // in, so one observation has one spelling.
+    expect(resolved.refs).toStrictEqual([
+      { name: "feat/x-1", sha: SHA_FEAT },
+      { name: "main", sha: SHA_MAIN },
+    ]);
+    // The id is a deterministic function of the HOST's own stable identifier for the
+    // repository — a refresh must land on the same row, not insert a second one.
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
+    expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
+  }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT")))),
+);
+
+// N3 (round 4) — an UNREPRESENTABLE ref is OMITTED, never fatal to the observation.
+//
+// Before this, the whole branch list was decoded through `RepositoryRefs` in one go, so a
+// single ref failing `BranchName` or `CommitSha` failed `resolve` as `unusable` — which
+// the daemon turns into a `PlanRejected` saying retrying will not help, blocking that
+// repository permanently. That contradicted the adapter's own pagination stance three
+// lines above it, which argues partial observation is fine precisely because an absent
+// branch reads as "not observed" and never as "does not exist". This resolves the
+// contradiction in favour of the pagination stance — nothing in DE1.2 looks a branch UP,
+// and the one production reader of `refs` only compares two observations for equality.
+it.effect("OMITS a ref it cannot represent rather than failing the whole observation", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    // The representable refs all survive; only the unrepresentable ones are dropped.
+    expect(resolved.refs).toStrictEqual([
+      { name: "feat/x-1", sha: SHA_FEAT },
+      { name: "main", sha: SHA_MAIN },
+    ]);
+    // …and the record itself is intact — the observation landed, id and all.
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: SHA_MAIN } },
+            // A sha outside `CommitSha` — uppercase, so not the canonical spelling.
+            { name: "loud", commit: { sha: SHA_MAIN.toUpperCase() } },
+            { name: "feat/x-1", commit: { sha: SHA_FEAT } },
+            // A branch name outside `BranchName` — `..` is git's range operator.
+            { name: "a..b", commit: { sha: SHA_FEAT } },
+          ]),
+      }),
+    ),
+  ),
+);
+
+// The consequence, pinned so it stays a decision rather than a surprise: a repository
+// using git's SHA-256 object format spells every sha as 64 hex characters, and
+// `CommitSha` is pinned to 40. Under the previous behaviour such a repository was
+// UNUSABLE outright — every plan naming it rejected, permanently. It now observes with an
+// EMPTY ref set, which is a valid observation meaning "nothing observed yet", and its id,
+// natural key and `observedAt` all land.
+it.effect("observes a SHA-256 repository with an EMPTY ref set rather than failing", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.refs).toStrictEqual([]);
+    expect(resolved.name).toBe("sprinter");
+    expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: "a".repeat(64) } },
+            { name: "feat/x-1", commit: { sha: "b".repeat(64) } },
+          ]),
+      }),
+    ),
+  ),
+);
+
+// …and the LIST-level rule is still fatal, which is what keeps `RepositoryRefs`' decode
+// load-bearing: a host returning one branch name TWICE produces a list the strict
+// ascending order rejects, and that is a genuine contradiction in the answer rather than
+// a value this domain cannot spell.
+it.effect("still FAILS on a duplicated branch name — the list rule is not relaxed", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.operation).toBe("resolve");
+  }).pipe(
+    Effect.provide(
+      backend({
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+        "/repos/callajd/sprinter/branches": () =>
+          json([
+            { name: "main", commit: { sha: SHA_MAIN } },
+            { name: "main", commit: { sha: SHA_FEAT } },
+          ]),
+      }),
+    ),
+  ),
+);
+
+// B3 — the natural key stored is the HOST's spelling, never the caller's. GitHub's
+// lookup is case-INSENSITIVE, so `CallaJD/Sprinter` and `callajd/sprinter` both answer
+// 200 for ONE repository. Building the record from the caller's key would mint one id
+// and one row per spelling — two anchors for one repository, invisible to the store's
+// `UNIQUE (host, owner, name)` because the triples genuinely differ. That is verbatim
+// the failure the entity exists to eliminate.
+it.effect("canonicalises the natural key — two spellings converge on ONE id and ONE record", () =>
+  Effect.gen(function* () {
+    const resolve = (asked: RepositoryKey) =>
+      Effect.gen(function* () {
+        const host = yield* CodeHost;
+        return Option.getOrThrow(yield* host.repositories.resolve(asked));
+      }).pipe(
+        Effect.provide(
+          backend({
+            // The host answers the MIS-CASED path too, with its own spelling in the body.
+            "/repos/CallaJD/Sprinter": () =>
+              json({
+                id: GH_ID,
+                default_branch: "main",
+                name: "sprinter",
+                owner: { login: "callajd" },
+              }),
+            ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+          }),
+        ),
+      );
+
+    const asked = yield* resolve(key("CallaJD", "Sprinter"));
+    const canonical = yield* resolve(KEY);
+    // ONE id, and ONE natural key — so ONE row, and the UNIQUE constraint can see it.
+    expect(asked.id).toBe(canonical.id);
+    expect(asked.owner).toBe("callajd");
+    expect(asked.name).toBe("sprinter");
+    expect(asked.refs).toStrictEqual(canonical.refs);
+  }),
+);
+
+// N7 — a REAL 301, not a stand-in for one. GitHub answers a renamed repository's old
+// path with `301 Moved Permanently` + `Location`, and `resolve` treats every status
+// other than 200/404 as a host failure — so "the HTTP client follows the redirect" is a
+// load-bearing assumption of the rename path, and this is where it is verified. If the
+// transport ever stopped following (a `redirect: "manual"` anywhere in the stack), the
+// 301 would reach `resolve`'s unexpected-status branch and this test would fail.
+it.effect("follows a real 301 to the canonical name (the redirect target's spelling)", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(
+      yield* host.repositories.resolve(key("callajd", "old-name")),
+    );
+    expect(resolved.name).toBe("sprinter");
+    expect(resolved.id).toBe(yield* repositoryIdFor("github", GH_ID));
+    // The refs were read from the CANONICAL path, so they are the renamed repository's.
+    expect(resolved.refs.map((ref) => ref.name)).toStrictEqual(["feat/x-1", "main"]);
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/old-name": () =>
+          new Response(null, {
+            status: 301,
+            headers: { location: "https://api.github.com/repos/callajd/sprinter" },
+          }),
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+      }),
+    ),
+  ),
+);
+
+// B1 (round 2) — identity must survive a RENAME, and following the 301 is NOT what buys
+// that. The redirect makes the LOOKUP survive; it lands on the repository's NEW natural
+// key, so an id derived from that key would change with it: the repository would acquire
+// a SECOND row under the new name while every existing `Workstream.repositoryId` still
+// pointed at the old one, with `UNIQUE (host, owner, name)` blind to it because the
+// triples genuinely differ. Deriving the id from the host's own numeric id — the one
+// field a rename does not touch — is what makes the two observations ONE repository.
+it.effect("a RENAME keeps the SAME id while the natural key changes", () =>
+  Effect.gen(function* () {
+    const observe = (askedName: string, routes: Record<string, Route>) =>
+      Effect.gen(function* () {
+        const host = yield* CodeHost;
+        return Option.getOrThrow(yield* host.repositories.resolve(key("callajd", askedName)));
+      }).pipe(Effect.provide(backend(routes)));
+
+    // T0 — observed under its original name.
+    const before = yield* observe("sprinter", repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"));
+    // T1/T2 — renamed upstream; the old path now 301s to the new one, and the same
+    // numeric id comes back under the new name.
+    const after = yield* observe("sprinter", {
+      "/repos/callajd/sprinter": () =>
+        new Response(null, {
+          status: 301,
+          headers: { location: "https://api.github.com/repos/callajd/sprint" },
+        }),
+      ...repoRoutes("Tue, 21 Jul 2026 09:30:00 GMT", { name: "sprint" }),
+    });
+
+    expect(before.name).toBe("sprinter");
+    expect(after.name).toBe("sprint");
+    // The natural key moved; the identity did NOT.
+    expect(after.id).toBe(before.id);
+  }),
+);
+
+// N2 — `resolve`'s non-200/non-404 branch. 404 is INFORMATION (below); every other
+// unexpected status is the host failing to answer, which is the owned `CodeHostError`.
+it.effect("surfaces an unexpected resolve status as CodeHostError", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.operation).toBe("resolve");
+    expect(error.detail).toContain("500");
+  }).pipe(
+    Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "boom" }, 500) })),
+  ),
+);
+
+// N2 — the `Date`-header fallback. A host that omits the optional header must not cost
+// us the observation: `observedAt` falls back to OUR clock, which is canonical by
+// construction (`toISOString`), so the record still carries a real instant.
+//
+// The clock is read through Effect's `Clock`, not `new Date()`, which is what makes the
+// branch ASSERTABLE: under the `TestClock` these tests already run on, the fallback
+// lands on an instant this test CHOSE, so what is checked is which clock the record
+// ended up measuring — not merely that it got some string.
+const FALLBACK_INSTANT = "2026-03-01T08:15:00.000Z";
+
+it.effect("falls back to OUR clock — read through Clock — when the host sends no Date", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes()))),
+);
+
+// …and the same fallback for a header that is present but NOT an IMF-fixdate at all.
+it.effect("falls back to OUR clock for a Date header in no recognised form", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("yesterday afternoon")))),
+);
+
+// The DEGRADATION IS UNIFORM, which is the whole point. `Sat, 45 Jun 2026 …` is
+// IMF-fixdate SHAPED — it matches the regex and re-spells cleanly — and then fails
+// `Timestamp` on the impossible day. Failing the observation for THAT while degrading
+// gracefully for an ABSENT header would put a host with a buggy `Date` VALUE in a worse
+// position than a host that omits the header entirely, which is backwards. Both take the
+// clock.
+it.effect("falls back to OUR clock for an IMF-SHAPED Date carrying an impossible value", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 45 Jun 2026 12:00:00 GMT")))),
+);
+
+// …and one more shape that reaches the SAME re-speller and dies at `Timestamp`: a month
+// abbreviation the IMF regex admits (`[A-Za-z]{3}`) but RFC 7231 does not name.
+it.effect("falls back to OUR clock for a Date header naming no real month", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 12 Zzz 2026 12:00:00 GMT")))),
+);
+
+// `Option.none`, not a failure: "no such repository" is INFORMATION the host has,
+// where a `CodeHostError` means the host could not be asked. The daemon turns the
+// former into a `PlanRejected` that writes nothing and the latter into a defect.
+it.effect("answers Option.none for a repository the host does not know", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    expect(yield* host.repositories.resolve(KEY)).toStrictEqual(Option.none());
+  }).pipe(Effect.provide(backend({}))),
+);
+
+// D7 — a second observation REPLACES the record and ADVANCES `observedAt`. The port
+// has no partial/merge variant: a refresh is just another resolve.
+it.effect("a REFRESH is a new complete observation with a later observedAt (D7)", () =>
+  Effect.gen(function* () {
+    const first = yield* Effect.gen(function* () {
+      const host = yield* CodeHost;
+      return Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"))));
+
+    const second = yield* Effect.gen(function* () {
+      const host = yield* CodeHost;
+      return Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    }).pipe(
+      Effect.provide(
+        backend({
+          ...repoRoutes("Tue, 21 Jul 2026 09:30:00 GMT"),
+          // The tip of `main` moved and `feat/x-1` was deleted upstream.
+          "/repos/callajd/sprinter/branches": () =>
+            json([{ name: "main", commit: { sha: SHA_FEAT } }]),
+        }),
+      ),
+    );
+
+    // SAME id (so the store upserts the same row) …
+    expect(second.id).toBe(first.id);
+    // … NEW observedAt, and a record describing ONE later moment: the deleted branch
+    // is simply absent, never merged in from the earlier read.
+    expect(second.observedAt).toBe("2026-07-21T09:30:00.000Z");
+    expect(second.observedAt > first.observedAt).toBe(true);
+    expect(second.refs).toStrictEqual([{ name: "main", sha: SHA_FEAT }]);
+  }),
+);
+
+// D5 — the LEAP SECOND is translated at the ADAPTER boundary, not in `Timestamp`.
+// `Timestamp` rejects `:60` outright by design; a code host can still emit one, so
+// this module translates it to the instant it denotes BEFORE the value reaches the
+// domain. The whole observation must survive — a decode failure here would drop a
+// repository because its host restated a UTC broadcast.
+it.effect("translates a host LEAP SECOND to the following second (D5)", () =>
+  Effect.forEach(
+    [
+      // The canonical case: the end of a UTC day.
+      ["2012-06-30T23:59:60Z", "2012-07-01T00:00:00.000Z"],
+      // Mid-year, mid-month — the roll is the platform's date arithmetic, not string
+      // surgery, so every boundary behaves.
+      ["2026-07-20T12:00:60Z", "2026-07-20T12:01:00.000Z"],
+      // The zero-offset spelling of the same thing.
+      ["2015-06-30T23:59:60+00:00", "2015-07-01T00:00:00.000Z"],
+      // KNOWN LOSS, pinned so it stays a decision rather than drifting into a surprise:
+      // a FRACTIONAL leap second loses its sub-second part. The translation is `:59`
+      // plus one second, and the fraction is not re-attached — see `hostInstant`.
+      ["2012-06-30T23:59:60.500Z", "2012-07-01T00:00:00.000Z"],
+    ],
+    ([raw = "", expected = ""]) =>
+      Effect.gen(function* () {
+        expect(yield* hostInstant(raw, "resolve")).toBe(expected);
+      }),
+  ),
+);
+
+it.effect("the leap-second translation does NOT weaken Timestamp for anything else", () =>
+  Effect.forEach(
+    // Every other refusal still stands: an impossible field value, a rolled-over date,
+    // a non-zero offset, and a non-instant string all fail at this boundary rather
+    // than being smuggled past it.
+    //
+    // The last two are the INTERSECTION the earlier inputs miss and the one that
+    // actually broke: a string that is impossible AND carries a `:60` seconds field
+    // takes the leap-second TRANSLATION branch, where `Date.parse` answers `NaN` and
+    // `new Date(NaN).toISOString()` throws inside an `Effect.sync`. Without the
+    // non-finite guard these were a DIE — a defect killing the calling fiber — rather
+    // than the declared `CodeHostError`. `Effect.flip` is what pins that: a defect does
+    // not flip, it propagates, so this test fails rather than passes if it regresses.
+    [
+      "2026-13-45T99:99:99Z",
+      "2026-02-30T00:00:00.000Z",
+      "2026-07-20T12:00:00+02:00",
+      "nope",
+      "2026-13-45T23:59:60Z",
+      "2026-02-30T23:59:60Z",
+    ],
+    (raw) =>
+      Effect.gen(function* () {
+        const error = yield* hostInstant(raw, "resolve").pipe(Effect.flip);
+        expect(error).toBeInstanceOf(CodeHostError);
+      }),
+  ),
+);
+
+it.effect("carries a host leap second all the way through resolve, as a real Timestamp", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    // End-to-end: the host's `Date` header said `23:59:60`, and the observation
+    // survived — stamped with the instant that spelling denotes.
+    expect(resolved.observedAt).toBe("2012-07-01T00:00:00.000Z");
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 30 Jun 2012 23:59:60 GMT")))),
+);
+
+// …and the same path with an IMPOSSIBLE date BEHIND the leap second degrades rather
+// than DYING. `httpDateToIso` deliberately does not validate the day (it re-spells
+// only), so `45 Jun` reaches `hostInstant` together with `:60` — the exact intersection
+// that would otherwise format `new Date(NaN)` and throw. It resolves, on our clock: the
+// translation refuses to invent an instant, and an unusable `Date` header of ANY kind is
+// one policy. That a `resolve` SUCCEEDS here is what proves no defect escaped — a defect
+// would propagate out of `Option.getOrThrow`'s effect and fail this test.
+it.effect("degrades a malformed host Date WITH a leap second, never dies", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(FALLBACK_INSTANT));
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    expect(resolved.observedAt).toBe(FALLBACK_INSTANT);
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 45 Jun 2026 23:59:60 GMT")))),
+);
+
+// `hostInstant` ITSELF stays strict, and that is the boundary the degradation does NOT
+// cross: an instant arriving in a repository's BODY has no optional-header excuse, and
+// falling back there would be inventing data rather than timing our own read.
+it.effect("keeps hostInstant strict — the degradation is the HEADER's, not the domain's", () =>
+  Effect.gen(function* () {
+    const error = yield* hostInstant("2026-13-45T12:00:00Z", "resolve").pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.kind).toBe("unusable");
+  }),
+);
+
+// The id encoding must be INJECTIVE, or two different repositories would share one id
+// and the store's id-keyed upsert would let either silently overwrite the other's row.
+// Two different repositories on one host have two different numeric ids, and a numeric
+// id cannot contain the `:` separator, so the encoding cannot re-split.
+it.effect("mints DISTINCT ids for distinct repositories, and is deterministic", () =>
+  Effect.gen(function* () {
+    const left = yield* repositoryIdFor("github", num(1296269));
+    const right = yield* repositoryIdFor("github", num(1296270));
+    expect(left).not.toBe(right);
+    // Deterministic: the same repository always mints the same id, which is what lets a
+    // refresh land on the row it already has (D7).
+    expect(yield* repositoryIdFor("github", num(1296269))).toBe(left);
+  }),
+);
+
+// N8 (round 3) — `repositoryIdFor` has NO failure branch, and the reason is checkable
+// rather than asserted: `PositiveInt`'s own check is `Number.isSafeInteger`, so a host id
+// is at most 2^53−1 and always stringifies as plain decimal digits — never JavaScript's
+// exponent form — which the `RepositoryId` shape admits. This drives the EXTREMES of that
+// argument (the largest and smallest a `PositiveInt` can be) through the real schema; a
+// spelling the format refused would DIE here and fail this test, not flip.
+it.effect("mints a well-formed id at both extremes of PositiveInt, with no failure branch", () =>
+  Effect.gen(function* () {
+    expect(yield* repositoryIdFor("github", num(1))).toBe("repo:github:1");
+    expect(yield* repositoryIdFor("github", num(Number.MAX_SAFE_INTEGER))).toBe(
+      `repo:github:${Number.MAX_SAFE_INTEGER}`,
+    );
+    // And `PositiveInt` is what forbids the one spelling that would not be a token: an
+    // integer big enough to stringify as `1e+21` is not a safe integer, so it cannot be
+    // constructed and can never reach this function.
+    expect(Schema.decodeUnknownExit(PositiveInt)(1e21)._tag).toBe("Failure");
+  }),
+);
+
+// ============================================================================
+// CodeHostFailure — the classification a consumer branches on (INV-SUM)
+// ============================================================================
+//
+// `detail` is prose and must never be parsed, so the ONE question a consumer asks — is
+// trying again the remedy? — has to be answered by data. `createWorkstreamFromPlan`
+// phrases its rejection off exactly this field, and told users with an expired token to
+// retry forever before it existed. Each case below drives the classifier through the
+// REAL adapter rather than constructing the error directly.
+
+/** A route whose transport REJECTS — the shape a TCP black hole takes at `fetch`. */
+const unreachableRoutes: Record<string, Route> = {
+  "/repos/callajd/sprinter": () =>
+    new Response(null, { status: 302, headers: { location: "/repos/callajd/sprinter" } }),
+};
+
+it.effect("classifies a TRANSPORT failure as `unreachable` — a retry is the remedy", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unreachable");
+  }).pipe(Effect.provide(backend(unreachableRoutes))),
+);
+
+it.effect("classifies 401 and 403 as `denied` — the host was reached and refused", () =>
+  Effect.forEach([401, 403], (status) =>
+    Effect.gen(function* () {
+      const host = yield* CodeHost;
+      const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+      expect(error.kind).toBe("denied");
+      expect(error.detail).toContain(String(status));
+    }).pipe(
+      Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "no" }, status) })),
+    ),
+  ),
+);
+
+// N7 (round 4) — `429` is a REFUSAL, not a reachability problem. GitHub answers a
+// SECONDARY rate limit with 429 + `Retry-After`, and an immediate retry reproduces it
+// exactly — so classifying it `unreachable` made the daemon's rejection tell the user to
+// do the one thing that cannot work, which is the very mistake the `denied`/`unreachable`
+// split exists to prevent. The advice is the one `403` already carries: wait for the
+// limit to reset.
+it.effect("classifies 429 (secondary rate limit) as `denied`, not as `unreachable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("denied");
+    expect(error.detail).toContain("429");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () =>
+          new Response(JSON.stringify({ message: "slow down" }), {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "60" },
+          }),
+      }),
+    ),
+  ),
+);
+
+it.effect("classifies another 5xx as `unreachable`, not as a refusal", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unreachable");
+  }).pipe(
+    Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "boom" }, 500) })),
+  ),
+);
+
+// A 200 whose BODY is not JSON: the transport's own `DecodeError`, which is neither a
+// reachability problem nor a refusal — the exchange completed and produced nothing usable.
+it.effect("classifies a response body that will not parse as `unusable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unusable");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () =>
+          new Response("<html>not json</html>", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      }),
+    ),
+  ),
+);
+
+// …and a body that parses but fails the OWNED schema: a `Schema.SchemaError`, not an
+// `HttpClientError` at all, and `unusable` by the same argument.
+it.effect("classifies a response that fails the owned schema as `unusable`", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error.kind).toBe("unusable");
+  }).pipe(
+    Effect.provide(
+      backend({
+        "/repos/callajd/sprinter": () => json({ default_branch: "main", name: "sprinter" }),
+      }),
     ),
   ),
 );

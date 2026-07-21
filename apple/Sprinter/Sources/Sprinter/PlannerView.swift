@@ -28,8 +28,16 @@ struct PlannerView: View {
     VStack(alignment: .leading, spacing: 8) {
       TextField("Workstream name", text: $model.name)
         .textFieldStyle(.roundedBorder)
-      TextField("Repository (owner/name)", text: $model.repo)
+      TextField("Repository owner", text: $model.owner)
         .textFieldStyle(.roundedBorder)
+      TextField("Repository name", text: $model.repositoryName)
+        .textFieldStyle(.roundedBorder)
+      // A repository key the daemon's schema would refuse is caught HERE, with a
+      // message naming the field and the remedy — the wire rejection for the same
+      // input is an opaque contract decode failure.
+      if let problem = model.repositoryProblem {
+        Text(problem).font(.caption).foregroundStyle(.red)
+      }
       TextField("Spec", text: $model.spec)
         .textFieldStyle(.roundedBorder)
       HStack {

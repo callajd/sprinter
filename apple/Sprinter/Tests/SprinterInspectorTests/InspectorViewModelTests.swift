@@ -117,7 +117,8 @@ struct InspectorViewModelTests {
       backend: InspectorFakeBackend(
         knownSession: Self.session,
         snapshot: Snapshot(
-          workstreams: [], epics: [], issues: [], jobs: [], sessions: [], agents: [],
+          repositories: [], workstreams: [], epics: [], issues: [], jobs: [], sessions: [],
+          agents: [],
           generation: StoreGenerationId(rawValue: "gen-test"))),
       sessionId: Self.session)
 

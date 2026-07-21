@@ -1,5 +1,9 @@
 {
   "name": "Foundation",
-  "repo": "callajd/sprinter",
+  "repository": {
+    "host": "github",
+    "owner": "callajd",
+    "name": "sprinter"
+  },
   "spec": "Build the daemon↔client contract and its mirrors."
 }

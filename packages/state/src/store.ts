@@ -15,6 +15,9 @@
  *
  * - {@link AgentStore} — the append-only `Agent` REGISTRY: global, scoped to no
  *   repository, exposing append + read and NO delete.
+ * - {@link RepositoryStore} — the `── STATE ──` layer's OBSERVED `Repository`
+ *   entity: put + read, no delete, and the anchor `Workstream.repositoryId`
+ *   references.
  * - {@link WorkGraphStore} — the work graph `Workstream ⊃ Epic ⊃ Issue` plus the
  *   dependency DAG (`Issue.dependsOn` edges); upserts, reads, and the child lists
  *   that status roll-up (D13) is computed from.
@@ -40,6 +43,9 @@ import {
   type Job,
   JobId,
   NonNegativeInt,
+  type Repository,
+  RepositoryId,
+  type RepositoryKey,
   type Session,
   SessionEvent,
   SessionId,
@@ -250,6 +256,87 @@ export interface AgentStore {
 }
 
 /**
+ * Persist and read the `── STATE ──` layer's {@link Repository} entity — a repository
+ * as OBSERVED on a code host (DE1.2), and the anchor `Workstream.repositoryId`
+ * references.
+ *
+ * The surface is PUT + READ. There is deliberately **no delete**: the only removal a
+ * repository record ever undergoes is the `ON DELETE CASCADE` that clears its observed
+ * refs when the row itself goes, and the row itself goes only when the whole store
+ * generation does (INV-FRESH). Exposing a delete would let a caller strand every
+ * workstream anchored to a repository — which the `workstream.repositoryId` FOREIGN
+ * KEY would refuse anyway, so the operation could never succeed on a repository that
+ * mattered.
+ *
+ * `putRepository` REPLACES the record WHOLESALE (D7): the scalar columns AND the whole
+ * observed ref set, under the incoming `observedAt`. It is not a merge, and that is the
+ * point — a refresh is a NEW OBSERVATION of the same repository, so a branch deleted
+ * upstream must DISAPPEAR from `refs` rather than linger from an older read. A record
+ * therefore always describes ONE coherent moment.
+ *
+ * It upserts on the {@link Repository.id}, while the store also holds the NATURAL key
+ * `(host, owner, name)` UNIQUE. Both are load-bearing and they are not redundant: the
+ * id is what other rows reference (so it must be stable across refreshes), and the
+ * triple is what actually identifies a repository BY NAME (so two records disagreeing
+ * about one repository must be unconstructible — INV-ENFORCE).
+ *
+ * The two can DISAGREE, and handling that is part of this contract: the natural key is
+ * MUTABLE (a rename, a transfer) while the id an adapter mints is derived from the
+ * host's own stable identifier and is not (see {@link RepositoryId}). So a refresh
+ * after a rename arrives with the SAME id and a DIFFERENT triple, and the id-keyed
+ * upsert must UPDATE the existing row's `host`/`owner`/`name` in place rather than
+ * insert a second one. The `UNIQUE (host, owner, name)` index does not stand in the way:
+ * the old triple leaves the table in the same statement that writes the new one. A
+ * rename therefore keeps ONE row and every reference to it valid.
+ *
+ * Reads NEVER gate on staleness (D7). Nothing here refuses to return a repository
+ * because its `observedAt` is old — staleness is RENDERED from that stamp (DE4.4), and
+ * a store that hid stale records would make "how old is this?" unanswerable by removing
+ * the evidence.
+ *
+ * KNOWN GAP (DE1.2): new-plan materialisation is `putRepository`'s only production
+ * caller, and nothing SCHEDULES a re-observation. A record is therefore refreshed only if
+ * a user happens to submit another plan naming the same repository — incidental, not a
+ * trigger — so in the ordinary case `observedAt`/`refs` freeze at first sighting. The
+ * refresh MECHANISM here is complete and tested; the TRIGGER does not exist and is out of
+ * scope for this task.
+ * DE4.4's staleness rendering needs one. See the module docstring of
+ * `packages/domain/src/repository.ts`.
+ *
+ * That gap also bites the rename path above, which only holds when the refresh carries
+ * the SAME id: a never-refreshed record keeps holding a natural key the host has already
+ * freed, so a DIFFERENT repository renamed INTO that key hits the failure documented on
+ * `putRepository` below and stays unstorable until something refreshes the stale record.
+ * A trigger is what resolves it; the current behaviour is pinned by a test rather than
+ * worked around here.
+ */
+export interface RepositoryStore {
+  /**
+   * Upsert a {@link Repository} observation by id, REPLACING its scalar columns —
+   * INCLUDING the natural key, so a RENAME moves the existing row rather than adding
+   * one — and its ENTIRE observed ref set (D7). Fails with {@link StateStoreError} when
+   * the record's natural key `(host, owner, name)` is already held by a DIFFERENT id —
+   * the backing's UNIQUE constraint, not a read-then-check.
+   */
+  readonly putRepository: (repository: Repository) => Effect.Effect<void, StateStoreError>;
+  /** Read one {@link Repository} (with its observed refs, ordered by name) by id, if present. */
+  readonly getRepository: (
+    id: RepositoryId,
+  ) => Effect.Effect<Option.Option<Repository>, StateStoreError>;
+  /**
+   * Read one {@link Repository} by its NATURAL key `(host, owner, name)`, if present —
+   * the read a caller holding no id has (a plan naming `github / callajd / sprinter`).
+   * At most one row can match: the triple is UNIQUE in the backing, so this is
+   * deterministic by construction rather than by convention.
+   */
+  readonly findRepository: (
+    key: RepositoryKey,
+  ) => Effect.Effect<Option.Option<Repository>, StateStoreError>;
+  /** Every stored repository, ordered by id. */
+  readonly listRepositories: Effect.Effect<ReadonlyArray<Repository>, StateStoreError>;
+}
+
+/**
  * Persist and read the work graph `Workstream ⊃ Epic ⊃ Issue` and its dependency
  * DAG. `put*` upserts a node by id (idempotent); the reads hydrate the owned
  * domain schemas back out, including reconstructing each issue's `dependsOn`
@@ -430,6 +517,8 @@ export class StateStore extends Context.Service<
   {
     /** The append-only, globally-scoped `Agent` registry capability group. */
     readonly agents: AgentStore;
+    /** The observed `Repository` entity capability group — the STATE layer's anchor. */
+    readonly repositories: RepositoryStore;
     /** The work-graph capability group. */
     readonly workGraph: WorkGraphStore;
     /** The Job / Session / mapping capability group. */

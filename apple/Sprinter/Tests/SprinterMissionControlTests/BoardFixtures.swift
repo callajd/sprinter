@@ -21,10 +21,35 @@ enum BoardFixtures {
     status: .active,
     issues: [IssueId(rawValue: "iss-a")])
 
+  /// The two repositories the workstreams REFERENCE. The board resolves each into
+  /// its `owner/name` display string, so a snapshot missing one would render the raw id.
+  static let repositoryA = Repository(
+    id: RepositoryId(rawValue: "repo:github:1296269"),
+    host: .github,
+    owner: "callajd",
+    name: "sprinter",
+    refs: [
+      RepositoryRef(
+        name: BranchName(rawValue: "main"),
+        sha: CommitSha(rawValue: "0123456789abcdef0123456789abcdef01234567"))
+    ],
+    observedAt: "2026-07-20T12:00:00.000Z")
+  static let repositoryB = Repository(
+    id: RepositoryId(rawValue: "repo:github:1296270"),
+    host: .github,
+    owner: "callajd",
+    name: "sprinter-daemon",
+    refs: [
+      RepositoryRef(
+        name: BranchName(rawValue: "main"),
+        sha: CommitSha(rawValue: "0123456789abcdef0123456789abcdef01234567"))
+    ],
+    observedAt: "2026-07-20T12:00:00.000Z")
+
   static let workstreamA = Workstream(
     id: WorkstreamId(rawValue: "ws-a"),
     name: "SwiftUI app",
-    repo: "callajd/sprinter",
+    repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
     status: .active,
     epics: [EpicId(rawValue: "ep-a")])
 
@@ -65,12 +90,13 @@ enum BoardFixtures {
   static let workstreamB = Workstream(
     id: WorkstreamId(rawValue: "ws-b"),
     name: "Daemon",
-    repo: "callajd/sprinter-daemon",
+    repositoryId: RepositoryId(rawValue: "repo:github:1296270"),
     status: .done,
     epics: [EpicId(rawValue: "ep-b")])
 
   /// The baseline: two repo-scoped workstreams, one with a live agent.
   static let snapshot = Snapshot(
+    repositories: [repositoryA, repositoryB],
     workstreams: [workstreamA, workstreamB],
     epics: [epicA, epicB],
     issues: [issueA, issueB],
@@ -124,11 +150,12 @@ enum BoardFixtures {
     sessions: [Session]
   ) -> Snapshot {
     Snapshot(
+      repositories: [repositoryA],
       workstreams: [
         Workstream(
           id: WorkstreamId(rawValue: "ws"),
           name: "W",
-          repo: "callajd/sprinter",
+          repositoryId: RepositoryId(rawValue: "repo:github:1296269"),
           status: .active,
           epics: [EpicId(rawValue: "ep")])
       ],

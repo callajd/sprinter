@@ -8,7 +8,7 @@
  * — driven from the app side by a REAL `effect/unstable/rpc` client over that socket, with
  * only the two non-deterministic leaves substituted as pure Layers, INV-EFFECT-DI: a
  * CONTROLLABLE scripted `pi` at the `ChildProcessSpawner` seam and a SANDBOXED in-process
- * `Repository`). CE4.2 adds the RESTART: the daemon is brought up, driven to a mid-flight
+ * `CodeHost`). CE4.2 adds the RESTART: the daemon is brought up, driven to a mid-flight
  * `running` Job persisted to the file, then its whole layer scope is TORN DOWN — the
  * process death: the socket unbinds and SQLite closes with the Job still durably `running`,
  * NOT settled — and a FRESH daemon graph is brought up on the SAME database file + socket
@@ -43,7 +43,8 @@ import { BunFileSystem, BunServices, BunSocket } from "@effect/platform-bun";
 import { expect } from "vitest";
 import { SprinterRpc } from "@sprinter/contract";
 import { Epic, Issue, Job, Session, SessionId, Workstream } from "@sprinter/domain";
-import { Repository, RepositoryIssue } from "@sprinter/repository";
+import { Repository as DomainRepository } from "@sprinter/domain";
+import { CodeHost, RepositoryIssue } from "@sprinter/repository";
 import { layer as layerStateSqlite, StateStore } from "@sprinter/state";
 import { appLayer, bootLayer, type DaemonConfig, socketProtocolLayer } from "./main.ts";
 import { SESSION_RESOLVE_TIMEOUT } from "./session-registry.ts";
@@ -54,11 +55,47 @@ const HARD_TIMEOUT = "15 seconds";
 const decode = <A, I>(schema: Schema.Codec<A, I>, raw: I): A =>
   Schema.decodeUnknownSync(schema)(raw);
 
+/**
+ * The stand-in for the NUMERIC identifier a code host assigns a repository — a pure
+ * FNV-1a hash of the natural key, so it is deterministic and independent of test order.
+ *
+ * It stands in for the host's OWN id rather than being the key in the id's clothing: a
+ * real adapter mints a `RepositoryId` from an identifier a RENAME does not change, and
+ * `RepositoryId` now CHECKS that shape (`repo:<host>:<host-id>`, host-id from the
+ * URL-unreserved set), so a key-shaped `repo:github:owner/name` no longer decodes at
+ * all. Spelling the fake's id like the real one keeps this harness from agreeing with a
+ * broken adapter.
+ */
+const fakeRepositoryId = (owner: string, name: string): string => {
+  let hash = 0x811c9dc5;
+  for (const character of `${owner}/${name}`) {
+    hash = Math.imul(hash ^ (character.codePointAt(0) ?? 0), 0x01000193) >>> 0;
+  }
+  return `repo:github:${hash}`;
+};
+
 // ── the sandboxed code host: the Issue stays open (not landed) across the restart, so
 //    StartupReconcile RESUMES the in-flight Job rather than settling it as landed. ─────
-const fakeRepository: Layer.Layer<Repository> = Layer.succeed(
-  Repository,
-  Repository.of({
+const fakeRepository: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      // Resolves ANY key to a canned observation: these suites exercise Issue/PR
+      // reconciliation, not repository resolution (which is tested on its own).
+      resolve: (key) =>
+        Effect.succeed(
+          Option.some(
+            decode(DomainRepository, {
+              id: fakeRepositoryId(key.owner, key.name),
+              host: key.host,
+              owner: key.owner,
+              name: key.name,
+              refs: [{ name: "main", sha: "a".repeat(40) }],
+              observedAt: "2026-07-20T12:00:00.000Z",
+            }),
+          ),
+        ),
+    },
     code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(true) },
     issues: {
       getIssue: (number) =>
@@ -159,10 +196,23 @@ const entryAppended = (id: string, text: string) => ({
 });
 
 // ── the seeded materialized plan (an active workstream with one queued Job) ────
+/**
+ * The repository the seeded workstream is anchored to — `repositoryId` is a real
+ * FOREIGN KEY, so it has to be written before the workstream that references it.
+ */
+const seedRepository = decode(DomainRepository, {
+  id: "repo:github:1296269",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+});
+
 const seedWorkstream = decode(Workstream, {
   id: "ws-seed",
   name: "Restart Seed",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["epic-seed"],
 });
@@ -224,6 +274,7 @@ it.effect(
       // short-lived non-journaling store whose scope closes before the daemon opens it).
       yield* Effect.gen(function* () {
         const store = yield* StateStore;
+        yield* store.repositories.putRepository(seedRepository);
         yield* store.workGraph.putWorkstream(seedWorkstream);
         yield* store.workGraph.putEpic(seedEpic);
         yield* store.workGraph.putIssue(seedIssue);
@@ -372,6 +423,7 @@ it.effect(
       // checkpoint. It commits the in-flight rows…
       yield* Effect.gen(function* () {
         const writer = yield* StateStore;
+        yield* writer.repositories.putRepository(seedRepository);
         yield* writer.workGraph.putWorkstream(seedWorkstream);
         yield* writer.workGraph.putEpic(seedEpic);
         yield* writer.workGraph.putIssue(seedIssue);

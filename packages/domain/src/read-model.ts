@@ -13,7 +13,7 @@
  * or running instance (INV-PORT).
  */
 import { Schema } from "effect";
-import { EpicId, IssueId, JobId, SessionId, WorkstreamId } from "./ids.ts";
+import { EpicId, IssueId, JobId, RepositoryId, SessionId, WorkstreamId } from "./ids.ts";
 import { PositiveInt } from "./numeric.ts";
 
 /**
@@ -111,14 +111,22 @@ export const Epic = Schema.Struct({
 export type Epic = (typeof Epic)["Type"];
 
 /**
- * A Workstream: a related set of Epics with one spec and one repo — the
- * top-level unit driven to done. Repo-scoped per D14 (`repo` is the bound
- * repository; cross-repo work is many workstreams).
+ * A Workstream: a related set of Epics with one spec and one repository — the
+ * top-level unit driven to done. Repo-scoped per D14 (cross-repo work is many
+ * workstreams).
+ *
+ * `repositoryId` REFERENCES a stored {@link Repository} (DE1.2). It replaced the bare
+ * `repo: string` this node used to carry, and the difference is not cosmetic: a string
+ * is not an identity, so two spellings of one repository were two anchors, nothing
+ * could be referenced from it, and no constraint could be stated about it. The
+ * reference is a real `FOREIGN KEY` in the store, so a workstream naming a repository
+ * that was never observed is REJECTED at the write rather than stored and reconciled
+ * later (INV-ENFORCE).
  */
 export const Workstream = Schema.Struct({
   id: WorkstreamId,
   name: Schema.NonEmptyString,
-  repo: Schema.NonEmptyString,
+  repositoryId: RepositoryId,
   status: WorkStatus,
   epics: Schema.Array(EpicId),
 });

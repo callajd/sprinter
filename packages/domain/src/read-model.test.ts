@@ -24,7 +24,7 @@ const assertRoundTrip = (schema: Schema.Codec<unknown, unknown>, raw: unknown) =
 const workstream = {
   id: "ws-fdn",
   name: "Foundation",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["epic-fe1", "epic-fe2"],
 };

@@ -52,10 +52,18 @@ const ALL_TAGS = [
 ] as const;
 
 // Representative, domain-valid fixtures.
+const repository = {
+  id: "repo:github:1296269",
+  host: "github",
+  owner: "callajd",
+  name: "sprinter",
+  refs: [{ name: "main", sha: "0123456789abcdef0123456789abcdef01234567" }],
+  observedAt: "2026-07-20T12:00:00.000Z",
+};
 const workstream = {
   id: "ws-1",
   name: "Foundation",
-  repo: "callajd/sprinter",
+  repositoryId: "repo:github:1296269",
   status: "active",
   epics: ["ep-1"],
 };
@@ -92,6 +100,7 @@ it("streams the reactive feeds and not the request/response models (INV-REACTIVE
 
 it("hydrates full state through the snapshot success schema (resolves to domain types)", () => {
   const full = {
+    repositories: [repository],
     workstreams: [workstream],
     epics: [{ id: "ep-1", workstreamId: "ws-1", name: "FE2", status: "active", issues: ["iss-1"] }],
     issues: [issue],
@@ -106,6 +115,11 @@ it("hydrates full state through the snapshot success schema (resolves to domain 
   // are exactly the FE2.1 domain schemas.
   expect(decoded).toEqual(Schema.decodeUnknownSync(Snapshot)(full));
   expect(Schema.decodeUnknownSync(Workstream)(workstream).id).toBe("ws-1");
+  // The STATE layer rides the snapshot too: `Workstream.repositoryId` is a REFERENCE,
+  // so a client receiving workstreams without their repositories could resolve none of
+  // them. Each record carries its own `observedAt` — what DE4.4 renders staleness from.
+  expect(decoded.repositories[0]?.id).toBe("repo:github:1296269");
+  expect(decoded.repositories[0]?.observedAt).toBe("2026-07-20T12:00:00.000Z");
   expect(decoded.issues[0]?.number).toBe(10);
   // The REGISTRY layer rides the snapshot whole — every revision, no per-repo slice
   // (an Agent names no repository; the per-repo view is a fold, INV-DERIVED).
@@ -286,7 +300,13 @@ it("decodes the events request through the wire JSON codec — {} replays from o
 });
 
 it("accepts a workstream plan and answers with a WorkstreamId", () => {
-  const plan = { plan: { name: "Foundation", repo: "callajd/sprinter", spec: "build it" } };
+  const plan = {
+    plan: {
+      name: "Foundation",
+      repository: { host: "github", owner: "callajd", name: "sprinter" },
+      spec: "build it",
+    },
+  };
   const decodedPayload = Schema.decodeUnknownSync(createWorkstreamFromPlan.payloadSchema)(plan);
   expect(decodedPayload).toEqual({
     plan: Schema.decodeUnknownSync(WorkstreamPlan)(plan.plan),

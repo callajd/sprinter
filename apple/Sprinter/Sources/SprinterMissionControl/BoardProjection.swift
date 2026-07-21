@@ -19,6 +19,7 @@ import SprinterContract
 public enum BoardProjection {
   /// Rebuilds the board tree from one snapshot.
   public static func project(_ snapshot: Snapshot) -> [BoardWorkstream] {
+    let repositoriesById = indexed(snapshot.repositories, by: \.id)
     let epicsById = indexed(snapshot.epics, by: \.id)
     let issuesById = indexed(snapshot.issues, by: \.id)
     let activityByIssue = liveActivity(in: snapshot)
@@ -39,10 +40,22 @@ public enum BoardProjection {
           status: BoardStatus(epic.status),
           issues: issues)
       }
+      // The workstream carries a REFERENCE; the board shows a name. Resolve it out
+      // of the snapshot's own state layer, and fall back to the raw id when the
+      // referenced record is absent.
+      //
+      // The fallback is a TOTALITY guarantee, not a prediction that it never fires.
+      // The daemon builds a snapshot by reading workstreams first and repositories
+      // last, precisely so a concurrently-materialised plan cannot leave a workstream
+      // here whose repository is missing (`buildSnapshot`, `rpc-handlers.ts`) — but
+      // that is the daemon's ordering discipline, not something this projection can
+      // check, and a raw id on screen is strictly better than a dropped workstream or
+      // a force-unwrap (INV-NOFORCE).
+      let repository = repositoriesById[workstream.repositoryId]
       return BoardWorkstream(
         id: workstream.id,
         name: workstream.name,
-        repo: workstream.repo,
+        repo: repository.map { "\($0.owner)/\($0.name)" } ?? workstream.repositoryId.rawValue,
         status: BoardStatus(workstream.status),
         epics: epics)
     }

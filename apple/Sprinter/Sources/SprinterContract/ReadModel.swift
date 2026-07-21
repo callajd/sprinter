@@ -138,24 +138,106 @@ public struct Epic: Codable, Equatable, Sendable {
   }
 }
 
-/// A workstream: a related set of epics with one spec and one repo.
+/// The code hosts a ``Repository`` can be observed on — a CLOSED set on the contract.
+///
+/// It is an enum rather than a `String` because the daemon's set is closed: a host
+/// value with no adapter behind it names a repository nothing can read. A tag this
+/// mirror does not know is therefore a real decode failure, not something to render as
+/// unknown — it means this client is older than the contract it is talking to.
+public enum RepositoryHost: String, Codable, CaseIterable, Sendable {
+  case github
+}
+
+/// One OBSERVED ref: a branch name paired with the commit its tip pointed at when the
+/// repository was observed.
+public struct RepositoryRef: Codable, Equatable, Sendable {
+  public let name: BranchName
+  public let sha: CommitSha
+
+  public init(name: BranchName, sha: CommitSha) {
+    self.name = name
+    self.sha = sha
+  }
+}
+
+/// A repository as OBSERVED on a code host — the anchor the state layer hangs from.
+///
+/// Unlike the owned nodes above it carries ``observedAt``: Sprinter does not create
+/// repositories, it reads them off a host, so every record is a SNAPSHOT and says when
+/// it was taken (INV-OBSERVED). Staleness is RENDERED from that stamp — neither the
+/// daemon nor this mirror withholds a record for being old, so a client that wants to
+/// show "last observed N minutes ago" has the evidence to do it.
+///
+/// ``refs`` is the observed ref map `BranchName → CommitSha`, on the wire as a LIST
+/// ordered by branch name. The daemon models it that way deliberately: as a keyed
+/// object a malformed branch name would be silently DROPPED on decode, while as a list
+/// it fails loudly. An EMPTY list is valid — it means nothing has been observed yet,
+/// NOT that the repository has no branches.
+public struct Repository: Codable, Equatable, Sendable {
+  public let id: RepositoryId
+  public let host: RepositoryHost
+  public let owner: String
+  public let name: String
+  public let refs: [RepositoryRef]
+  /// The ISO-8601 UTC instant this observation was made.
+  ///
+  /// - Note: the TypeScript side models this as a `Timestamp` (canonical
+  ///   `YYYY-MM-DDTHH:MM:SS.sssZ`), so lexicographic order IS chronological order. As
+  ///   with ``Agent/retiredAt``, that property is NOT re-enforced here: this mirror is
+  ///   DECODE-ONLY, and every value it sees was canonicalised by the daemon, which is
+  ///   the only writer (the same posture, and the same expiry, as #89).
+  public let observedAt: String
+
+  public init(
+    id: RepositoryId,
+    host: RepositoryHost,
+    owner: String,
+    name: String,
+    refs: [RepositoryRef],
+    observedAt: String
+  ) {
+    self.id = id
+    self.host = host
+    self.owner = owner
+    self.name = name
+    self.refs = refs
+    self.observedAt = observedAt
+  }
+
+  /// The commit `branch`'s tip pointed at when this repository was observed, or `nil`
+  /// when that branch was not among the observed refs.
+  ///
+  /// `nil` means exactly "NOT OBSERVED" — never "the branch does not exist", which
+  /// only the code host can say.
+  public func tip(of branch: BranchName) -> CommitSha? {
+    refs.first { $0.name == branch }?.sha
+  }
+}
+
+/// A workstream: a related set of epics with one spec and one repository.
+///
+/// ``repositoryId`` REFERENCES a ``Repository`` carried in the same ``Snapshot`` (and
+/// upserted by ``WorkGraphEvent/repositoryChanged(_:)``). It replaced a bare `repo`
+/// string, and the difference is not cosmetic: a string is not an identity, so two
+/// spellings of one repository were two different anchors and nothing could be
+/// referenced from it.
 public struct Workstream: Codable, Equatable, Sendable {
   public let id: WorkstreamId
   public let name: String
-  public let repo: String
+  public let repositoryId: RepositoryId
   public let status: WorkStatus
   public let epics: [EpicId]
 
   public init(
     id: WorkstreamId,
     name: String,
-    repo: String,
+    repositoryId: RepositoryId,
     status: WorkStatus,
     epics: [EpicId]
   ) {
     self.id = id
     self.name = name
-    self.repo = repo
+    self.repositoryId = repositoryId
     self.status = status
     self.epics = epics
   }
@@ -216,6 +298,11 @@ public struct Session: Codable, Equatable, Sendable {
 /// The full owned state, hydrated on connect by the `snapshot` RPC: the read model
 /// plus the registry layer (``agents``).
 ///
+/// ``repositories`` is the STATE layer: every ``Repository`` the daemon has OBSERVED
+/// on a code host. It is hydrated because ``Workstream/repositoryId`` is a REFERENCE
+/// — a client holding workstreams without the repositories they name could resolve
+/// none of them, nor render how stale each observation is.
+///
 /// ``agents`` is the WHOLE append-only registry, not a per-repository slice — an
 /// ``Agent`` is global, so the per-repo view is a fold over that repo's executions
 /// (INV-DERIVED). Retired and superseded revisions are included, because a
@@ -232,6 +319,7 @@ public struct Session: Codable, Equatable, Sendable {
 /// silently resumed against a log it never belonged to. It is OPAQUE — equality is
 /// the only defined operation; nothing may parse or order it.
 public struct Snapshot: Codable, Equatable, Sendable {
+  public let repositories: [Repository]
   public let workstreams: [Workstream]
   public let epics: [Epic]
   public let issues: [Issue]
@@ -241,6 +329,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
   public let generation: StoreGenerationId
 
   public init(
+    repositories: [Repository],
     workstreams: [Workstream],
     epics: [Epic],
     issues: [Issue],
@@ -249,6 +338,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
     agents: [Agent],
     generation: StoreGenerationId
   ) {
+    self.repositories = repositories
     self.workstreams = workstreams
     self.epics = epics
     self.issues = issues

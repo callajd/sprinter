@@ -63,7 +63,7 @@
  * these handlers drive the `JobRunner` PORT, which a runtime backs with either the
  * real adapter or a fake — this task keeps it fakeable and does not wire LocalPi.
  */
-import { Context, Effect, Option, Schema, Stream } from "effect";
+import { Context, Duration, Effect, Option, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type ControlAction,
@@ -83,6 +83,7 @@ import {
   type Issue,
   type IssueId,
   Job,
+  type Repository,
   type Session,
   type SessionId,
   type SessionInput,
@@ -92,6 +93,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
+import { CodeHost, type CodeHostFailure } from "@sprinter/repository";
 import type { SessionHandle } from "@sprinter/runner";
 import { StateStore } from "@sprinter/state";
 import { resyncEvents } from "./event-journal.ts";
@@ -101,6 +103,7 @@ import { WorkGraphEvents } from "./work-graph-events.ts";
 
 type Store = Context.Service.Shape<typeof StateStore>;
 type Runner = Context.Service.Shape<typeof JobRunner>;
+type Host = Context.Service.Shape<typeof CodeHost>;
 type Registry = Context.Service.Shape<typeof SessionRegistry>;
 type SessionFeed = Context.Service.Shape<typeof SessionEvents>;
 
@@ -120,6 +123,35 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
  * and each job's session. Reuses the store's FK-scoped reads so the result is
  * consistent regardless of a node's cached child list.
  *
+ * The `── STATE ──` layer (`repositories`) is hydrated WHOLE for a different reason
+ * than the registry: `Workstream.repositoryId` is a REFERENCE, so a client that
+ * received workstreams without the repositories they name could resolve none of them.
+ * Every observation is shipped as stored, INCLUDING an old one — staleness is rendered
+ * from each record's `observedAt` (DE4.4), and withholding a stale record would delete
+ * the very evidence that rendering needs (D7: reads never gate on staleness).
+ *
+ * READ ORDER IS LOAD-BEARING: workstreams FIRST, repositories LAST. These reads are not
+ * one transaction, so a concurrent `createWorkstreamFromPlan` can interleave between
+ * them — and it always writes the repository BEFORE the workstream that references it
+ * (`Workstream.repositoryId` is a FOREIGN KEY, so it cannot do otherwise). Reading
+ * repositories first would therefore admit `read repos → write R → write W → read
+ * workstreams`, yielding a snapshot carrying a workstream whose repository is absent —
+ * a dangling reference the Swift projection has to render around. Reading them last
+ * makes that window unreachable: any workstream in the list was written before the read
+ * that found it, so the repository it references was written earlier still and is in the
+ * later read. (The converse skew — a repository with no workstream yet referencing it —
+ * is harmless; the state layer is not required to be reachable from the work graph.)
+ *
+ * GROWTH CURVE, stated so it is a known cost rather than a surprise: this ships EVERY
+ * repository with EVERY observed ref (up to the adapter's 100-branch page) on every
+ * `snapshot()` and on every `ResyncRequired` recovery, so the payload grows as
+ * `repositories × refs` and a resync storm multiplies it by the reconnect rate. It is
+ * acceptable at the scale `DMR` targets — a handful of repositories on one local
+ * daemon — and it is the shape a REFERENCE demands: a client cannot resolve
+ * `Workstream.repositoryId` against a record it was not sent. Paginating or ref-pruning
+ * the snapshot is a real change to the resume contract (a partial snapshot needs its
+ * own cursor), so it belongs to a later task, not to a quiet trim here.
+ *
  * The REGISTRY layer is hydrated flat and WHOLE — `listAgents`, not a per-repo or
  * per-workstream read — because an `Agent` is global and carries no repository:
  * "the agents used in this repo" is a fold the client computes over that repo's
@@ -134,6 +166,9 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
 const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
   Effect.gen(function* () {
     const agents = yield* store.agents.listAgents;
+    // Workstreams FIRST and repositories LAST — see the docstring: a repository always
+    // predates the workstream referencing it, so this order makes a dangling
+    // `repositoryId` in a snapshot unreachable rather than merely unlikely.
     const workstreams = yield* store.workGraph.listWorkstreams;
     const epics: Array<Epic> = [];
     const issues: Array<Issue> = [];
@@ -155,7 +190,9 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
         }
       }
     }
+    const repositories = yield* store.repositories.listRepositories;
     return {
+      repositories,
       workstreams,
       epics,
       issues,
@@ -168,12 +205,198 @@ const buildSnapshot = (store: Store): Effect.Effect<Snapshot, never> =>
 
 // ── createWorkstreamFromPlan ──────────────────────────────────────────────────
 
-/** Derive a stable, url-safe workstream-id slug from the plan name. */
+/**
+ * How long `createWorkstreamFromPlan` will wait for the code host to answer before
+ * rejecting the plan as unreachable.
+ *
+ * Ten seconds is chosen against the INTERACTION, not against GitHub: a human is
+ * watching a form, and a wait longer than this reads as a hang rather than as work in
+ * progress. It is far above GitHub's normal repository-lookup latency (tens of
+ * milliseconds), so it fires on a genuinely stuck connection and not on a slow one.
+ */
+export const RESOLVE_TIMEOUT = Duration.seconds(10);
+
+/**
+ * Derive a stable, url-safe workstream-id slug from the plan name.
+ *
+ * KNOWN, TRACKED: this is LOSSY on the plan NAME — every run of non-alphanumerics
+ * collapses to one `-` and case is folded — so `"Fix A/B"` and `"fix a b"` yield the
+ * same slug and the second plan is rejected as a duplicate of the first, for the same
+ * repository. It predates DE1.2 (the entity work only changed the REPOSITORY half of
+ * the id, which is now injective) and is tracked as issue #95; it is deliberately not
+ * fixed here.
+ */
 const slugify = (name: string): string =>
   name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+
+/**
+ * RESOLVE-OR-CREATE the {@link Repository} a plan names (DE1.2 D6).
+ *
+ * The plan carries the NATURAL key `(host, owner, name)` because the client composing
+ * it has never seen a `RepositoryId`. So the key is OBSERVED through the {@link CodeHost}
+ * port: the host either knows the repository — and the observation it returns is stored
+ * (creating the record on a first sighting, REFRESHING it wholesale under a new
+ * `observedAt` on a later one, D7) — or it does not, in which case the plan is
+ * {@link PlanRejected} with a reason.
+ *
+ * The rejection branch writes NOTHING, and that is the point rather than an
+ * optimisation: fabricating a repository row from the plan's own words would put a
+ * record in the `── STATE ──` layer that no host ever confirmed — an "observation" of
+ * something nobody observed — and every workstream anchored to it would then reference
+ * a repository that may not exist. `Workstream.repositoryId` is a real FOREIGN KEY, so
+ * this is also the only way the workstream write below can succeed at all.
+ *
+ * A host that could not be ASKED is a different outcome from a host that answered "no
+ * such repository", and it stays that way — but it is a REJECTION, not a defect. Both
+ * are `PlanRejected`, and the `reason` is what keeps them apart. Reporting "that
+ * repository does not exist" for an unreachable host would be a lie the user would act
+ * on; killing the request fiber over a transient upstream 500 would be worse — a plan
+ * that was not materialised because GitHub hiccupped is an ordinary, expected outcome
+ * of talking to a network service, and `PlanRejected` already carries the vocabulary to
+ * say so.
+ *
+ * ## Only the RETRYABLE failure invites a retry
+ *
+ * "The host could not be asked" is itself three outcomes, and they take different
+ * reasons, because the reason is the only thing the user can act on. `CodeHostError`
+ * carries the closed `CodeHostFailure` that says which (INV-SUM), so this is a branch on
+ * DATA, not on prose:
+ *
+ * - `unreachable` — a transport failure, a timeout, a 5xx. Transient and upstream, so
+ *   the reason says RETRY.
+ * - `denied` — a 401 (the daemon's token is absent, wrong or expired) or a 403 (the
+ *   token lacks access, or the rate limit is spent). Retrying with the same token
+ *   reproduces it exactly, so the reason says the host REFUSED and points at the
+ *   credential.
+ * - `unusable` — the host answered something Sprinter could not read (a body that failed
+ *   `GhRepo`, a value that failed an owned schema). Also deterministic, and it points at
+ *   Sprinter or at a host contract change rather than at anything the user did.
+ *
+ * Telling a user with an expired token to "retry" is a false instruction that produces
+ * an unbounded retry loop and no progress, which is exactly what the earlier single
+ * message did.
+ *
+ * ## `putRepository` fails as a REJECTION for the one HOST-caused collision
+ *
+ * A `StateStoreError` is normally a DEFECT here, and the rest of this file keeps that
+ * convention: it means Sprinter's own store is broken, which is not an outcome the user
+ * can act on or a plan can be corrected for.
+ *
+ * This one write is the documented exception, because at THIS call site the failure has
+ * a second, entirely non-broken cause. The store holds `(host, owner, name)` UNIQUE, and
+ * a record that was observed once and NEVER REFRESHED (the KNOWN GAP on
+ * `@sprinter/domain`'s `Repository`) goes on occupying a natural key the host has since
+ * FREED. So when repository B is renamed `callajd/x` → `callajd/y` upstream and
+ * repository A is then renamed INTO `callajd/x`, storing A collides with our stale row
+ * for B: the ids differ, so the id-keyed upsert does not fire, and the write fails —
+ * permanently, on every retry, for a repository that is entirely valid on the host. The
+ * trigger is ordinary GitHub behaviour, the store is intact, and nothing the daemon can
+ * do at this instant fixes it. `packages/state/src/store.test.ts` pins the store half;
+ * `./rpc-handlers.test.ts` pins it up through this RPC.
+ *
+ * Dying on it would deliver a client an unmodelled defect for a condition the contract
+ * has a word for — the Swift client models `PlanRejected`, not a `Cause([Die(...)])` —
+ * so it is REJECTED, with a reason that names the natural key so the user can see which
+ * repository is in the way. Every OTHER `StateStoreError` from this write is genuinely a
+ * broken store; a rejection is the strictly safer misclassification of the two (a
+ * rejection that should have been a defect writes nothing and says so, while a defect
+ * that should have been a rejection kills a live request).
+ *
+ * The reason is therefore phrased for the WHOLE set of errors that can reach it, not for
+ * the collision alone. `StateStoreError` carries no discriminator, so this branch CANNOT
+ * tell a natural-key collision from a locked database, a full disk or a decode failure —
+ * a reason asserting "another repository is already recorded there" would be flatly false
+ * for the others. It states what was ATTEMPTED and what the LIKELY cause is, and leaves
+ * the store's own availability on the table. Issue **#97** is the real fix: carry the
+ * distinction as DATA on `StateStoreError`, exactly the way `CodeHostFailure` already
+ * does on the code-host port, after which this branch can name the cause it has instead
+ * of hedging across all of them.
+ *
+ * ## The resolve is BOUNDED (`RESOLVE_TIMEOUT`)
+ *
+ * This is the first NETWORK call on a user-facing command — `createWorkstreamFromPlan`
+ * was store-only before DE1.2 — and the adapter carries no timeout and no retry of its
+ * own (`packages/repository/src/github.ts`). A hung connection (a TCP black hole, a
+ * proxy that accepts and never answers) does not fail: it simply never returns, so
+ * without a bound the RPC would hang FOREVER, holding the caller's request open with no
+ * outcome of any kind for the user to act on.
+ *
+ * So the resolve is bounded, and a timeout is mapped to the SAME "could not be
+ * reached — retry" rejection an unreachable host gets, because that is exactly what it
+ * is: from the plan's point of view a host that never answered and a host that answered
+ * 500 are one outcome — the plan was not materialised, nothing was written, and a retry
+ * is the remedy. Inventing a third reason would only ask the user to distinguish two
+ * situations they act on identically.
+ *
+ * The bound belongs HERE rather than in the adapter: it is a property of the
+ * INTERACTION — a human is waiting on a synchronous RPC — not of GitHub. A background
+ * reconciler calling the same port would want a different bound, and the adapter has no
+ * way to know which caller it is serving (INV-PORT).
+ */
+const resolveRepository = (
+  store: Store,
+  host: Host,
+  plan: WorkstreamPlan,
+): Effect.Effect<Repository, PlanRejected> =>
+  Effect.gen(function* () {
+    const named = `${plan.repository.owner}/${plan.repository.name}`;
+    /** The rejection for a host that could not be asked, phrased per {@link CodeHostFailure}. */
+    const notAsked = (kind: CodeHostFailure, detail: string) =>
+      new PlanRejected({
+        reason:
+          kind === "unreachable"
+            ? `the code host could not be reached to resolve ${named} (${detail}); the plan was not materialized — retry`
+            : kind === "denied"
+              ? `the code host refused Sprinter's request to resolve ${named} (${detail}); the plan was not materialized — check the daemon's code-host credentials, or wait for the rate limit to reset; retrying now will not help`
+              : `the code host answered with something Sprinter could not read while resolving ${named} (${detail}); the plan was not materialized, and retrying will not change the answer`,
+      });
+    const observed = yield* host.repositories.resolve(plan.repository).pipe(
+      Effect.mapError((error) => notAsked(error.kind, error.detail)),
+      Effect.timeoutOrElse({
+        duration: RESOLVE_TIMEOUT,
+        // A timeout IS the unreachable case: the host never answered.
+        orElse: () =>
+          Effect.fail(
+            notAsked("unreachable", `no response within ${Duration.format(RESOLVE_TIMEOUT)}`),
+          ),
+      }),
+    );
+    if (Option.isNone(observed)) {
+      // The host answered "not found", and that answer is AMBIGUOUS by design on GitHub:
+      // it returns 404 — deliberately NOT 403 — for a repository the token cannot see, so
+      // it does not confirm the existence of a private repository to an unauthorized
+      // caller. Org SSO not authorised for the token, a missing `repo` scope, and a
+      // fine-grained PAT that does not select this repository all arrive here as 404, and
+      // those are the COMMONEST credential failures on this path. Saying "does not exist"
+      // would name a diagnosis this outcome cannot support and send the user off to check
+      // their spelling while the real fix is the daemon's token.
+      return yield* Effect.fail(
+        new PlanRejected({
+          reason: `the code host has no repository ${named} that Sprinter can see — either it does not exist, or the daemon's code-host token cannot access it (a code host answers 404, not 403, for a private repository a token may not see); check the name, then check the token's access. The plan was not materialized`,
+        }),
+      );
+    }
+    // Every `StateStoreError` from this write reaches here, not just the natural-key
+    // collision — see this function's docstring. So the reason says what we ATTEMPTED and
+    // offers the collision as the LIKELY cause rather than asserting it: a locked
+    // database, a full disk or a decode failure would otherwise be reported to the user
+    // as "another repository is already recorded there", which is simply false. #97 is the
+    // real fix — carrying the distinction as DATA on `StateStoreError`, the way
+    // `CodeHostFailure` already does on the code-host port — after which this branch can
+    // name the cause it actually has.
+    yield* store.repositories.putRepository(observed.value).pipe(
+      Effect.mapError(
+        () =>
+          new PlanRejected({
+            reason: `Sprinter could not record its observation of ${observed.value.owner}/${observed.value.name}; most likely another repository still holds that name in Sprinter's store after a rename on the host, but the store may also be unavailable. The plan was not materialized`,
+          }),
+      ),
+    );
+    return observed.value;
+  });
 
 /**
  * Materialize a {@link WorkstreamPlan} into a new top-level {@link Workstream}
@@ -182,15 +405,46 @@ const slugify = (name: string): string =>
  * epic/issue breakdown is produced later by a planning Job — a fresh workstream
  * has an empty `epics` list, so FK/child-list consistency holds trivially.
  *
- * The id is derived from BOTH the plan name and its repo (a workstream is
- * repo-scoped, D14), so the same name for different repos does not collide. And
- * because `putWorkstream` is an UPSERT, a create whose id already exists would
- * silently clobber the existing workstream — resetting its `name`/`repo` and its
- * `epics` list while the epics' FK rows persist (a parentage desync). The contract
+ * The plan's repository key is resolved (or created) FIRST, through
+ * {@link resolveRepository}: the workstream's `repositoryId` is a real FOREIGN KEY,
+ * so the anchor has to exist before the workstream that references it can be written
+ * at all. A plan the host does not recognise fails there, having written nothing.
+ *
+ * The id is derived from BOTH the plan name and its RESOLVED repository (a workstream is
+ * repo-scoped, D14), so the same name for different repositories does not collide — and
+ * it is derived from the repository's `id`, which is INJECTIVE, rather than from a slug
+ * of its natural key, which is not: slugifying `${host}-${owner}-${name}` maps
+ * `(github, a-b, c)` and `(github, a, b-c)` — two different repositories — onto one
+ * string, and collapses case besides. The consequence was not corruption but a FALSE
+ * rejection ("a workstream already exists…") for a plan naming a genuinely different
+ * repository. The id is percent-encoded so the composed id stays url-safe despite the
+ * separators inside a `RepositoryId`; nothing parses it back out. The PLAN-NAME half of
+ * the slug is still lossy — see {@link slugify} and issue #95.
+ *
+ * Deriving it from the RESOLVED record means the repository is observed BEFORE the
+ * duplicate check, and the ORDER is forced: the id cannot be computed without
+ * `repository.id`, so moving the duplicate check earlier is not available. A plan
+ * rejected as a duplicate has therefore refreshed that repository's observation. That is
+ * not a write the rejection was supposed to avoid: the D6 hazard is fabricating a row
+ * for a repository nobody observed, and this is the opposite — a real observation of a
+ * repository that necessarily already had a row, since the workstream the duplicate
+ * check found holds a FOREIGN KEY to it.
+ *
+ * It does mean a client retry-looping on the duplicate rejection re-puts that record on
+ * every attempt. The row write is harmless (it is an id-keyed replace of a record with
+ * itself), and the DELTA it would otherwise emit — an append to the durable, untrimmed
+ * event log plus a broadcast to every client — is suppressed by the journaling
+ * decorator, which journals a repository put only when the observation actually changed
+ * (`./event-journal.ts`).
+ *
+ * Because `putWorkstream` is an UPSERT, a create whose id already exists would
+ * silently clobber the existing workstream — resetting its `name`/`repositoryId` and
+ * its `epics` list while the epics' FK rows persist (a parentage desync). The contract
  * materializes a NEW workstream, so a colliding create is rejected, not upserted.
  */
 const materialize = (
   store: Store,
+  host: Host,
   plan: WorkstreamPlan,
 ): Effect.Effect<WorkstreamId, PlanRejected> =>
   Effect.gen(function* () {
@@ -203,10 +457,14 @@ const materialize = (
         new PlanRejected({ reason: "cannot derive a workstream id from the plan name" }),
       );
     }
-    const repoSlug = slugify(plan.repo);
-    // Both parts are slugified; `ws-<slug>[-<repoSlug>]` is non-empty by
-    // construction, so the branded decode cannot fail.
-    const idString = repoSlug.length > 0 ? `ws-${slug}-${repoSlug}` : `ws-${slug}`;
+    const repository = yield* resolveRepository(store, host, plan);
+    // The repository half of the id is the RESOLVED record's `id` — the one encoding of
+    // a repository that is injective — percent-encoded so the composed id has no `:` or
+    // `/` in it. Slugifying the natural key instead is what made `(github, a-b, c)` and
+    // `(github, a, b-c)` collide.
+    const idString = `ws-${slug}-${encodeURIComponent(repository.id)}`;
+    // `slug` is non-empty (checked above) and the encoded id is non-empty, so the
+    // branded decode cannot fail.
     const id = yield* Schema.decodeUnknownEffect(WorkstreamId)(idString).pipe(Effect.orDie);
     const existing = yield* store.workGraph.getWorkstream(id).pipe(Effect.orDie);
     if (Option.isSome(existing)) {
@@ -217,7 +475,7 @@ const materialize = (
     const workstream: Workstream = {
       id,
       name: plan.name,
-      repo: plan.repo,
+      repositoryId: repository.id,
       status: "pending",
       epics: [],
     };
@@ -664,6 +922,7 @@ export const handlers = SprinterRpc.toLayer(
   Effect.gen(function* () {
     const store = yield* StateStore;
     const runner = yield* JobRunner;
+    const host = yield* CodeHost;
     const feed = yield* WorkGraphEvents;
     const sessionFeed = yield* SessionEvents;
     const sessions = yield* SessionRegistry;
@@ -690,7 +949,7 @@ export const handlers = SprinterRpc.toLayer(
       // drop-and-recreate can never be resumed incrementally against the new log
       // (`ResyncRequired`).
       events: ({ resume }) => resyncEvents(store, feed, resume),
-      createWorkstreamFromPlan: ({ plan }) => materialize(store, plan),
+      createWorkstreamFromPlan: ({ plan }) => materialize(store, host, plan),
       control: ({ workstreamId, action }) =>
         controlWorkstream(store, runner, scope, workstreamId, action),
       retryIssue: ({ issueId }) => retry(store, runner, scope, issueId),

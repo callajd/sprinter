@@ -1,7 +1,11 @@
 {
   "plan": {
     "name": "Foundation",
-    "repo": "callajd/sprinter",
+    "repository": {
+      "host": "github",
+      "owner": "callajd",
+      "name": "sprinter"
+    },
     "spec": "build it"
   }
 }
