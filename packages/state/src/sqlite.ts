@@ -86,6 +86,8 @@ import { SqliteClient } from "@effect/sql-sqlite-bun";
 import {
   Agent,
   AgentId,
+  BranchName,
+  CommitSha,
   EpicId,
   type Issue,
   IssueId,
@@ -160,6 +162,64 @@ const RepositoryScalarRow = Schema.Struct({
 
 /** A single `repository_ref` row: one observed branch tip. */
 const RepositoryRefRow = RepositoryRef;
+
+/**
+ * One row of the LEFT-JOINED repository read: a repository's scalar columns plus at
+ * most one of its refs.
+ *
+ * A joined read is how `listRepositories` avoids issuing one ref query per repository
+ * (an N+1 that grows with the number of repositories, on a path the daemon runs for
+ * every `snapshot()` and every resync). The join is LEFT because an EMPTY ref set is a
+ * valid observation — "nothing seen yet" — and an inner join would silently drop those
+ * repositories from the listing rather than returning them with no refs; the nullable
+ * `refName`/`refSha` pair is exactly that case, and it is decoded as `NullOr` rather
+ * than assumed away.
+ */
+const RepositoryJoinedRow = Schema.Struct({
+  id: RepositoryId,
+  host: RepositoryHost,
+  owner: RepositorySegment,
+  name: RepositorySegment,
+  observedAt: Timestamp,
+  refName: Schema.NullOr(BranchName),
+  refSha: Schema.NullOr(CommitSha),
+});
+
+/**
+ * Fold {@link RepositoryJoinedRow}s back into {@link Repository} records.
+ *
+ * The query orders by `(id, name)`, so every row of one repository is contiguous and
+ * its refs arrive already in the branch-name order `Repository.refs` requires — the
+ * fold appends, it never sorts. A row whose `refName` is `null` is the LEFT-join's
+ * "this repository has no refs" marker and contributes nothing to the list.
+ */
+const groupRepositories = (
+  rows: ReadonlyArray<(typeof RepositoryJoinedRow)["Type"]>,
+): ReadonlyArray<Repository> => {
+  const refsById = new Map<string, Array<RepositoryRef>>();
+  const firstRowPerRepository: Array<(typeof RepositoryJoinedRow)["Type"]> = [];
+  for (const row of rows) {
+    let refs = refsById.get(row.id);
+    if (refs === undefined) {
+      refs = [];
+      refsById.set(row.id, refs);
+      firstRowPerRepository.push(row);
+    }
+    if (row.refName !== null && row.refSha !== null) {
+      refs.push({ name: row.refName, sha: row.refSha });
+    }
+  }
+  return firstRowPerRepository.map(
+    (row): Repository => ({
+      id: row.id,
+      host: row.host,
+      owner: row.owner,
+      name: row.name,
+      refs: refsById.get(row.id) ?? [],
+      observedAt: row.observedAt,
+    }),
+  );
+};
 
 /** A workstream row: `epics` is a JSON-encoded child list. */
 const WorkstreamRow = Schema.Struct({
@@ -1037,11 +1097,27 @@ const make = Effect.gen(function* () {
           }),
         ),
       ),
-    listRepositories: sql`SELECT * FROM repository ORDER BY id`.pipe(
+    // ONE joined read, not one query per repository. `hydrateRepository` issues a
+    // `repository_ref` SELECT of its own, which is right for a single-record read and
+    // wrong here: the daemon lists every repository for every `snapshot()` and every
+    // resync, so a per-row ref query is an N+1 on the hottest read the store has.
+    //
+    // `ORDER BY r.id, f.name` does double duty — it groups each repository's rows
+    // contiguously so the fold is a single pass, and it delivers the refs in the
+    // branch-name order `Repository.refs` is checked for. That order is SQLite's default
+    // BINARY collation (a `memcmp` over UTF-8), which is exactly the domain's
+    // `compareBranchNames` (Unicode code point); the two are the same order by
+    // construction, so a record's refs cannot be reordered by a store round-trip.
+    listRepositories: sql`
+      SELECT r.id, r.host, r.owner, r.name, r."observedAt",
+             f.name AS "refName", f.sha AS "refSha"
+      FROM repository r
+      LEFT JOIN repository_ref f ON f."repositoryId" = r.id
+      ORDER BY r.id, f.name
+    `.pipe(
+      Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(RepositoryJoinedRow))),
+      Effect.map(groupRepositories),
       Effect.mapError(fail("listRepositories")),
-      Effect.flatMap((rows) =>
-        Effect.forEach(rows, (row) => hydrateRepository(row, "listRepositories")),
-      ),
     ),
   };
 

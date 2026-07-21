@@ -32,6 +32,15 @@
  * is what makes a code host's resolve deterministic by construction instead of by
  * convention (INV-ENFORCE).
  *
+ * The UNIQUE constraint can only see a collision between IDENTICAL triples, so the
+ * triple that reaches it must be the HOST's canonical spelling, never the caller's:
+ * `CallaJD/Sprinter` and `callajd/sprinter` name one repository on GitHub, and storing
+ * each caller's spelling verbatim would produce two triples that genuinely differ and
+ * two anchors for one repository — precisely the failure this entity exists to
+ * eliminate. Canonicalisation is therefore the ADAPTER's obligation (INV-PORT): a
+ * `CodeHost` builds the record, and mints its id, from the identity the host reports
+ * for the key it was asked about.
+ *
  * This module is a pure description of shape: it references no backing store, no HTTP
  * client and no running instance (INV-PORT). Nothing here knows what GitHub is.
  */
@@ -55,20 +64,55 @@ export const RepositoryHost = Schema.Literals(["github"]);
 export type RepositoryHost = (typeof RepositoryHost)["Type"];
 
 /**
+ * The characters a repository owner or name may be spelled with: ASCII letters,
+ * digits, `.`, `_` and `-`, one or more of them.
+ *
+ * This is an ALLOW-list, and deliberately a SUPERSET of what any code host actually
+ * permits (GitHub allows exactly this set for a repository name and a strict subset of
+ * it for an owner). An allow-list is the only form that closes this hole once: a
+ * deny-list of "the characters that were dangerous last time" is a list somebody has to
+ * keep complete, and the segment is CLIENT-SUPPLIED — it arrives on `WorkstreamPlan`
+ * off the RPC surface and is interpolated into an AUTHENTICATED request path by the
+ * code-host adapter.
+ */
+const REPOSITORY_SEGMENT = /^[A-Za-z0-9._-]+$/;
+
+/**
  * One SEGMENT of a repository's natural key — its `owner` or its `name`.
  *
- * Non-empty, and it may not contain `/`. The slash rule is what keeps the natural key
- * UNAMBIGUOUS: `(host, owner, name)` is a three-part key, and an owner of `"a/b"` with
- * a name of `"c"` would denote the same `owner/name` path as an owner of `"a"` with a
- * name of `"b/c"` — two rows, one repository, and the UNIQUE constraint powerless to
- * see it because the triples genuinely differ. Rejecting the separator at the SCHEMA
- * makes that collision unconstructible (INV-ENFORCE). No code host permits `/` in
- * either segment anyway, so nothing real is excluded.
+ * Two rules, both enforced HERE rather than at a call site, because this is the one
+ * boundary every natural key crosses (INV-ENFORCE):
+ *
+ * 1. **{@link REPOSITORY_SEGMENT}** — the segment is one or more of `[A-Za-z0-9._-]`.
+ *    Excluding `/` is what keeps the natural key UNAMBIGUOUS: `(host, owner, name)` is
+ *    a three-part key, and an owner of `"a/b"` with a name of `"c"` would denote the
+ *    same `owner/name` path as an owner of `"a"` with a name of `"b/c"` — two rows, one
+ *    repository, and the UNIQUE constraint powerless to see it because the triples
+ *    genuinely differ. Excluding everything ELSE outside the set is what keeps a
+ *    segment from meaning anything to the transports it is interpolated into: `%`, `?`,
+ *    `#`, `\` and a raw control character each carry a syntax somewhere downstream.
+ * 2. **`.` and `..` are rejected outright.** They match rule 1's character set, and they
+ *    are the reason rule 1 is not sufficient on its own: `.` and `..` are the relative
+ *    PATH segments, `encodeURIComponent` does NOT escape `.`, and URL normalisation
+ *    resolves them — so a `name` of `".."` interpolated into `/repos/{owner}/{name}`
+ *    walks OUT of the repository resource and lets a caller who supplied only a
+ *    repository key steer the adapter's authenticated request at an unrelated endpoint
+ *    (`owner: "..", name: "user"` → `GET /user`). A segment that denotes a directory
+ *    traversal is not a repository name on any host, so nothing real is excluded.
+ *
+ * Both rules are SCHEMA constraints, so a segment that violates either cannot be
+ * CONSTRUCTED — the rejection happens on DECODE, at the RPC boundary, before any
+ * adapter sees the value. Checking it in the adapter instead would leave the guarantee
+ * to whichever call site remembered to look.
  */
 export const RepositorySegment = Schema.NonEmptyString.check(
-  Schema.makeFilter((value: string) => !value.includes("/"), {
-    expected: "a repository owner/name segment containing no '/'",
-  }),
+  Schema.makeFilter(
+    (value: string) => REPOSITORY_SEGMENT.test(value) && value !== "." && value !== "..",
+    {
+      expected:
+        "a repository owner/name segment: one or more of [A-Za-z0-9._-], and neither '.' nor '..'",
+    },
+  ),
 );
 export type RepositorySegment = (typeof RepositorySegment)["Type"];
 
@@ -103,9 +147,52 @@ export const RepositoryRef = Schema.Struct({
 });
 export type RepositoryRef = (typeof RepositoryRef)["Type"];
 
+/**
+ * Compare two branch names by Unicode CODE POINT — the ONE order {@link Repository}'s
+ * `refs` list is held in, and the one every producer must sort by.
+ *
+ * It is code-point order because that is what SQLite's default `BINARY` collation
+ * yields for the `TEXT` column the store keeps ref names in: `BINARY` is a `memcmp`
+ * over the UTF-8 encoding, and UTF-8 preserves code-point order byte-for-byte. The
+ * obvious alternative — JavaScript's `<` on strings — is UTF-16 CODE UNIT order, which
+ * disagrees for every NON-BMP name (a surrogate pair sorts as `0xD800…` and so lands
+ * BEFORE `U+E000…`, while its code point is far above it). A branch name may hold such
+ * a character ({@link BranchName} forbids only whitespace, controls and git's own
+ * reserved forms), so the disagreement is reachable, and a record whose `refs` order
+ * flipped across a store round-trip would make the ordering claim on `refs` false in
+ * exactly the way a stale assertion is worst: silently.
+ *
+ * Comparing code points rather than transcoding to bytes is the same order with no
+ * allocation of an encoder, and it states the rule in the units the rule is about.
+ */
+export const compareBranchNames = (left: string, right: string): number => {
+  // `Array.from` on a string iterates CODE POINTS (a surrogate pair is one element),
+  // which is the whole point: comparing UTF-16 code units is the order this exists to
+  // avoid.
+  const leftPoints = Array.from(left);
+  const rightPoints = Array.from(right);
+  const shared = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < shared; index += 1) {
+    const leftPoint = leftPoints[index]?.codePointAt(0) ?? 0;
+    const rightPoint = rightPoints[index]?.codePointAt(0) ?? 0;
+    if (leftPoint !== rightPoint) return leftPoint < rightPoint ? -1 : 1;
+  }
+  return leftPoints.length - rightPoints.length;
+};
+
 /** True when no two refs in `refs` share a branch name. */
 const hasDistinctNames = (refs: ReadonlyArray<RepositoryRef>): boolean =>
   new Set(refs.map((ref) => ref.name)).size === refs.length;
+
+/**
+ * True when `refs` is in {@link compareBranchNames} order. Strict (`< 0`, not `<= 0`),
+ * so it also rejects the adjacent-duplicate case rather than leaning on
+ * {@link hasDistinctNames} to catch it.
+ */
+const isSortedByName = (refs: ReadonlyArray<RepositoryRef>): boolean =>
+  refs.every(
+    (ref, index) => index === 0 || compareBranchNames(refs[index - 1]?.name ?? "", ref.name) < 0,
+  );
 
 /**
  * A repository as observed on a code host — `{ id, host, owner, name, refs,
@@ -121,10 +208,14 @@ const hasDistinctNames = (refs: ReadonlyArray<RepositoryRef>): boolean =>
  *   deliberate: a record schema SELECTS the keys its key-schema matches, so a
  *   malformed branch name would be silently DROPPED on decode instead of rejecting the
  *   observation — the opposite of what {@link BranchName} exists for. As a list, every
- *   entry is decoded and a bad one fails loudly. Ordered by name, and its names are
- *   DISTINCT — checked here, and made unconstructible in the store by the
- *   `repository_ref` composite PRIMARY KEY (INV-ENFORCE). An EMPTY list is VALID: it
- *   means nothing has been observed yet, not that the repository has no branches.
+ *   entry is decoded and a bad one fails loudly. Its names are DISTINCT, and it is
+ *   ORDERED by {@link compareBranchNames} (Unicode code point, the order the store's
+ *   `ORDER BY name` yields) — both CHECKED here rather than merely documented, so a
+ *   producer that sorts differently fails to construct the record instead of shipping
+ *   an order the next round-trip through the store would silently change. Uniqueness is
+ *   additionally unconstructible in the store, by the `repository_ref` composite PRIMARY
+ *   KEY (INV-ENFORCE). An EMPTY list is VALID: it means nothing has been observed yet,
+ *   not that the repository has no branches.
  * - `observedAt` — when this snapshot was taken (INV-OBSERVED). See the module
  *   docstring: rendered as staleness, never enforced.
  *
@@ -140,6 +231,9 @@ export const Repository = Schema.Struct({
   refs: Schema.Array(RepositoryRef).check(
     Schema.makeFilter((refs: ReadonlyArray<RepositoryRef>) => hasDistinctNames(refs), {
       expected: "a ref list with no repeated branch name",
+    }),
+    Schema.makeFilter((refs: ReadonlyArray<RepositoryRef>) => isSortedByName(refs), {
+      expected: "a ref list ordered by branch name (Unicode code point order)",
     }),
   ),
   observedAt: Timestamp,

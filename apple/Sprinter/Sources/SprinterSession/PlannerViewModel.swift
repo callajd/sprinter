@@ -58,7 +58,10 @@ public final class PlannerViewModel {
   /// The owner and the repository name are SEPARATE fields rather than one
   /// `owner/name` string because the contract's ``RepositoryKey`` is a triple, and
   /// splitting a user-typed string on `/` here would put a SECOND parser of that
-  /// syntax in the tree — one the daemon never sees and cannot validate.
+  /// syntax in the tree — one the daemon never sees and cannot validate. Typing a
+  /// full `owner/name` slug into this field is therefore an ERROR, and
+  /// ``repositoryProblem`` says so in those words rather than letting it reach the
+  /// wire and come back as a decode failure.
   public var owner = ""
   /// The repository NAME the plan names (e.g. `sprinter`) — the other half of the key.
   public var repositoryName = ""
@@ -90,13 +93,61 @@ public final class PlannerViewModel {
       spec: spec.trimmed)
   }
 
+  /// The characters a repository owner or name may be spelled with — the same
+  /// allow-list the contract's `RepositorySegment` enforces on the daemon side.
+  private static let repositorySegmentCharacters = CharacterSet(
+    charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
+
+  /// A human-readable reason `segment` is not a usable repository owner/name, or `nil`
+  /// when it is one. `field` names the form field so the message points at it.
+  ///
+  /// This is a FORM validation, not a second parser of the contract: the daemon
+  /// enforces exactly these rules in its schema and refuses anything else regardless.
+  /// It exists because the alternative is worse for the person typing — the wire
+  /// rejection arrives as an opaque contract DECODE failure with no field and no
+  /// remedy in it. The commonest case by far is pasting a full `owner/name` slug into
+  /// the OWNER field, which this names explicitly, because splitting a `/` here
+  /// silently is what the two-field form was introduced to avoid.
+  private static func segmentProblem(_ segment: String, field: String) -> String? {
+    if segment.isEmpty { return "Enter the repository \(field)." }
+    if segment.contains("/") {
+      return
+        "The repository \(field) can't contain \"/\" — enter the owner and the repository name in their own fields."
+    }
+    if segment == "." || segment == ".." {
+      return "\"\(segment)\" isn't a repository \(field)."
+    }
+    if segment.rangeOfCharacter(from: repositorySegmentCharacters.inverted) != nil {
+      return
+        "The repository \(field) can only contain letters, digits, \".\", \"_\" and \"-\"."
+    }
+    return nil
+  }
+
+  /// Why the repository the form names is not usable, or `nil` when it is — the
+  /// message the view surfaces beside the owner/name fields.
+  ///
+  /// It is `nil` while both fields are still EMPTY: an untouched form is incomplete,
+  /// not wrong, and shouting at it before anything is typed is noise. ``canMaterialize``
+  /// still gates on completeness separately.
+  public var repositoryProblem: String? {
+    let trimmedOwner = owner.trimmed
+    let trimmedName = repositoryName.trimmed
+    if trimmedOwner.isEmpty && trimmedName.isEmpty { return nil }
+    return Self.segmentProblem(trimmedOwner, field: "owner")
+      ?? Self.segmentProblem(trimmedName, field: "name")
+  }
+
   /// Whether the form is complete enough to materialize: a plan needs a non-empty
-  /// name AND a complete repository key (the spec may be empty — a bare workstream is
-  /// valid). The
-  /// view disables the materialize control off this, and ``materializeDraft()``
-  /// guards on it too.
+  /// name AND a VALID repository key (the spec may be empty — a bare workstream is
+  /// valid). The view disables the materialize control off this, and
+  /// ``materializeDraft()`` guards on it too, so a key the daemon's schema would refuse
+  /// is never submitted and the user gets ``repositoryProblem`` instead of a decode
+  /// failure.
   public var canMaterialize: Bool {
-    !name.trimmed.isEmpty && !owner.trimmed.isEmpty && !repositoryName.trimmed.isEmpty
+    !name.trimmed.isEmpty
+      && Self.segmentProblem(owner.trimmed, field: "owner") == nil
+      && Self.segmentProblem(repositoryName.trimmed, field: "name") == nil
   }
 
   /// Materializes the plan the FORM currently describes — the explicit,

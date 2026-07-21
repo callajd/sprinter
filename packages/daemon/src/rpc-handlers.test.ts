@@ -55,7 +55,7 @@ import {
   WorkstreamId,
 } from "@sprinter/domain";
 import { JobRunner } from "@sprinter/job";
-import { CodeHost } from "@sprinter/repository";
+import { CodeHost, CodeHostError } from "@sprinter/repository";
 import { PiTransportError, type SessionHandle } from "@sprinter/runner";
 import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layerJournaling } from "./event-journal.ts";
@@ -205,6 +205,28 @@ const fakeCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
   }),
 );
 
+/**
+ * A {@link CodeHost} that cannot be ASKED — every repository resolve fails with the
+ * owned {@link CodeHostError}, the shape a transient upstream 503 takes at the port.
+ * Distinct from {@link fakeCodeHost}'s `Option.none`, which is the host ANSWERING "no
+ * such repository".
+ */
+const unreachableCodeHost: Layer.Layer<CodeHost> = Layer.succeed(
+  CodeHost,
+  CodeHost.of({
+    repositories: {
+      resolve: () =>
+        Effect.fail(new CodeHostError({ operation: "resolve", detail: "unexpected status 503" })),
+    },
+    code: { defaultBranch: Effect.succeed("main"), branchExists: () => Effect.succeed(false) },
+    issues: { getIssue: () => Effect.die("never driven") },
+    pullRequests: {
+      closingPullRequest: () => Effect.succeed(Option.none()),
+      getPullRequest: () => Effect.die("never driven"),
+    },
+  }),
+);
+
 // ── harness: RpcTest client over the handlers + fakes ─────────────────────────
 
 const clientEffect = () => RpcTest.makeClient(SprinterRpc);
@@ -221,6 +243,9 @@ interface Ctx {
 
 const harness = <A, E>(
   body: (ctx: Ctx) => Effect.Effect<A, E, Scope>,
+  // The code host is a PARAMETER so a test can drive the unhappy transport path (a
+  // transient 500) without a second copy of the whole harness.
+  codeHost: Layer.Layer<CodeHost> = fakeCodeHost,
 ): Effect.Effect<A, E | StateStoreError> =>
   Effect.gen(function* () {
     const dispatched = yield* Queue.unbounded<Job>();
@@ -232,12 +257,10 @@ const harness = <A, E>(
     );
     const app = handlers.pipe(
       Layer.provideMerge(
-        Layer.mergeAll(
-          layerJournaling(layerMemory),
-          runner,
-          layerSessionRegistry,
-          fakeCodeHost,
-        ).pipe(Layer.provideMerge(layerWorkGraphEvents), Layer.provideMerge(layerSessionEvents)),
+        Layer.mergeAll(layerJournaling(layerMemory), runner, layerSessionRegistry, codeHost).pipe(
+          Layer.provideMerge(layerWorkGraphEvents),
+          Layer.provideMerge(layerSessionEvents),
+        ),
       ),
     );
     return yield* Effect.gen(function* () {
@@ -320,10 +343,12 @@ it.effect("createWorkstreamFromPlan materializes and persists a new workstream",
           spec: "ship it",
         },
       });
-      // The id is derived from BOTH the name and the repository's NATURAL KEY
-      // (a workstream is repo-scoped, D14) — the key the plan states, not the id the
-      // host adapter happened to mint, so it is stable across adapters.
-      expect(id).toBe("ws-payments-revamp-github-callajd-sprinter");
+      // The id is derived from BOTH the name and the RESOLVED repository (a workstream
+      // is repo-scoped, D14), and specifically from the repository's `id` — the one
+      // INJECTIVE encoding of a repository — percent-encoded so the composed id stays
+      // url-safe. A slug of the natural key would map two different repositories onto
+      // one workstream id (see the injectivity test below).
+      expect(id).toBe("ws-payments-revamp-repo%3Agithub%3Acallajd%2Fsprinter");
 
       const persisted = Option.getOrThrow(yield* store.workGraph.getWorkstream(id));
       expect(persisted.name).toBe("Payments Revamp");
@@ -381,6 +406,59 @@ it.effect("createWorkstreamFromPlan rejects an UNKNOWN repository and writes not
       expect(yield* store.repositories.listRepositories).toStrictEqual([]);
       expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
       expect(yield* store.events.read).toStrictEqual([]);
+    }),
+  ),
+);
+
+// Q2 — a host that could not be ASKED is a different outcome from a host that answered
+// "no such repository", and BOTH are rejections. A transient upstream 500 is an
+// ordinary, expected outcome of talking to a network service; letting it kill the
+// request fiber (an `orDie`) turns a retryable hiccup into a dead connection, and
+// `PlanRejected` already carries a `reason` honest enough to say what happened.
+it.effect("createWorkstreamFromPlan REJECTS (not dies) when the code host is unreachable", () =>
+  harness(
+    ({ client, store }) =>
+      Effect.gen(function* () {
+        // `flip` makes the REJECTION the success. A defect does not flip — it
+        // propagates — so an `orDie` regression fails this test rather than passing it.
+        const error = yield* client
+          .createWorkstreamFromPlan({
+            plan: {
+              name: "Transient",
+              repository: { host: "github", owner: "callajd", name: "sprinter" },
+              spec: "real spec",
+            },
+          })
+          .pipe(Effect.flip);
+        expect(error).toBeInstanceOf(PlanRejected);
+        // The reason NAMES the failure as reachability, so it is not mistaken for
+        // "that repository does not exist" — a lie the user would act on.
+        expect(error.reason).toContain("could not be reached");
+        expect(error.reason).toContain("503");
+        // And nothing was written on the way out.
+        expect(yield* store.repositories.listRepositories).toStrictEqual([]);
+        expect(yield* store.workGraph.listWorkstreams).toStrictEqual([]);
+      }),
+    unreachableCodeHost,
+  ),
+);
+
+// N1 — the workstream id must be INJECTIVE in the repository. A slug of
+// `${host}-${owner}-${name}` maps `(github, a-b, c)` and `(github, a, b-c)` — two
+// different repositories, which `repositoryIdFor` deliberately keeps distinct — onto
+// ONE string, so the second plan would be refused with a FALSE "a workstream already
+// exists for this plan name and repo".
+it.effect("derives DISTINCT workstream ids for repositories a slug would collide", () =>
+  harness(({ client }) =>
+    Effect.gen(function* () {
+      const materialize = (owner: string, name: string) =>
+        client.createWorkstreamFromPlan({
+          plan: { name: "Same Name", repository: { host: "github", owner, name }, spec: "spec" },
+        });
+      const left = yield* materialize("a-b", "c");
+      // Would have been the same id — and so a rejection — before the fix.
+      const right = yield* materialize("a", "b-c");
+      expect(left).not.toBe(right);
     }),
   ),
 );

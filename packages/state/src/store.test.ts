@@ -24,6 +24,7 @@ import {
   isLineageRetired,
   Job,
   Repository,
+  RepositoryId,
   Session,
   Workstream,
 } from "@sprinter/domain";
@@ -605,6 +606,24 @@ it.effect("round-trips a repository observation, refs and all", () =>
   }).pipe(Effect.provide(layerMemory)),
 );
 
+// ABSENCE is `Option.none`, not a failure and not a fabricated empty record — on BOTH
+// reads. `findRepository` is the one a caller holding a plan takes, and its `none` is
+// what D6's "the host does not know this repository" rejection is distinguished from.
+it.effect("answers Option.none for a repository that was never observed", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    const id = yield* Schema.decodeUnknownEffect(RepositoryId)("repo:github:nobody/nothing");
+    expect(yield* store.repositories.getRepository(id)).toStrictEqual(Option.none());
+    expect(
+      yield* store.repositories.findRepository({
+        host: "github",
+        owner: "nobody",
+        name: "nothing",
+      }),
+    ).toStrictEqual(Option.none());
+  }).pipe(Effect.provide(layerMemory)),
+);
+
 // An EMPTY ref set is a valid observation ("nothing observed yet", D4) and must
 // survive the child-table round trip — the join has to produce `[]`, not a missing
 // record or a decode failure.
@@ -626,8 +645,8 @@ it.effect("a refresh REPLACES the record wholesale and advances observedAt", () 
     yield* store.repositories.putRepository(
       yield* repository({
         refs: [
-          { name: "main", sha: SHA_MAIN },
           { name: "feat/gone", sha: SHA_FEAT },
+          { name: "main", sha: SHA_MAIN },
         ],
       }),
     );

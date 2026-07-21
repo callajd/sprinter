@@ -46,11 +46,12 @@ import {
   HttpClientResponse,
 } from "effect/unstable/http";
 import {
+  compareBranchNames,
   PositiveInt,
   type PullRequestRef,
   type Repository,
   RepositoryId,
-  type RepositoryKey,
+  RepositoryKey,
   RepositoryRef,
   Timestamp,
 } from "@sprinter/domain";
@@ -112,6 +113,25 @@ const HOST_INSTANT = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|\+0
  * zero offset, and every impossible field value (month `13`, `2026-02-30`, hour `24`)
  * reach it untouched, so a host string that is malformed for any reason OTHER than a
  * leap second still fails at this boundary rather than being smuggled past it.
+ *
+ * That deferral needs a guard, because {@link HOST_INSTANT} is shape-only: a string
+ * that is BOTH a leap second AND otherwise impossible (`2026-13-45T23:59:60Z`,
+ * `2026-02-30T23:59:60Z`) takes the translation branch, where the arithmetic either
+ * throws (`new Date(NaN).toISOString()`, a DEFECT that would kill the calling fiber) or
+ * silently invents an instant (`Date.parse` rolls `2026-02-30` to 2 March). So the
+ * translation validates its own input through `Timestamp` FIRST — the domain's rule,
+ * not a second copy of it — and an input that fails is handed on RAW, to be refused
+ * below exactly as it would have been. The failure is always the declared
+ * `CodeHostError`.
+ *
+ * KNOWN LOSS: a FRACTIONAL leap second loses its sub-second part. The translation is
+ * computed from `:59` of the same minute plus one second, and the fraction (captured by
+ * the regex, then deliberately unused) is not re-attached — so `2012-06-30T23:59:60.5Z`
+ * becomes `2012-07-01T00:00:00.000Z` rather than `…:00.500Z`. It is accepted rather
+ * than fixed: it is confined to the one instant per leap event, no code host Sprinter
+ * reads emits a fractional leap second, and the value it feeds — `observedAt`, rendered
+ * as staleness (DE4.4) — is not sensitive at half a second. Re-attaching it would mean
+ * doing the arithmetic in milliseconds, which buys nothing real here.
  */
 export const hostInstant = (
   raw: string,
@@ -122,13 +142,28 @@ export const hostInstant = (
     const translated =
       match === null || match[4] !== "60"
         ? raw
-        : yield* Effect.sync(() => {
+        : yield* Effect.gen(function* () {
             const [, date = "", hour = "", minute = ""] = match;
-            // `:59` of the same minute ALWAYS exists (there is no leap 59th second), so
-            // this parses; adding 1000 ms then lands on the instant `:60` denotes, with
-            // every boundary roll handled by the platform.
-            const oneSecondEarlier = Date.parse(`${date}T${hour}:${minute}:59Z`);
-            return new Date(oneSecondEarlier + 1000).toISOString();
+            // `:59` of the same minute always exists (there is no leap 59th second) — but
+            // ONLY if the rest of the instant is real, which {@link HOST_INSTANT} does not
+            // check: it is shape-only, so `2026-13-45T23:59:60Z` and `2026-02-30T23:59:60Z`
+            // reach here too. So the `:59` spelling is validated by the DOMAIN's own rule
+            // before anything is translated, rather than by a second copy of it: `Timestamp`
+            // round-trips the parse, which is what catches BOTH the unparseable month `13`
+            // and the silently ROLLED-OVER `2026-02-30` (`Date.parse` answers 2 March for
+            // that one, so a bare `Number.isNaN` guard would let it through and the
+            // translation would invent an instant the host never sent).
+            const oneSecondEarlier = `${date}T${hour}:${minute}:59Z`;
+            const real = yield* Schema.decodeUnknownEffect(Timestamp)(oneSecondEarlier).pipe(
+              Effect.option,
+            );
+            // Not translatable: hand the RAW string on and let `Timestamp` refuse it below,
+            // so the failure is the declared `CodeHostError` — never a defect from
+            // formatting `new Date(NaN)`, which would kill the calling fiber.
+            if (Option.isNone(real)) return raw;
+            // Adding 1000 ms lands on the instant `:60` denotes, with every boundary roll
+            // (minute, hour, day, month, year) handled by the platform's date arithmetic.
+            return new Date(Date.parse(real.value) + 1000).toISOString();
           });
     return yield* Schema.decodeUnknownEffect(Timestamp)(translated).pipe(
       Effect.mapError(() =>
@@ -143,8 +178,25 @@ export const hostInstant = (
 // Wire schemas — GitHub REST JSON (decoded, then mapped to owned port types)
 // ============================================================================
 
-/** The `GET /repos/{owner}/{repo}` fields we read: the default branch. */
-const GhRepo = Schema.Struct({ default_branch: Schema.NonEmptyString });
+/**
+ * The `GET /repos/{owner}/{repo}` fields we read: the default branch, and the
+ * repository's CANONICAL identity as the host itself spells it.
+ *
+ * `owner.login` + `name` rather than `full_name`: the two carry the same information,
+ * but the split form is already the natural key's shape, so it needs no parser and no
+ * decision about what a `full_name` with more than one `/` in it would mean.
+ *
+ * The identity is read because GitHub's repository lookup is NOT
+ * spelling-preserving — it matches case-insensitively, and it 301-redirects a renamed
+ * repository to its current path (a redirect `fetch` follows transparently). So a 200
+ * confirms "a repository is here", never "it is spelled the way you asked", and the
+ * only spelling that can be stored is the one in the body.
+ */
+const GhRepo = Schema.Struct({
+  default_branch: Schema.NonEmptyString,
+  name: Schema.String,
+  owner: Schema.Struct({ login: Schema.String }),
+});
 
 /**
  * The `GET /repos/{owner}/{repo}/branches` fields we read: each branch's name and the
@@ -326,6 +378,10 @@ const DEFAULT_BASE_URL = "https://api.github.com";
  * and cannot contain `:` on any host Sprinter reads — so the three parts can never
  * re-split into a different triple.
  *
+ * The key it is handed must be the HOST's canonical spelling, not a caller's: the id is
+ * a function of the key, so two spellings of one repository would otherwise mint two
+ * ids. `resolve` reads that spelling off the `GET /repos/…` body before calling here.
+ *
  * Nothing above this module may parse the result: it is opaque, and equality is its
  * only defined operation.
  */
@@ -475,16 +531,42 @@ const make = (config: RepositoryConfig) =>
               }),
             );
           }
-          const id = yield* repositoryIdFor(key);
+          // The CANONICAL natural key — the host's spelling, not the caller's.
+          //
+          // GitHub resolves `/repos/{owner}/{name}` case-INSENSITIVELY and 301-redirects
+          // a renamed repository, so `CallaJD/Sprinter`, `callajd/sprinter` and a former
+          // name all answer 200 for ONE repository. Building the record from `key` would
+          // mint one `RepositoryId` and one row PER SPELLING — two anchors for one
+          // repository, invisible to the store's `UNIQUE (host, owner, name)` because the
+          // triples genuinely differ. That is verbatim the failure the `Repository` entity
+          // exists to eliminate, so the caller's spelling is used to ASK and the host's
+          // to ANSWER, and the rename case falls out for free.
+          //
+          // It is re-DECODED through the owned `RepositoryKey`, not trusted: the host's
+          // strings are externally sourced like any other, and this is the boundary they
+          // cross (INV-ENFORCE).
+          const repo = yield* response.json.pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(GhRepo)),
+            Effect.mapError(fail("resolve")),
+          );
+          const canonical = yield* Schema.decodeUnknownEffect(RepositoryKey)({
+            host: key.host,
+            owner: repo.owner.login,
+            name: repo.name,
+          }).pipe(Effect.mapError(fail("resolve")));
+          const id = yield* repositoryIdFor(canonical);
           const observedAt = yield* observedAtFrom(response.headers["date"], "resolve");
           // The refs are read in the SAME resolve, so the returned record describes ONE
-          // moment (D7: a refresh replaces the record wholesale, never merges into it).
+          // moment (D7: a refresh replaces the record wholesale, never merges into it),
+          // and from the CANONICAL path, so a renamed repository's refs are read from
+          // where it lives now rather than through a second redirect.
           // `per_page=100` is GitHub's maximum page; a repository with more branches is
           // observed partially, which the model already admits — `refs` is what WAS
           // observed, and an absent branch reads as "not observed", never as "does not
           // exist" (see `tipOf`).
+          const canonicalPath = `/repos/${encodeURIComponent(canonical.owner)}/${encodeURIComponent(canonical.name)}`;
           const branchRows = yield* client
-            .execute(HttpClientRequest.get(`${path}/branches?per_page=100`))
+            .execute(HttpClientRequest.get(`${canonicalPath}/branches?per_page=100`))
             .pipe(
               Effect.flatMap(HttpClientResponse.filterStatusOk),
               Effect.flatMap((branches) => branches.json),
@@ -499,12 +581,15 @@ const make = (config: RepositoryConfig) =>
           ).pipe(Effect.mapError(fail("resolve")));
           const repository: Repository = {
             id,
-            host: key.host,
-            owner: key.owner,
-            name: key.name,
+            host: canonical.host,
+            owner: canonical.owner,
+            name: canonical.name,
             // Ordered by name so one observation has ONE spelling, whatever order the
-            // host paginated them in.
-            refs: [...refs].sort((left, right) => (left.name < right.name ? -1 : 1)),
+            // host paginated them in — in the domain's `compareBranchNames` (Unicode code
+            // point) order, which is also the order the store reads them back in, so a
+            // round-trip cannot reorder them. JS `<` here would be UTF-16 code-unit order
+            // and would disagree with the store for a non-BMP branch name.
+            refs: [...refs].sort((left, right) => compareBranchNames(left.name, right.name)),
             observedAt,
           };
           return Option.some(repository);

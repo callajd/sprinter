@@ -130,6 +130,16 @@ type SessionEventsError = SessionNotFound | ResyncRequired;
  * from each record's `observedAt` (DE4.4), and withholding a stale record would delete
  * the very evidence that rendering needs (D7: reads never gate on staleness).
  *
+ * GROWTH CURVE, stated so it is a known cost rather than a surprise: this ships EVERY
+ * repository with EVERY observed ref (up to the adapter's 100-branch page) on every
+ * `snapshot()` and on every `ResyncRequired` recovery, so the payload grows as
+ * `repositories × refs` and a resync storm multiplies it by the reconnect rate. It is
+ * acceptable at the scale `DMR` targets — a handful of repositories on one local
+ * daemon — and it is the shape a REFERENCE demands: a client cannot resolve
+ * `Workstream.repositoryId` against a record it was not sent. Paginating or ref-pruning
+ * the snapshot is a real change to the resume contract (a partial snapshot needs its
+ * own cursor), so it belongs to a later task, not to a quiet trim here.
+ *
  * The REGISTRY layer is hydrated flat and WHOLE — `listAgents`, not a per-repo or
  * per-workstream read — because an `Agent` is global and carries no repository:
  * "the agents used in this repo" is a fold the client computes over that repo's
@@ -205,10 +215,19 @@ const slugify = (name: string): string =>
  * this is also the only way the workstream write below can succeed at all.
  *
  * A host that could not be ASKED (a 500, a rate limit) is a different outcome from a
- * host that answered "no such repository", and it stays that way: the port's
- * `CodeHostError` is a DEFECT here, never folded into `PlanRejected`. Reporting "that
- * repository does not exist" because GitHub was briefly unreachable would be a lie the
- * user would act on.
+ * host that answered "no such repository", and it stays that way — but it is a
+ * REJECTION, not a defect. Both are `PlanRejected`, and the `reason` is what keeps them
+ * apart: one says the host does not know the repository, the other says the host could
+ * not be reached, and only the second invites a retry. Reporting "that repository does
+ * not exist" for an unreachable host would be a lie the user would act on; killing the
+ * request fiber over a transient upstream 500 would be worse — a plan that was not
+ * materialised because GitHub hiccupped is an ordinary, expected outcome of talking to
+ * a network service, and `PlanRejected` already carries the vocabulary to say so.
+ *
+ * The `putRepository` failure stays a DEFECT. A `StateStoreError` is not an outcome the
+ * user can act on or a plan can be corrected for — it means Sprinter's own store is
+ * broken — and folding it into a rejection would advertise a user-facing reason for an
+ * internal fault.
  */
 const resolveRepository = (
   store: Store,
@@ -216,7 +235,14 @@ const resolveRepository = (
   plan: WorkstreamPlan,
 ): Effect.Effect<Repository, PlanRejected> =>
   Effect.gen(function* () {
-    const observed = yield* host.repositories.resolve(plan.repository).pipe(Effect.orDie);
+    const observed = yield* host.repositories.resolve(plan.repository).pipe(
+      Effect.mapError(
+        (error) =>
+          new PlanRejected({
+            reason: `the code host could not be reached to resolve ${plan.repository.owner}/${plan.repository.name} (${error.detail}); the plan was not materialized — retry`,
+          }),
+      ),
+    );
     if (Option.isNone(observed)) {
       return yield* Effect.fail(
         new PlanRejected({
@@ -240,9 +266,24 @@ const resolveRepository = (
  * so the anchor has to exist before the workstream that references it can be written
  * at all. A plan the host does not recognise fails there, having written nothing.
  *
- * The id is derived from BOTH the plan name and its repository (a workstream is
- * repo-scoped, D14), so the same name for different repositories does not collide. And
- * because `putWorkstream` is an UPSERT, a create whose id already exists would
+ * The id is derived from BOTH the plan name and its RESOLVED repository (a workstream is
+ * repo-scoped, D14), so the same name for different repositories does not collide — and
+ * it is derived from the repository's `id`, which is INJECTIVE, rather than from a slug
+ * of its natural key, which is not: slugifying `${host}-${owner}-${name}` maps
+ * `(github, a-b, c)` and `(github, a, b-c)` — two different repositories — onto one
+ * string, and collapses case besides. The consequence was not corruption but a FALSE
+ * rejection ("a workstream already exists…") for a plan naming a genuinely different
+ * repository. The id is percent-encoded so the composed id stays url-safe despite the
+ * separators inside a `RepositoryId`; nothing parses it back out.
+ *
+ * Deriving it from the RESOLVED record means the repository is observed BEFORE the
+ * duplicate check, so a plan rejected as a duplicate has refreshed that repository's
+ * observation. That is not a write the rejection was supposed to avoid: the D6 hazard
+ * is fabricating a row for a repository nobody observed, and this is the opposite — a
+ * real observation of a repository that necessarily already had a row, since the
+ * workstream the duplicate check found holds a FOREIGN KEY to it.
+ *
+ * Because `putWorkstream` is an UPSERT, a create whose id already exists would
  * silently clobber the existing workstream — resetting its `name`/`repositoryId` and
  * its `epics` list while the epics' FK rows persist (a parentage desync). The contract
  * materializes a NEW workstream, so a colliding create is rejected, not upserted.
@@ -262,14 +303,14 @@ const materialize = (
         new PlanRejected({ reason: "cannot derive a workstream id from the plan name" }),
       );
     }
-    // Derived from the plan's stated key rather than from the resolved record's id, so
-    // the workstream id stays stable no matter how the host adapter mints ids.
-    const repoSlug = slugify(
-      `${plan.repository.host}-${plan.repository.owner}-${plan.repository.name}`,
-    );
-    // Both parts are slugified; `ws-<slug>[-<repoSlug>]` is non-empty by
-    // construction, so the branded decode cannot fail.
-    const idString = repoSlug.length > 0 ? `ws-${slug}-${repoSlug}` : `ws-${slug}`;
+    const repository = yield* resolveRepository(store, host, plan);
+    // The repository half of the id is the RESOLVED record's `id` — the one encoding of
+    // a repository that is injective — percent-encoded so the composed id has no `:` or
+    // `/` in it. Slugifying the natural key instead is what made `(github, a-b, c)` and
+    // `(github, a, b-c)` collide.
+    const idString = `ws-${slug}-${encodeURIComponent(repository.id)}`;
+    // `slug` is non-empty (checked above) and the encoded id is non-empty, so the
+    // branded decode cannot fail.
     const id = yield* Schema.decodeUnknownEffect(WorkstreamId)(idString).pipe(Effect.orDie);
     const existing = yield* store.workGraph.getWorkstream(id).pipe(Effect.orDie);
     if (Option.isSome(existing)) {
@@ -277,7 +318,6 @@ const materialize = (
         new PlanRejected({ reason: "a workstream already exists for this plan name and repo" }),
       );
     }
-    const repository = yield* resolveRepository(store, host, plan);
     const workstream: Workstream = {
       id,
       name: plan.name,

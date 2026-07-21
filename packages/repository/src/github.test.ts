@@ -103,7 +103,8 @@ it.effect("reads the default branch and detects branch existence (present / abse
   }).pipe(
     Effect.provide(
       backend({
-        "/repos/callajd/sprinter": () => json({ default_branch: "main" }),
+        "/repos/callajd/sprinter": () =>
+          json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
         "/repos/callajd/sprinter/branches/main": () => json({ name: "main" }),
       }),
     ),
@@ -467,16 +468,23 @@ const SHA_FEAT = "89abcdef0123456789abcdef0123456789abcdef";
 /**
  * A canned repository route pair (the repo itself + its branches), optionally under a
  * host `Date` response header — the instant the adapter reads `observedAt` from.
+ *
+ * The repo body carries the CANONICAL identity (`owner.login` + `name`) because that is
+ * what the adapter builds the record from — GitHub's lookup is case-insensitive and
+ * follows renames, so the caller's spelling is only ever the question.
  */
 const repoRoutes = (date?: string): Record<string, Route> => ({
   "/repos/callajd/sprinter": () =>
-    new Response(JSON.stringify({ default_branch: "main" }), {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        ...(date === undefined ? {} : { date }),
+    new Response(
+      JSON.stringify({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          ...(date === undefined ? {} : { date }),
+        },
       },
-    }),
+    ),
   "/repos/callajd/sprinter/branches": () =>
     json([
       { name: "main", commit: { sha: SHA_MAIN } },
@@ -502,6 +510,92 @@ it.effect("resolves a repository into the owned entity, refs and all", () =>
     expect(resolved.id).toBe(yield* repositoryIdFor(KEY));
     expect(resolved.observedAt).toBe("2026-07-20T12:00:00.000Z");
   }).pipe(Effect.provide(backend(repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT")))),
+);
+
+// B3 — the natural key stored is the HOST's spelling, never the caller's. GitHub's
+// lookup is case-INSENSITIVE, so `CallaJD/Sprinter` and `callajd/sprinter` both answer
+// 200 for ONE repository. Building the record from the caller's key would mint one id
+// and one row per spelling — two anchors for one repository, invisible to the store's
+// `UNIQUE (host, owner, name)` because the triples genuinely differ. That is verbatim
+// the failure the entity exists to eliminate.
+it.effect("canonicalises the natural key — two spellings converge on ONE id and ONE record", () =>
+  Effect.gen(function* () {
+    const resolve = (key: { host: "github"; owner: string; name: string }) =>
+      Effect.gen(function* () {
+        const host = yield* CodeHost;
+        return Option.getOrThrow(yield* host.repositories.resolve(key));
+      }).pipe(
+        Effect.provide(
+          backend({
+            // The host answers the MIS-CASED path too, with its own spelling in the body.
+            "/repos/CallaJD/Sprinter": () =>
+              json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+            ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+          }),
+        ),
+      );
+
+    const asked = yield* resolve({ host: "github", owner: "CallaJD", name: "Sprinter" });
+    const canonical = yield* resolve(KEY);
+    // ONE id, and ONE natural key — so ONE row, and the UNIQUE constraint can see it.
+    expect(asked.id).toBe(canonical.id);
+    expect(asked.owner).toBe("callajd");
+    expect(asked.name).toBe("sprinter");
+    expect(asked.refs).toStrictEqual(canonical.refs);
+  }),
+);
+
+// The same mechanism handles a RENAME for free: GitHub 301-redirects an old path to the
+// repository's current one and `fetch` follows it, so the 200 that comes back describes
+// a repository with a DIFFERENT name than the one asked for. Only the body can say so.
+it.effect("follows a RENAME to the canonical name (the redirect target's spelling)", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(
+      yield* host.repositories.resolve({ host: "github", owner: "callajd", name: "old-name" }),
+    );
+    expect(resolved.name).toBe("sprinter");
+    expect(resolved.id).toBe(yield* repositoryIdFor(KEY));
+    // The refs were read from the CANONICAL path, so they are the renamed repository's.
+    expect(resolved.refs.map((ref) => ref.name)).toStrictEqual(["feat/x-1", "main"]);
+  }).pipe(
+    Effect.provide(
+      backend({
+        // What a followed 301 looks like to the client: a 200 whose body names the
+        // repository's CURRENT path.
+        "/repos/callajd/old-name": () =>
+          json({ default_branch: "main", name: "sprinter", owner: { login: "callajd" } }),
+        ...repoRoutes("Mon, 20 Jul 2026 12:00:00 GMT"),
+      }),
+    ),
+  ),
+);
+
+// N2 — `resolve`'s non-200/non-404 branch. 404 is INFORMATION (below); every other
+// unexpected status is the host failing to answer, which is the owned `CodeHostError`.
+it.effect("surfaces an unexpected resolve status as CodeHostError", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.operation).toBe("resolve");
+    expect(error.detail).toContain("500");
+  }).pipe(
+    Effect.provide(backend({ "/repos/callajd/sprinter": () => json({ message: "boom" }, 500) })),
+  ),
+);
+
+// N2 — the `Date`-header fallback. A host that omits the optional header must not cost
+// us the observation: `observedAt` falls back to THIS process's clock, which is
+// canonical by construction (`toISOString`), so the record still carries a real instant.
+it.effect("falls back to this process's clock when the host sends no Date header", () =>
+  Effect.gen(function* () {
+    const before = new Date().toISOString();
+    const host = yield* CodeHost;
+    const resolved = Option.getOrThrow(yield* host.repositories.resolve(KEY));
+    const after = new Date().toISOString();
+    expect(resolved.observedAt >= before && resolved.observedAt <= after).toBe(true);
+  }).pipe(Effect.provide(backend(repoRoutes()))),
 );
 
 // `Option.none`, not a failure: "no such repository" is INFORMATION the host has,
@@ -562,6 +656,10 @@ it.effect("translates a host LEAP SECOND to the following second (D5)", () =>
       ["2026-07-20T12:00:60Z", "2026-07-20T12:01:00.000Z"],
       // The zero-offset spelling of the same thing.
       ["2015-06-30T23:59:60+00:00", "2015-07-01T00:00:00.000Z"],
+      // KNOWN LOSS, pinned so it stays a decision rather than drifting into a surprise:
+      // a FRACTIONAL leap second loses its sub-second part. The translation is `:59`
+      // plus one second, and the fraction is not re-attached — see `hostInstant`.
+      ["2012-06-30T23:59:60.500Z", "2012-07-01T00:00:00.000Z"],
     ],
     ([raw = "", expected = ""]) =>
       Effect.gen(function* () {
@@ -575,7 +673,22 @@ it.effect("the leap-second translation does NOT weaken Timestamp for anything el
     // Every other refusal still stands: an impossible field value, a rolled-over date,
     // a non-zero offset, and a non-instant string all fail at this boundary rather
     // than being smuggled past it.
-    ["2026-13-45T99:99:99Z", "2026-02-30T00:00:00.000Z", "2026-07-20T12:00:00+02:00", "nope"],
+    //
+    // The last two are the INTERSECTION the earlier inputs miss and the one that
+    // actually broke: a string that is impossible AND carries a `:60` seconds field
+    // takes the leap-second TRANSLATION branch, where `Date.parse` answers `NaN` and
+    // `new Date(NaN).toISOString()` throws inside an `Effect.sync`. Without the
+    // non-finite guard these were a DIE — a defect killing the calling fiber — rather
+    // than the declared `CodeHostError`. `Effect.flip` is what pins that: a defect does
+    // not flip, it propagates, so this test fails rather than passes if it regresses.
+    [
+      "2026-13-45T99:99:99Z",
+      "2026-02-30T00:00:00.000Z",
+      "2026-07-20T12:00:00+02:00",
+      "nope",
+      "2026-13-45T23:59:60Z",
+      "2026-02-30T23:59:60Z",
+    ],
     (raw) =>
       Effect.gen(function* () {
         const error = yield* hostInstant(raw, "resolve").pipe(Effect.flip);
@@ -592,6 +705,20 @@ it.effect("carries a host leap second all the way through resolve, as a real Tim
     // survived — stamped with the instant that spelling denotes.
     expect(resolved.observedAt).toBe("2012-07-01T00:00:00.000Z");
   }).pipe(Effect.provide(backend(repoRoutes("Sat, 30 Jun 2012 23:59:60 GMT")))),
+);
+
+// …and the same path with an IMPOSSIBLE date behind the leap second FAILS rather than
+// DIES. `httpDateToIso` deliberately does not validate the day (it re-spells only), so
+// `45 Jun` reaches `hostInstant` together with `:60` — the exact intersection that used
+// to format `new Date(NaN)` and throw. `Effect.flip` proves it is the declared failure:
+// a defect would propagate and fail this test instead of satisfying it.
+it.effect("a malformed host Date WITH a leap second FAILS the observation, never dies", () =>
+  Effect.gen(function* () {
+    const host = yield* CodeHost;
+    const error = yield* host.repositories.resolve(KEY).pipe(Effect.flip);
+    expect(error).toBeInstanceOf(CodeHostError);
+    expect(error.operation).toBe("resolve");
+  }).pipe(Effect.provide(backend(repoRoutes("Sat, 45 Jun 2026 23:59:60 GMT")))),
 );
 
 // The id encoding must be INJECTIVE, or two different repositories would share one id
