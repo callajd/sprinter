@@ -39,9 +39,13 @@ final class RawSocketPeer: @unchecked Sendable {
   /// transport's `close()` skips its `shutdown(2)`, which is precisely the state the real race
   /// leaves behind (a `shutdown(2)` that landed in the reader's syscall-entry window woke
   /// nothing), and the peer here stays open, so nothing but the wake pipe can end the read
-  /// loop. See ``UnixSocketTransport/init(connectedDescriptor:receiveBufferLimit:raisesShutdownOnClose:)``.
+  /// loop. `wake: .unusable()` is the second half of that: it is the shape a failed `pipe(2)`
+  /// leaves behind, so the FALLBACK the wake degrades to (a bounded poll, re-checking
+  /// `isClosed`) is exercised instead of assumed. Both are test seams — see
+  /// ``UnixSocketTransport/init(connectedDescriptor:receiveBufferLimit:raisesShutdownOnClose:wake:)``.
   static func pair(
-    receiveBufferLimit: Int = 1024, raisesShutdownOnClose: Bool = true
+    receiveBufferLimit: Int = 1024, raisesShutdownOnClose: Bool = true,
+    wake: ReadLoopWake = .make()
   ) throws -> (transport: UnixSocketTransport, peer: RawSocketPeer) {
     var descriptors: [Int32] = [-1, -1]
     let result = socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors)
@@ -58,7 +62,7 @@ final class RawSocketPeer: @unchecked Sendable {
     return (
       transport: UnixSocketTransport(
         connectedDescriptor: descriptors[0], receiveBufferLimit: receiveBufferLimit,
-        raisesShutdownOnClose: raisesShutdownOnClose),
+        raisesShutdownOnClose: raisesShutdownOnClose, wake: wake),
       peer: RawSocketPeer(descriptor: descriptors[1])
     )
   }
