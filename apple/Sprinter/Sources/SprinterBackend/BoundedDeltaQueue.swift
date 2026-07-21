@@ -46,8 +46,13 @@ actor BoundedDeltaQueue<Element: Sendable> {
     waiter = nil
   }
 
-  /// Pops the next delta, suspending until one arrives or the feed finishes
-  /// (`nil`). One outstanding consumer at a time.
+  /// Pops the next delta, suspending until one arrives, the feed finishes (`nil`), or the
+  /// consumer is CANCELLED (`nil`). One outstanding consumer at a time.
+  ///
+  /// The wait is cancellation-aware on purpose: the consumer is a child of an attempt's
+  /// task group, and the group's teardown cancels it. A bare `withCheckedContinuation`
+  /// here would be an unbounded wait on a producer that may already be gone — the shape
+  /// that turns an attempt's teardown into a hang instead of a return (#94).
   func next() async -> Element? {
     if !items.isEmpty {
       return items.removeFirst()
@@ -55,8 +60,21 @@ actor BoundedDeltaQueue<Element: Sendable> {
     if finished {
       return nil
     }
-    return await withCheckedContinuation { continuation in
-      waiter = continuation
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Element?, Never>) in
+        waiter = continuation
+      }
+    } onCancel: {
+      // Hops back onto the actor: it runs after `next()` has installed its waiter (the
+      // install is synchronous with the suspension), so the wakeup cannot be lost.
+      Task { await self.releaseWaiter() }
     }
+  }
+
+  /// Wakes a suspended ``next()`` with `nil` because its consumer was cancelled. The feed
+  /// itself is untouched — this only ends THIS consumer's wait.
+  private func releaseWaiter() {
+    waiter?.resume(returning: nil)
+    waiter = nil
   }
 }

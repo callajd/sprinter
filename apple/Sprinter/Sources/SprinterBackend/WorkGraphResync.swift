@@ -316,13 +316,27 @@ public actor WorkGraphResync {
           try await fold(
             from: queue, backend: backend, resume: resume, gapLimit: gapLimit, continuation)
         }
-        do {
-          try await group.next()
-        } catch {
+        // DRAIN BOTH halves — never just the first to finish. They are coupled: the reader
+        // hands the folder its terminator (`queue.finish()`) BEFORE it rethrows, so a failing
+        // reader makes the folder runnable and then races it. Taking only `group.next()` let
+        // the folder's normal completion win that race and DISCARD the reader's error. A
+        // swallowed `ResyncRequired` leaves the dead point in place, so the next attempt
+        // re-sends a cursor the daemon refused instead of re-hydrating through `snapshot()`.
+        // Every child's outcome is collected, and the first REAL failure is the attempt's
+        // (`CancellationError` from `cancelAll` is bookkeeping, so a genuine error outranks it).
+        var failure: (any Error)?
+        var draining = true
+        while draining {
+          do {
+            if try await group.next() == nil { draining = false }
+          } catch {
+            if failure == nil || failure is CancellationError { failure = error }
+          }
+          // One half finishing ends the attempt; cancelling the other bounds the drain (both
+          // the reader's stream and the folder's queue wait are cancellation-aware).
           group.cancelAll()
-          throw error
         }
-        group.cancelAll()
+        if let failure { throw failure }
       }
     } catch {
       // Reconnect: the next attempt re-dials and resumes incrementally from the cursor —

@@ -182,8 +182,8 @@ struct UnixSocketTransportTests {
   @Test("close() racing the read loop tears down cleanly and gates the fd close on read exit")
   func closeRacingReadLoop() async throws {
     // FIX1 (READ side): close() shutdown(2)s to unblock the parked read(2), then defers the
-    // real close(2) behind BOTH the write-queue drain AND the read thread's exit (it waits on
-    // `readLoopExited`) — so the fd number is never released while the read loop might still
+    // real close(2) to the teardown rendezvous behind BOTH the write-queue drain AND the read
+    // thread's exit — so the fd number is never released while the read loop might still
     // read from it. Whether that gate actually PREVENTS an fd reuse can't be observed
     // deterministically, so this stresses the teardown path instead: the peer keeps the read
     // loop actively reading, then close() races it. The guarantee we CAN assert is
