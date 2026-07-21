@@ -7,8 +7,10 @@
  * the fixtures pinning their present/absent forms — and prose does not fail a build. A new
  * `Schema.optionalKey` field whose fixture always populates it would leave the whole
  * omission-vs-`null` question unasked for that field, silently, while every gate stayed
- * green. Epics DE2–DE4 add `Execution`, `Execution`, `Workspace`, `PullRequest`, `Spec`,
- * `SpecRevision` and the transcript variants under exactly that risk.
+ * green. Epics DE2–DE4 add `Execution`, `Session`, `Workspace`, `PullRequest`, `Spec`,
+ * `SpecRevision` and the transcript variants under exactly that risk. (`Session` here is
+ * DE2.4's UNIT OF WORK — a forward reference to a type that does not exist yet, not the
+ * process-level type #103 renamed to `Execution`. Do not rename it.)
  *
  * So the property is derived from the SCHEMAS instead of asserted about the files, at
  * FIELD granularity rather than file granularity:
