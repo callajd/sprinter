@@ -40,7 +40,27 @@ import { PiSpawnRouter } from "./spawn-router.ts";
  * registry revision's id is DERIVED from it (`agent-registration.ts`), so changing any
  * field here lands as a new revision rather than colliding with the old one.
  *
- * Three fields are recorded honestly rather than invented:
+ * ONE field is recorded honestly; TWO are FABRICATED. Say that plainly, because this
+ * content is written into an APPEND-ONLY production registry with no delete:
+ *
+ * - `tools: []` is honest — an empty list is a real statement (see below).
+ * - `model: "pi-cli-default"` and `version: "1.0.0"` are INVENTED. No such model name is
+ *   reported by anything, and no `pi` binary was consulted for that version. They are
+ *   placeholders occupying required fields, and the caveats below say why each is not yet
+ *   knowable — but a caveat in a docstring does not travel with the row.
+ *
+ * **So `sqlite.ts`'s claim that "a historical execution always resolves to the agent that
+ * actually ran it" is, TODAY, FALSE for the only agent that exists.** Ids are
+ * content-derived and the registry has no delete, so every execution dispatched before
+ * these fields become real data resolves — permanently, across every restart, and visibly
+ * in `Snapshot.agents` — to a revision asserting `pi 1.0.0` on model `pi-cli-default`.
+ * Those rows do not become correct later; a future real version simply appends a SECOND
+ * revision beside them. What makes the claim true is the change described at the end of
+ * this docstring: the resolved version and model must reach this module as DATA at spawn
+ * time, after which `LOCAL_PI_AGENT` stops being a constant. Until then the registry
+ * faithfully records WHICH content ran, and that content is partly fiction.
+ *
+ * The per-field caveats:
  *
  * - `model` — the model selection is `pi`'s OWN configuration. This adapter spawns
  *   `pi --mode rpc` and the wire it consumes reports the resolved model only through a

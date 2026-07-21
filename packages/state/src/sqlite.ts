@@ -451,11 +451,31 @@ const GENERATION_KEY = "generation";
  * `parent` and `mode` columns and a `transcript` JSON column, LOSES its `status`
  * column (liveness is the transcript variant — see `Transcript` in
  * `@sprinter/domain`), and gains THREE foreign keys — `"jobId"` → `job (id)`,
- * `"agentId"` → `agent (id)`, `parent` → `execution (id)`. Its `UNIQUE execution_job`
- * index becomes a PLAIN index: one job now has a TREE of executions, so uniqueness
- * would refuse the model rather than protect it. `execution_event_log."executionId"`
- * also becomes a real foreign key onto `execution (id)`, so a transcript cannot exist
- * without the run that produced it (1 Execution = 1 Transcript).
+ * `"agentId"` → `agent (id)`, and a COMPOSITE `parent` edge (below). Its
+ * `UNIQUE execution_job` index becomes a PLAIN index: one job now has a TREE of
+ * executions, so uniqueness would refuse the model rather than protect it.
+ * `execution_event_log."executionId"` also becomes a real foreign key onto
+ * `execution (id)`, so a transcript cannot exist without the run that produced it
+ * (1 Execution = 1 Transcript).
+ *
+ * Dropping `UNIQUE execution_job` is what forces the REST of version 7's tree shape, and
+ * both pieces landed in this same version rather than in any later one:
+ *
+ * - a partial `UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`.
+ *   Without it, "the job's ROOT execution" ({@link StateStore}'s `getExecutionForJob`) is
+ *   undefined the moment two PARENTLESS rows exist for one job — an ordinary write — and
+ *   the read's `ORDER BY id LIMIT 1` picks between them by id collation while calling
+ *   itself deterministic. The partial index refuses the second root outright, so a tree
+ *   has one root by construction and the read has exactly one row it can return.
+ * - a `UNIQUE (id, "jobId")` key and a COMPOSITE parent edge —
+ *   `FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")`. A single-column
+ *   `parent` → `execution (id)` would constrain only that the parent ROW exists; nothing
+ *   would require it to belong to the SAME job, so a CROSS-JOB edge would be an ordinary
+ *   write and would recreate the very state the root index closes — a job owning an
+ *   execution while holding no `parent IS NULL` row, hence `getExecutionForJob` → `None`
+ *   and a `startup-reconcile.settle` that silently skips sealing. With the composite key a
+ *   child's `"jobId"` must MATCH its parent's, so "one job owns one tree, and that tree has
+ *   exactly one root" is enforced by the engine (INV-ENFORCE).
  *
  * The same RESET consequence version 5 recorded for `workstream.repositoryId` is what
  * makes `"agentId"` hold: a bump drops `agent`, `job` and `execution` TOGETHER, so a
@@ -464,25 +484,6 @@ const GENERATION_KEY = "generation";
  * table does not outlive the referenced one — which is what closes DE1.1's recorded
  * `INV-FRESH`-vs-registry-durability tension for referential integrity (see
  * `registry.ts`).
- *
- * Version 8 makes the execution TREE well-defined rather than merely intended: a
- * partial `UNIQUE INDEX execution_root ON execution ("jobId") WHERE parent IS NULL`.
- * Version 7 dropped `UNIQUE execution_job` because a job owns many executions — correct,
- * but it left "the job's ROOT execution" ({@link StateStore}'s `getExecutionForJob`)
- * undefined whenever two PARENTLESS rows existed for one job, which was an ordinary
- * write. The read's `ORDER BY id LIMIT 1` then picked between them by id collation and
- * called it deterministic. The partial index refuses the second root outright, so a tree
- * has one root by construction and the read has exactly one row it can return.
- *
- * Version 9 closes the tree at the JOB boundary: `execution` gains `UNIQUE (id, "jobId")`
- * and its `parent` edge becomes COMPOSITE — `FOREIGN KEY (parent, "jobId") REFERENCES
- * execution (id, "jobId")`. Version 8's single-column key constrained only that the parent
- * ROW exists; nothing required it to belong to the SAME job, so a CROSS-JOB edge was an
- * ordinary write and it recreated the very state version 8 closed — a job owning an
- * execution while holding no `parent IS NULL` row, hence `getExecutionForJob` → `None` and
- * a `startup-reconcile.settle` that silently skips sealing. With the composite key a
- * child's `"jobId"` must MATCH its parent's, so "one job owns one tree, and that tree has
- * exactly one root" is enforced by the engine (INV-ENFORCE).
  *
  * The bump is observable only across a daemon RESTART: {@link applySchema} runs at
  * LAYER CONSTRUCTION, so a running daemon holds the generation it opened with and

@@ -38,6 +38,25 @@
  * fails with `ExecutionNotFound` after the bound. The immediate {@link get} is retained
  * for callers that want a strict present-or-absent read (no wait).
  *
+ * ### The bridge does NOT cover the FIRST leg of that window (DE2.2)
+ *
+ * `execution."jobId"` became a FOREIGN KEY in DE2.2, so `dispatch` must now write the Job
+ * row BEFORE the execution row — the reverse of the pre-DE2.2 order, and forced by the
+ * database rather than chosen. The `running` `JobChanged` delta already carries
+ * `executionId`, so a client can open the execution channel the INSTANT it lands — and
+ * between that delta and the very next statement, the execution row DOES NOT YET EXIST.
+ *
+ * The bridge above is gated on the durable read (see the next section): with no row,
+ * `getExecution` answers `None`, the handlers' gate takes the fail-fast {@link get} path,
+ * and the client sees `ExecutionNotFound` WITHOUT the bounded wait. Previously the
+ * execution row was written first, so that same instant found a LIVE row and waited the
+ * window out. The window is therefore covered in two parts, not one: its first leg (job
+ * written, execution not yet) degrades to a CLIENT RETRY, and only its second leg (execution
+ * row live, handle not yet registered) is bridged here. That first leg is a couple of
+ * statements wide with no I/O of its own between them, and a retry is a far better failure
+ * than the alternative — but it IS a retry, and this section would otherwise claim
+ * otherwise.
+ *
  * ## Who decides wait-vs-fail-fast — the durable-state gate lives in the CALLER
  *
  * `resolve` is INTENTIONALLY unconditional: on a miss it always waits out the bound.

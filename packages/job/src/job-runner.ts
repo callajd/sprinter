@@ -185,6 +185,9 @@ const sealTranscript = (
  * rows stuck in the `running`/live limbo the initial persist wrote. The terminal write
  * is best-effort (its own {@link StateStoreError} is swallowed) so the ORIGINAL dispatch
  * error still propagates to the caller.
+ *
+ * ORDER IS RECOVERY-ORDERED, and it is the INVERSE of the start order — see the terminal
+ * write in {@link dispatch} for the full statement of why.
  */
 const persistFailedTerminal = (
   store: Context.Service.Shape<typeof StateStore>,
@@ -194,8 +197,8 @@ const persistFailedTerminal = (
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     const transcript = yield* sealTranscript(store, execution.id, yield* Ref.get(highWater));
-    yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
     yield* store.jobs.putExecution({ ...execution, transcript });
+    yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
   }).pipe(Effect.orElseSucceed(() => undefined));
 
 /**
@@ -223,6 +226,16 @@ const dispatch = (
     // `execution.agentId` is a FOREIGN KEY onto `agent`, so an execution cannot be
     // stored until its agent revision is. Idempotent by construction (the id is derived
     // from the content), so a re-dispatch appends nothing and fans out no delta.
+    //
+    // ITS BLAST RADIUS IS INTENDED, not overlooked: a transient `putAgent` failure fails
+    // the WHOLE dispatch, before `run` and before any durable row is written. That is the
+    // right trade rather than a fragility, because `agentId` is a hard FOREIGN KEY — the
+    // execution literally cannot be stored without its agent revision, so "degrade by
+    // skipping the registration and running anyway" is not an available behaviour; it would
+    // just move the same failure one statement later, after a `pi` process had been spawned.
+    // Failing here leaves the Job NOT `running` and nothing half-written, which is the
+    // recoverable state (`startup-reconcile` settles `running` jobs; a job that never
+    // started is simply re-dispatchable).
     const agentId = yield* registerAgent(store, runner.agent);
 
     // Persist the durable Issue→Job→execution mapping BEFORE running. ORDER IS LOAD-
@@ -379,17 +392,40 @@ const dispatch = (
     const transcriptRef = yield* transcriptRefFor(executionId);
     const jobResult = toJobResult(settled, { transcriptRef, entries });
 
-    // Persist the terminal Job row and SEAL the execution's transcript. The seal is the
+    // SEAL the execution's transcript, then persist the terminal Job row. The seal is the
     // whole of "this run has ended": the transcript stops being tailable and becomes the
     // closed, cacheable range `[0, lastOffset]`, and every liveness gate reads that one
     // value. The run's OUTCOME (succeeded / failed) belongs to the Job it advanced —
     // recording it a second time on the execution would be a lifecycle its transcript
     // already determines (INV-LIFECYCLE).
-    yield* store.jobs.putJob({ ...job, status: jobResult.status, executionId, transcriptRef });
+    //
+    // ORDER IS LOAD-BEARING, and it is DELIBERATELY THE INVERSE of the START order above.
+    // The two orders answer two different questions, and neither generalises to the other:
+    //
+    //   - START is FK-ORDERED. `execution."jobId"` is a foreign key, so the execution
+    //     CANNOT exist before its job. The database forces `putJob` → `putExecution`
+    //     there; there is no choice to make.
+    //   - TERMINAL is RECOVERY-ORDERED. The job row already exists, so `putJob` is a pure
+    //     update and BOTH orders are legal to the database — which means the order is ours
+    //     to choose, and we choose by asking what a crash BETWEEN the two writes leaves
+    //     behind. The Job must be the LAST thing to go terminal, so that any crash (or a
+    //     transient `StateStoreError` from the seal) leaves a `running` Job with a LIVE
+    //     execution — precisely the state `startup-reconcile` exists to settle and seal on
+    //     the next boot. The inverse order leaves a TERMINAL Job with a LIVE execution, and
+    //     NOTHING repairs that: reconcile skips every job whose `status !== "running"`, and
+    //     `settle` — the only other writer of a `SealedTranscript` in this tree — is
+    //     reachable only from behind that gate. Such a row is a PERMANENT live orphan that
+    //     survives every restart, and it is user-visible: `resyncExecutionEvents` sees an
+    //     unsettled row, so a run that produced no durable entries answers `ExecutionNotFound`
+    //     forever rather than returning an empty settled transcript.
+    //
+    // {@link persistFailedTerminal} holds the same order for the same reason. A test pins
+    // it: failing the seal `putExecution` must leave the Job `running` (still recoverable).
     yield* store.jobs.putExecution({
       ...startExecution,
       transcript: yield* sealTranscript(store, executionId, yield* Ref.get(highWater)),
     });
+    yield* store.jobs.putJob({ ...job, status: jobResult.status, executionId, transcriptRef });
 
     return jobResult;
   });

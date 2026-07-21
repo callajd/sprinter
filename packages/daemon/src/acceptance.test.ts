@@ -557,7 +557,12 @@ it.effect(
           // only once MERGED; see the runbook's "Known limitation"). This asserts the
           // pairing WIRE, not open-PR discovery.
           const execution = finalSnap.executions.find((s) => s.id === "execution-job-seed");
-          expect(execution?.jobId).toBe("job-seed");
+          expect(execution).toBeDefined();
+          // `toBeDefined` asserts, but does not NARROW, so the guard below is what lets the
+          // assertions read plainly instead of being smuggled into a ternary (and it keeps
+          // a missing row failing HERE, with a legible message, rather than obscurely).
+          if (execution === undefined) throw new Error("execution-job-seed missing from snapshot");
+          expect(execution.jobId).toBe("job-seed");
           // ── DE2.2 / D2: the registry's FIRST PRODUCTION WRITER ────────────────
           //
           // After a REAL daemon has run ONE execution end-to-end, `Snapshot.agents` is
@@ -567,13 +572,15 @@ it.effect(
           expect(finalSnap.agents.length).toBeGreaterThan(0);
           // …and the execution RESOLVES to the exact revision that ran it: the id is a
           // FOREIGN KEY into that registry, so it cannot name anything else.
-          const ranBy = finalSnap.agents.find((a) => a.id === execution?.agentId);
+          const ranBy = finalSnap.agents.find((a) => a.id === execution.agentId);
           expect(ranBy?.name).toBe("pi");
           // The run has ENDED — its transcript is SEALED, and it holds the turn itself
           // (an autonomous root, no parent). Liveness lives in that one value.
-          expect(execution?.transcript._tag).toBe("SealedTranscript");
-          expect(execution?.mode).toBe("autonomous");
-          expect(execution === undefined ? true : "parent" in execution).toBe(false);
+          expect(execution.transcript._tag).toBe("SealedTranscript");
+          expect(execution.mode).toBe("autonomous");
+          // `parent` is an `optionalKey`, so ROOT means the KEY IS ABSENT — a membership
+          // check, not a value check (`undefined` would also read as absent).
+          expect("parent" in execution).toBe(false);
           const pairedIssue = finalSnap.issues.find((i) => i.id === finalJob?.issueId);
           expect(pairedIssue?.pr?.number).toBe(PR_NUMBER);
           expect(pairedIssue?.pr?.merged).toBe(false);
