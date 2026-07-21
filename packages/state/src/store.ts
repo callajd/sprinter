@@ -402,7 +402,53 @@ export interface JobStore {
   /**
    * Upsert an {@link Execution} (by execution id). A job owns a TREE of executions
    * (DE2.2 dropped the `UNIQUE (jobId)` index), so a SECOND execution for a job is
-   * ordinary and SUCCEEDS; what fails is a reference the model does not admit:
+   * ordinary and SUCCEEDS.
+   *
+   * ## What an upsert may change — the RULE, and the table it produces
+   *
+   * **An `Execution` is a HISTORICAL RECORD OF A RUN.** A field that is a FACT ABOUT
+   * WHAT HAPPENED does not become a different fact later, so every column is FROZEN
+   * unless there is a NAMED reason it changes. Exactly one column has such a reason.
+   * The upsert's updated set is DERIVED from that rule rather than assembled column by
+   * column — four review rounds in a row found a freeze that covered the column someone
+   * happened to name while the invariant needed a different one (`supersedes` write
+   * order → `parent` re-point → `parent` cross-job → `jobId` migration), and this table
+   * is what stops the fifth:
+   *
+   * | column       | class            | on re-put                                      |
+   * | ------------ | ---------------- | ---------------------------------------------- |
+   * | `id`         | KEY              | selects the row; never a value that changes    |
+   * | `jobId`      | STRUCTURAL       | **FROZEN** — refused (see below)                |
+   * | `parent`     | STRUCTURAL       | **FROZEN** — refused (see below)                |
+   * | `agentId`    | PER-RUN FACT     | OVERWRITTEN by a re-dispatch (issue #77)       |
+   * | `mode`       | PER-RUN FACT     | OVERWRITTEN by a re-dispatch (issue #77)       |
+   * | `transcript` | THE LIVE FIELD   | OVERWRITTEN — live → sealed IS the lifecycle   |
+   *
+   * - STRUCTURAL means WHERE THIS RUN SITS: which job owns it and which execution
+   *   spawned it. Nothing legitimately re-homes or re-parents a run that already
+   *   happened, and every attempt so far has been a live-orphan bug rather than a use
+   *   case. Both are refused by the adapter INSIDE the upsert statement (INV-ENFORCE),
+   *   not checked afterwards.
+   * - PER-RUN FACT means WHAT RAN THIS TIME. These are deliberately NOT frozen: issue
+   *   #77's merged-transcript model reuses ONE execution id across re-dispatches, so a
+   *   retry after an agent/`pi` upgrade MUST be able to re-attribute the row — freezing
+   *   `agentId` would make that retry fail hard. The consequence is stated, not hidden:
+   *   the row carries the agent revision of the MOST RECENT run while
+   *   `execution_event_log` keeps every earlier run's entries, so a merged transcript is
+   *   attributed to the latest revision. Modelling "a retry is a NEW execution" is DE2.4
+   *   work (it re-points the link at `sessionId` and models the unit of work), not this
+   *   column's.
+   * - THE LIVE FIELD is the one thing that genuinely changes about a run in progress:
+   *   its transcript goes from live to sealed. That transition is the whole of an
+   *   execution's lifecycle (INV-SUM / INV-LIFECYCLE — there is no status column).
+   *
+   * **A NEW COLUMN'S DEFAULT IS FROZEN.** Adding one to the updated set requires the
+   * kind of named reason the two PER-RUN rows carry; absent that, it belongs in the
+   * adapter's exclusion list and in this table as STRUCTURAL.
+   *
+   * ## What fails
+   *
+   * A reference the model does not admit:
    *
    * - a `jobId` naming a job that is NOT STORED, an `agentId` naming an unregistered
    *   agent revision, or a `parent` naming an execution that is not stored — all three
@@ -415,6 +461,12 @@ export interface JobStore {
    *   is fixed at insert: RE-PARENTING is not an operation an execution has, and the
    *   upsert leaves the column out of its updated set rather than checking a tree
    *   invariant afterwards (INV-ENFORCE);
+   * - a `jobId` DIFFERENT from the one the execution was first stored under. Same
+   *   freeze, same reason: RE-HOMING is not an operation an execution has. The composite
+   *   `parent` key below closes cross-job EDGES and says NOTHING about a row re-pointing
+   *   its own `jobId`, so this needs its own clause — while it had none, an ordinary
+   *   re-put migrated a leaf to another job and left the original owning nothing, which
+   *   `listExecutionsForJob` reported as `[]` and `startup-reconcile`'s seal skipped;
    * - a `parent` belonging to a DIFFERENT `jobId`. ONE JOB OWNS ONE TREE, so an edge
    *   that crosses jobs is not a tree edge at all; the adapter's `parent` key is
    *   COMPOSITE — `(parent, jobId)` → `(id, jobId)` — so a child's job must match its
@@ -423,7 +475,7 @@ export interface JobStore {
    * A SECOND ROOT for one job is refused too, by a partial `UNIQUE (jobId) WHERE parent
    * IS NULL` index — see {@link getExecutionForJob}.
    *
-   * The last three rules are what make the relation a FOREST OF TREES, one per job — the
+   * The last FOUR rules are what make the relation a FOREST OF TREES, one per job — the
    * first two do not get there on their own. A foreign key constrains the row a write
    * REFERENCES, never the re-pointing of an existing row, so while `parent` was mutable a
    * 2-cycle was constructible out of three writes each of which satisfied the key and
@@ -438,10 +490,12 @@ export interface JobStore {
    * `getExecutionForJob` answered `None` for a job that plainly had executions, and every
    * caller guarded on that `Option` (notably `startup-reconcile`'s seal) silently did
    * nothing. Scoping the edge to the job makes that state unconstructible rather than
-   * detected.
+   * detected — and freezing `jobId` closes the remaining route to the SAME state, which
+   * needed no edge at all: a lone leaf simply re-put under another job.
    *
    * A restart re-attaches by upserting the SAME execution id, not a new one — which is
-   * unaffected: a re-attach carries the parent it already had.
+   * unaffected: a re-attach carries the job and parent it already had, and rewrites only
+   * the per-run facts and the transcript, exactly as the table above says.
    */
   readonly putExecution: (execution: Execution) => Effect.Effect<void, StateStoreError>;
   /** Read an {@link Execution} by id, if present. */

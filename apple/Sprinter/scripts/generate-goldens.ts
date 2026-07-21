@@ -142,9 +142,11 @@ const jobMinimal = { id: "job-2", issueId: "iss-2", kind: "review", status: "que
 // and each transcript variant appears in the corpus, and `parent` appears in both its
 // present and its omitted form.
 //
-// `agentId` REFERENCES a revision in the registry fixtures below (`agt-1`): an
-// execution names the exact agent revision that ran it, and the reference is a real
-// foreign key in the store.
+// `agentId` REFERENCES a revision in the registry fixtures below — the ROOT names
+// `agt-1` and the CHILD names `agt-2`, so the corpus pins that DIFFERENT executions in
+// ONE job may run DIFFERENT agent revisions rather than a job-wide one. An execution
+// names the revision of the run it records, and the reference is a real foreign key in
+// the store.
 const execution = {
   id: "exe-1",
   jobId: "job-1",

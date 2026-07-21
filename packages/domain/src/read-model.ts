@@ -128,8 +128,12 @@ export type ExecutionMode = (typeof ExecutionMode)["Type"];
  * - the seal reads the extent from the durable log, and a TRANSIENT read failure falls
  *   back to `0` rather than refusing to seal — an execution left LIVE because a read
  *   hiccuped would look forever-running to every liveness gate, which is worse than an
- *   understated extent (`packages/job/src/job-runner.ts`, and the same fallback in
- *   `startup-reconcile.ts`);
+ *   understated extent. This is why the bound is stated for the SEAL AT RESTART
+ *   (`startup-reconcile.ts`): there, the run's process is gone and nothing better than
+ *   that read exists. The DISPATCH seal (`packages/job/src/job-runner.ts`) does better —
+ *   its fold is the transcript's sole writer, so it seals at the max of the read and the
+ *   offsets `append` returned — but the contract is written for the weaker path, since a
+ *   reader cannot tell which one sealed what it is holding;
  * - the durable-append fold is bounded by the execution's terminal
  *   (`Stream.interruptWhen(handle.result)`), so an append still in flight when the
  *   terminal resolves can land AFTER the extent is read;
@@ -260,12 +264,23 @@ export type Job = (typeof Job)["Type"];
  *   `FOREIGN KEY` into `job (id)`, and DE2.4 re-points it at `sessionId` when `Session`
  *   replaces `Job`. Referential integrity therefore holds at EVERY intermediate state,
  *   which is what INV-ENFORCE is for.
- * - `agentId` — the exact {@link Agent} REVISION that ran, a `FOREIGN KEY` into the
- *   append-only registry. Because the registry never rewrites a revision, a historical
- *   execution always resolves to the agent that actually ran it; because the link is a
- *   real key, an execution naming an agent that was never registered is UNSTORABLE, and
- *   a `SCHEMA_VERSION` reset drops `agent` and `execution` TOGETHER, so a DANGLING
+ * - `agentId` — the {@link Agent} REVISION that ran, a `FOREIGN KEY` into the append-only
+ *   registry. Precisely: the revision of the MOST RECENT RUN under this execution id.
+ *   Because the registry never rewrites a revision, whatever this field names always
+ *   resolves to the intact content of a real revision; because the link is a real key,
+ *   an execution naming an agent that was never registered is UNSTORABLE, and a
+ *   `SCHEMA_VERSION` reset drops `agent` and `execution` TOGETHER, so a DANGLING
  *   `agentId` is unconstructible rather than merely unlikely (D2 / D3).
+ *
+ *   It is NOT frozen, and the reason is worth stating plainly because it is visible in
+ *   the product: issue #77 chose ONE MERGED TRANSCRIPT per execution, and `executionIdFor`
+ *   derives a single id (`execution-<jobId>`) that every re-dispatch REUSES. So a retry
+ *   under changed agent content REWRITES `agentId` (and `mode`) in place, while
+ *   `execution_event_log` keeps the earlier run's entries — a merged transcript is
+ *   therefore attributed to the LATEST revision, not split per revision. Freezing the
+ *   field would not fix that; it would make the retry fail outright. Modelling "a retry
+ *   is a NEW execution" needs the unit of work to exist, which is DE2.4 (it re-points
+ *   this link at `sessionId`). See `putExecution`'s per-column rule (`@sprinter/state`).
  * - `parent` — the execution that SPAWNED this one, absent on a root. Executions form a
  *   TREE: a `FOREIGN KEY` onto this same table means a child cannot name a parent that
  *   is not already stored, so a dangling parent is unstorable and no write ORDER closes

@@ -100,6 +100,18 @@ public enum BoardProjection {
         // Prefer the job's declared execution; fall back to the execution that
         // references the job, so a live execution is named even when `job.executionId`
         // has not been persisted yet.
+        //
+        // NOTE THE ASYMMETRY, which is deliberate: `live` above may have been decided by
+        // a LIVE CHILD that `indexedPreferringLive` kept over a sealed root, while the id
+        // named here is still the job's DECLARED execution — i.e. the root. So an
+        // activity can name a SEALED execution. That is the right id to name: the job's
+        // declared execution is its dispatch ROOT, the same one `job.transcriptRef` is
+        // derived from, so naming it keeps the activity's id and the job's transcript
+        // reference pointing at one thing rather than at a subagent the user never
+        // dispatched. Liveness is a BOOLEAN about the whole tree; the id is the tree's
+        // entry point. Pinned by `queuedJobLivenessTracksTheSeal`, so a change here is a
+        // decision rather than a drift. (An affordance that must name the live NODE has
+        // to read `snapshot.executions` — see `indexedPreferringLive`.)
         activity[job.issueId] = IssueActivity(
           jobId: job.id, kind: job.kind, executionId: job.executionId ?? execution?.id)
       }

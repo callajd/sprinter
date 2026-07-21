@@ -292,6 +292,82 @@ it.effect(
 );
 
 // ============================================================================
+// Sealing under a failing `maxOffset` — the LOWER-BOUND fallback
+// ============================================================================
+
+/** A {@link StateStore} whose `executionLog.maxOffset` ALWAYS fails; everything else delegates. */
+const failMaxOffset: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      executionLog: {
+        ...base.executionLog,
+        maxOffset: () =>
+          Effect.fail(new StateStoreError({ operation: "maxOffset", detail: "transient" })),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
+
+// The seal must NEVER be blocked by a failed extent read. An execution left LIVE because
+// `maxOffset` hiccupped looks forever-running to every liveness gate — the CE4.1-R4 stall —
+// which is strictly worse than an understated `lastOffset`. That fallback is the load-bearing
+// premise of the `Transcript` contract's LOWER-BOUND wording, so it is pinned here rather than
+// left as prose: with nothing appended and the read failing, the seal is `{ lastOffset: 0 }` and
+// liveness STILL clears.
+it.effect("seals at the LOWER BOUND 0 when `maxOffset` fails and nothing was appended", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+    const result = yield* runner.dispatch(job);
+    expect(result.status).toBe("succeeded");
+
+    const store = yield* StateStore;
+    const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 0 });
+    // The whole point: `0` is not a claim the run produced nothing — it is a lower bound,
+    // and LIVENESS IS CLEARED regardless, so no gate sees a forever-running execution.
+    expect(isExecutionLive(sealed)).toBe(false);
+    const persistedJob = Option.getOrThrow(yield* store.jobs.getJob(job.id));
+    expect(persistedJob.status).toBe("succeeded");
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    // Only EPHEMERAL events, so the fold appends nothing and has no local high-water either.
+    Effect.provide(fakeRunner(fakeHandle(Stream.make(messageDelta), { _tag: "Completed" }))),
+    Effect.provide(failMaxOffset),
+  ),
+);
+
+// …and when the fold DID append, the dispatch path does better than the bound: it seals at the
+// offsets `append` handed back, so a `maxOffset` hiccup costs nothing here. "No local high-water
+// mark to prefer" is true of `startup-reconcile`'s settle (the run's process is gone) and FALSE
+// of this one — the fold is the sole writer of this transcript and knows exactly what it wrote.
+it.effect("prefers THIS dispatch's high-water mark over the failed `maxOffset` read", () =>
+  Effect.gen(function* () {
+    const job = yield* makeJob();
+    const runner = yield* JobRunner;
+    yield* runner.dispatch(job);
+
+    const store = yield* StateStore;
+    const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job.id));
+    // Two durable entries were appended at offsets 1 and 2; the seal is EXACT despite the
+    // read failing, rather than falling back to `0` and understating the whole run.
+    expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 2 });
+    expect(isExecutionLive(sealed)).toBe(false);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layer),
+    Effect.provide(
+      fakeRunner(fakeHandle(Stream.make(entryEvent, noticeEvent), { _tag: "Completed" })),
+    ),
+    Effect.provide(failMaxOffset),
+  ),
+);
+
+// ============================================================================
 // F1 terminal-result contract — the events fold is BOUNDED by handle.result
 // ============================================================================
 

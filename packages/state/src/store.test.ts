@@ -1158,6 +1158,73 @@ it.effect(
     }).pipe(Effect.provide(layerMemory)),
 );
 
+it.effect(
+  "refuses a RE-HOME — an execution's `jobId` is fixed at insert, so it cannot migrate",
+  () =>
+    Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* seedExecutionRefs(store);
+      yield* store.jobs.putJob(yield* job({ id: "job-2" }));
+      // The falsifying sequence every constraint ABOVE accepted. The composite `parent`
+      // key closes cross-job EDGES and says nothing about re-pointing a row's OWN
+      // `"jobId"`: while `"jobId"` sat in the upsert's `DO UPDATE SET` list, an ordinary
+      // re-put moved a stored execution to another job — no dangling reference, no cycle,
+      // no second root, and `job-1` was left owning NOTHING while its Job row still named
+      // the execution. That is the same live-orphan the re-parent and cross-job rules
+      // close: `listExecutionsForJob("job-1")` answers `[]`, so `startup-reconcile`'s
+      // `settle` iterates an empty list and seals nothing, and the run stays LIVE forever.
+      // A leaf is the common case (a root WITH a child is separately refused by the
+      // composite key, which would have to re-home the child too).
+      yield* store.jobs.putExecution(yield* execution());
+      const rehome = yield* store.jobs
+        .putExecution(yield* execution({ jobId: "job-2" }))
+        .pipe(Effect.flip);
+      expect(rehome).toBeInstanceOf(StateStoreError);
+      expect(rehome.operation).toBe("putExecution");
+      // The refusal is the WHOLE write: the execution is still owned by the job it was
+      // stored under, and still owned by exactly one job.
+      const stored = yield* store.jobs.getExecution(yield* executionId("execution-1"));
+      expect(Option.isSome(stored)).toBe(true);
+      if (Option.isSome(stored)) expect(stored.value.jobId).toBe("job-1");
+      expect(
+        (yield* store.jobs.listExecutionsForJob(yield* jobIdOf("job-1"))).map((e) => e.id),
+      ).toStrictEqual(["execution-1"]);
+      expect(yield* store.jobs.listExecutionsForJob(yield* jobIdOf("job-2"))).toStrictEqual([]);
+      // POSITIVE CONTROL: a re-attach under the SAME job is the upsert this port exists
+      // for, and still updates the per-run columns.
+      yield* store.jobs.putExecution(yield* execution({ mode: "interactive" }));
+      const reattached = yield* store.jobs.getExecution(yield* executionId("execution-1"));
+      expect(Option.isSome(reattached)).toBe(true);
+      if (Option.isSome(reattached)) expect(reattached.value.mode).toBe("interactive");
+    }).pipe(Effect.provide(layerMemory)),
+);
+
+it.effect("REWRITES the per-run facts on re-dispatch — `agentId` and `mode` are not frozen", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    yield* seedExecutionRefs(store);
+    yield* store.agents.putAgent(yield* agent({ id: "agt-2", version: "2.0.0" }));
+    yield* store.jobs.putExecution(yield* execution());
+    // The OTHER half of the column rule (see `putExecution`, `@sprinter/state`): the
+    // STRUCTURAL columns are frozen, the PER-RUN ones are not. Issue #77's merged-
+    // transcript model reuses ONE execution id across re-dispatches, so a retry after a
+    // `pi`/agent upgrade MUST be able to re-attribute the row — freezing `agentId` would
+    // make that retry fail hard. The consequence is stated rather than hidden: the row
+    // reads the agent revision of the MOST RECENT run, while `execution_event_log` keeps
+    // the earlier run's entries, so the merged transcript is attributed to the latest
+    // revision.
+    yield* store.jobs.putExecution(yield* execution({ agentId: "agt-2", mode: "interactive" }));
+    const stored = yield* store.jobs.getExecution(yield* executionId("execution-1"));
+    expect(Option.isSome(stored)).toBe(true);
+    if (Option.isSome(stored)) {
+      expect(stored.value.agentId).toBe("agt-2");
+      expect(stored.value.mode).toBe("interactive");
+      // …and the earlier run's durable entries are untouched by the re-attribution.
+      expect(stored.value.jobId).toBe("job-1");
+    }
+  }).pipe(Effect.provide(layerMemory)),
+);
+
 it.effect("refuses a transcript entry for an execution that was never stored", () =>
   Effect.gen(function* () {
     const store = yield* StateStore;

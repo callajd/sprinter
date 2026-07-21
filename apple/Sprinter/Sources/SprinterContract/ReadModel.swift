@@ -293,9 +293,13 @@ public struct Job: Codable, Equatable, Sendable {
 ///   links an execution to the `Session` that owns it, but that type does not exist
 ///   yet, so the daemon keeps the existing job link (a real foreign key) and re-points
 ///   it later.
-/// - ``agentId``: the exact ``Agent`` REVISION that ran. The registry is append-only, so
-///   a historical execution always resolves to the agent that actually ran it — look it
-///   up in ``Snapshot/agents``.
+/// - ``agentId``: the ``Agent`` REVISION of the MOST RECENT run under this execution id.
+///   The registry is append-only, so whatever this names always resolves to the intact
+///   content of a real revision — look it up in ``Snapshot/agents``. It is NOT frozen:
+///   one execution id is REUSED across re-dispatches (issue #77's merged transcript), so
+///   a retry under changed agent content rewrites this field while the transcript keeps
+///   the earlier run's entries — a merged transcript is attributed to the latest
+///   revision. "A retry is a new execution" is DE2.4 work.
 /// - ``parent``: the execution that SPAWNED this one; `nil` on a ROOT. Executions form a
 ///   TREE, so one job may carry several.
 /// - ``mode``: who holds the turn (``ExecutionMode``), per execution.

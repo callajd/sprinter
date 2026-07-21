@@ -385,13 +385,35 @@ DE1 ──► DE2 ──► DE3 ──► DE4
     parentless rows and picked between them by id collation.
   - **ONE JOB OWNS ONE TREE**, enforced by a COMPOSITE `parent` edge — `UNIQUE (id,
     "jobId")` plus `FOREIGN KEY (parent, "jobId") REFERENCES execution (id, "jobId")`
-    (`SCHEMA_VERSION` 9). The single-column key constrained only that the parent ROW
+    (`SCHEMA_VERSION` 7). The single-column key constrained only that the parent ROW
     exists; nothing required it to belong to the same job, so a CROSS-JOB edge was an
     ordinary write and it recreated the very state the single-root index closed — a job
     owning an execution while holding no rootless row, hence `getExecutionForJob` → `None`
     and a `startup-reconcile.settle` that silently skipped sealing. With the edge scoped to
     the job a job's executions are closed under `parent`, so `None` now genuinely means
     "this job owns no executions" (`INV-ENFORCE`).
+  - **`putExecution`'s update set is a RULE, not a list.** Four review rounds each found a
+    freeze that covered the column someone had named while the invariant needed a
+    different one (`supersedes` write order → `parent` re-point → `parent` cross-job →
+    `jobId` migration: an ordinary re-put moved a leaf to another job, leaving the
+    original owning nothing and `settle` sealing nothing). The rule that replaces the
+    patching: **an `Execution` is a historical record of a run, so every column is FROZEN
+    unless there is a named reason it changes.** That yields `id` (key), `jobId`/`parent`
+    (STRUCTURAL — frozen, refused inside the upsert statement), `agentId`/`mode` (PER-RUN
+    FACTS — rewritten by a re-dispatch), `transcript` (the one field that legitimately
+    changes, live → sealed). **A new column's default is FROZEN.** Stated on
+    `putExecution` in `store.ts` and beside the DDL.
+  - **`agentId` is the MOST RECENT run's revision, not "the agent that ran".** #77's
+    merged-transcript model reuses ONE execution id across re-dispatches, so a retry
+    after an agent upgrade must be able to re-attribute the row — freezing it would break
+    the retry. The docstrings claiming an unconditional "always resolves to the agent that
+    actually ran it" were narrowed on both sides of the wire instead: a merged transcript
+    is attributed to the latest revision, and *"a retry is a new execution"* is DE2.4 work.
+  - **The dispatch seal is EXACT; only the reconcile seal is a bound.** `job-runner`'s
+    fold is the sole writer of the transcript and now KEEPS the offsets `append` returns,
+    sealing at `max(localHighWater, maxOffset ?? 0)`. The "no local high-water mark to
+    prefer" argument is true only of `startup-reconcile`'s settle, whose run's process is
+    already gone — which is the path the lower-bound contract is written for.
   - **`settle` seals EVERY execution a job owns**, iterating `listExecutionsForJob` rather
     than sealing `getExecutionForJob`'s root. A job owns a tree; a sibling left with a
     `LiveTranscript` kept `isExecutionLive` true and made `resolveLive` bounded-WAIT on it

@@ -72,7 +72,9 @@ public struct LiveTranscript: Codable, Equatable, Sendable {
 /// about the PREFIX `[0, lastOffset]`: that range is complete and immutable, so entries a
 /// client has already read within it can be cached and never re-fetched. It says NOTHING
 /// about the transcript as a whole. The daemon's own log may hold entries beyond it — the
-/// seal falls back to `0` on a transient extent read, an append in flight when the run
+/// RESTART seal falls back to `0` on a transient extent read (the dispatch seal holds the
+/// offsets its own fold wrote and does better, but a client cannot tell which one sealed
+/// what it is holding, so the weaker guarantee is the contract), an append in flight when the run
 /// terminates can land after the extent is read, a per-append store error is absorbed and
 /// leaves a gap the extent never reflects, and a re-dispatch re-attaches the same execution
 /// id and APPENDS to the same log, so a sealed transcript can even become live again with a

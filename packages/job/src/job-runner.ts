@@ -22,7 +22,7 @@
  * dispatch registers the agent revision it runs and attributes the execution to it, so
  * `Snapshot.agents` in a real daemon reflects the agents that actually ran.
  */
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect";
+import { Context, Effect, Layer, Option, Ref, Schema, Stream } from "effect";
 import type { Scope } from "effect/Scope";
 import {
   type Execution,
@@ -126,19 +126,31 @@ const toJobResult = (result: ExecutionResult, payload: unknown): JobResult => {
  * SEAL an execution's transcript at the extent its durable log has reached — the write
  * that ends a run.
  *
- * The extent is read from the durable log itself (`executionLog.maxOffset`, answered
- * from the backing's index — no transcript is materialised), so the seal describes what
- * was actually persisted rather than what this dispatch believes it appended.
+ * The extent is the MAXIMUM of two things this dispatch actually knows:
  *
- * `lastOffset` is a LOWER BOUND, and this function is one of the reasons the contract
- * says so (`Transcript`, `@sprinter/domain` — the claim is mirrored client-side). TWO
- * ways it understates, both deliberate:
+ * 1. `executionLog.maxOffset` — read from the durable log itself (answered from the
+ *    backing's index, no transcript materialised), so it describes what was persisted
+ *    rather than what this dispatch believes it appended;
+ * 2. `localHighWater` — the highest offset THIS dispatch's fold saw `append` RETURN.
+ *    The fold is the sole writer of this execution's transcript and every successful
+ *    append hands back its assigned offset, so discarding them and then falling back to
+ *    `0` when the read hiccups would throw away an exact answer already in hand. Taking
+ *    the max means a `maxOffset` failure on the DISPATCH path degrades to "everything
+ *    this run durably wrote" rather than to "nothing" — and in the ordinary case the two
+ *    agree, so the seal is exact.
  *
- * - a transient `maxOffset` failure falls back to `0` rather than stopping the seal. An
- *   execution left LIVE because the extent could not be read would look forever-running
- *   to every liveness gate — the CE4.1-R4 stall — which is strictly worse than an
- *   understated extent. It is NOT a claim that the run produced nothing: `0` is a lower
- *   bound like any other, which is exactly why the contract cannot promise an upper one.
+ * `lastOffset` is still a LOWER BOUND, and this function is one of the reasons the
+ * contract says so (`Transcript`, `@sprinter/domain` — the claim is mirrored
+ * client-side). TWO ways it can understate, both deliberate:
+ *
+ * - if BOTH the read fails and this dispatch appended nothing it observed, the seal is
+ *   `0` rather than a refusal. An execution left LIVE because the extent could not be
+ *   read would look forever-running to every liveness gate — the CE4.1-R4 stall — which
+ *   is strictly worse than an understated extent. It is NOT a claim that the run produced
+ *   nothing: `0` is a lower bound like any other, which is exactly why the contract
+ *   cannot promise an upper one. (This is also the case a PRIOR run's entries fall into:
+ *   the local high-water covers THIS dispatch only, so a re-dispatch whose read fails
+ *   understates by the earlier runs — a lower bound, and the prefix claim is unaffected.)
  * - the durable-append fold is bounded by `Stream.interruptWhen(handle.result)` (below),
  *   so an append still in flight when the terminal resolves can land AFTER this read.
  *   Waiting for it would mean deciding how long to wait for a stream the terminal has
@@ -147,14 +159,24 @@ const toJobResult = (result: ExecutionResult, payload: unknown): JobResult => {
  * Neither weakens cacheability, because the cacheability claim is about the PREFIX:
  * `[0, lastOffset]` is complete and immutable whatever the true extent is, since entries
  * never change and per-execution offsets never reset.
+ *
+ * `startup-reconcile`'s settle seals WITHOUT a local high-water and cannot do better:
+ * the run whose appends it would have counted belongs to a process that is already gone,
+ * which is why that settle runs at all. The lower-bound contract exists for that path.
  */
 const sealTranscript = (
   store: Context.Service.Shape<typeof StateStore>,
   executionId: ExecutionId,
+  localHighWater: number,
 ): Effect.Effect<Transcript> =>
   store.executionLog.maxOffset(executionId).pipe(
     Effect.orElseSucceed(() => 0),
-    Effect.map((lastOffset): Transcript => ({ _tag: "SealedTranscript", lastOffset })),
+    Effect.map(
+      (durable): Transcript => ({
+        _tag: "SealedTranscript",
+        lastOffset: Math.max(durable, localHighWater),
+      }),
+    ),
   );
 
 /**
@@ -168,9 +190,10 @@ const persistFailedTerminal = (
   store: Context.Service.Shape<typeof StateStore>,
   job: Job,
   execution: Execution,
+  highWater: Ref.Ref<number>,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
-    const transcript = yield* sealTranscript(store, execution.id);
+    const transcript = yield* sealTranscript(store, execution.id, yield* Ref.get(highWater));
     yield* store.jobs.putJob({ ...job, status: "failed", executionId: execution.id });
     yield* store.jobs.putExecution({ ...execution, transcript });
   }).pipe(Effect.orElseSucceed(() => undefined));
@@ -218,6 +241,16 @@ const dispatch = (
     // only when blocked. It is recorded on the EXECUTION and nowhere above it
     // (INV-MODE). `parent` is absent — a dispatched Job's execution is a ROOT; a
     // subagent's execution names it as parent, which is what makes the relation a tree.
+    //
+    // THIS IS THE ONLY PRODUCTION WRITER OF `mode`, and it is CONSTANT — so
+    // `ExecutionMode.interactive` is, in this PR's scope, an inhabited type with no
+    // producer. That is deliberate, not an oversight: a dispatched Job is autonomous by
+    // definition, and the interactive turn belongs to the human-driven path DE2.4 models
+    // (a `Session` a person drives, whose root execution carries `interactive`). The axis
+    // is declared CLOSED now (`ExecutionMode`, `@sprinter/domain`) because it is part of
+    // the shape the contract and its Swift mirror pin; the second inhabitant gets its
+    // writer when the thing that would set it exists. Read a store that holds only
+    // `autonomous` as a KNOWN state of the world, not as evidence the field is dead.
     const startExecution: Execution = {
       id: executionId,
       jobId: job.id,
@@ -227,6 +260,13 @@ const dispatch = (
     };
     yield* store.jobs.putJob({ ...job, status: "running", executionId });
     yield* store.jobs.putExecution(startExecution);
+
+    // THIS dispatch's high-water mark: the highest offset the fold below saw `append`
+    // RETURN. It is what lets the seal be exact on this path instead of depending on a
+    // second read that may hiccup (see {@link sealTranscript}). It starts at `0`, which
+    // is below every durable offset, so a dispatch that appends nothing contributes
+    // nothing.
+    const highWater = yield* Ref.make(0);
 
     // Start + drive the execution and await its terminal outcome. On failure of
     // starting/driving (not a mere stream teardown), record a `failed` terminal so
@@ -290,6 +330,12 @@ const dispatch = (
               // rejection from a hiccup, so the discipline is to LOG every one and let the
               // repetition be the signal: one line is a hiccup, one per event is the key.
               yield* store.executionLog.append(executionId, event).pipe(
+                // Remember the offset the store just assigned. Offsets only grow, so
+                // `max` is belt-and-braces over a plain set; what matters is that the
+                // fold no longer DISCARDS what it wrote (see {@link sealTranscript}).
+                Effect.flatMap((persisted) =>
+                  Ref.update(highWater, (seen) => Math.max(seen, persisted.offset)),
+                ),
                 Effect.catchTag("StateStoreError", (error) =>
                   Effect.logWarning("durable transcript append rejected — entry dropped").pipe(
                     Effect.annotateLogs({
@@ -313,7 +359,7 @@ const dispatch = (
         Effect.orElseSucceed(() => undefined),
       );
       return yield* handle.result;
-    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, startExecution)));
+    }).pipe(Effect.tapError(() => persistFailedTerminal(store, job, startExecution, highWater)));
 
     // The `entries` metric = the count of DURABLE `EntryAppended` records in the execution's
     // transcript, computed cheaply in the store (`countEntries` — a `COUNT(*)`, no full-log
@@ -342,7 +388,7 @@ const dispatch = (
     yield* store.jobs.putJob({ ...job, status: jobResult.status, executionId, transcriptRef });
     yield* store.jobs.putExecution({
       ...startExecution,
-      transcript: yield* sealTranscript(store, executionId),
+      transcript: yield* sealTranscript(store, executionId, yield* Ref.get(highWater)),
     });
 
     return jobResult;

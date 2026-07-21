@@ -254,7 +254,11 @@ export const layer: Layer.Layer<StartupReconcile, never, StateStore | CodeHost |
        * settled — which is trivially true and never invalidates a cached prefix. There is
        * no local high-water mark to prefer on THIS path: the run whose appends it would
        * have counted belongs to a process that is already gone, which is why this settle
-       * runs at all.
+       * runs at all. That argument is specific to this path and does NOT carry over to
+       * `job-runner`'s seal, whose fold IS the writer and therefore holds the offsets
+       * `append` returned; it seals at `max(localHighWater, maxOffset ?? 0)` and is exact
+       * in the common case. The LOWER-BOUND contract is written for the path here, where
+       * nothing better exists.
        */
       const settle = (job: Job, status: SettleStatus): Effect.Effect<void, StateStoreError> =>
         Effect.gen(function* () {

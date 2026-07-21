@@ -41,7 +41,7 @@ import {
 import { Repository as DomainRepository } from "@sprinter/domain";
 import { ExecutionRunnerError, JobRunner } from "@sprinter/job";
 import { CodeHost, CodeHostError, RepositoryIssue } from "@sprinter/repository";
-import { layerMemory, StateStore } from "@sprinter/state";
+import { layerMemory, StateStore, StateStoreError } from "@sprinter/state";
 import { layer as startupLayer, StartupReconcile } from "./startup-reconcile.ts";
 
 // ============================================================================
@@ -273,8 +273,27 @@ const flakyRunner = (log: Queue.Enqueue<Job>, failFor: string): Layer.Layer<JobR
  * `provideMerge`, so the `StateStore` the test seeds is the exact instance
  * `StartupReconcile` reads (a plain `Layer.provide` would build a second store).
  */
-const testLayer = (state: HostState, runner: Layer.Layer<JobRunner>) =>
-  startupLayer.pipe(Layer.provideMerge(Layer.mergeAll(layerMemory, fakeRepository(state), runner)));
+const testLayer = (
+  state: HostState,
+  runner: Layer.Layer<JobRunner>,
+  store: Layer.Layer<StateStore, StateStoreError> = layerMemory,
+) => startupLayer.pipe(Layer.provideMerge(Layer.mergeAll(store, fakeRepository(state), runner)));
+
+/** A {@link StateStore} whose `executionLog.maxOffset` ALWAYS fails; everything else delegates. */
+const failMaxOffset: Layer.Layer<StateStore, StateStoreError> = Layer.effect(
+  StateStore,
+  Effect.gen(function* () {
+    const base = yield* StateStore;
+    return StateStore.of({
+      ...base,
+      executionLog: {
+        ...base.executionLog,
+        maxOffset: () =>
+          Effect.fail(new StateStoreError({ operation: "maxOffset", detail: "transient" })),
+      },
+    });
+  }),
+).pipe(Layer.provide(layerMemory));
 
 // ============================================================================
 // reconcile roll-up with one host error isolated (F4)
@@ -491,6 +510,17 @@ it.effect("seals EVERY execution a settled Job owns, not just the tree's ROOT", 
       yield* store.jobs.putExecution(
         execution({ id: "execution-child", parent: "execution-job-1" }),
       );
+      // A THIRD execution that is ALREADY SEALED. The settle must SKIP it rather than
+      // re-seal it: a sealed range is settled and immutable, and re-writing its
+      // `lastOffset` from a fresh read would move a range a client may already have
+      // cached (the whole cacheability claim).
+      yield* store.jobs.putExecution(
+        execution({
+          id: "execution-done",
+          parent: "execution-job-1",
+          transcript: { _tag: "SealedTranscript", lastOffset: 99 },
+        }),
+      );
       // Distinct per-execution extents, so a seal that reused ONE offset for the whole
       // tree would be visible rather than coincidentally right.
       const entry = decode(ExecutionEvent, { _tag: "ExecutionIdle" });
@@ -503,10 +533,20 @@ it.effect("seals EVERY execution a settled Job owns, not just the tree's ROOT", 
       expect(summary.skipped).toStrictEqual(["job-1"]);
       expect(yield* Queue.size(dispatched)).toBe(0);
 
-      // BOTH executions are sealed — the whole tree, not the root alone.
+      // EVERY execution is sealed — the whole tree, not the root alone.
       const all = yield* store.jobs.listExecutionsForJob(job().id);
-      expect(all.map((e) => e.id)).toStrictEqual(["execution-child", "execution-job-1"]);
+      expect(all.map((e) => e.id)).toStrictEqual([
+        "execution-child",
+        "execution-done",
+        "execution-job-1",
+      ]);
       expect(all.every((e) => !isExecutionLive(e))).toBe(true);
+      // The ALREADY-SEALED one was SKIPPED, not re-sealed: its settled range is exactly
+      // what it was, even though its own log is empty (a re-seal would have moved it to 0).
+      expect(all.find((e) => e.id === "execution-done")?.transcript).toStrictEqual({
+        _tag: "SealedTranscript",
+        lastOffset: 99,
+      });
       // …and each at ITS OWN log's extent, not a shared one.
       const sealedAt = new Map(
         all.map((e) => [
@@ -526,6 +566,51 @@ it.effect("seals EVERY execution a settled Job owns, not just the tree's ROOT", 
     }).pipe(
       Effect.provide(
         testLayer(host({ issues: new Map([[1, "open"]]) }), recordingRunner(dispatched)),
+      ),
+    );
+  }),
+);
+
+// The settle's `maxOffset` fallback, pinned. It is the LOAD-BEARING premise of the whole
+// lower-bound disposition of `Transcript.lastOffset`: sealing at `0` rather than refusing to
+// seal is what guarantees a settle can never leave an execution LIVE, and an execution left live
+// because an extent read hiccupped is the CE4.1-R4 stall — strictly worse than an understated
+// extent. Unlike the dispatch path there is NO local high-water mark to prefer here: the run
+// whose appends it would have counted belongs to a process that is already gone, which is why
+// this settle runs at all. So `0` is the honest answer, and liveness must still clear.
+it.effect("seals at the LOWER BOUND 0 when the settle's `maxOffset` read fails", () =>
+  Effect.gen(function* () {
+    const dispatched = yield* Queue.unbounded<Job>();
+    yield* Effect.gen(function* () {
+      const store = yield* StateStore;
+      yield* store.repositories.putRepository(repository);
+      yield* store.workGraph.putWorkstream(workstream({ status: "blocked" }));
+      yield* store.workGraph.putEpic(epic({ status: "blocked" }));
+      yield* store.workGraph.putIssue(issue(1));
+      yield* seedRun(store, job(), execution());
+      // Entries DO exist — so `0` is demonstrably an understatement rather than a
+      // coincidentally-correct empty log, which is exactly the lower-bound claim.
+      const entry = decode(ExecutionEvent, { _tag: "ExecutionIdle" });
+      yield* store.executionLog.append(execution().id, entry);
+      yield* store.executionLog.append(execution().id, entry);
+
+      const startup = yield* StartupReconcile;
+      const summary = yield* startup.run;
+      expect(summary.skipped).toStrictEqual(["job-1"]);
+
+      const sealed = Option.getOrThrow(yield* store.jobs.getExecutionForJob(job().id));
+      expect(sealed.transcript).toStrictEqual({ _tag: "SealedTranscript", lastOffset: 0 });
+      // The whole point of the fallback: LIVENESS STILL CLEARS, so no gate sees a
+      // forever-running execution, and the settled Job is durably settled.
+      expect(isExecutionLive(sealed)).toBe(false);
+      expect(Option.getOrThrow(yield* store.jobs.getJob(job().id)).status).toBe("queued");
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          host({ issues: new Map([[1, "open"]]) }),
+          recordingRunner(dispatched),
+          failMaxOffset,
+        ),
       ),
     );
   }),

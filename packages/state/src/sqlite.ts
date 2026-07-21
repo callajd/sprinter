@@ -491,7 +491,7 @@ const GENERATION_KEY = "generation";
  * generation identity below is on the wire. The bound is also SINGLE-PROCESS only —
  * see {@link applySchema} for what a second process at a different version can do.
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 7;
 
 /**
  * A row of `sqlite_master` naming one existing schema object and its kind. The kind
@@ -722,11 +722,14 @@ const createSchema = Effect.gen(function* () {
   // - `"jobId"` → `job (id)`: the work this run advances. It is the `sessionId` of the
   //   target model under its pre-DE2.4 name (D1) — a real key NOW, so referential
   //   integrity holds at every intermediate state rather than arriving with `Session`.
-  // - `"agentId"` → `agent (id)`: the exact registry revision that ran. Since the
-  //   registry never rewrites a revision, a historical execution always resolves to the
-  //   agent that actually ran it — and the key is what makes that a guarantee instead of
-  //   a hope (an execution naming an unregistered agent is refused by the engine, and a
-  //   reset drops both tables together so the reference cannot outlive its referent).
+  // - `"agentId"` → `agent (id)`: the registry revision that ran — specifically, the one
+  //   that ran the MOST RECENT dispatch under this execution id. Since the registry never
+  //   rewrites a revision, whatever this column names always resolves to a real, intact
+  //   revision — and the key is what makes THAT a guarantee instead of a hope (an
+  //   execution naming an unregistered agent is refused by the engine, and a reset drops
+  //   both tables together so the reference cannot outlive its referent). It is NOT a
+  //   claim that the column is frozen: it is a PER-RUN FACT and a re-dispatch rewrites it
+  //   (see `putExecution`'s per-column rule, `store.ts`).
   // - `parent` → `execution (id)`: executions form a TREE. Acyclicity takes THREE
   //   things, and the key alone is only the first of them:
   //   1. the KEY — a child cannot name a parent that is not already stored, so a
@@ -767,6 +770,23 @@ const createSchema = Effect.gen(function* () {
   // `@sprinter/domain`), and a status enum beside it would be a second field that must
   // agree with the first (INV-SUM / INV-ENFORCE). `transcript` is stored as ONE JSON
   // column for the same reason — the variant and its payload move together.
+  //
+  // WHAT AN UPSERT MAY REWRITE — the per-column rule, stated where the columns are
+  // declared so a column added HERE inherits it. An `Execution` is a HISTORICAL RECORD
+  // OF A RUN, so a column is FROZEN unless there is a NAMED reason it changes:
+  //
+  //   id         KEY            selects the row
+  //   "jobId"    STRUCTURAL     FROZEN — nothing re-homes a run that already happened
+  //   parent     STRUCTURAL     FROZEN — nothing re-parents one either
+  //   "agentId"  PER-RUN FACT   rewritten by a re-dispatch (issue #77's merged transcript
+  //                             reuses ONE execution id, so a retry after an agent/`pi`
+  //                             upgrade must be able to re-attribute the row)
+  //   mode       PER-RUN FACT   rewritten by a re-dispatch, same reason
+  //   transcript THE LIVE FIELD rewritten — live → sealed IS the lifecycle
+  //
+  // A NEW COLUMN'S DEFAULT IS FROZEN. The full rule, its reasons and the four review
+  // rounds that produced it live on `putExecution` in `store.ts`; the mechanism (the
+  // exclusion list and the `WHERE … IS excluded.…` clauses) is in `putExecution` here.
   yield* sql`CREATE TABLE execution (
       id TEXT PRIMARY KEY NOT NULL,
       "jobId" TEXT NOT NULL,
@@ -1573,30 +1593,58 @@ const make = Effect.gen(function* () {
           mode: execution.mode,
           transcript,
         };
-        // `parent` is INSERT-ONLY: it is absent from the `DO UPDATE SET` list, so an
-        // upsert of an EXISTING id cannot re-point its edge. That omission is what makes
-        // the foreign key mean what its docstring claims — the key only guarantees the
-        // REFERENCED row exists, and while `parent` was in the updated set a 2-cycle was
-        // constructible in three ordinary writes (insert `a` rootless, insert `b` under
-        // `a`, upsert `a` under `b`), leaving the job with no `parent IS NULL` row at all.
-        // Frozen at insert, closing a cycle genuinely requires naming a row that does not
-        // exist yet, which the key refuses (INV-ENFORCE: unconstructible, not checked).
+        // THE UPDATE SET IS DERIVED FROM ONE RULE, NOT ASSEMBLED COLUMN BY COLUMN. See
+        // `putExecution` in `store.ts` for the rule and the per-column table it produces;
+        // this is its mechanism. An `Execution` is a HISTORICAL RECORD OF A RUN, so a
+        // column is FROZEN unless there is a named reason it changes, and only
+        // `transcript` has one. The frozen list is therefore what `sql.update` EXCLUDES:
+        // `id` (the key), plus the two STRUCTURAL columns `"jobId"` and `parent`.
         //
-        // The `WHERE … IS excluded.parent` makes the freeze LOUD rather than silent, and
-        // the ENGINE decides it inside the one statement — no read-then-write window a
+        // The `WHERE … IS excluded.…` makes each freeze LOUD rather than silent, and the
+        // ENGINE decides it inside the one statement — no read-then-write window a
         // concurrent writer can slip through. A re-attach (the intended upsert) passes the
-        // same `parent` and updates normally; a re-parent matches no row, updates nothing,
-        // and `RETURNING` comes back empty, which is the failure below. `IS` is SQLite's
-        // null-safe equality, so a rootless execution's `NULL` compares as a value.
+        // same structural columns and updates normally; a re-home or a re-parent matches
+        // no row, updates nothing, and `RETURNING` comes back empty, which is the failure
+        // below. `IS` is SQLite's null-safe equality, so a rootless execution's `NULL`
+        // parent compares as a value.
+        //
+        // Why each structural column needs its OWN clause — neither covers the other, and
+        // both were live holes found in review:
+        //   - `parent`: a foreign key constrains the row a write REFERENCES, never the
+        //     re-pointing of an EXISTING one, so while `parent` was in the updated set a
+        //     2-cycle was constructible in three ordinary writes (insert `a` rootless,
+        //     insert `b` under `a`, upsert `a` under `b`), leaving the job with NO
+        //     `parent IS NULL` row at all.
+        //   - `"jobId"`: the COMPOSITE `(parent, "jobId")` key closes cross-job EDGES and
+        //     says nothing about a row re-pointing its own `"jobId"`. While it was in the
+        //     updated set, an ordinary re-put MIGRATED a stored execution to another job —
+        //     no dangling reference, no cycle, no second root — leaving the original job
+        //     owning nothing while its Job row still named the execution, so
+        //     `listExecutionsForJob` answered `[]` and `startup-reconcile`'s `settle`
+        //     iterated an empty list and sealed nothing: the CE4.1-R4 live-orphan stall
+        //     again, by a third route.
+        // Frozen, each of those states requires naming a row that does not exist yet,
+        // which the keys refuse (INV-ENFORCE: unconstructible, not checked).
         const written =
-          yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id", "parent"])} WHERE execution.parent IS excluded.parent RETURNING id`.pipe(
+          yield* sql`INSERT INTO execution ${sql.insert(row)} ON CONFLICT (id) DO UPDATE SET ${sql.update(row, ["id", "jobId", "parent"])} WHERE execution."jobId" IS excluded."jobId" AND execution.parent IS excluded.parent RETURNING id`.pipe(
             Effect.mapError(fail("putExecution")),
           );
         if (written.length === 0) {
+          // The statement refused; SAY WHICH freeze did it. This read runs only on the
+          // failure path — after the write is already known not to have happened — so it
+          // adds no window to the write itself, and it is the only way to tell the two
+          // apart from an empty `RETURNING`.
+          const current = yield* sql`SELECT * FROM execution WHERE id = ${execution.id}`.pipe(
+            Effect.mapError(fail("putExecution")),
+            Effect.flatMap((rows) => findExecution(rows, "putExecution")),
+          );
+          const rehomed = Option.exists(current, (stored) => stored.jobId !== execution.jobId);
           return yield* Effect.fail(
             new StateStoreError({
               operation: "putExecution",
-              detail: `execution "${execution.id}" is already stored with a DIFFERENT parent; an execution's parent is fixed at its first write — re-parenting is not an operation an execution has`,
+              detail: rehomed
+                ? `execution "${execution.id}" is already stored under a DIFFERENT job; an execution's job is fixed at its first write — re-homing is not an operation an execution has`
+                : `execution "${execution.id}" is already stored with a DIFFERENT parent; an execution's parent is fixed at its first write — re-parenting is not an operation an execution has`,
             }),
           );
         }
