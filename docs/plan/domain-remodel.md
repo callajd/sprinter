@@ -312,7 +312,9 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   name)` is `UNIQUE`; `refs` is a child table keyed `(repositoryId, name)`; and
   `workstream.repositoryId` is a `FOREIGN KEY` (`INV-ENFORCE`).
 - **Out of scope, stated:** the refresh MECHANISM lands here; the refresh TRIGGER
-  does not. See the constraint recorded against `DE4.4`.
+  does not. One consequence is documented and pinned by a test rather than fixed: a
+  stale row's natural key blocks a different repository renamed into it. See the
+  constraint recorded against `DE4.4`.
 - **Depends on:** —
 
 ### DE1.3 — Retire `SprinterCore/Workstream.swift`
@@ -459,7 +461,13 @@ DE1 ──► DE2 ──► DE3 ──► DE4
   DE4.4 therefore **must land a trigger** (a poll, an invalidation, or a refresh on
   read) before it can render staleness honestly; rendering `observedAt` against a
   record nothing refreshes measures when Sprinter first saw the repository, not how
-  stale the data is.
+  stale the data is. A trigger also buys a **write** fix, not just a rendering one: a
+  never-refreshed record keeps holding a `(host, owner, name)` the host has already
+  freed, so a *different* repository renamed into that key collides with the stale row
+  on the `UNIQUE` natural key and fails with `StateStoreError` — permanently, though it
+  is entirely valid on the host. DE1.2 pins that behaviour with a test rather than
+  guessing which observation is current; the trigger is what makes the guess
+  unnecessary.
 - **Depends on:** `DE2.3`, `DE3.3`
 
 ### DE4.5 — Execution tree in the session view

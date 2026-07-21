@@ -300,6 +300,13 @@ export interface AgentStore {
  * is complete and tested; the TRIGGER does not exist and is out of scope for this task.
  * DE4.4's staleness rendering needs one. See the module docstring of
  * `packages/domain/src/repository.ts`.
+ *
+ * That gap also bites the rename path above, which only holds when the refresh carries
+ * the SAME id: a never-refreshed record keeps holding a natural key the host has already
+ * freed, so a DIFFERENT repository renamed INTO that key hits the failure documented on
+ * `putRepository` below and stays unstorable until something refreshes the stale record.
+ * A trigger is what resolves it; the current behaviour is pinned by a test rather than
+ * worked around here.
  */
 export interface RepositoryStore {
   /**

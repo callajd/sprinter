@@ -35,11 +35,22 @@
  * `repositoryKey` are exported for the readers that will follow and have no production
  * caller yet.
  *
- * The consequence is concrete and belongs to DE4.4, which renders staleness from
- * `observedAt`: with no refresh trigger every record renders as monotonically ageing,
- * so DE4.4 cannot land honestly until a trigger exists. That constraint is recorded
- * against DE4.4 in `docs/plan/domain-remodel.md`. Building the trigger is deliberately
- * NOT part of this task.
+ * Two consequences are concrete, and both belong to DE4.4, which is where a trigger
+ * would land. That constraint is recorded against DE4.4 in
+ * `docs/plan/domain-remodel.md`; building the trigger is deliberately NOT part of this
+ * task.
+ *
+ * The first is what DE4.4 renders: with no refresh trigger every record renders as
+ * monotonically ageing, so DE4.4 cannot land honestly until a trigger exists.
+ *
+ * The second is a WRITE failure, not just a rendering one. A stale record's
+ * `(host, owner, name)` keeps occupying a natural key the host has already freed, so a
+ * DIFFERENT repository renamed INTO that key cannot be stored at all: the ids differ, so
+ * the id-keyed upsert does not fire, and the write collides on the store's UNIQUE
+ * natural key and fails — permanently, for a repository that is entirely valid on the
+ * host. So a refresh trigger does not only buy honest staleness; it also frees the
+ * natural keys that stale records are squatting on. The sequence is written out on
+ * `putRepository` in `packages/state/src/sqlite.ts` and pinned by a test.
  *
  * ## The natural key is `(host, owner, name)`; the ID is the HOST's own
  *

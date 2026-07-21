@@ -573,6 +573,10 @@ const createSchema = Effect.gen(function* () {
   // repository is the domain's own "two records disagreeing about the same thing", and
   // it is made UNCONSTRUCTIBLE by the UNIQUE index below rather than by a resolve-time
   // read-then-check, which a concurrent or reordered write walks straight past.
+  //
+  // KNOWN CONSEQUENCE: a STALE row's natural key blocks a different repository from
+  // being renamed INTO it. See the note on `putRepository` for the sequence; the cause
+  // is that nothing TRIGGERS a refresh, not this index.
   yield* sql`CREATE TABLE repository (
       id TEXT PRIMARY KEY NOT NULL,
       host TEXT NOT NULL,
@@ -1078,6 +1082,25 @@ const make = Effect.gen(function* () {
     // is satisfied because the old triple leaves the table in the same statement.
     // Deriving the id from the natural key instead would make that case an INSERT, and
     // the store would end up with two rows for one repository.
+    //
+    // KNOWN GAP (stated, not fixed here): a rename only moves the row when the CONFLICT
+    // IS ON `id`. When it is not, a STALE row can permanently block a VALID repository:
+    //
+    //   1. Repository B (host id 2) is observed at `owner/X` — row stored, natural key `X`.
+    //   2. B is renamed on the host to `owner/Y`. NOTHING refreshes it (there is no
+    //      production refresh trigger), so our row still claims `X`.
+    //   3. Repository A (host id 1) is renamed on the host into `owner/X`.
+    //   4. Storing A inserts id 1 with natural key `X`. The ids differ, so `ON CONFLICT
+    //      (id)` does NOT fire; it collides with the stale B row on the
+    //      `repository_natural_key` UNIQUE index and surfaces as a `StateStoreError` —
+    //      permanently, for a repository that is entirely valid on the host.
+    //
+    // The root cause is the ABSENT REFRESH TRIGGER, not the index: with a trigger, B's
+    // row would move to `Y` and A would land. Evicting the stale row or resolving the
+    // conflict HERE would invent policy DE1.2 has no basis to choose (which of the two
+    // observations is the current one is exactly what only a refresh can answer), so the
+    // behaviour is PINNED by a test in `store.test.ts` rather than changed, and the fix
+    // is recorded against DE4.4 with the trigger it depends on.
     putRepository: (repository) =>
       sql
         .withTransaction(

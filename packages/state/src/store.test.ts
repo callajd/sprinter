@@ -731,6 +731,38 @@ it.effect("REJECTS a second repository row for the same (host, owner, name)", ()
   }).pipe(Effect.provide(layerMemory)),
 );
 
+// PINS CURRENT BEHAVIOUR — NOT AN ENDORSEMENT. A STALE row's natural key blocks a
+// DIFFERENT repository from being renamed INTO it, and the valid repository becomes
+// permanently unstorable. This asserts what the code does today so the behaviour is
+// known and cannot change silently; it is a consequence of the KNOWN GAP that nothing
+// TRIGGERS a refresh (see `packages/domain/src/repository.ts`), not of the UNIQUE index,
+// which is doing exactly its job. The fix belongs to whoever lands the refresh trigger
+// (recorded against DE4.4) — evicting the stale row or resolving the conflict here would
+// invent policy DE1.2 has no basis to choose.
+it.effect("PINS: a stale row's natural key blocks another repository renamed into it", () =>
+  Effect.gen(function* () {
+    const store = yield* StateStore;
+    // 1. Repository B (host id 2) is observed at `callajd/x`.
+    yield* store.repositories.putRepository(
+      yield* repository({ id: "repo:github:2", name: "x", refs: [] }),
+    );
+    // 2. B is renamed upstream to `callajd/y`. Nothing refreshes our row, so it still
+    //    claims `x` — the stale observation is now WRONG about the host, undetectably.
+    // 3. Repository A (host id 1) is renamed upstream INTO `callajd/x`.
+    const renamedIntoStaleKey = yield* repository({ id: "repo:github:1", name: "x", refs: [] });
+    // 4. Storing A does NOT hit `ON CONFLICT (id)` — the ids differ — so it collides with
+    //    the stale B row on `UNIQUE (host, owner, name)` and fails, for a repository that
+    //    is entirely valid on the host. `flip` makes the REJECTION the success.
+    const rejected = yield* store.repositories.putRepository(renamedIntoStaleKey).pipe(Effect.flip);
+    expect(rejected).toBeInstanceOf(StateStoreError);
+    expect(rejected.operation).toBe("putRepository");
+    // The stale row survives untouched, so the failure REPEATS on every retry: it is
+    // permanent until something refreshes B.
+    const stored = yield* store.repositories.listRepositories;
+    expect(stored.map((row) => row.id)).toStrictEqual(["repo:github:2"]);
+  }).pipe(Effect.provide(layerMemory)),
+);
+
 // D4(a) — a repeated branch name within ONE repository is unconstructible. The domain
 // schema refuses to build such a value at all, so the store never sees one; this
 // asserts the schema-side half, which is what keeps a hand-built wire payload or
